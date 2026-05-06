@@ -1,0 +1,102 @@
+// Package cac.store.v1 defines the gRPC wire protocol for the
+// store-ctl daemon. Clients (manifest-ctl, cache-ctl origin) talk to
+// store-ctl through this interface and never touch the underlying
+// filesystem or object storage directly.
+//
+// The service is deliberately small: GetSalt to seed client-side
+// convergent encryption, Get to stream bytes out, Put to stream bytes
+// in. Generation management is an internal server concern — clients
+// do not carry generation labels in their requests.
+//
+// Put is client-streaming with a header-first convention: the first
+// PutRequest MUST carry a PutHeader (partition + client-computed key);
+// subsequent PutRequests carry raw bytes. The server streams data
+// directly into a temp file (zero-memory receive) and may SendAndClose
+// early with is_new=false if the key already exists (dedup
+// short-circuit, saves the full payload bandwidth on dedup hits).
+//
+// Get is server-streaming: one GetRequest produces one or more
+// GetResponse messages with byte chunks, or a NOT_FOUND status on miss.
+syntax = "proto3";
+
+package cac.store.v1;
+
+option go_package = "github.com/fullof-work/mass-sandbox/pkg/store/pb";
+
+service Store {
+    // GetSalt returns the server's active generation name and the
+    // 32-byte salt derived from it. Clients combine this with any
+    // extra salt they control (CLI --salt flag, per-tenant nonces)
+    // and use the result as the convergent-encryption seed.
+    rpc GetSalt(GetSaltRequest) returns (GetSaltResponse);
+
+    // Get streams an object's bytes back to the caller. On miss,
+    // the server returns NOT_FOUND (no stream payload). On hit, one
+    // or more data messages form the full object in order.
+    rpc Get(GetRequest) returns (stream GetResponse);
+
+    // Put streams an object from the caller. The first message MUST
+    // be a PutHeader carrying partition + client-computed key.
+    // Subsequent messages carry raw byte chunks. The server may
+    // SendAndClose early with is_new=false if the key already
+    // exists. Otherwise the server streams data directly into a
+    // temp file, optionally re-hashes to verify the key matches,
+    // and atomically renames on success.
+    rpc Put(stream PutRequest) returns (PutResponse);
+}
+
+message GetSaltRequest {}
+
+message GetSaltResponse {
+    // Active generation name (e.g. "G1"). Informational — clients do
+    // not label their own Put/Get requests with it; the server uses
+    // this generation for all writes and includes it in reverse-
+    // search during Get.
+    string generation = 1;
+    // 32-byte salt derived from the generation via the server's
+    // opaque algorithm. Clients combine this with their own extra
+    // salt before deriving per-chunk encryption keys.
+    bytes  salt       = 2;
+}
+
+enum Partition {
+    PARTITION_UNSPECIFIED = 0;
+    PARTITION_CHUNK       = 1;
+    PARTITION_MANIFEST    = 2;
+}
+
+message GetRequest {
+    Partition partition = 1;
+    bytes     key       = 2;   // 32 bytes SHA256
+}
+
+message GetResponse {
+    // A single chunk of the object's bytes. Multiple GetResponses
+    // concatenate in order to form the full object. The client
+    // buffers these before returning a materialized store.Blob.
+    bytes data = 1;
+}
+
+message PutRequest {
+    oneof body {
+        PutHeader header = 1;  // first message only
+        bytes     data   = 2;  // subsequent messages
+    }
+}
+
+message PutHeader {
+    Partition partition = 1;
+    // 32-byte SHA256 of the full object bytes, computed by the
+    // client. The server uses this to resolve the target path
+    // immediately (enabling the dedup short-circuit) and
+    // optionally re-hashes the streamed bytes to verify the
+    // client's claim (per-daemon config).
+    bytes     key       = 2;
+}
+
+message PutResponse {
+    // false means dedup hit: the key already existed on the server
+    // and no new file was written. true means a new file was
+    // created.
+    bool is_new = 1;
+}

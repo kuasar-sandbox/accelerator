@@ -1,0 +1,93 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"google.golang.org/grpc"
+
+	"github.com/fullof-work/mass-sandbox/pkg/store/pb"
+	"github.com/fullof-work/mass-sandbox/pkg/store/server"
+)
+
+// cmdServe starts the gRPC store daemon and blocks until the
+// process receives SIGINT or SIGTERM, at which point it does a
+// graceful gRPC shutdown.
+//
+// The backend must already be initialised — `serve` refuses to
+// auto-init a fresh root, and the surfaced ErrUninitialised tells
+// the operator to run `store-ctl init` first.
+func cmdServe(args []string) {
+	fset := flag.NewFlagSet("serve", flag.ExitOnError)
+	configPath := fset.String("config", "", "YAML config file (required)")
+	fset.Parse(args)
+
+	if *configPath == "" {
+		fatal("--config is required")
+	}
+	cfg, err := LoadConfig(*configPath, true)
+	if err != nil {
+		fatal("%v", err)
+	}
+
+	backend, err := serveBackend(cfg)
+	if err != nil {
+		fatal("%v", err)
+	}
+
+	srv, err := server.New(server.Options{
+		Backend:   backend,
+		VerifyKey: cfg.VerifyKey(),
+	})
+	if err != nil {
+		fatal("server.New: %v", err)
+	}
+
+	gs := grpc.NewServer()
+	pb.RegisterStoreServer(gs, srv)
+
+	lis, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		fatal("listen %s: %v", cfg.Listen, err)
+	}
+
+	fmt.Fprintf(os.Stderr, "store-ctl serve listen=%s backend=%s generation=%s verify=%t\n",
+		cfg.Listen, cfg.Backend, backend.ActiveGeneration(), cfg.VerifyKey())
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- gs.Serve(lis) }()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case sig := <-sigCh:
+		fmt.Fprintf(os.Stderr, "store-ctl: received %s, shutting down...\n", sig)
+		gs.GracefulStop()
+	case err := <-errCh:
+		if err != nil {
+			fatal("gRPC serve: %v", err)
+		}
+	}
+}
+
+// serveBackend dispatches on cfg.Backend. Returns the abstract
+// server.Backend so the caller doesn't need to import every backend
+// package directly. Error messages keep the per-backend context so
+// misconfiguration (missing fs.root, bad obs endpoint, etc.) lands
+// with a clear hint.
+func serveBackend(cfg *Config) (server.Backend, error) {
+	switch cfg.Backend {
+	case "fs":
+		return openFSStore(cfg)
+	case "obs":
+		return openOBSStore(context.Background(), cfg)
+	default:
+		return nil, fmt.Errorf("unknown backend %q", cfg.Backend)
+	}
+}

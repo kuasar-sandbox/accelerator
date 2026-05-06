@@ -1,0 +1,58 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+
+	"github.com/fullof-work/mass-sandbox/pkg/store"
+)
+
+// cmdInfo opens the store described by the config in read-only mode
+// and prints a short report: backend, location, active generation,
+// the full generations list, and per-generation chunk/manifest object
+// counts.
+//
+// Works on both backends — the per-partition walk happens through
+// the admin GenerationStats method, which fs implements with
+// filepath.WalkDir and obs implements with paginated List.
+func cmdInfo(args []string) {
+	fset := flag.NewFlagSet("info", flag.ExitOnError)
+	configPath := fset.String("config", "", "YAML config file (required)")
+	fset.Parse(args)
+
+	if *configPath == "" {
+		fatal("--config is required")
+	}
+	cfg, err := LoadConfig(*configPath, false)
+	if err != nil {
+		fatal("%v", err)
+	}
+	s, err := openAdminStore(cfg)
+	if err != nil {
+		fatal("%v", err)
+	}
+
+	fmt.Printf("Backend: %s\n", cfg.Backend)
+	switch cfg.Backend {
+	case "fs":
+		fmt.Printf("Root:    %s\n", cfg.FS.Root)
+	case "obs":
+		fmt.Printf("Bucket:  %s\n", cfg.OBS.Bucket)
+		fmt.Printf("Prefix:  %s\n", cfg.OBS.Prefix)
+	}
+	fmt.Printf("Active:  %s\n", s.ActiveGeneration())
+	gens := s.Generations()
+	fmt.Printf("Generations (newest first): %v\n\n", gens)
+
+	ctx := context.Background()
+	for _, gen := range gens {
+		stats, err := s.GenerationStats(ctx, gen)
+		if err != nil {
+			fmt.Printf("  %s: error: %v\n", gen, err)
+			continue
+		}
+		fmt.Printf("  %s: chunk=%d manifest=%d\n",
+			gen, stats[store.PartitionChunk], stats[store.PartitionManifest])
+	}
+}
