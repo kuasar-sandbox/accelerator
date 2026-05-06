@@ -1,0 +1,25 @@
+mode: tiered
+listen: 0.0.0.0:7070
+health_listen: 0.0.0.0:7071
+rpc_timeout: 2s
+
+freq:
+  counters: 8M
+  reset_after: 1M
+  reset_interval: 1h
+  persist_interval: 5m
+
+tiers:
+  - type: embedded
+    rocks:
+      path: /var/cache/accel-l1
+      disk_bytes: 1TiB
+      mem_ratio: 0.01
+      direct_reads: true
+      bloom_bits: 15
+
+origin:
+  backend: fs
+  fs:
+    root: /var/store
+  max_inflight: 16

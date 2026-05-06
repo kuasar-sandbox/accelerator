@@ -1,0 +1,421 @@
+package cache
+
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/fullof-work/mass-sandbox/pkg/store"
+)
+
+// CacheResult distinguishes the three lookup outcomes from a cache layer.
+type CacheResult int
+
+const (
+	CacheHit     CacheResult = iota // hit, blob valid
+	CacheMiss                        // miss, caller should try the next layer
+	CacheHitMiss                     // negative cache hit ("known absent"), terminate cascade
+)
+
+// Getter is the read-side contract implemented by every cache layer.
+//
+// Get returns a cache.Blob on hit. The caller owns the returned handle
+// and MUST Release it exactly once. If the caller needs to hand the
+// blob to a goroutine that outlives the sync path, it must first
+// Clone the handle.
+type Getter interface {
+	Get(ctx context.Context, p store.Partition, key store.ContentKey) (CacheResult, Blob, error)
+}
+
+// Filler is the write-side contract: a tier that supports backfill.
+//
+// Fill receives raw bytes, not an io.Reader. The `data` slice is valid
+// only for the synchronous duration of Fill — implementations that
+// need to retain bytes for async work (fire-and-forget fan-out, etc.)
+// must copy before returning.
+type Filler interface {
+	Fill(ctx context.Context, p store.Partition, key store.ContentKey, data []byte) error
+}
+
+// Tier is a complete cache layer that supports both lookup and fill.
+// It is the object-level read+write contract: Getter + Filler.
+type Tier interface {
+	Getter
+	Filler
+}
+
+// ShardGetter is the read-side contract for shard-level storage, where
+// a single object is split into N erasure-coded shards.
+//
+// A shard's (idx, total) is encoded in the first ShardPrefixSize bytes
+// of the returned Blob (see shard_value.go); the reader/router does
+// NOT tell the peer which idx to fetch. This decouples shard identity
+// from cluster membership: a peer serves whatever shard it holds,
+// and the EC client accepts any K of N distinct idx.
+type ShardGetter interface {
+	GetShard(ctx context.Context, p store.Partition, key store.ContentKey) (CacheResult, Blob, error)
+}
+
+// ShardFiller is the write-side contract for shard-level storage.
+//
+// value must be pre-formatted as [idx][total][shard_data] — see
+// EncodeShardPrefix. The store writes value verbatim; it does not
+// interpret the prefix. This lets the hot path avoid any intermediate
+// copy between the RS encoder's output buffer and rocksdb.
+type ShardFiller interface {
+	FillShard(ctx context.Context, p store.Partition, key store.ContentKey, value []byte) error
+}
+
+// ShardTier is the complete shard-level read+write contract.
+type ShardTier interface {
+	ShardGetter
+	ShardFiller
+}
+
+// Semaphore is the optional concurrency-control capability.
+//
+// A tier or origin that implements Semaphore is rate-limited; on Acquire wait
+// the caller restarts the search from layer 0 (which may have been filled
+// during the wait).
+type Semaphore interface {
+	Acquire(ctx context.Context) (waited bool, err error)
+	Release()
+}
+
+// FillMiss is the optional negative-cache filling capability.
+//
+// When all layers miss, TieredCache calls FillMiss on every tier that
+// implements it so the negative result can be remembered.
+type FillMiss interface {
+	FillMiss(ctx context.Context, p store.Partition, key store.ContentKey) error
+}
+
+// Repairable is optionally implemented by tiers that can backfill
+// reconstructed data after a partial Get (e.g., EC fills the shards
+// that were confirmed missing after a successful reconstruction).
+//
+// Repair is opt-in: a tier defaults to not repairing until EnableRepair
+// is called with a non-nil runner. The runner is invoked once per
+// repair operation; implementations MUST ensure the thunk runs exactly
+// once.
+//
+// TieredCache auto-calls EnableRepair on tiers that implement this, so
+// repair goroutines become visible to WaitFills and graceful shutdown.
+type Repairable interface {
+	EnableRepair(runner func(fn func()))
+}
+
+// fillTimeout bounds asynchronous fill goroutines.
+const fillTimeout = 30 * time.Second
+
+// TieredCache composes cache tiers and an origin into a layered lookup.
+//
+// Counters are per-tier parallel slices (hits / misses / fills) plus
+// origin-level scalars. The slices are pre-allocated to len(tiers) and
+// never grow, so the embedded atomic.Uint64 values are safe to address
+// by index — no mutex, no pointer indirection. Counters feed the Info
+// gRPC service via Counters() and are the only Go-level stats exposed
+// by TieredCache; see pkg/cache/stats.go for the wire shape.
+type TieredCache struct {
+	tiers        []Tier
+	origin       Getter
+	fillInflight []sync.WaitGroup // per-tier inflight fill WaitGroups
+
+	tierHits   []atomic.Uint64
+	tierMisses []atomic.Uint64
+	tierFills  []atomic.Uint64
+	tierErrors []atomic.Uint64 // per-tier tryTier err-return count
+
+	originHits   atomic.Uint64
+	originMisses atomic.Uint64
+	originErrors atomic.Uint64
+}
+
+// TieredCounters is the snapshot returned by TieredCache.Counters().
+// The server package composes these with per-tier type detail (rocks
+// properties, EC peers, upstream endpoint) to produce cache.TieredStats.
+type TieredCounters struct {
+	TierHits     []uint64
+	TierMisses   []uint64
+	TierFills    []uint64
+	TierErrors   []uint64
+	OriginHits   uint64
+	OriginMisses uint64
+	OriginErrors uint64
+}
+
+// NewTieredCache builds a TieredCache from an origin and zero or more cache tiers.
+// Tiers are searched in order; backfill flows upward (origin → ... → tier 0).
+//
+// Tiers that implement Repairable are auto-enabled with a runner that
+// tracks repair goroutines in the tier's fillInflight WaitGroup, so
+// WaitFills and graceful shutdown correctly account for in-flight
+// repairs.
+func NewTieredCache(origin Getter, tiers ...Tier) *TieredCache {
+	tc := &TieredCache{
+		tiers:        tiers,
+		origin:       origin,
+		fillInflight: make([]sync.WaitGroup, len(tiers)),
+		tierHits:     make([]atomic.Uint64, len(tiers)),
+		tierMisses:   make([]atomic.Uint64, len(tiers)),
+		tierFills:    make([]atomic.Uint64, len(tiers)),
+		tierErrors:   make([]atomic.Uint64, len(tiers)),
+	}
+	for i, t := range tiers {
+		r, ok := t.(Repairable)
+		if !ok {
+			continue
+		}
+		idx := i
+		r.EnableRepair(func(fn func()) {
+			tc.fillInflight[idx].Add(1)
+			go func() {
+				defer tc.fillInflight[idx].Done()
+				fn()
+			}()
+		})
+	}
+	return tc
+}
+
+// Counters returns a snapshot of per-tier + origin counters. Safe to
+// call concurrently with Get/startFill.
+func (tc *TieredCache) Counters() TieredCounters {
+	c := TieredCounters{
+		TierHits:     make([]uint64, len(tc.tiers)),
+		TierMisses:   make([]uint64, len(tc.tiers)),
+		TierFills:    make([]uint64, len(tc.tiers)),
+		TierErrors:   make([]uint64, len(tc.tiers)),
+		OriginHits:   tc.originHits.Load(),
+		OriginMisses: tc.originMisses.Load(),
+		OriginErrors: tc.originErrors.Load(),
+	}
+	for i := range tc.tiers {
+		c.TierHits[i] = tc.tierHits[i].Load()
+		c.TierMisses[i] = tc.tierMisses[i].Load()
+		c.TierFills[i] = tc.tierFills[i].Load()
+		c.TierErrors[i] = tc.tierErrors[i].Load()
+	}
+	return c
+}
+
+// Get attempts to read by key, looking through cache tiers and then the origin.
+// On hit, upper cache tiers are filled asynchronously. On terminal miss, FillMiss
+// is invoked on every tier that supports it.
+//
+// Returned Blob ownership: the caller owns the handle and must Release
+// it exactly once after use. Fill-aside cloning is handled internally
+// by startFill, so the handle returned to the caller is distinct from
+// any clones in flight inside fill goroutines.
+func (tc *TieredCache) Get(ctx context.Context, p store.Partition, key store.ContentKey) (bool, Blob, error) {
+	// Build the layer list once: cache tiers + origin.
+	layers := make([]Getter, 0, len(tc.tiers)+1)
+	for _, t := range tc.tiers {
+		layers = append(layers, t)
+	}
+	layers = append(layers, tc.origin)
+
+restart:
+	for {
+		for i, layer := range layers {
+			result, blob, waited, err := tryTier(ctx, layer, p, key)
+			if err != nil {
+				// Attribute the error to the tier (or origin) that
+				// tried to answer. Distinct from misses: "we failed
+				// to ask" vs "peer said absent".
+				if i == len(tc.tiers) {
+					tc.originErrors.Add(1)
+				} else {
+					tc.tierErrors[i].Add(1)
+				}
+				return false, nil, err
+			}
+			if waited {
+				continue restart // restart from layer 0 — upper layers may be filled
+			}
+			// Bump per-layer counters. Origin is the trailing entry
+			// (i == len(tiers)); tier indices are 0..len(tiers)-1.
+			isOrigin := i == len(tc.tiers)
+			switch result {
+			case CacheHit, CacheHitMiss:
+				if isOrigin {
+					tc.originHits.Add(1)
+				} else {
+					tc.tierHits[i].Add(1)
+				}
+			case CacheMiss:
+				if isOrigin {
+					tc.originMisses.Add(1)
+				} else {
+					tc.tierMisses[i].Add(1)
+				}
+			}
+			switch result {
+			case CacheHit:
+				// Backfill upper cache tiers (skip if origin hit fills all tiers).
+				upper := i
+				if upper > len(tc.tiers) {
+					upper = len(tc.tiers)
+				}
+				for j := upper - 1; j >= 0; j-- {
+					tc.startFill(j, p, key, blob)
+				}
+				return true, blob, nil
+
+			case CacheHitMiss:
+				return false, nil, nil
+
+			case CacheMiss:
+				continue
+			}
+		}
+
+		// Final miss — record negative cache on every supporting tier.
+		for j := len(tc.tiers) - 1; j >= 0; j-- {
+			tc.startFillMiss(j, p, key)
+		}
+		return false, nil, nil
+	}
+}
+
+// tryTier acquires the optional sem, then calls Get.
+// If acquire would block (waited=true), it releases and returns the restart signal
+// without calling Get — the caller will restart from layer 0.
+func tryTier(ctx context.Context, c Getter, p store.Partition, key store.ContentKey) (CacheResult, Blob, bool, error) {
+	if sem, ok := c.(Semaphore); ok {
+		waited, err := sem.Acquire(ctx)
+		if err != nil {
+			return CacheMiss, nil, false, err
+		}
+		if waited {
+			sem.Release()
+			return CacheMiss, nil, true, nil
+		}
+		defer sem.Release()
+	}
+	result, blob, err := c.Get(ctx, p, key)
+	return result, blob, false, err
+}
+
+// startFill clones the blob (refcount++) and hands the clone to a
+// fire-and-forget goroutine that writes the bytes into the named tier.
+// The caller's original `blob` handle is unaffected — it continues to
+// own its own reference and must still be Released independently (the
+// wire server does so after writing the response frame). The clone is
+// Released inside the goroutine after Fill returns, balancing the
+// refcount.
+//
+// This clone pattern is the whole reason cache.Blob exists: without
+// it, a pool-backed blob would be returned to its pool as soon as the
+// "main" Release fired, and the fill-goroutine's view of the buffer
+// would race with the next caller that pulled the same slice from the
+// pool. Refcounting turns the race into safe cooperative ownership.
+func (tc *TieredCache) startFill(tierIdx int, p store.Partition, key store.ContentKey, blob Blob) {
+	cloned := blob.Clone()
+	tc.fillInflight[tierIdx].Add(1)
+	tc.tierFills[tierIdx].Add(1)
+	go func() {
+		defer tc.fillInflight[tierIdx].Done()
+		defer cloned.Release()
+		ctx, cancel := context.WithTimeout(context.Background(), fillTimeout)
+		defer cancel()
+		_ = tc.tiers[tierIdx].Fill(ctx, p, key, cloned.Bytes())
+	}()
+}
+
+// startFillMiss invokes FillMiss on the tier if it implements the optional interface.
+func (tc *TieredCache) startFillMiss(tierIdx int, p store.Partition, key store.ContentKey) {
+	mf, ok := tc.tiers[tierIdx].(FillMiss)
+	if !ok {
+		return
+	}
+	tc.fillInflight[tierIdx].Add(1)
+	go func() {
+		defer tc.fillInflight[tierIdx].Done()
+		ctx, cancel := context.WithTimeout(context.Background(), fillTimeout)
+		defer cancel()
+		_ = mf.FillMiss(ctx, p, key)
+	}()
+}
+
+// WaitFills blocks until all in-flight fill goroutines have completed or ctx is cancelled.
+// Callers should defer this before exiting to avoid losing fills.
+func (tc *TieredCache) WaitFills(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		for i := range tc.fillInflight {
+			tc.fillInflight[i].Wait()
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// ───────────────────────────── semaphore (internal) ─────────────────────────────
+
+// semaphore is a context-aware concurrency gate (default Semaphore implementation).
+type semaphore struct{ ch chan struct{} }
+
+// newSemaphore returns a semaphore with capacity n. n<=0 returns nil (unlimited).
+func newSemaphore(n int) *semaphore {
+	if n <= 0 {
+		return nil
+	}
+	return &semaphore{ch: make(chan struct{}, n)}
+}
+
+// Acquire returns waited=true if the call had to block on a full channel.
+func (s *semaphore) Acquire(ctx context.Context) (waited bool, err error) {
+	if s == nil {
+		return false, nil
+	}
+	select {
+	case s.ch <- struct{}{}:
+		return false, nil
+	default:
+	}
+	select {
+	case s.ch <- struct{}{}:
+		return true, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
+
+// Release returns one slot.
+func (s *semaphore) Release() {
+	if s == nil {
+		return
+	}
+	<-s.ch
+}
+
+// ───────────────────────────── origin adapter ─────────────────────────────
+
+// originAdapter composes an inner Getter with a max-inflight semaphore,
+// serving as the origin tier of a TieredCache. The inner Getter can be
+// any read-capable cache component — rocks, a wire client, a NewStoreOrigin
+// bridge over a store-ctl client, etc.
+type originAdapter struct {
+	inner Getter
+	*semaphore
+}
+
+// NewOriginAdapter wraps inner with a max-inflight semaphore.
+// maxInflight<=0 means unlimited.
+func NewOriginAdapter(inner Getter, maxInflight int) Getter {
+	return &originAdapter{
+		inner:     inner,
+		semaphore: newSemaphore(maxInflight),
+	}
+}
+
+func (oa *originAdapter) Get(ctx context.Context, p store.Partition, key store.ContentKey) (CacheResult, Blob, error) {
+	return oa.inner.Get(ctx, p, key)
+}

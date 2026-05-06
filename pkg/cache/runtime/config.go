@@ -1,0 +1,223 @@
+// Package runtime loads YAML configuration and assembles the cache-ctl server.
+package runtime
+
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Config is the top-level YAML configuration for cache-ctl serve.
+type Config struct {
+	Mode         string     `yaml:"mode"`          // "local" | "shard" | "tiered"
+	Listen       string     `yaml:"listen"`        // e.g. "0.0.0.0:7070" (wire data)
+	HealthListen string     `yaml:"health_listen"` // e.g. "0.0.0.0:7071" (gRPC health)
+	RPCTimeout   string     `yaml:"rpc_timeout"`   // e.g. "2s"
+	// PprofListen, if non-empty, binds an HTTP listener that serves
+	// /debug/pprof/{profile,heap,goroutine,...}. Intended for
+	// perf investigation — leave empty in production.
+	PprofListen string `yaml:"pprof_listen"` // e.g. "127.0.0.1:6060"
+	Freq       FreqConfig `yaml:"freq"`
+	Rocks      RocksConfig `yaml:"rocks"`  // used by local, shard, and embedded tier
+	Tiers      []TierConfig `yaml:"tiers"` // tiered mode only
+	Origin     *OriginConfig `yaml:"origin"` // tiered mode only
+}
+
+// FreqConfig holds CMS frequency sketch parameters.
+type FreqConfig struct {
+	Counters        string `yaml:"counters"`         // e.g. "8M"
+	ResetAfter      string `yaml:"reset_after"`      // e.g. "1M"
+	ResetInterval   string `yaml:"reset_interval"`   // e.g. "1h"
+	EvictThreshold  int    `yaml:"evict_threshold"`
+	PersistInterval string `yaml:"persist_interval"` // e.g. "5m"
+	// DisableEviction turns off the frequency-based compaction filter
+	// entirely. The sketch is still maintained for stats, but the
+	// filter is never armed — no keys are evicted regardless of their
+	// access count. Used when a cache-ctl local daemon plays the
+	// "origin" role for a downstream tiered instance (bench scenarios),
+	// where writes land once and must stay put.
+	DisableEviction bool `yaml:"disable_eviction"`
+}
+
+// RocksConfig holds RocksDB parameters.
+//
+// BlobDB is always enabled on chunk and manifest CFs with fixed
+// parameters (min_blob_size=4 KiB, blob_file_size=256 MiB) — there is
+// no YAML knob to disable or tune it. Large values bypass the LSM main
+// path automatically; small values (< 4 KiB) remain inline in the SST.
+type RocksConfig struct {
+	Path              string  `yaml:"path"`
+	DiskBytes         string  `yaml:"disk_bytes"`          // e.g. "1TiB"
+	MemRatio          float64 `yaml:"mem_ratio"`           // BlockCache = disk_bytes * mem_ratio
+	DirectReads       *bool   `yaml:"direct_reads"`        // default true
+	BloomBits         int     `yaml:"bloom_bits"`          // default 15
+	BlockSize         string  `yaml:"block_size"`          // e.g. "64KiB"
+	WriteBufferBytes  string  `yaml:"write_buffer_bytes"`  // default "256MiB"
+	MaxBackgroundJobs int     `yaml:"max_background_jobs"` // default 8
+}
+
+// TierConfig describes one tier in a tiered-mode tier chain.
+type TierConfig struct {
+	Type        string      `yaml:"type"`         // "embedded" | "upstream" | "ec"
+	MaxInflight int         `yaml:"max_inflight"` // 0 = unlimited
+
+	// embedded
+	Rocks *RocksConfig `yaml:"rocks"`
+
+	// upstream
+	Endpoint string `yaml:"endpoint"`
+	Pool     int    `yaml:"pool"`
+	Timeout  string `yaml:"timeout"`
+
+	// ec
+	Cluster *ECClusterConfig `yaml:"cluster"`
+}
+
+// ECClusterConfig holds EC cluster parameters (embedded in TierConfig).
+type ECClusterConfig struct {
+	DataShards   int          `yaml:"data_shards"`
+	ParityShards int          `yaml:"parity_shards"`
+	Peers        []PeerConfig `yaml:"peers"`
+	Pool         int          `yaml:"pool"`
+	Timeout      string       `yaml:"timeout"`
+}
+
+// PeerConfig identifies a single shard peer.
+type PeerConfig struct {
+	ID       string `yaml:"id"`
+	Endpoint string `yaml:"endpoint"`
+}
+
+// OriginConfig describes the L3 origin that cache-ctl falls through
+// to on L1/L2 miss. The `type` discriminator selects between a
+// store-ctl gRPC origin ("store") and a cache-ctl wire-client origin
+// ("upstream") — the latter lets one cache-ctl instance point its
+// origin at another cache-ctl endpoint for composite topologies.
+type OriginConfig struct {
+	// Type selects the origin flavour: "store" or "upstream".
+	Type string `yaml:"type"`
+	// Store holds the gRPC client parameters when Type == "store".
+	Store *StoreClientConfig `yaml:"store"`
+	// Upstream holds the cache-ctl wire client parameters when
+	// Type == "upstream".
+	Upstream *UpstreamClientConfig `yaml:"upstream"`
+	// MaxInflight caps concurrent origin RPCs via the origin
+	// adapter's semaphore (0 = unlimited).
+	MaxInflight int `yaml:"max_inflight"`
+}
+
+// StoreClientConfig holds the gRPC client knobs for reaching a
+// store-ctl daemon. Same shape as the manifest-ctl side — pool is
+// the number of independent ClientConns for head-of-line relief.
+type StoreClientConfig struct {
+	Endpoint string `yaml:"endpoint"`
+	Pool     int    `yaml:"pool"`
+	Timeout  string `yaml:"timeout"`
+}
+
+// UpstreamClientConfig holds the cache-ctl wire-client knobs for
+// reaching another cache-ctl endpoint as an origin. Same field shape
+// as StoreClientConfig but they're distinct types so the wire-protocol
+// client and gRPC store client can't be confused in Validate.
+type UpstreamClientConfig struct {
+	Endpoint string `yaml:"endpoint"`
+	Pool     int    `yaml:"pool"`
+	Timeout  string `yaml:"timeout"`
+}
+
+// LoadConfig reads and parses a YAML config file.
+func LoadConfig(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("runtime: read config %s: %w", path, err)
+	}
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("runtime: parse config %s: %w", path, err)
+	}
+	return &cfg, nil
+}
+
+// Validate checks required fields based on mode.
+func (c *Config) Validate() error {
+	switch c.Mode {
+	case "local", "shard":
+		if c.Rocks.Path == "" {
+			return fmt.Errorf("runtime: rocks.path is required for mode %q", c.Mode)
+		}
+	case "tiered":
+		if len(c.Tiers) == 0 {
+			return fmt.Errorf("runtime: at least one tier is required for tiered mode")
+		}
+		embeddedCount := 0
+		for i, t := range c.Tiers {
+			switch t.Type {
+			case "embedded":
+				if t.Rocks == nil || t.Rocks.Path == "" {
+					return fmt.Errorf("runtime: tiers[%d] (embedded): rocks.path is required", i)
+				}
+				embeddedCount++
+			case "upstream":
+				if t.Endpoint == "" {
+					return fmt.Errorf("runtime: tiers[%d] (upstream): endpoint is required", i)
+				}
+			case "ec":
+				if t.Cluster == nil || len(t.Cluster.Peers) == 0 {
+					return fmt.Errorf("runtime: tiers[%d] (ec): cluster.peers is required", i)
+				}
+			default:
+				return fmt.Errorf("runtime: tiers[%d]: unknown type %q", i, t.Type)
+			}
+		}
+		// A cache-ctl process exposes exactly one local RocksDB instance,
+		// so multiple embedded tiers have no physical meaning — they would
+		// compete for the same mem/disk budget at the same latency class.
+		if embeddedCount > 1 {
+			return fmt.Errorf("runtime: at most one embedded tier is allowed, got %d", embeddedCount)
+		}
+		// Origin is required for tiered mode. Two flavours:
+		//   - type: store — gRPC to a store-ctl daemon
+		//   - type: upstream — wire-client to another cache-ctl
+		if c.Origin == nil {
+			return fmt.Errorf("runtime: origin is required for tiered mode")
+		}
+		switch c.Origin.Type {
+		case "store":
+			if c.Origin.Store == nil || c.Origin.Store.Endpoint == "" {
+				return fmt.Errorf("runtime: origin.store.endpoint is required for type=store")
+			}
+		case "upstream":
+			if c.Origin.Upstream == nil || c.Origin.Upstream.Endpoint == "" {
+				return fmt.Errorf("runtime: origin.upstream.endpoint is required for type=upstream")
+			}
+		default:
+			return fmt.Errorf("runtime: origin.type must be \"store\" or \"upstream\" (got %q)", c.Origin.Type)
+		}
+	default:
+		return fmt.Errorf("runtime: unknown mode %q (expected local, shard, or tiered)", c.Mode)
+	}
+
+	if c.Listen == "" {
+		return fmt.Errorf("runtime: listen address is required")
+	}
+	return nil
+}
+
+// ParseRPCTimeout parses the rpc_timeout field.
+func (c *Config) ParseRPCTimeout() time.Duration {
+	d, err := time.ParseDuration(c.RPCTimeout)
+	if err != nil || d <= 0 {
+		return 2 * time.Second
+	}
+	return d
+}
+
+// BoolDefault returns the value of a *bool field, defaulting to def if nil.
+func BoolDefault(b *bool, def bool) bool {
+	if b == nil {
+		return def
+	}
+	return *b
+}

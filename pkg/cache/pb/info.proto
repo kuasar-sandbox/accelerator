@@ -1,0 +1,139 @@
+// Package cac.cache.v1 defines the Info gRPC service for cache-ctl.
+// The service is registered alongside grpc_health_v1.Health on the
+// cfg.HealthListen listener (same port, distinct service name). No
+// new YAML config is required.
+//
+// The service exposes counter-only statistics: hits/misses/fills at
+// three layers — wire-handler (daemon external view), TieredCache
+// (per-tier cascade), and shardImpl (per-EC-peer). Daemon latency is
+// not collected; clients measure end-to-end latency themselves.
+syntax = "proto3";
+
+package cac.cache.v1;
+
+option go_package = "github.com/fullof-work/mass-sandbox/pkg/cache/pb";
+
+service Info {
+    // Get returns a point-in-time snapshot of the daemon's counters.
+    // All counters are monotonically increasing over the daemon's
+    // lifetime; clients compute deltas by subtracting successive
+    // snapshots.
+    rpc Get(InfoRequest) returns (InfoReply);
+
+    // WaitFills blocks until all in-flight fill goroutines on the
+    // daemon's TieredCache have drained, or the client's ctx deadline
+    // fires. Intended for test/bench workflows that need to observe a
+    // quiescent-after-warm state before taking measurements.
+    //
+    // In tiered mode this delegates to cache.TieredCache.WaitFills. In
+    // other modes there is no fill-inflight tracking, so this returns
+    // immediately with nil. Clients should set a ctx deadline — the
+    // call will block indefinitely if fills never drain (e.g., a peer
+    // is permanently stuck).
+    rpc WaitFills(WaitFillsRequest) returns (WaitFillsReply);
+}
+
+message InfoRequest {}
+
+message WaitFillsRequest {}
+
+message WaitFillsReply {}
+
+message InfoReply {
+    // "local" | "shard" | "tiered" — determines which of tiered/rocks
+    // fields are populated.
+    string mode = 1;
+    // Seconds since daemon start.
+    int64  uptime_sec = 2;
+    // Wire-handler counters. Always populated regardless of mode.
+    ServerStats server = 3;
+    // Tiered-mode cascade stats. Nil when mode != "tiered".
+    TieredStats tiered = 4;
+    // Top-level RocksDB CF properties. Populated in local/shard mode
+    // (the daemon's primary rocks.Store); nil in tiered mode because
+    // tiered has no single top-level rocks — per-tier rocks properties
+    // appear inside TieredStats.tiers[].rocks instead.
+    repeated RocksCFStats rocks = 5;
+}
+
+// ServerStats is the daemon-as-server view. A single external RPC
+// bumps exactly one of Hits/Misses (for Get/GetShard) or exactly one
+// of Fills (for Fill/FillShard success). Distinct from the tier-level
+// cascade counts where a single RPC may bump multiple tiers.
+message ServerStats {
+    uint64 hits   = 1;
+    uint64 misses = 2;
+    uint64 fills  = 3;
+}
+
+message TieredStats {
+    repeated TierStats tiers = 1;
+    OriginStats        origin = 2;
+}
+
+// TierStats is one tier's cascade-view counts. Hits = CacheHit +
+// CacheHitMiss (the tier answered); Misses = CacheMiss (punt to next);
+// Errors = tryTier returned a non-nil err (wire failure, decode error,
+// etc.) — distinct from Miss so "peer said no" is not conflated with
+// "we failed to ask". Fills = number of fill-aside ops initiated on
+// this tier.
+//
+// Exactly one of rocks/peers/endpoint is populated, per Type:
+//   - "embedded": rocks
+//   - "ec":       peers
+//   - "upstream": endpoint
+message TierStats {
+    string type   = 1;
+    uint64 hits   = 2;
+    uint64 misses = 3;
+    uint64 fills  = 4;
+
+    repeated RocksCFStats rocks    = 5;
+    repeated PeerStats    peers    = 6;
+    string                endpoint = 7;
+    uint64                errors   = 8;
+}
+
+// OriginStats is the final cascade layer. Origin is a Getter (no
+// Fill), so no Fills field. Errors mirrors TierStats.Errors.
+message OriginStats {
+    string type   = 1;
+    uint64 hits   = 2;
+    uint64 misses = 3;
+
+    string store_path = 4;
+    string endpoint   = 5;
+    uint64 errors     = 6;
+}
+
+// PeerStats is per-EC-peer counts. Distinct from tier-level hits
+// (which require ≥ dataShards peers to answer for a tier hit); each
+// PeerStats row counts the individual peer's shard-level responses.
+//
+// Misses counts only peer-confirmed StatusMiss replies. Errors counts
+// wire/pool failures plus StatusError replies — keeping these separate
+// stops transport noise from inflating "cache miss rate". Cancelled
+// counts StatusCancelled replies (e.g., after EC.Get early-exits with
+// enough hits and cancels the straggler shard fetch). Fills captures
+// per-peer write distribution (Maglev should be approximately uniform;
+// large deviations indicate routing issues or single-peer write
+// failures).
+message PeerStats {
+    string id        = 1;
+    string endpoint  = 2;
+    uint64 hits      = 3;
+    uint64 misses    = 4;
+    uint64 fills     = 5;
+    uint64 errors    = 6;
+    uint64 cancelled = 7;
+}
+
+// RocksCFStats mirrors rocks.CFStats. All numeric fields are strings
+// because that is how RocksDB's GetProperty returns them — we avoid
+// lossy conversion in the daemon and let consumers parse if they want.
+message RocksCFStats {
+    string name       = 1;
+    string num_keys   = 2;
+    string disk_usage = 3;
+    string mem_usage  = 4;
+}

@@ -1,0 +1,38 @@
+mode: tiered
+listen: 0.0.0.0:7070
+health_listen: 0.0.0.0:7071
+rpc_timeout: 2s
+
+freq:
+  counters: 8M
+  reset_after: 1M
+  reset_interval: 1h
+  persist_interval: 5m
+
+tiers:
+  - type: embedded
+    rocks:
+      path: /var/cache/accel-l1
+      disk_bytes: 1TiB
+      mem_ratio: 0.01
+      direct_reads: true
+      bloom_bits: 15
+
+  - type: ec
+    cluster:
+      data_shards: 4
+      parity_shards: 1
+      peers:
+        - {id: l2-01, endpoint: 10.0.1.11:7070}
+        - {id: l2-02, endpoint: 10.0.1.12:7070}
+        - {id: l2-03, endpoint: 10.0.1.13:7070}
+        - {id: l2-04, endpoint: 10.0.1.14:7070}
+        - {id: l2-05, endpoint: 10.0.1.15:7070}
+      pool: 2
+      timeout: 2s
+
+origin:
+  backend: fs
+  fs:
+    root: /var/store
+  max_inflight: 16

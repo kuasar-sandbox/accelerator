@@ -1,0 +1,21 @@
+mode: shard
+listen: 0.0.0.0:7070
+health_listen: 0.0.0.0:7071
+rpc_timeout: 2s
+
+freq:
+  counters: 32M
+  reset_after: 10M
+  reset_interval: 6h
+  evict_threshold: 1
+  persist_interval: 5m
+
+rocks:
+  path: /mnt/ssd/accel-l2
+  disk_bytes: 5TiB
+  mem_ratio: 0.08
+  direct_reads: true
+  block_size: 128KiB
+  bloom_bits: 15
+  write_buffer_bytes: 512MiB
+  max_background_jobs: 16

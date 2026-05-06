@@ -1,0 +1,181 @@
+package server
+
+import (
+	"context"
+	"sync/atomic"
+
+	"github.com/fullof-work/mass-sandbox/pkg/cache"
+	"github.com/fullof-work/mass-sandbox/pkg/cache/wire"
+	"github.com/fullof-work/mass-sandbox/pkg/store"
+)
+
+// CacheHandler dispatches wire frames to the appropriate backend.
+//
+// Sketch frequency tracking lives inside the rocks layer — the handler
+// does not see or touch the sketch. Object-level opcodes (ObjectGet /
+// ObjectPut) are routed through `tier`; shard-level opcodes (ShardGet /
+// ShardPut) through `shard`. Either may be nil when the daemon mode
+// doesn't support that opcode family, in which case the handler
+// returns StatusError.
+//
+// Server-level counters (srvHits/srvMisses/srvFills) capture the
+// external view: one RPC bumps exactly one counter. Unlike tier-level
+// counts which may bump several tiers per RPC.
+type CacheHandler struct {
+	tier  cache.Tier
+	shard cache.ShardTier
+
+	srvHits   atomic.Uint64
+	srvMisses atomic.Uint64
+	srvFills  atomic.Uint64
+}
+
+// NewCacheHandler wires the object-level and shard-level backends.
+// Pass nil for the unused family in modes that don't support both:
+//   - local / tiered: tier non-nil, shard nil
+//   - shard:           tier nil, shard non-nil
+func NewCacheHandler(tier cache.Tier, shard cache.ShardTier) *CacheHandler {
+	return &CacheHandler{tier: tier, shard: shard}
+}
+
+// ServerStats returns a snapshot of the wire-handler counters. Safe to
+// call concurrently with request handling.
+func (h *CacheHandler) ServerStats() cache.ServerStats {
+	return cache.ServerStats{
+		Hits:   h.srvHits.Load(),
+		Misses: h.srvMisses.Load(),
+		Fills:  h.srvFills.Load(),
+	}
+}
+
+// HandleFrame processes one request and returns a response. It never
+// returns an error; business errors are encoded as StatusError
+// responses.
+//
+// ctx carries the per-request rpc_timeout set by wire_server.
+// Backends that honour context (tier chain remote hops, origin FS
+// IO) will be cancelled when ctx fires; backends that don't (rocks
+// CGO) run to completion regardless. The caller (wire_server) uses
+// the same ctx deadline to release the connection if the response
+// write itself stalls.
+func (h *CacheHandler) HandleFrame(ctx context.Context, req *wire.Request) *wire.Response {
+	switch req.Opcode {
+	case wire.OpcodeObjectGet:
+		return h.objectGet(ctx, req)
+	case wire.OpcodeObjectPut:
+		return h.objectPut(ctx, req)
+	case wire.OpcodeShardGet:
+		return h.shardGet(ctx, req)
+	case wire.OpcodeShardPut:
+		return h.shardPut(ctx, req)
+	case wire.OpcodePing:
+		return &wire.Response{Status: wire.StatusHit}
+	default:
+		return &wire.Response{Status: wire.StatusError, ErrMsg: "unknown opcode"}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Object handlers
+// ---------------------------------------------------------------------------
+
+func (h *CacheHandler) objectGet(ctx context.Context, req *wire.Request) *wire.Response {
+	if h.tier == nil {
+		return &wire.Response{Status: wire.StatusError, ErrMsg: "object ops not supported in this mode"}
+	}
+	result, blob, err := h.tier.Get(ctx, wireNSToPartition(req.Namespace), req.Hash)
+	if err != nil {
+		return &wire.Response{Status: wire.StatusError, ErrMsg: err.Error()}
+	}
+	if result != cache.CacheHit {
+		h.srvMisses.Add(1)
+		return &wire.Response{Status: wire.StatusMiss}
+	}
+	h.srvHits.Add(1)
+	// Zero-copy handoff: the blob owns its own backing bytes. The
+	// wire-server drops the reference via resp.Value.Release() after
+	// the frame has been written. TieredCache fill-aside clones hold
+	// their own refcounts and outlive this handle.
+	return &wire.Response{
+		Status: wire.StatusHit,
+		Value:  blob,
+	}
+}
+
+func (h *CacheHandler) objectPut(ctx context.Context, req *wire.Request) *wire.Response {
+	if h.tier == nil {
+		return &wire.Response{Status: wire.StatusError, ErrMsg: "writes not supported"}
+	}
+	// Non-writable tiers (e.g. tiered-mode adapter) report their
+	// rejection via a marker interface before we spend cycles on the
+	// empty-value guard. This preserves the legacy error message
+	// tests assert on: "writes not supported" vs "empty value".
+	if rw, ok := h.tier.(interface{ RejectsWrites() bool }); ok && rw.RejectsWrites() {
+		return &wire.Response{Status: wire.StatusError, ErrMsg: "writes not supported"}
+	}
+	if len(req.Value) == 0 {
+		return &wire.Response{Status: wire.StatusError, ErrMsg: "empty value"}
+	}
+	if err := h.tier.Fill(ctx, wireNSToPartition(req.Namespace), req.Hash, req.Value); err != nil {
+		return &wire.Response{Status: wire.StatusError, ErrMsg: err.Error()}
+	}
+	h.srvFills.Add(1)
+	return &wire.Response{Status: wire.StatusHit}
+}
+
+// ---------------------------------------------------------------------------
+// Shard handlers
+// ---------------------------------------------------------------------------
+
+func (h *CacheHandler) shardGet(ctx context.Context, req *wire.Request) *wire.Response {
+	if h.shard == nil {
+		return &wire.Response{Status: wire.StatusError, ErrMsg: "shard ops not supported in this mode"}
+	}
+	// The shard handler is oblivious to shard idx / total — they live
+	// inside the stored value and travel back untouched to the client,
+	// which does the unpacking for RS decode.
+	result, blob, err := h.shard.GetShard(ctx, wireNSToPartition(req.Namespace), req.Hash)
+	if err != nil {
+		return &wire.Response{Status: wire.StatusError, ErrMsg: err.Error()}
+	}
+	if result != cache.CacheHit {
+		h.srvMisses.Add(1)
+		return &wire.Response{Status: wire.StatusMiss}
+	}
+	h.srvHits.Add(1)
+	return &wire.Response{
+		Status: wire.StatusHit,
+		Value:  blob,
+	}
+}
+
+func (h *CacheHandler) shardPut(ctx context.Context, req *wire.Request) *wire.Response {
+	if h.shard == nil {
+		return &wire.Response{Status: wire.StatusError, ErrMsg: "writes not supported"}
+	}
+	// Minimum value length is ShardPrefixSize (client must include the
+	// [idx][total] header even for a degenerate empty shard body).
+	if len(req.Value) < cache.ShardPrefixSize {
+		return &wire.Response{Status: wire.StatusError, ErrMsg: "shard value missing idx/total prefix"}
+	}
+	if err := h.shard.FillShard(ctx, wireNSToPartition(req.Namespace), req.Hash, req.Value); err != nil {
+		return &wire.Response{Status: wire.StatusError, ErrMsg: err.Error()}
+	}
+	h.srvFills.Add(1)
+	return &wire.Response{Status: wire.StatusHit}
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// wireNSToPartition maps a wire namespace byte to its store.Partition.
+// Unknown namespaces fall back to PartitionChunk.
+func wireNSToPartition(ns byte) store.Partition {
+	switch ns {
+	case wire.NSManifest:
+		return store.PartitionManifest
+	default:
+		return store.PartitionChunk
+	}
+}
