@@ -39,6 +39,8 @@ func main() {
 		cmdPurge(os.Args[2:])
 	case "info":
 		cmdInfo(os.Args[2:])
+	case "config":
+		cmdConfig(os.Args[2:])
 	case "-h", "--help", "help":
 		printUsage()
 	default:
@@ -46,6 +48,19 @@ func main() {
 		printUsage()
 		os.Exit(1)
 	}
+}
+
+// storeConfigEnv is the env-var fallback for --config across all
+// store-ctl subcommands when the flag is not given.
+const storeConfigEnv = "STORE_CONFIG"
+
+// resolveConfigPath returns the config path from --config, falling
+// back to $STORE_CONFIG. Empty result -> caller should fatal.
+func resolveConfigPath(flagValue string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+	return os.Getenv(storeConfigEnv)
 }
 
 func printUsage() {
@@ -56,6 +71,10 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  rollout   Add a new generation and make it active")
 	fmt.Fprintln(os.Stderr, "  purge     Delete a non-active generation, or --all to wipe the store")
 	fmt.Fprintln(os.Stderr, "  info      Show generations and per-partition object counts")
+	fmt.Fprintln(os.Stderr, "  config    Inspect or generate the store-ctl config")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "Environment:")
+	fmt.Fprintln(os.Stderr, "  STORE_CONFIG  fallback for --config across subcommands")
 }
 
 func fatal(format string, args ...any) {

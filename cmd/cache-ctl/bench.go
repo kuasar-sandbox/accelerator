@@ -20,7 +20,7 @@ import (
 )
 
 // cmdBench runs a concurrency sweep + latency percentiles against a
-// cache-ctl endpoint. See docs/cli-tools.md for a full flag reference.
+// cache-ctl endpoint. See docs/cache.md for a full flag reference.
 //
 // --prefill-endpoint lets the operator split prefill writes and bench
 // reads across two different cache-ctl instances, so the bench target
@@ -30,7 +30,7 @@ import (
 // try to write to the bench target and fail on the first frame.
 func cmdBench(args []string) {
 	fs := flag.NewFlagSet("bench", flag.ExitOnError)
-	endpoint := fs.String("endpoint", "127.0.0.1:7070", "cache-ctl endpoint (bench target)")
+	endpoint := fs.String("endpoint", "", "cache-ctl data endpoint, bench target (overrides CACHE_ENDPOINT env)")
 	prefillEndpoint := fs.String("prefill-endpoint", "", "separate prefill write endpoint (default: use --endpoint; non-empty implies --mode get)")
 	infoEndpoint := fs.String("info-endpoint", "", "bench target's Info gRPC endpoint (HealthListen); enables bench-window counter printout")
 	concurrency := fs.Int("concurrency", 8, "number of parallel workers")
@@ -58,6 +58,15 @@ func cmdBench(args []string) {
 	} else if *mode == "" {
 		*mode = "mixed"
 	}
+
+	// Resolve the bench target endpoint with env fallback. prefill /
+	// info endpoints stay flag-only — they target different daemons
+	// and shouldn't accidentally inherit CACHE_ENDPOINT.
+	resolvedEP := resolveDataEndpoint(*endpoint)
+	if resolvedEP == "" {
+		fatal("--endpoint or CACHE_ENDPOINT required")
+	}
+	*endpoint = resolvedEP
 
 	// Use a process-global BlobPool for ReadResponse payload buffers.
 	// Without this, every Get allocates a fresh `value-size` slice via

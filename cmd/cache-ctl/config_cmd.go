@@ -1,0 +1,100 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+
+	"github.com/fullof-work/mass-sandbox/pkg/cache/runtime"
+	"gopkg.in/yaml.v3"
+)
+
+// cmdConfig dispatches `cache-ctl config <subcommand>`.
+//
+//	show      Print the resolved YAML at the configured path.
+//	generate  Print a commented daemon-config template to stdout.
+func cmdConfig(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: cache-ctl config <show|generate> [flags]")
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "show":
+		cmdConfigShow(args[1:])
+	case "generate":
+		cmdConfigGenerate(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "unknown config subcommand %q\n", args[0])
+		os.Exit(1)
+	}
+}
+
+func cmdConfigShow(args []string) {
+	fs := flag.NewFlagSet("config show", flag.ExitOnError)
+	configPath := fs.String("config", "", "YAML config file (overrides CACHE_CONFIG env)")
+	fs.Parse(args)
+
+	resolved := *configPath
+	if resolved == "" {
+		resolved = os.Getenv(cacheConfigEnv)
+	}
+	if resolved == "" {
+		fatal("--config or %s required", cacheConfigEnv)
+	}
+	cfg, err := runtime.LoadConfig(resolved)
+	if err != nil {
+		fatal("%v", err)
+	}
+	out, err := yaml.Marshal(cfg)
+	if err != nil {
+		fatal("marshal config: %v", err)
+	}
+	os.Stdout.Write(out)
+}
+
+func cmdConfigGenerate(args []string) {
+	fs := flag.NewFlagSet("config generate", flag.ExitOnError)
+	fs.Parse(args)
+	fmt.Print(cacheConfigTemplate)
+}
+
+// cacheConfigTemplate is a commented YAML for `cache-ctl config generate`.
+// Picks the tiered mode (rocksdb L1 + store origin) as the most common
+// production shape; users in other shapes can prune or adapt.
+const cacheConfigTemplate = `# cache-ctl daemon configuration.
+# Reference this file via --config or the CACHE_CONFIG environment
+# variable. There is no auto-discovery; unset = error.
+
+# Mode: local | shard | tiered.
+mode: tiered
+
+# Wire data plane.
+listen: 127.0.0.1:7070
+
+# Health + Info gRPC.
+health_listen: 127.0.0.1:7071
+
+# Per-RPC timeout for client connections.
+rpc_timeout: 5s
+
+freq:
+  counters: 1M       # CMS sketch size for admission heuristic
+  reset_after: 100K  # halving cadence
+
+tiers:
+  - type: embedded   # rocksdb-backed local L1
+    rocks:
+      path: /var/lib/cache-ctl/rocks
+      disk_bytes: 16GiB
+      mem_ratio: 0.1
+      direct_reads: true
+      bloom_bits: 10
+
+origin:
+  type: store        # treat store-ctl as the cold tier
+  store:
+    endpoint: 127.0.0.1:7100
+    pool: 4
+    timeout: 5s
+  max_inflight: 32
+`

@@ -18,17 +18,18 @@ import (
 //	obs: PUTs <prefix>/__meta/generations with If-None-Match: *
 func cmdInit(args []string) {
 	fset := flag.NewFlagSet("init", flag.ExitOnError)
-	configPath := fset.String("config", "", "YAML config file (required)")
+	configPath := fset.String("config", "", "YAML config file (overrides STORE_CONFIG env)")
 	generation := fset.String("generation", "", "starting generation name (required, e.g. G1)")
 	fset.Parse(args)
 
-	if *configPath == "" {
-		fatal("--config is required")
+	resolved := resolveConfigPath(*configPath)
+	if resolved == "" {
+		fatal("--config or %s required", storeConfigEnv)
 	}
 	if *generation == "" {
 		fatal("--generation is required (e.g. --generation G1)")
 	}
-	cfg, err := LoadConfig(*configPath, false)
+	cfg, err := LoadConfig(resolved, false)
 	if err != nil {
 		fatal("%v", err)
 	}

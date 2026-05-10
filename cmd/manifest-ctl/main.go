@@ -47,6 +47,8 @@ func main() {
 		cmdVerify(os.Args[2:])
 	case "diff":
 		cmdDiff(os.Args[2:])
+	case "config":
+		cmdConfig(os.Args[2:])
 	default:
 		printUsage()
 		os.Exit(1)
@@ -64,6 +66,12 @@ Commands:
   info           Display manifest metadata
   verify         Verify chunk integrity against a manifest
   diff           Compare two manifests and report shared/unique chunks
+  config         Inspect or generate the manifest config file
+
+Configuration:
+  Every command (except 'config generate') needs a YAML config file.
+  Provide it via --config <path> or the MANIFEST_CONFIG environment
+  variable. Flag wins when both are set. There is no auto-discovery.
 `)
 }
 
@@ -72,89 +80,31 @@ Commands:
 // ---------------------------------------------------------------------------
 
 type globalFlags struct {
-	configPath     *string
-	manifestKey    *string
-	storeEndpoint  *string
-	storePool      *string
-	storeTimeout   *string
-	chunkMode      *string
-	cdcMin         *string
-	cdcAvg         *string
-	cdcMax         *string
-	fixedSize      *string
-	cryptoChunk    *string
-	cryptoManifest *string
-	cryptoFake     *bool
-	cacheEndpoint  *string
-	cachePool      *string
-	cacheTimeout   *string
+	configPath *string
+	cryptoFake *bool
 }
 
 func addGlobalFlags(fs *flag.FlagSet) globalFlags {
 	var g globalFlags
-	g.configPath = fs.String("config", "", "path to config file")
-	g.manifestKey = fs.String("manifest-key", "", "32-byte hex-encoded customer key")
-	g.storeEndpoint = fs.String("store-endpoint", "", "store-ctl gRPC endpoint (required)")
-	g.storePool = fs.String("store-pool", "", "store-ctl client pool size (default 4)")
-	g.storeTimeout = fs.String("store-timeout", "", "per-RPC timeout to store-ctl (default 5s)")
-	g.chunkMode = fs.String("chunk-mode", "", "chunking mode (cdc, fixed)")
-	g.cdcMin = fs.String("chunk-cdc-min", "", "CDC minimum chunk size (e.g. 64KiB)")
-	g.cdcAvg = fs.String("chunk-cdc-avg", "", "CDC average chunk size (e.g. 512KiB)")
-	g.cdcMax = fs.String("chunk-cdc-max", "", "CDC maximum chunk size (e.g. 1MiB)")
-	g.fixedSize = fs.String("chunk-fixed-size", "", "fixed chunk size (e.g. 512KiB)")
-	g.cryptoChunk = fs.String("crypto-chunk", "", "chunk encryption mode (aes, fake)")
-	g.cryptoManifest = fs.String("crypto-manifest", "", "manifest encryption mode (aes, fake)")
-	g.cryptoFake = fs.Bool("crypto-fake", false, "acknowledge use of fake encryption (required when mode is fake)")
-	g.cacheEndpoint = fs.String("cache-endpoint", "", "cache-ctl wire endpoint (empty = bypass)")
-	g.cachePool = fs.String("cache-pool", "", "number of wire connections to cache (default 4)")
-	g.cacheTimeout = fs.String("cache-timeout", "", "per-RPC timeout to cache (default 2s)")
+	g.configPath = fs.String("config", "", "path to manifest config YAML (overrides MANIFEST_CONFIG env)")
+	g.cryptoFake = fs.Bool("crypto-fake", false, "acknowledge use of fake encryption (required when crypto.chunk or crypto.manifest is fake)")
 	return g
-}
-
-func (g globalFlags) flagMap() map[string]string {
-	m := make(map[string]string)
-	put := func(k, v string) {
-		if v != "" {
-			m[k] = v
-		}
-	}
-	put("manifest-key", *g.manifestKey)
-	put("store-endpoint", *g.storeEndpoint)
-	put("store-pool", *g.storePool)
-	put("store-timeout", *g.storeTimeout)
-	put("chunk-mode", *g.chunkMode)
-	put("chunk-cdc-min", *g.cdcMin)
-	put("chunk-cdc-avg", *g.cdcAvg)
-	put("chunk-cdc-max", *g.cdcMax)
-	put("chunk-fixed-size", *g.fixedSize)
-	put("crypto-chunk", *g.cryptoChunk)
-	put("crypto-manifest", *g.cryptoManifest)
-	put("cache-endpoint", *g.cacheEndpoint)
-	put("cache-pool", *g.cachePool)
-	put("cache-timeout", *g.cacheTimeout)
-	return m
 }
 
 // ---------------------------------------------------------------------------
 // Config loading
 // ---------------------------------------------------------------------------
 
-func loadConfig(configPath string, flagMap map[string]string) (*config.Config, error) {
-	var cfg *config.Config
-	if configPath != "" {
-		c, err := config.LoadFile(configPath)
-		if err != nil {
-			return nil, err
+const manifestConfigEnv = "MANIFEST_CONFIG"
+
+func loadConfig(configPath string) (*config.Config, error) {
+	cfg, err := config.LoadFromFlagOrEnv(configPath, manifestConfigEnv)
+	if err != nil {
+		if errors.Is(err, config.ErrConfigNotProvided) {
+			return nil, fmt.Errorf("missing manifest config: pass --config <path> or set %s", manifestConfigEnv)
 		}
-		cfg = c
-	} else {
-		c, err := config.FindAndLoad()
-		if err != nil {
-			return nil, err
-		}
-		cfg = c
+		return nil, err
 	}
-	cfg.MergeFlags(flagMap)
 	return cfg, nil
 }
 
@@ -227,7 +177,7 @@ func chunkModeString(m manifest.ChunkMode) string {
 // filesystem path); error if cfg.Store.Endpoint is empty.
 func makeStoreClient(cfg *config.Config) (*storeclient.Client, error) {
 	if cfg.Store.Endpoint == "" {
-		return nil, fmt.Errorf("config: store.endpoint is required (run store-ctl and set it in accelerator.yaml or via --store-endpoint)")
+		return nil, fmt.Errorf("config: store.endpoint is required (set it in the manifest config YAML)")
 	}
 	pool := cfg.Store.Pool
 	if pool <= 0 {
@@ -503,7 +453,7 @@ func cmdStore(args []string) {
 	gf := addGlobalFlags(fs)
 	fs.Parse(args)
 
-	cfg, err := loadConfig(*gf.configPath, gf.flagMap())
+	cfg, err := loadConfig(*gf.configPath)
 	if err != nil {
 		fatal("load config: %v", err)
 	}
@@ -708,7 +658,7 @@ func cmdLoad(args []string) {
 	gf := addGlobalFlags(fs)
 	fs.Parse(args)
 
-	cfg, err := loadConfig(*gf.configPath, gf.flagMap())
+	cfg, err := loadConfig(*gf.configPath)
 	if err != nil {
 		fatal("load config: %v", err)
 	}
@@ -840,7 +790,7 @@ func cmdPutManifest(args []string) {
 	gf := addGlobalFlags(fs)
 	fs.Parse(args)
 
-	cfg, err := loadConfig(*gf.configPath, gf.flagMap())
+	cfg, err := loadConfig(*gf.configPath)
 	if err != nil {
 		fatal("load config: %v", err)
 	}
@@ -882,7 +832,7 @@ func cmdGetManifest(args []string) {
 		os.Exit(1)
 	}
 
-	cfg, err := loadConfig(*gf.configPath, gf.flagMap())
+	cfg, err := loadConfig(*gf.configPath)
 	if err != nil {
 		fatal("load config: %v", err)
 	}
@@ -1088,7 +1038,7 @@ func cmdVerify(args []string) {
 	gf := addGlobalFlags(fs)
 	fs.Parse(args)
 
-	cfg, err := loadConfig(*gf.configPath, gf.flagMap())
+	cfg, err := loadConfig(*gf.configPath)
 	if err != nil {
 		fatal("load config: %v", err)
 	}

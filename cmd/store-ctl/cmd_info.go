@@ -18,13 +18,14 @@ import (
 // filepath.WalkDir and obs implements with paginated List.
 func cmdInfo(args []string) {
 	fset := flag.NewFlagSet("info", flag.ExitOnError)
-	configPath := fset.String("config", "", "YAML config file (required)")
+	configPath := fset.String("config", "", "YAML config file (overrides STORE_CONFIG env)")
 	fset.Parse(args)
 
-	if *configPath == "" {
-		fatal("--config is required")
+	resolved := resolveConfigPath(*configPath)
+	if resolved == "" {
+		fatal("--config or %s required", storeConfigEnv)
 	}
-	cfg, err := LoadConfig(*configPath, false)
+	cfg, err := LoadConfig(resolved, false)
 	if err != nil {
 		fatal("%v", err)
 	}

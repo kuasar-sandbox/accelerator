@@ -22,14 +22,15 @@ import (
 // so the foot-cannon surface is much smaller).
 func cmdPurge(args []string) {
 	fset := flag.NewFlagSet("purge", flag.ExitOnError)
-	configPath := fset.String("config", "", "YAML config file (required)")
+	configPath := fset.String("config", "", "YAML config file (overrides STORE_CONFIG env)")
 	generation := fset.String("generation", "", "non-active generation to drop")
 	all := fset.Bool("all", false, "wipe the entire store (requires --confirm)")
 	confirm := fset.Bool("confirm", false, "required for --all (proves intent)")
 	fset.Parse(args)
 
-	if *configPath == "" {
-		fatal("--config is required")
+	resolved := resolveConfigPath(*configPath)
+	if resolved == "" {
+		fatal("--config or %s required", storeConfigEnv)
 	}
 	switch {
 	case *all && *generation != "":
@@ -40,7 +41,7 @@ func cmdPurge(args []string) {
 		fatal("--all requires --confirm (no recovery after wipe)")
 	}
 
-	cfg, err := LoadConfig(*configPath, false)
+	cfg, err := LoadConfig(resolved, false)
 	if err != nil {
 		fatal("%v", err)
 	}

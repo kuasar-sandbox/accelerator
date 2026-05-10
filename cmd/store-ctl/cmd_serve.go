@@ -24,13 +24,14 @@ import (
 // the operator to run `store-ctl init` first.
 func cmdServe(args []string) {
 	fset := flag.NewFlagSet("serve", flag.ExitOnError)
-	configPath := fset.String("config", "", "YAML config file (required)")
+	configPath := fset.String("config", "", "YAML config file (overrides STORE_CONFIG env)")
 	fset.Parse(args)
 
-	if *configPath == "" {
-		fatal("--config is required")
+	resolved := resolveConfigPath(*configPath)
+	if resolved == "" {
+		fatal("--config or %s required", storeConfigEnv)
 	}
-	cfg, err := LoadConfig(*configPath, true)
+	cfg, err := LoadConfig(resolved, true)
 	if err != nil {
 		fatal("%v", err)
 	}

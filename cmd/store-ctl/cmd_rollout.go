@@ -18,17 +18,18 @@ import (
 //	obs: CAS-rewrites <prefix>/__meta/generations with If-Match
 func cmdRollout(args []string) {
 	fset := flag.NewFlagSet("rollout", flag.ExitOnError)
-	configPath := fset.String("config", "", "YAML config file (required)")
+	configPath := fset.String("config", "", "YAML config file (overrides STORE_CONFIG env)")
 	generation := fset.String("generation", "", "new generation name to add and activate (required)")
 	fset.Parse(args)
 
-	if *configPath == "" {
-		fatal("--config is required")
+	resolved := resolveConfigPath(*configPath)
+	if resolved == "" {
+		fatal("--config or %s required", storeConfigEnv)
 	}
 	if *generation == "" {
 		fatal("--generation is required (e.g. --generation G2)")
 	}
-	cfg, err := LoadConfig(*configPath, false)
+	cfg, err := LoadConfig(resolved, false)
 	if err != nil {
 		fatal("%v", err)
 	}

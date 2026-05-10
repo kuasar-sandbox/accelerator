@@ -84,6 +84,8 @@ func main() {
 		cmdInfo(os.Args[2:])
 	case "bench":
 		cmdBench(os.Args[2:])
+	case "config":
+		cmdConfig(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
 		printUsage()
@@ -102,20 +104,48 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  ping        Health probe")
 	fmt.Fprintln(os.Stderr, "  info        Inspect RocksDB (offline)")
 	fmt.Fprintln(os.Stderr, "  bench       Run performance benchmark")
+	fmt.Fprintln(os.Stderr, "  config      Inspect or generate the cache-ctl config")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "Environment:")
+	fmt.Fprintln(os.Stderr, "  CACHE_CONFIG    fallback for serve --config")
+	fmt.Fprintln(os.Stderr, "  CACHE_ENDPOINT  fallback for object/shard/bench --endpoint")
 }
 
 // ── serve ──
 
+// cacheConfigEnv overrides --config for cache-ctl serve when both are absent.
+const cacheConfigEnv = "CACHE_CONFIG"
+
+// cacheEndpointEnv supplies --endpoint for client commands (data port:
+// object/shard/bench) when the flag is absent. ping/info/info --rocks-path
+// are deliberately not affected: they speak the health endpoint or no
+// network at all.
+const cacheEndpointEnv = "CACHE_ENDPOINT"
+
+// resolveDataEndpoint returns the cache data endpoint chosen from, in
+// priority order, the --endpoint flag value then $CACHE_ENDPOINT.
+// Empty result -> caller should fatal.
+func resolveDataEndpoint(flagValue string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+	return os.Getenv(cacheEndpointEnv)
+}
+
 func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	configPath := fs.String("config", "", "YAML config file (required)")
+	configPath := fs.String("config", "", "YAML config file (overrides CACHE_CONFIG env)")
 	fs.Parse(args)
 
-	if *configPath == "" {
-		fatal("--config is required")
+	resolved := *configPath
+	if resolved == "" {
+		resolved = os.Getenv(cacheConfigEnv)
+	}
+	if resolved == "" {
+		fatal("--config or %s required", cacheConfigEnv)
 	}
 
-	cfg, err := runtime.LoadConfig(*configPath)
+	cfg, err := runtime.LoadConfig(resolved)
 	if err != nil {
 		fatal("%v", err)
 	}
@@ -333,7 +363,7 @@ func cmdServe(args []string) {
 		sig := <-sigCh
 		switch sig {
 		case syscall.SIGHUP:
-			reloadMembership(*configPath, tieredComps)
+			reloadMembership(resolved, tieredComps)
 			continue
 		default:
 			fmt.Fprintf(os.Stderr, "\ncache-ctl: received %v, shutting down...\n", sig)
@@ -445,7 +475,7 @@ func probeAndFilter(candidates []ec.Peer) []ec.Peer {
 
 func cmdObjectGet(args []string) {
 	fs := flag.NewFlagSet("object get", flag.ExitOnError)
-	endpoint := fs.String("endpoint", "127.0.0.1:7070", "cache-ctl endpoint")
+	endpoint := fs.String("endpoint", "", "cache-ctl data endpoint (overrides CACHE_ENDPOINT env)")
 	namespace := fs.String("namespace", "chunk", "namespace (chunk|manifest)")
 	hashHex := fs.String("hash", "", "32-byte hash (hex, required)")
 	fs.Parse(args)
@@ -458,7 +488,12 @@ func cmdObjectGet(args []string) {
 		fatal("--hash must be 64 hex chars (32 bytes)")
 	}
 
-	c, err := client.NewGetter(*endpoint, client.Options{Pool: 1, Timeout: 5 * time.Second})
+	resolved := resolveDataEndpoint(*endpoint)
+	if resolved == "" {
+		fatal("--endpoint or CACHE_ENDPOINT required")
+	}
+
+	c, err := client.NewGetter(resolved, client.Options{Pool: 1, Timeout: 5 * time.Second})
 	if err != nil {
 		fatal("dial: %v", err)
 	}
@@ -482,7 +517,7 @@ func cmdObjectGet(args []string) {
 
 func cmdObjectPut(args []string) {
 	fs := flag.NewFlagSet("object put", flag.ExitOnError)
-	endpoint := fs.String("endpoint", "127.0.0.1:7070", "cache-ctl endpoint")
+	endpoint := fs.String("endpoint", "", "cache-ctl data endpoint (overrides CACHE_ENDPOINT env)")
 	namespace := fs.String("namespace", "chunk", "namespace")
 	hashHex := fs.String("hash", "", "32-byte hash (hex, required)")
 	valuePath := fs.String("value", "-", "value file (- for stdin)")
@@ -510,7 +545,12 @@ func cmdObjectPut(args []string) {
 		fatal("read value: %v", err)
 	}
 
-	c, err := client.New(*endpoint, client.Options{Pool: 1, Timeout: 5 * time.Second})
+	resolved := resolveDataEndpoint(*endpoint)
+	if resolved == "" {
+		fatal("--endpoint or CACHE_ENDPOINT required")
+	}
+
+	c, err := client.New(resolved, client.Options{Pool: 1, Timeout: 5 * time.Second})
 	if err != nil {
 		fatal("dial: %v", err)
 	}
@@ -528,7 +568,7 @@ func cmdObjectPut(args []string) {
 
 func cmdShardGet(args []string) {
 	fs := flag.NewFlagSet("shard get", flag.ExitOnError)
-	endpoint := fs.String("endpoint", "127.0.0.1:7070", "cache-ctl endpoint")
+	endpoint := fs.String("endpoint", "", "cache-ctl data endpoint (overrides CACHE_ENDPOINT env)")
 	namespace := fs.String("namespace", "chunk", "namespace")
 	hashHex := fs.String("hash", "", "32-byte hash (hex, required)")
 	fs.Parse(args)
@@ -541,7 +581,12 @@ func cmdShardGet(args []string) {
 		fatal("--hash must be 64 hex chars")
 	}
 
-	c, err := client.NewShard(*endpoint, client.Options{Pool: 1, Timeout: 5 * time.Second})
+	resolved := resolveDataEndpoint(*endpoint)
+	if resolved == "" {
+		fatal("--endpoint or CACHE_ENDPOINT required")
+	}
+
+	c, err := client.NewShard(resolved, client.Options{Pool: 1, Timeout: 5 * time.Second})
 	if err != nil {
 		fatal("dial: %v", err)
 	}
@@ -572,7 +617,7 @@ func cmdShardGet(args []string) {
 
 func cmdShardPut(args []string) {
 	fs := flag.NewFlagSet("shard put", flag.ExitOnError)
-	endpoint := fs.String("endpoint", "127.0.0.1:7070", "cache-ctl endpoint")
+	endpoint := fs.String("endpoint", "", "cache-ctl data endpoint (overrides CACHE_ENDPOINT env)")
 	namespace := fs.String("namespace", "chunk", "namespace")
 	hashHex := fs.String("hash", "", "32-byte hash (hex, required)")
 	idx := fs.Uint("idx", 0, "shard index (0..total-1)")
@@ -611,7 +656,12 @@ func cmdShardPut(args []string) {
 	cache.EncodeShardPrefix(value, byte(*idx), byte(*total))
 	copy(value[cache.ShardPrefixSize:], data)
 
-	c, err := client.NewShard(*endpoint, client.Options{Pool: 1, Timeout: 5 * time.Second})
+	resolved := resolveDataEndpoint(*endpoint)
+	if resolved == "" {
+		fatal("--endpoint or CACHE_ENDPOINT required")
+	}
+
+	c, err := client.NewShard(resolved, client.Options{Pool: 1, Timeout: 5 * time.Second})
 	if err != nil {
 		fatal("dial: %v", err)
 	}
