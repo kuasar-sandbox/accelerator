@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/fullof-work/mass-sandbox/pkg/binloc"
 )
 
 // dockerManifestEntry describes one image in a docker-archive tar.
@@ -374,29 +376,17 @@ func normalizeTimestamps(rootfsDir string) error {
 	})
 }
 
-// locateMkfsErofs resolves the mkfs.erofs binary. The lookup order is:
-//  1. $MKFS_EROFS_PATH — explicit override (useful for tests or unusual layouts)
-//  2. Same directory as the running executable — the normal case for our
-//     release bundle, where bin/mkfs.erofs ships alongside bin/flatten-ctl
-//  3. $PATH — compatibility with hosts that have a system-installed mkfs.erofs
-//
-// Returns a descriptive error if none of the above yields a binary.
+// locateMkfsErofs resolves the mkfs.erofs binary via the shared binloc
+// helper (env override → exe-dir → PATH). The hint message in the
+// returned error keeps users pointed at `make deps-erofs`.
 func locateMkfsErofs() (string, error) {
-	if p := os.Getenv("MKFS_EROFS_PATH"); p != "" {
-		return p, nil
+	p, err := binloc.Locate("mkfs.erofs", "MKFS_EROFS_PATH")
+	if err != nil {
+		return "", fmt.Errorf("flatten: mkfs.erofs not found " +
+			"(set MKFS_EROFS_PATH, place it alongside flatten-ctl, " +
+			"or add it to PATH; run `make deps-erofs` to build it)")
 	}
-	if exe, err := os.Executable(); err == nil {
-		candidate := filepath.Join(filepath.Dir(exe), "mkfs.erofs")
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate, nil
-		}
-	}
-	if p, err := exec.LookPath("mkfs.erofs"); err == nil {
-		return p, nil
-	}
-	return "", fmt.Errorf("flatten: mkfs.erofs not found " +
-		"(set MKFS_EROFS_PATH, place it alongside flatten-ctl, " +
-		"or add it to PATH; run `make deps-erofs` to build it)")
+	return p, nil
 }
 
 // buildImage produces the output image from the flattened rootfs directory
