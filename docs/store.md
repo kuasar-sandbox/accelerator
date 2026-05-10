@@ -1,0 +1,423 @@
+# store — 远端存储代理设计
+
+`store-ctl` 是项目里**唯一**对持久层后端(本地文件系统 / 远端 OBS)读写
+的进程。所有数据进出最终都汇聚到这里:`manifest-ctl` 通过 gRPC 把
+chunk 与 Manifest 推过来,`cache-ctl tiered` 在 origin miss 时通过 gRPC
+拉过来。store-ctl 负责后端抽象、generation 生命周期与运维操作。
+
+## 1. 概述
+
+### 1.1 为什么需要单独的 store 进程
+
+跨 sandbox / 跨 manifest-ctl / 跨 cache-ctl 进程的物理字节,必须由**单一
+进程**协调写入,以下问题才能成立:
+
+- **唯一写者**:fs / obs 后端的物理字节写入需要协调,否则 dedup 元数据
+  (`__meta/generations`)与 staged 临时文件可能被并发修改坏掉;
+- **后端可替换**:本地开发用 fs,生产用 OBS,manifest-ctl / cache-ctl 不
+  该感知差异;切换后端不能改客户端代码;
+- **代次管理**:租户隔离靠 generation 划分(同代去重、跨代隔离),线上
+  要支持"开新代"和"决扫旧代"两个低频但关键的操作;
+- **完整性可验证**:写入路径要能在服务端重算 ContentKey,拒绝 hash 算错
+  的请求,免得污染整代去重域。
+
+### 1.2 在系统拓扑中的位置
+
+```
+┌─ manifest-ctl ─┐       ┌─ cache-ctl tiered ─┐
+│  store client   │       │  origin: store      │
+└───────┬─────────┘       └───────┬─────────────┘
+        │                         │
+        └───────┬─────────────────┘
+                │  gRPC (Put/Get/GetSalt)
+                ▼
+        ┌── store-ctl ────────┐
+        │  fs / obs backend    │
+        │  __meta/generations  │
+        └──────────────────────┘
+```
+
+### 1.3 设计原则
+
+1. **后端抽象**:fs 与 obs 共享 `Backend` 接口(`Get / Put / OpenPut /
+   Exists / ActiveGeneration`),客户端代码无差别;两者的 generation 维护、
+   Get 多代回退、verify 语义完全一致,差异仅限物理后端。
+2. **admin / serve 分离**:generation 生命周期(`init / rollout / purge`)
+   由专用 admin 子命令承担,**不**塞进 yaml 字段或 serve 启动逻辑;serve
+   只读后端 meta 决定 active,从不修改。
+3. **fail-fast 而非自愈**:serve 遇到未初始化仓库直接报 `ErrUninitialised`
+   + 提示 `run store-ctl init`,不静默创建——让运维错误立刻浮现。
+4. **客户端凭据透明传递**:obs 凭据从 yaml `${VAR}` → `~/.obsconfig` →
+   AWS SDK 默认链三档退化,生产挂 ECS instance role 时 yaml 只需 bucket。
+5. **单写者 + CAS**:obs 的 generation 元数据写入用 S3 条件头
+   (`If-None-Match` / `If-Match`)防并发覆盖,但稳态运行仍假设 per-bucket
+   单 store-ctl 实例做写入。
+
+## 2. 命令行接口
+
+### 2.1 公共 flag
+
+```
+Global Flags:
+  --config string         YAML 配置文件路径(覆盖 STORE_CONFIG 环境变量)
+```
+
+`--config` 与 `STORE_CONFIG` 至少需要一项指向有效 YAML;两者皆缺则报错
+(`config generate` 子命令除外)。所有子命令共享同一份 yaml(§3)。
+
+### 2.2 命令矩阵
+
+| 命令 | 用途 | 要求已 init | 修改状态 |
+|---|---|---|---|
+| `serve`   | 启动 gRPC daemon | 是 | 否(读) |
+| `init`    | 在空仓库写入起始 generation | 否 | 是(创建 meta) |
+| `rollout` | 追加新 generation 并设为 active | 是 | 是(改 meta) |
+| `purge --generation G` | 删除一个非 active generation | 是 | 是(改 meta + 删数据) |
+| `purge --all --confirm` | 彻底清空整个仓库 | 是 | 是(全删) |
+| `info`    | 打印 generations 与对象数 | 是 | 否(读) |
+| `config show` / `generate` | 配置检查/模板 | 否 | 否 |
+
+`serve` 不自动 init;遇到未初始化仓库报 `ErrUninitialised`。
+
+### 2.3 `store-ctl init`
+
+```
+store-ctl init --config FILE --generation G
+```
+
+写入第一个 generation(典型 `G1`)。**不可重入**,meta 已存在则报错。
+整库重置必须 `purge --all --confirm` 后再 `init`。
+
+### 2.4 `store-ctl serve`
+
+```
+store-ctl serve --config FILE
+```
+
+绑定 yaml `listen:` 端口接受 gRPC。active generation 在 daemon 生命周期
+内**不变**,换代见 §2.5。
+
+### 2.5 `store-ctl rollout`
+
+```
+store-ctl rollout --config FILE --generation G
+```
+
+追加新 generation 并设为 active(`G` 必须不存在)。**需要重启 serve** 才
+能让运行中的 daemon 看到新 active。换代是控制平面操作,频率每代/月级别;
+serve 不订阅 meta 变化避免引入额外 watcher。
+
+### 2.6 `store-ctl purge`
+
+```
+store-ctl purge --config FILE --generation G    # 删除一个非 active 旧代
+store-ctl purge --config FILE --all --confirm   # 清空整个仓库
+```
+
+- `--generation`:拒绝删 active(`ErrCannotDropActive`);未知名报
+  `ErrGenerationNotFound`。顺序是先 CAS 改 meta,再删数据树。中途失败再次
+  drop 同名因 NotFound 短路,数据残余可手动清。
+- `--all`:必须配 `--confirm`(无 dry-run,先停 serve 再操作)。obs 上是
+  `ListObjects` + 逐个 `DeleteObject`,几十万对象级别会跑分钟级。删后仓
+  库变 uninitialised。
+
+### 2.7 `store-ctl info`
+
+```
+store-ctl info --config FILE
+```
+
+只读,可与运行中的 serve 共存。打印:
+
+- backend 类型(fs / obs)
+- root / bucket+prefix
+- active generation
+- generations 列表
+- 每代的 chunk / manifest 对象数
+
+### 2.8 `store-ctl config`
+
+```
+store-ctl config show     [--config <path>]
+store-ctl config generate
+```
+
+`generate` 输出带注释的 daemon 配置模板(默认 fs backend)。
+
+## 3. 配置
+
+### 3.1 fs backend
+
+```yaml
+listen: 127.0.0.1:7060
+backend: fs
+fs:
+  root: /var/store               # 文件系统根目录(必填,init 时创建结构)
+  verify_content_key: true       # 默认 true
+```
+
+### 3.2 obs backend
+
+```yaml
+listen: 127.0.0.1:7060
+backend: obs
+obs:
+  bucket: container-accelerator-prod
+  prefix: store/                                       # 桶内可选前缀(多租户)
+  # endpoint / region / access_key / secret_key 全部可省;
+  # 缺省值依次从 yaml ${VAR} → ~/.obsconfig → AWS SDK 默认凭证链 解析
+  access_key: ${OBS_AK}                                # 显式注入(可选)
+  secret_key: ${OBS_SK}
+  verify_content_key: true
+  max_inflight: 64                                     # 并发 OBS 调用上限
+  op_timeout: 10s                                      # 单次 OBS 调用超时
+  max_object_size_bytes: 16777216                      # Get 响应字节上限(默认 16 MiB)
+```
+
+最小 obs 配置(凭据走 IMDS / `~/.obsconfig`):
+
+```yaml
+listen: 127.0.0.1:7060
+backend: obs
+obs:
+  bucket: ops-dev
+```
+
+### 3.3 verify_content_key
+
+- `true`(默认):服务端重算 SHA256 并与客户端传的 ContentKey 比对;不一
+  致 → 拒绝 + 清理 staged 数据。
+- `false`:服务端信任客户端的 key,跳过 hash 重算;仅适合受信批量加载,
+  不推荐生产常开。
+
+## 4. 设计
+
+### 4.1 总体架构
+
+```
+┌──────── store-ctl 进程 ────────────────────────┐
+│                                                  │
+│  gRPC server (listen)                            │
+│   ├ StoreServer (Put/Get/GetSalt)               │
+│   └ Health server (health_listen)               │
+│                                                  │
+│  Backend                                         │
+│   ├ fs:  filepath I/O at root                   │
+│   └ obs: aws-sdk-go-v2/s3 to OBS                │
+│                                                  │
+│  __meta/generations  ←──── 唯一写者             │
+└──────────────────────────────────────────────────┘
+```
+
+数据面与控制面分离:
+
+- **数据面**:gRPC `Put` (客户端流) / `Get` (服务端流) / `GetSalt` 走
+  `listen:` 端口,客户端通过 `pkg/store/client` 连接;
+- **控制面**:`grpc.health.v1.Health` 走 `health_listen:` 端口供探针使用;
+- **运维面**:admin 子命令直接打开后端,**不**经过 gRPC,与运行中的 serve
+  共存(读同一份 meta)。
+
+### 4.2 Backend 接口
+
+server 层的最小契约,fs 与 obs 都实现:
+
+```
+Get(ctx, partition, key)             → (found bool, data []byte, err error)
+Put(ctx, partition, key, data)       → (isNew bool, err error)
+OpenPut(partition)                   → PutHandle (流式 Put)
+Exists(partition, key) bool          // 仅查 active gen
+ActiveGeneration() string
+```
+
+admin 操作(`Rollout` / `Drop` / `Wipe` / `GenerationStats`)是 Store 类型上
+的额外方法,**不**在 Backend 接口里——server 不需要这些。
+
+### 4.3 fs 后端
+
+布局:
+
+```
+{root}/
+├── __meta/
+│   ├── generations            ← 文本文件,每行一个 generation 名(最旧在首)
+│   └── tmp/                   ← 流式 Put 的临时文件 staging
+├── chunk/
+│   ├── G1/                    ← generation 1
+│   │   ├── a1/b2/a1b2c3...    ← 文件名 = lowercase-hex(SHA256(client bytes))
+│   │   └── ...
+│   └── G2/
+└── manifest/
+    ├── G1/
+    └── G2/
+```
+
+**ContentKey** = `SHA256(bytes-as-submitted-by-client)`,**没有 salt 参与
+寻址**。dedup 仍天然成立——客户端的 convergent encryption 用 store-ctl
+`GetSalt` 提供的 salt 派生加密 key(详见 [`manifest.md`](manifest.md)
+§4.5),同 plaintext + 同 salt → 同 ciphertext → 同 ContentKey → 同存储。
+
+**Put 原子性**:写入走 `__meta/tmp/put-XXXX` 临时文件 + `os.Rename` 到
+`chunk/<gen>/aa/bb/<hash>`;rename 是 POSIX 原子操作,故障也不会落出半写
+文件。Server 启动时扫一遍 `__meta/tmp/` 删掉所有遗留 `put-*`。
+
+**verify_content_key**:写入时若启用,服务端重算 SHA256 并与客户端 ContentKey
+比对,不一致 → `ErrKeyMismatch` + 删 staged 文件。
+
+### 4.4 obs 后端
+
+布局完全对应 fs:
+
+```
+<bucket>/<prefix>/__meta/generations
+<bucket>/<prefix>/chunk/<gen>/<aa>/<bb>/<hash>
+<bucket>/<prefix>/manifest/<gen>/<aa>/<bb>/<hash>
+```
+
+**写入路径**:obs 没有"流式 Put + atomic rename"原语,改用"内存缓冲 + 单
+次 PutObject"。chunk 大小天然 ≤1 MiB,缓冲不会膨胀;每个 PutHandle 独占
+一个 `bytes.Buffer`,Commit 时一次 PutObject 上去。
+
+**dedup short-circuit**:Put 前先 HEAD 检查 active gen 路径;命中则跳过
+上传(对应 fs 的 stat 检查)。
+
+**meta 并发**:obs 的 `__meta/generations` 写入用 S3 条件头:
+
+- `init`:`If-None-Match: *`(只在 key 不存在时创建)
+- `rollout / drop`:`If-Match: <etag>`(只在 etag 未变时改)
+
+CAS 失败 → 重读 + 重试,有界次数(默认 5)后报错。这保证多个 store-ctl
+实例并发 init 同一桶时只有一个赢,但稳态运行仍假定单写者。
+
+**defensive wrapper**:`pkg/store/obs` 在 SDK 之上加一层信号量
+(`MaxInflight`)+ 上下文超时(`OpTimeout`)+ 响应大小封顶(`MaxObjectSize`),
+防止 OBS 抖动导致 store-ctl OOM 或队头阻塞。
+
+### 4.5 凭据自动发现(obs)
+
+obs 后端的 endpoint / access_key / secret_key 三档退化:
+
+| 字段 | 优先级 1 | 优先级 2 | 优先级 3 | 优先级 4 |
+|---|---|---|---|---|
+| `endpoint` | yaml 字面 | yaml `${VAR}` 展开 | `~/.obsconfig` 的 `endpoint` | (无)— 必填 |
+| `region` | yaml 字面 | (无 env 展开) | 从 endpoint 自动提取 | (无) |
+| `access_key` | yaml 字面 | yaml `${VAR}` 展开 | `~/.obsconfig` 的 `access-key` | AWS SDK 默认凭证链 |
+| `secret_key` | 同上 | 同上 | `~/.obsconfig` 的 `secret-key` | AWS SDK 默认凭证链 |
+
+`~/.obsconfig` 是 obsutil / obs-browser 工具写的 JSON 文件。文件不存在不
+报错(走下一级);文件存在但 JSON 损坏报错。
+
+生产部署如果用 ECS instance role,留空 `access_key/secret_key` 并删
+`~/.obsconfig`,SDK 走 IMDS 拿 STS 凭证。
+
+### 4.6 Generation 模型
+
+generation 是 store 内部的代次划分:**同代去重、跨代不共享**。每个
+chunk / manifest 对象按 `<partition>/<gen>/...` 路径存,active generation
+是新写入的目标,旧 generation 仍可被反向 Get 找到。
+
+`__meta/generations` 是 source of truth,文本文件(fs)或对象(obs):
+
+```
+G1
+G2
+G3        ← 最后一行 = active
+```
+
+#### 不支持的操作
+
+- 把已删除的 generation"恢复":删了就是删了,decommissioning 是单向操作;
+- 改 active 为旧 generation:rollout 只追加,不能"回退"。要恢复旧代行为
+  应该开新一代再用 reverse-search Get 找老数据;
+- 重 `init`:不可重入,meta 已在则报 `ErrAlreadyInitialised`。
+
+#### 反向 Get
+
+Get 请求按 newest-first 顺序扫所有已知 generation,首次命中即返回:
+
+```
+for gen in [G3, G2, G1]:
+    if backend.read(partition, gen, key): return
+return not found
+```
+
+旧 generation 写入的 chunk 在 active 切到新代后仍可读。`purge --generation`
+后该代的数据真正消失。
+
+`Exists`(用于写路径上的 dedup short-circuit)**不**做反向扫描——只看
+active 路径。在旧代存在不算 dedup(因为旧代会被 purge,留下来的引用就
+dangling)。
+
+## 5. 部署与运维
+
+### 5.1 首次部署
+
+```bash
+# 一次性 init
+store-ctl init --config /etc/store-ctl.yaml --generation G1
+
+# 长驻 serve
+store-ctl serve --config /etc/store-ctl.yaml
+```
+
+### 5.2 横向扩展
+
+数据面(`serve` 的 Get/Put)**完全横向扩展**,任意多 store-ctl 实例并发
+指向同一 fs root / obs bucket+prefix 都安全:
+
+- **Put**:客户端先算 `key = SHA256(client_bytes)` 再 PUT,两个并发写者
+  写同样内容 → 同 key → 同路径 → 同字节。fs 上 `os.Rename` 是原子覆盖
+  且字节相同,obs PutObject 同 key 是幂等的。dedup 是**寻址层面**成立的,
+  不需要写者协调。
+- **Get**:纯读,反向扫 generation 列表,跨实例无副作用。
+
+**meta 写入有 CAS 保护**:
+
+- **obs**:`init` 用 `If-None-Match: *`,`rollout / purge --generation` 用
+  `If-Match: <etag>`。多个实例并发改同一 bucket 的 meta,冲突触发
+  `PreconditionFailed` → 重读重试或返回错误。**永不丢更新**。
+- **fs**:`writeGenerationsFile` 用 temp + rename 原子写,但**没有** CAS。
+  两个 admin 进程并发 `rollout` 同一 root 可能 lost update。fs 部署典型
+  是单机本地开发,生产用 obs。
+
+**结论**:
+
+- 多副本 store-ctl serve 同源 fs/obs:数据路径任意并发,生产可直接横向
+  扩展;
+- admin 命令(init/rollout/purge):obs 自然 CAS-safe 多实例并发;fs 需要
+  外部协调成单 admin(脚本编排即可);
+- 不需要 Active-Standby 选主或写者锁。
+
+### 5.3 必配 cache-ctl tiered(obs)
+
+OBS GetObject 区域内 ~10–50 ms,跨区更长。生产部署必须把 cache-ctl tiered
+装在 store-ctl 前面(rocksdb L1 + store-ctl origin)以收敛 hit 路径延迟。
+本地 fs backend 不需要 cache 也能跑,但生产 obs 没有 cache 直接跑等于把
+OBS 延迟加到每次客户端 Get 上。详见 [`cache.md`](cache.md)。
+
+### 5.4 容量监控(obs)
+
+OBS 不限对象数,监控 bucket 计费即可。chunk 路径下对象数 ≈ 唯一 chunk
+数(高去重场景 < 100K /节点 /月,见 PROPOSAL §6.6 容量规划)。
+
+### 5.5 e2e 验证
+
+```bash
+# fs backend 链路
+make test-e2e
+
+# obs backend 链路(需要凭据)
+OBS_E2E=1 OBS_BUCKET=ops-dev make test-e2e-obs
+```
+
+obs 链路 endpoint/region/AK/SK 自动从 `~/.obsconfig` 取;无凭证时 skip 不
+阻塞 CI。
+
+## 6. See Also
+
+- [`manifest.md`](manifest.md) — 客户端,通过 gRPC `Put`/`Get`/`GetSalt`
+  与 store-ctl 交互;chunk 加密在客户端发生
+- [`cache.md`](cache.md) — `tiered` 模式的 origin 是一个 store gRPC 客户端
+  指向 store-ctl
+- [`build.md`](build.md) — store-ctl 是纯 Go 二进制,`make build` /
+  `make store-ctl` 产出
+- `PROPOSAL.md` §6.6 — 存储模型与容量规划
