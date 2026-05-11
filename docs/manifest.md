@@ -11,14 +11,13 @@
 ### 1.1 模块定位
 
 ```
-┌──── 输入流 ────┐    ┌──── manifest-ctl store ────┐    ┌──── 出去 ────┐
-│  io.Reader     │ ── │  chunker                   │    │  Manifest    │
-│  (file/stdin/  │    │  ↓                         │    │  (二进制文件 │
-│   pipe)        │    │  convergent encrypt        │    │   或 stdout) │
-└────────────────┘    │  ↓                         │    └──────────────┘
-                      │  store-ctl Put(chunk_hash) │           +
-                      │  →→→→→→→→→→→→→→→→→→→→→→→→→ │    chunk 字节落到
-                      └────────────────────────────┘    store-ctl 后端
+   ┌─ input stream ──┐      ┌─ manifest-ctl store ──────────────┐      ┌─ output ──────────┐
+   │  io.Reader      │ ───► │  chunker                          │ ───► │  Manifest         │
+   │  (file/stdin/   │      │      ↓                            │      │  (binary file or  │
+   │   pipe)         │      │  convergent encrypt               │      │   stdout)         │
+   └─────────────────┘      │      ↓                            │      └───────────────────┘
+                            │  store-ctl Put(chunk_hash) ───────┼───►  chunk bytes land in
+                            └───────────────────────────────────┘      store-ctl backend
 ```
 
 读取方向相反:`manifest-ctl load` 从 Manifest 取 chunk 列表 → 经 cache-ctl
@@ -373,27 +372,26 @@ final_salt = SHA256(server_salt || extra_salt)
 Manifest 是一段紧凑的小型二进制:
 
 ```
-┌────────── header ───────────┐
-│ magic         "MANI"  4 B    │
-│ version       u32     4 B    │
-│ chunk_mode    u8      1 B    │  0=cdc / 1=fixed
-│ chunk_avg     u32     4 B    │
-│ chunk_min     u32     4 B    │
-│ chunk_max     u32     4 B    │
-│ image_size    u64     8 B    │
-│ chunk_count   u32     4 B    │
-│ ...                          │
-├──────── chunk index ─────────┤  按 image_offset 升序
-│  for each chunk:             │
-│    image_offset   u64        │  (隐式,可省略,用 cumulative)
-│    plain_len      u32        │
-│    cipher_hash    32 B       │  store 寻址 key
-│    flags          u8         │  zero-chunk / aes / fake bit
-├──────── key table ───────────┤  customer key 密封
-│  AES-GCM(manifest.key, [    │
-│    key_0[32], key_1[32], ...│
-│  ])                          │
-└──────────────────────────────┘
+   ┌──────────────── header ──────────────────┐
+   │  magic        "MANI"   4 B               │
+   │  version      u32      4 B               │
+   │  chunk_mode   u8       1 B               │   0 = cdc  /  1 = fixed
+   │  chunk_avg    u32      4 B               │
+   │  chunk_min    u32      4 B               │
+   │  chunk_max    u32      4 B               │
+   │  image_size   u64      8 B               │
+   │  chunk_count  u32      4 B               │
+   │  ...                                     │
+   ├──────────── chunk index ─────────────────┤   sorted by image_offset
+   │  for each chunk:                         │
+   │     image_offset   u64                   │   (implicit — derivable from cumulative)
+   │     plain_len      u32                   │
+   │     cipher_hash    32 B                  │   store addressing key
+   │     flags          u8                    │   zero-chunk / aes / fake bit
+   ├───────────── key table ──────────────────┤   sealed with the customer key
+   │  AES-GCM( manifest.key,                  │
+   │           [ key_0[32], key_1[32], … ] )  │
+   └──────────────────────────────────────────┘
 ```
 
 读路径:解析 header → 二分查找 chunk index 定位 offset → 用 `manifest.key`
