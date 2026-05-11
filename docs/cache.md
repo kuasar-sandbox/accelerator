@@ -255,29 +255,29 @@ tiers:
 ### 4.1 总体架构
 
 ```
-┌─── manifest-ctl ─────────────────────────────────────────────────┐
-│  load:  fetch ── wire ObjectGet ────┐                            │
-│  store: ingest ── store gRPC Put ──┐│                            │
-└────────────────────────────────────┼┼─────────────────────────────┘
-                                     ││
-                  store gRPC Put/Get ││ wire ObjectGet
-                                     ▼▼
-                       ┌── store-ctl ────┐  ┌── cache-ctl tiered ───────┐
-                       │  gRPC server     │  │  wire server              │
-                       │  ▼               │  │  ▼                       │
-                       │  fs/obs backend  │  │  TieredCache              │
-                       │  __meta/gens     │  │  ├ tier 0: embedded (L1) │
-                       └────────▲─────────┘  │  ├ tier 1: ec            │
-                                │            │  └ origin → store gRPC   │
-                                │ origin     └────────┬──────────────────┘
-                                │                     │
-                                └─────────────────────┘
-                                                      │ wire ShardGet/Put × 5
-                                                      ▼
-                                            ┌─ cache-ctl shard ─┐
-                                            │  wire server      │ × 5 nodes
-                                            │  RocksDB          │
-                                            └───────────────────┘
+   ┌─ manifest-ctl ──────────────────────────────────────────────────────────────┐
+   │    load:    fetch  ── wire ObjectGet ───────────────┐                       │
+   │    store:   ingest ── store gRPC Put ──┐            │                       │
+   └────────────────────────────────────────┼────────────┼───────────────────────┘
+                                            │            │
+                              store gRPC    │            │  wire ObjectGet
+                                            ▼            ▼
+                       ┌─ store-ctl ──────────┐    ┌─ cache-ctl  tiered ──────────┐
+                       │   gRPC server        │    │   wire server                │
+                       │      │               │    │      │                       │
+                       │      ▼               │    │      ▼                       │
+                       │   fs / obs backend   │    │   TieredCache                │
+                       │   __meta/generations │    │     tier 0   embedded  (L1)  │
+                       └──────────▲───────────┘    │     tier 1   ec ──────┐      │
+                                  │                │     origin ──┐        │      │
+                                  │                └──────────────┼────────┼──────┘
+                                  │  origin (gRPC Get)            │        │
+                                  └───────────────────────────────┘        │  wire ShardGet/Put × 5
+                                                                           ▼
+                                                              ┌─ cache-ctl  shard ──┐
+                                                              │   wire server       │   × 5 nodes
+                                                              │   RocksDB           │   (RS 4+1, Maglev)
+                                                              └─────────────────────┘
 ```
 
 cache-ctl 不参与写入路径——所有 Put 由 manifest-ctl → store-ctl 直接走;
