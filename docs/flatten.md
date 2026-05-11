@@ -34,15 +34,15 @@ Entrypoint / Env / WorkingDir 等启动参数。
 ### 1.3 在系统中的位置
 
 ```
-┌─ docker save ──┐    ┌──── flatten-ctl ──────┐    ┌──── manifest-ctl store ──┐
-│  layered tar   ├───►│  layer iter + merge   ├───►│  chunk + crypto + dedup  │
-└────────────────┘    │  whiteout 处理        │    │  → store-ctl gRPC        │
-                      │  mtime 归零           │    └──────────────────────────┘
-                      │  mkfs.erofs           │
-                      │  + append config zip  │    ┌──── sandbox-ctl run ─────┐
-                      └───────────────────────┘    │  blk0.base = file://...  │
-                                                   │           或 manifest:// │
-                                                   └──────────────────────────┘
+   ┌─ docker save ──┐     ┌─ flatten-ctl ───────────┐     ┌─ manifest-ctl store ──────┐
+   │  layered tar   │────►│  layer iter + merge     │────►│  chunk + crypto + dedup   │
+   └────────────────┘     │  whiteout handling      │     │  → store-ctl gRPC Put     │
+                          │  mtime → 0              │     └───────────────────────────┘
+                          │  mkfs.erofs             │
+                          │  + append config zip    │     ┌─ sandbox-ctl run ─────────┐
+                          └─────────────────────────┘     │  blk0.base = file://...   │
+                                                          │             or manifest://│
+                                                          └───────────────────────────┘
 ```
 
 OCI layout (`oci:./dir`) 可先经 `skopeo copy oci:./xxx docker-archive:/tmp/x.tar`
