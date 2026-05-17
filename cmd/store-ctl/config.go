@@ -188,10 +188,13 @@ func (c *Config) VerifyKey() bool {
 	}
 }
 
-// OBSOpTimeout returns the parsed OBS op-timeout, defaulting to 10s.
+// OBSOpTimeout returns the parsed OBS op-timeout. Empty/absent = 0 =
+// no per-op deadline: an obs op is bounded only by the caller's
+// context, never an arbitrary number. Operators opt into a finite
+// budget by setting obs.op_timeout explicitly.
 func (c *Config) OBSOpTimeout() (time.Duration, error) {
 	if c.OBS.OpTimeout == "" {
-		return 10 * time.Second, nil
+		return 0, nil
 	}
 	return time.ParseDuration(c.OBS.OpTimeout)
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/fullof-work/mass-sandbox/pkg/cache/wire"
+	"github.com/fullof-work/mass-sandbox/pkg/util/optrace"
 )
 
 // WireServer accepts TCP/UDS connections and serves cache RPCs using the
@@ -19,6 +20,7 @@ type WireServer struct {
 	closing     atomic.Bool
 	idleTimeout time.Duration
 	rpcTimeout  time.Duration
+	tr          *optrace.Tracer
 
 	connsMu sync.Mutex
 	conns   map[net.Conn]struct{}
@@ -41,6 +43,7 @@ func NewWireServer(handler *CacheHandler, idleTimeout, rpcTimeout time.Duration)
 		handler:     handler,
 		idleTimeout: idleTimeout,
 		rpcTimeout:  rpcTimeout,
+		tr:          optrace.FromEnv("cache-ctl"),
 		conns:       make(map[net.Conn]struct{}),
 	}
 }
@@ -149,7 +152,10 @@ func (s *WireServer) serveConn(c net.Conn) {
 
 		resps := make(chan *wire.Response, 1)
 		go func() {
-			resps <- s.handler.HandleFrame(ctx, req)
+			end := s.tr.Begin("cache.req")
+			r := s.handler.HandleFrame(ctx, req)
+			end()
+			resps <- r
 		}()
 
 		var cancelled bool

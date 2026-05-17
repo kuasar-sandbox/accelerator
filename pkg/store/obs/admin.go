@@ -244,7 +244,7 @@ func (s *Store) deleteBounded(parent context.Context, key string) error {
 		return parent.Err()
 	}
 	defer func() { <-s.sem }()
-	ctx, cancel := context.WithTimeout(parent, s.opTimeout)
+	ctx, cancel := s.opCtx(parent)
 	defer cancel()
 	return s.client.Delete(ctx, key)
 }

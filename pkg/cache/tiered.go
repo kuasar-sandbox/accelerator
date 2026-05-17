@@ -106,8 +106,23 @@ type Repairable interface {
 	EnableRepair(runner func(fn func()))
 }
 
-// fillTimeout bounds asynchronous fill goroutines.
-const fillTimeout = 30 * time.Second
+// fillCtx returns the context for an async fill goroutine: always a
+// child of baseCtx (so Close cancels it — no leak on a wedged origin),
+// with the optional fillTimeout deadline applied only when > 0.
+func (tc *TieredCache) fillCtx() (context.Context, context.CancelFunc) {
+	if tc.fillTimeout > 0 {
+		return context.WithTimeout(tc.baseCtx, tc.fillTimeout)
+	}
+	return context.WithCancel(tc.baseCtx)
+}
+
+// Close cancels all in-flight async fill/repair goroutines. Idempotent.
+// Pair with WaitFills to drain them on graceful shutdown.
+func (tc *TieredCache) Close() {
+	if tc.baseCancel != nil {
+		tc.baseCancel()
+	}
+}
 
 // TieredCache composes cache tiers and an origin into a layered lookup.
 //
@@ -121,6 +136,16 @@ type TieredCache struct {
 	tiers        []Tier
 	origin       Getter
 	fillInflight []sync.WaitGroup // per-tier inflight fill WaitGroups
+
+	// baseCtx parents every async fill/repair goroutine; baseCancel
+	// (called by Close) cancels them all on shutdown. This is what
+	// makes "no fill deadline" safe — a wedged origin no longer leaks
+	// fill goroutines; they unblock when the cache is torn down.
+	baseCtx    context.Context
+	baseCancel context.CancelFunc
+	// fillTimeout bounds async fills. 0 = no deadline (default): a fill
+	// is bounded only by baseCtx (Close) — never an arbitrary number.
+	fillTimeout time.Duration
 
 	tierHits   []atomic.Uint64
 	tierMisses []atomic.Uint64
@@ -153,9 +178,12 @@ type TieredCounters struct {
 // WaitFills and graceful shutdown correctly account for in-flight
 // repairs.
 func NewTieredCache(origin Getter, tiers ...Tier) *TieredCache {
+	baseCtx, baseCancel := context.WithCancel(context.Background())
 	tc := &TieredCache{
 		tiers:        tiers,
 		origin:       origin,
+		baseCtx:      baseCtx,
+		baseCancel:   baseCancel,
 		fillInflight: make([]sync.WaitGroup, len(tiers)),
 		tierHits:     make([]atomic.Uint64, len(tiers)),
 		tierMisses:   make([]atomic.Uint64, len(tiers)),
@@ -318,7 +346,7 @@ func (tc *TieredCache) startFill(tierIdx int, p store.Partition, key store.Conte
 	go func() {
 		defer tc.fillInflight[tierIdx].Done()
 		defer cloned.Release()
-		ctx, cancel := context.WithTimeout(context.Background(), fillTimeout)
+		ctx, cancel := tc.fillCtx()
 		defer cancel()
 		_ = tc.tiers[tierIdx].Fill(ctx, p, key, cloned.Bytes())
 	}()
@@ -333,7 +361,7 @@ func (tc *TieredCache) startFillMiss(tierIdx int, p store.Partition, key store.C
 	tc.fillInflight[tierIdx].Add(1)
 	go func() {
 		defer tc.fillInflight[tierIdx].Done()
-		ctx, cancel := context.WithTimeout(context.Background(), fillTimeout)
+		ctx, cancel := tc.fillCtx()
 		defer cancel()
 		_ = mf.FillMiss(ctx, p, key)
 	}()

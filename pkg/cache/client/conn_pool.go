@@ -57,9 +57,10 @@ func DialConnPool(addr string, cfg ConnPoolConfig) (*ConnPool, error) {
 	if cfg.MaxSize <= 0 {
 		cfg.MaxSize = 1
 	}
-	if cfg.Timeout <= 0 {
-		cfg.Timeout = 2 * time.Second
-	}
+	// cfg.Timeout <= 0 stays 0 = no per-op deadline (SetOpDeadline
+	// no-ops on <=0, so ops are bounded only by the caller's context).
+	// The TCP/UDS *connect* still keeps a bounded fallback below — a
+	// dead listener must not hang the dial forever.
 	network, dialAddr := parseAddr(addr)
 
 	p := &ConnPool{
@@ -70,8 +71,12 @@ func DialConnPool(addr string, cfg ConnPoolConfig) (*ConnPool, error) {
 		done:    make(chan struct{}),
 	}
 
+	dialTimeout := cfg.Timeout
+	if dialTimeout <= 0 {
+		dialTimeout = 2 * time.Second // bounded connect even when ops are unbounded
+	}
 	for i := 0; i < cfg.PoolSize; i++ {
-		raw, err := net.DialTimeout(network, dialAddr, cfg.Timeout)
+		raw, err := net.DialTimeout(network, dialAddr, dialTimeout)
 		if err != nil {
 			p.Close()
 			return nil, fmt.Errorf("dial %s: %w", addr, err)

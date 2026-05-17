@@ -205,11 +205,14 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// ParseRPCTimeout parses the rpc_timeout field.
+// ParseRPCTimeout parses the rpc_timeout field. Empty/absent/invalid =
+// 0 = no per-request deadline: a request is bounded only by the client
+// connection / caller cancellation, never an arbitrary number.
+// Operators opt into a finite budget by setting rpc_timeout explicitly.
 func (c *Config) ParseRPCTimeout() time.Duration {
 	d, err := time.ParseDuration(c.RPCTimeout)
 	if err != nil || d <= 0 {
-		return 2 * time.Second
+		return 0
 	}
 	return d
 }

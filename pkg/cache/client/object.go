@@ -49,9 +49,8 @@ func newImpl(endpoint string, opts Options) (*impl, error) {
 	if opts.Pool <= 0 {
 		opts.Pool = 4
 	}
-	if opts.Timeout <= 0 {
-		opts.Timeout = 2 * time.Second
-	}
+	// opts.Timeout <= 0 stays 0 = no per-call deadline: bounded only by
+	// the caller's context, never an arbitrary number.
 	if opts.BlobPool == nil {
 		opts.BlobPool = cache.DefaultPool
 	}

@@ -11,8 +11,8 @@ import (
 	"github.com/fullof-work/mass-sandbox/pkg/cache"
 	"github.com/fullof-work/mass-sandbox/pkg/cache/freq"
 	"github.com/fullof-work/mass-sandbox/pkg/cache/runtime"
-	"github.com/fullof-work/mass-sandbox/pkg/config"
 	"github.com/fullof-work/mass-sandbox/pkg/store"
+	"github.com/fullof-work/mass-sandbox/pkg/util"
 	grocksdb "github.com/linxGnu/grocksdb"
 )
 
@@ -410,7 +410,7 @@ func parseCountWithDefault(s string, def uint64) uint64 {
 	if s == "" {
 		return def
 	}
-	v, err := config.ParseSize(s)
+	v, err := util.ParseSize(s)
 	if err != nil || v == 0 {
 		return def
 	}

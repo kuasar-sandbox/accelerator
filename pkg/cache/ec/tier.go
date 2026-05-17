@@ -62,6 +62,11 @@ type impl struct {
 	router *router
 	pool   *peerPool
 
+	// baseCtx parents the detached repair-backfill goroutine; baseCancel
+	// (called by Close) reaps it on shutdown so a fill blocked on a
+	// wedged peer can't leak when fillTimeout is 0 (= no deadline).
+	baseCtx     context.Context
+	baseCancel  context.CancelFunc
 	fillTimeout time.Duration
 
 	// shardScratchPool holds per-shard scratch buffers large enough
@@ -126,16 +131,16 @@ func New(cfg Config) (Interface, error) {
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
-	fillTimeout := cfg.FillTimeout
-	if fillTimeout <= 0 {
-		fillTimeout = 30 * time.Second
-	}
-
+	// cfg.FillTimeout <= 0 stays 0 = no fill deadline: a fill is
+	// bounded only by baseCtx (Close), never an arbitrary number.
+	baseCtx, baseCancel := context.WithCancel(context.Background())
 	t := &impl{
 		enc:         enc,
 		router:      rt,
 		pool:        newPeerPool(poolSize, timeout, cfg.BlobPool),
-		fillTimeout: fillTimeout,
+		baseCtx:     baseCtx,
+		baseCancel:  baseCancel,
+		fillTimeout: cfg.FillTimeout,
 	}
 	// Seed: 256 KiB covers a single shard for values up to ~1 MiB.
 	t.shardScratchPool.New = func() any { return make([]byte, 0, 256<<10) }
@@ -478,7 +483,7 @@ func (t *impl) scheduleRepair(shards [][]byte, seenIdx []bool, missPeerPos []int
 			if err != nil {
 				continue
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), t.fillTimeout)
+			ctx, cancel := t.fillCtxFrom(t.baseCtx)
 			_ = sc.FillShard(ctx, p, key, j.value)
 			cancel()
 		}
@@ -527,7 +532,7 @@ func (t *impl) Fill(ctx context.Context, p store.Partition, key store.ContentKey
 		return err
 	}
 
-	fillCtx, cancel := context.WithTimeout(ctx, t.fillTimeout)
+	fillCtx, cancel := t.fillCtxFrom(ctx)
 	defer cancel()
 
 	var (
@@ -576,8 +581,21 @@ func (t *impl) Fill(ctx context.Context, p store.Partition, key store.ContentKey
 	return nil
 }
 
-// Close closes the peer pool.
+// fillCtxFrom derives a fill context from parent, applying the
+// fillTimeout deadline only when > 0 (0 = no deadline; bounded solely
+// by parent / Close).
+func (t *impl) fillCtxFrom(parent context.Context) (context.Context, context.CancelFunc) {
+	if t.fillTimeout > 0 {
+		return context.WithTimeout(parent, t.fillTimeout)
+	}
+	return context.WithCancel(parent)
+}
+
+// Close cancels the detached repair backfill and closes the peer pool.
 func (t *impl) Close() error {
+	if t.baseCancel != nil {
+		t.baseCancel()
+	}
 	return t.pool.Close()
 }
 

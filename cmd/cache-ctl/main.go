@@ -241,7 +241,7 @@ func cmdServe(args []string) {
 			if pool <= 0 {
 				pool = 4
 			}
-			timeout := 2 * time.Second
+			var timeout time.Duration // 0 = no per-op deadline (caller ctx only)
 			if sc.Timeout != "" {
 				if d, err := time.ParseDuration(sc.Timeout); err == nil && d > 0 {
 					timeout = d
@@ -260,7 +260,7 @@ func cmdServe(args []string) {
 			if pool <= 0 {
 				pool = 4
 			}
-			timeout := 2 * time.Second
+			var timeout time.Duration // 0 = no per-op deadline (caller ctx only)
 			if uc.Timeout != "" {
 				if d, err := time.ParseDuration(uc.Timeout); err == nil && d > 0 {
 					timeout = d
@@ -373,6 +373,12 @@ func cmdServe(args []string) {
 			ws.GracefulStop()
 			if grpcServer != nil {
 				grpcServer.GracefulStop()
+			}
+			if tieredCache != nil {
+				// Cancel any in-flight async fills so a fill blocked on
+				// a wedged origin can't hang shutdown (fills now have no
+				// deadline by default; baseCtx cancellation reaps them).
+				tieredCache.Close()
 			}
 			return
 		}

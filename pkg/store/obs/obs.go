@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/fullof-work/mass-sandbox/pkg/store"
+	"github.com/fullof-work/mass-sandbox/pkg/util/optrace"
 )
 
 // metaGenerationsKey is the in-bucket path of the generations meta
@@ -83,6 +84,7 @@ type Store struct {
 	opTimeout  time.Duration
 	sem        chan struct{}
 	metaTries  int
+	tr         *optrace.Tracer
 
 	mu       sync.RWMutex
 	gens     []string // newest-first
@@ -150,9 +152,10 @@ func newStore(client s3Client, cfg Config) (*Store, error) {
 	if cfg.MaxInflight <= 0 {
 		cfg.MaxInflight = 64
 	}
-	if cfg.OpTimeout <= 0 {
-		cfg.OpTimeout = 10 * time.Second
-	}
+	// cfg.OpTimeout <= 0 means "no per-op deadline": an op is bounded
+	// only by the caller's context (cancellation / client disconnect),
+	// not an arbitrary number. An operator opts into a finite budget
+	// explicitly via obs.op_timeout. opWithTimeout() honours 0 = none.
 	if cfg.MaxObjectSize <= 0 {
 		cfg.MaxObjectSize = defaultMaxObjectSize
 	}
@@ -168,6 +171,7 @@ func newStore(client s3Client, cfg Config) (*Store, error) {
 		opTimeout:  cfg.OpTimeout,
 		sem:        make(chan struct{}, cfg.MaxInflight),
 		metaTries:  cfg.MetaCASRetries,
+		tr:         optrace.FromEnv("store-ctl"),
 	}, nil
 }
 
@@ -262,6 +266,17 @@ func (s *Store) metaKey() string {
 	return path.Join(s.prefix, metaGenerationsKey)
 }
 
+// opCtx applies the per-op deadline only when one is configured.
+// s.opTimeout <= 0 means "no deadline": the op is bounded solely by
+// the caller's context (cancellation / client disconnect), never an
+// arbitrary number.
+func (s *Store) opCtx(parent context.Context) (context.Context, context.CancelFunc) {
+	if s.opTimeout <= 0 {
+		return parent, func() {}
+	}
+	return context.WithTimeout(parent, s.opTimeout)
+}
+
 // bounded wraps an s3 Get-style call with the semaphore + timeout.
 // Returns whatever the inner call returns.
 func (s *Store) bounded(parent context.Context, fn func(ctx context.Context) ([]byte, *ObjectMeta, error)) ([]byte, *ObjectMeta, error) {
@@ -271,7 +286,8 @@ func (s *Store) bounded(parent context.Context, fn func(ctx context.Context) ([]
 		return nil, nil, parent.Err()
 	}
 	defer func() { <-s.sem }()
-	ctx, cancel := context.WithTimeout(parent, s.opTimeout)
+	defer s.tr.Begin("obs.get")()
+	ctx, cancel := s.opCtx(parent)
 	defer cancel()
 	body, meta, err := fn(ctx)
 	if err == nil && meta != nil && meta.Size > s.maxObjSize {
@@ -288,7 +304,8 @@ func (s *Store) boundedHead(parent context.Context, fn func(ctx context.Context)
 		return nil, parent.Err()
 	}
 	defer func() { <-s.sem }()
-	ctx, cancel := context.WithTimeout(parent, s.opTimeout)
+	defer s.tr.Begin("obs.head")()
+	ctx, cancel := s.opCtx(parent)
 	defer cancel()
 	return fn(ctx)
 }
@@ -301,7 +318,8 @@ func (s *Store) boundedPut(parent context.Context, key string, body []byte, opts
 		return "", parent.Err()
 	}
 	defer func() { <-s.sem }()
-	ctx, cancel := context.WithTimeout(parent, s.opTimeout)
+	defer s.tr.Begin("obs.put")()
+	ctx, cancel := s.opCtx(parent)
 	defer cancel()
 	return s.client.Put(ctx, key, body, opts)
 }

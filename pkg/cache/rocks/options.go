@@ -1,8 +1,8 @@
 package rocks
 
 import (
-	"github.com/fullof-work/mass-sandbox/pkg/config"
 	"github.com/fullof-work/mass-sandbox/pkg/cache/runtime"
+	"github.com/fullof-work/mass-sandbox/pkg/util"
 	grocksdb "github.com/linxGnu/grocksdb"
 )
 
@@ -19,7 +19,7 @@ func BuildOptions(cfg runtime.RocksConfig) *OpenOptions {
 	bbto := grocksdb.NewDefaultBlockBasedTableOptions()
 
 	// BlockCache size = disk_bytes * mem_ratio
-	diskBytes, _ := config.ParseSize(cfg.DiskBytes)
+	diskBytes, _ := util.ParseSize(cfg.DiskBytes)
 	if diskBytes == 0 {
 		diskBytes = 1 << 40 // 1 TiB default
 	}
@@ -34,7 +34,7 @@ func BuildOptions(cfg runtime.RocksConfig) *OpenOptions {
 	bbto.SetBlockCache(grocksdb.NewLRUCache(blockCacheBytes))
 
 	// Block size
-	blockSize, _ := config.ParseSize(cfg.BlockSize)
+	blockSize, _ := util.ParseSize(cfg.BlockSize)
 	if blockSize == 0 {
 		blockSize = 64 << 10 // 64 KiB
 	}
@@ -66,7 +66,7 @@ func BuildOptions(cfg runtime.RocksConfig) *OpenOptions {
 	}
 
 	// Write buffer — default 256 MiB to reduce flush frequency under concurrent writes.
-	writeBufferBytes, _ := config.ParseSize(cfg.WriteBufferBytes)
+	writeBufferBytes, _ := util.ParseSize(cfg.WriteBufferBytes)
 	if writeBufferBytes == 0 {
 		writeBufferBytes = 256 << 20 // 256 MiB default (was 64 MiB Go/RocksDB default)
 	}

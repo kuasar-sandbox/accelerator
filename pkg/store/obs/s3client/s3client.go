@@ -83,6 +83,10 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	}
 	api := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
 		o.BaseEndpoint = aws.String(cfg.Endpoint)
+		// OBS's S3-compatible responses carry no CRC/SHA checksum
+		// header, so the SDK logs a WARN on every GET. Silence it —
+		// we verify content-length ourselves and the transport is TLS.
+		o.DisableLogOutputChecksumValidationSkipped = true
 	})
 	return &Client{api: api, bucket: cfg.Bucket}, nil
 }
