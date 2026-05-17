@@ -44,26 +44,27 @@
 
 ```
 Global Flags:
-  --config string         清单配置 YAML 路径(覆盖 MANIFEST_CONFIG 环境变量)
-  --crypto-fake           允许处理 fake 加密(仅 CLI flag,不可配置文件化)
+  --manifest-config string    清单配置 YAML 路径(覆盖 MANIFEST_CONFIG 环境变量)
 ```
 
-`--config` 与 `MANIFEST_CONFIG` 至少需要一项指向有效 YAML;两者都缺则命
-令报错(`config generate` 子命令除外)。配置文件 schema 见 §3.1。
+`--manifest-config` 与 `MANIFEST_CONFIG` 至少需要一项指向有效 YAML;两者
+都缺则命令报错(`config generate` 子命令除外)。配置文件 schema 见 §3.1。
 
 ### 2.2 子命令一览
 
 | 命令 | 功能 |
 |---|---|
-| `store`         | 写入数据 → 产出 Manifest 文件或 hex content key |
-| `load`          | 从 Manifest 读取明文数据 |
-| `info`          | 打印 Manifest 摘要(无需 customer key) |
-| `verify`        | 逐 chunk 哈希 + 解密验证完整性 |
-| `diff`          | 比较两个 Manifest 的 chunk 重叠度(去重率分析) |
-| `put-manifest`  | 把 Manifest 文件本身存进 store-ctl,返回 hex key |
-| `get-manifest`  | 按 hex key 从 store-ctl 取出 Manifest |
+| `store`         | 写入数据 → 自动上传 manifest 并返回 hex content key |
+| `load`          | 按 manifest key 读取明文数据 |
+| `get-manifest`  | 按 hex key 取回 Manifest 原始字节(debug 用) |
+| `info`          | 打印本地 Manifest 文件摘要(无需 customer key) |
+| `verify`        | 通过 fetch 路径端到端验证 store 中 manifest 可用 |
+| `diff`          | 比较两个本地 Manifest 的 chunk 重叠度(去重率分析) |
 | `config show`   | 打印解析后的配置 YAML |
 | `config generate` | 输出带注释的配置模板 |
+
+> 写入 manifest blob 始终由 `store` 内部完成,不再有独立的 `put-manifest`
+> 子命令。
 
 ### 2.3 `manifest-ctl store` — 数据写入
 
@@ -72,41 +73,38 @@ manifest-ctl store [flags]
 
 Flags:
   --input string              输入路径 (default "-", stdin)
-  --manifest string           输出 Manifest 路径 (default "-", stdout);
-                              --put-manifest 指定时忽略
-  --put-manifest              将 Manifest 存入 Store 并输出 hex key 到 stdout
-  --salt string               额外 salt (hex),叠加到 generation salt
+  --extra-salt string         额外 salt 字节,叠加到 generation salt
+  --detect-holes              对常规文件 lseek(SEEK_HOLE/SEEK_DATA) 检测稀疏空洞
   --no-progress               禁用进度输出
 ```
 
-stderr 摘要(默认开,`--no-progress` 关):
+stdout 输出一行 64 字符 hex —— 这是上传后的 manifest content key。stderr
+是人类可读的摘要(默认开,`--no-progress` 关):
 
 ```
-image size:     10.0 GiB
-chunks:         20480 (stored 2048, dedup 18432, zero 0)
-stored bytes:   1.0 GiB
-manifest bytes: 1887436
+image size:   10.0 GiB
+stored bytes: 1.0 GiB
+chunks:       stored=2048 dedup=18432 zero=0
+generation:   gen-2026-05-01
+manifest key: a1b2c3d4...
 ```
 
 示例:
 
 ```bash
-# 文件 → Manifest 文件
-manifest-ctl store --input disk.img --manifest disk.manifest
+# 文件 → manifest key
+MKEY=$(manifest-ctl store --input disk.img)
 
-# stdin → stdout
-cat disk.img | manifest-ctl store > disk.manifest
+# stdin → manifest key
+cat disk.img | manifest-ctl store > disk.key
 
 # docker save → 展平 → 入库(典型管道)
-docker save myapp:v1 | flatten-ctl | manifest-ctl store --manifest app.manifest
-
-# 一步入库:Manifest 直接落 Store,stdout 输出 hex key
-MKEY=$(manifest-ctl store --input disk.img --put-manifest)
+docker save myapp:v1 | flatten-ctl export --input - --upload > app.key
 
 # 额外 salt(隔离 dedup 域)
-manifest-ctl store --input snap.bin --manifest snap.manifest --salt "deadbeef..."
+manifest-ctl store --input snap.bin --extra-salt "tenant-xyz"
 
-# 切换分块 / 加密模式 → 改 YAML(--chunk-mode / --crypto-* 已移除)
+# 切换分块 / 加密模式 → 改 YAML
 ```
 
 ### 2.4 `manifest-ctl load` — 数据读取
@@ -115,54 +113,45 @@ manifest-ctl store --input snap.bin --manifest snap.manifest --salt "deadbeef...
 manifest-ctl load [flags]
 
 Flags:
-  --manifest string           Manifest 路径 (default "-", stdin);
-                              --get-manifest 指定时忽略
-  --get-manifest string       从 Store 获取 Manifest 的 hex key,
-                              等价于 `get-manifest ... | load`
+  --manifest-key string       要加载的 manifest 的 hex content key(必填)
   --output string             输出路径 (default "-", stdout)
   --offset uint               起始偏移
   --length uint               读取长度 (0 = 整个镜像)
+  --hole string               空洞策略: error (默认) | zero | punch
   --no-progress               禁用进度输出
 ```
 
 ```bash
 # 全量还原
-manifest-ctl load --manifest disk.manifest --output disk-restored.img
+manifest-ctl load --manifest-key a1b2c3d4... --output disk-restored.img
 
 # 部分读
-manifest-ctl load --manifest disk.manifest --length 4096 | hexdump -C
+manifest-ctl load --manifest-key a1b2c3d4... --length 4096 | hexdump -C
 
-# 一步取回:按 Store 里的 key 加载数据
-manifest-ctl load --get-manifest a1b2c3d4... --output disk.img
+# 稀疏镜像:把 manifest 空洞落成文件空洞
+manifest-ctl load --manifest-key a1b2c3d4... --output disk.img --hole punch
 ```
 
-### 2.5 `manifest-ctl put-manifest` / `get-manifest`
+### 2.5 `manifest-ctl get-manifest` — 取回 manifest 字节
 
-把 Manifest 文件本身放进 store-ctl,获得一串 hex content key 作为唯一句
-柄(64 字符 hex,实际是 `SHA256(manifest_bytes)`)。
+把 manifest 原始字节从 store 拿出来(主要用于 debug 或 `info`/`diff` 离
+线场景)。
 
 ```
-manifest-ctl put-manifest [--input -|FILE]      # stdout 输出 hex key
-manifest-ctl get-manifest --key HEX [--output -|FILE]
+manifest-ctl get-manifest --manifest-key HEX [--output -|FILE]
 ```
-
-典型管道:
 
 ```bash
-# store 产 Manifest → 直接 put-manifest
-manifest-ctl store --input disk.img | manifest-ctl put-manifest
-# → a1b2c3d4...
+# 拿出来直接看
+manifest-ctl get-manifest --manifest-key a1b2c3d4... | manifest-ctl info --manifest -
 
-# get-manifest → load
-manifest-ctl get-manifest --key a1b2c3d4... | manifest-ctl load --output disk.img
-
-# 一步:store --put-manifest
-manifest-ctl store --input disk.img --put-manifest
+# 存档
+manifest-ctl get-manifest --manifest-key a1b2c3d4... --output disk.manifest
 ```
 
 ### 2.6 `manifest-ctl info`
 
-无需 customer key:
+读取本地 manifest 文件并打印摘要(无需 customer key、无需 store 连接):
 
 ```
 manifest-ctl info --manifest disk.manifest
@@ -180,16 +169,18 @@ key table:     655380 bytes (sealed)
 manifest size: 1887436 bytes
 ```
 
+要查看 store 中的 manifest,先 `get-manifest` 取回字节再管道给 `info`。
+
 ### 2.7 `manifest-ctl verify`
 
-逐 chunk 验证密文哈希 + 密钥表解密 + 明文重加密比对。
+通过 fetch 路径逐 chunk 端到端解密,验证 store 中的 manifest 全可用。
 
 ```
-manifest-ctl verify --manifest disk.manifest
+manifest-ctl verify --manifest-key a1b2c3d4...
 ```
 
 ```
-verified: 20480  skipped(zero): 0  failed: 0  total: 20480
+verified: 20480  skipped(zero): 0  holes: 0  failed: 0  total chunks: 20480
 ```
 
 ### 2.8 `manifest-ctl diff` — 去重率分析
@@ -197,6 +188,9 @@ verified: 20480  skipped(zero): 0  failed: 0  total: 20480
 ```
 manifest-ctl diff <manifest-a> <manifest-b>
 ```
+
+两个参数都是本地 manifest 文件(用 `get-manifest` 取回);diff 不需要打开
+store。
 
 ```
 manifest A:  10.0 GiB, 20480 chunks (20480 unique)
@@ -210,7 +204,7 @@ dedup ratio: 45.0%
 ### 2.9 `manifest-ctl config`
 
 ```
-manifest-ctl config show     [--config <path>]
+manifest-ctl config show     [--manifest-config <path>]
 manifest-ctl config generate
 ```
 
@@ -222,27 +216,26 @@ manifest-ctl config generate
 
 ```yaml
 manifest:
-  key: "0a1b2c3d..."             # 32 字节 hex 客户密钥;Manifest 内嵌的密钥表用它密封
+  key: "0a1b2c3d..."              # 32 字节 hex 客户密钥;Manifest 内嵌的密钥表用它密封
 store:
-  endpoint: 127.0.0.1:7060        # store-ctl gRPC 端点(必填)
+  endpoint: 127.0.0.1:7100        # store-ctl gRPC 端点(必填)
   pool: 4                         # 客户端并行 grpc.ClientConn 数 (round-robin)
   timeout: 5s                     # 单次 store RPC 超时
-chunk:
+cache:
+  endpoint: 127.0.0.1:7070        # 空 = 跳过 cache 层、直接走 store
+  pool: 4
+  timeout: 2s
+chunker:
   mode: cdc                       # cdc | fixed
   cdc:
-    min: 64KiB
+    min: 128KiB
     avg: 512KiB
     max: 1MiB
   fixed:
     size: 512KiB
 crypto:
-  chunk: aes                      # aes | fake | none
+  chunk: aes                      # aes | fake
   manifest: aes                   # aes | fake
-cache:
-  endpoint: ""                    # 空 = 直接走 store gRPC,跳过 cache 层;
-                                  # 非空指向 cache-ctl wire 数据面
-  pool: 4
-  timeout: 2s
 ```
 
 字段说明:
@@ -251,20 +244,20 @@ cache:
   chunk 加密或寻址**。loss → 整个 Manifest 不可读。
 - `store.endpoint` — manifest-ctl 不直接读写持久层;所有 chunk / Manifest
   I/O 通过这个 gRPC 客户端打到 store-ctl 守护进程。
-- `chunk.mode` — `cdc`(FastCDC,变长)或 `fixed`(固定大小)。详见 §4.1。
-- `crypto.chunk` / `crypto.manifest` — chunk 与 Manifest 各自的加密模式
-  (§4.3 / §4.4)。
 - `cache.endpoint` — 空则 manifest-ctl `load` 路径直走 store gRPC;非空则
-  通过 wire 协议穿 cache-ctl tiered。
+  通过 wire 协议穿 cache-ctl。
+- `chunker.mode` — `cdc`(FastCDC,变长)或 `fixed`(固定大小)。详见 §4.1。
+- `crypto.chunk` / `crypto.manifest` — chunk 与 Manifest 各自的加密模式
+  (§4.3 / §4.4)。fake 是性能基线模式,不要在生产打开。
 
 ### 3.2 加载顺序
 
 CLI flag 与对应环境变量是仅有的两种来源,**没有自动查找**:
 
 ```
---config FILE     ┐
-                  ├─ 优先级:flag > env;两者皆缺则报错(config generate 除外)
-MANIFEST_CONFIG   ┘
+--manifest-config FILE     ┐
+                           ├─ 优先级:flag > env;两者皆缺则报错
+MANIFEST_CONFIG            ┘   (config generate 除外)
 ```
 
 不再支持单字段 CLI overrides(`--manifest-key` / `--chunk-mode` 等已移除)
@@ -326,14 +319,12 @@ YAML `crypto.chunk`:
 
 | 模式 | 行为 | 用途 |
 |---|---|---|
-| `aes`  | AES-256-CTR(key, IV, plaintext) | 生产默认 |
-| `fake` | `[flag=0x00] + HMAC(key, plaintext)[:32] + plaintext` | 性能基线;**生产拒绝读取** |
-| `none` | 跳过 AES,但 key 派生 + content-dependent 寻址仍生效 | 受信批量场景;不推荐 |
+| `aes`  | `[flag=0x01] + AES-256-CTR(key, IV, plaintext)` | 生产默认 |
+| `fake` | `[flag=0x00] + HMAC(key, plaintext)[:32] + plaintext` | 性能基线;不要在生产打开 |
 
 `fake` 模式专为对比测量收敛寻址 / 去重 / 上传开销时,排除 AES 加密的
-CPU 影响 —— 由于密文 = 明文,生产部署不应允许读取它,所以 manifest-ctl 通过
-`--crypto-fake` flag 显式承认。该 flag 不可配置文件化,提示运维不要"忘
-了它默认开"。
+CPU 影响 —— 由于密文 = 明文,生产部署不应允许使用。flag byte 在解密时
+做模式校验,跨模式读取会失败。
 
 ### 4.4 加密模式 — Manifest
 
