@@ -87,6 +87,13 @@ func (c *Client) Close() error {
 	return errors.Join(errs...)
 }
 
+// PoolSize reports the number of independent gRPC connections (the
+// configured store.pool). It is the real client-side parallelism limit
+// — round-robin RPC dispatch can only have this many Puts in genuinely
+// concurrent flight — so callers (e.g. the ingest worker pool) size
+// their concurrency to it. Race-free: stubs is fixed at New().
+func (c *Client) PoolSize() int { return len(c.stubs) }
+
 // pickStub returns the next gRPC stub via atomic round-robin. With
 // pool=1 every call returns the same stub; with larger pools the
 // counter wraps modulo len(stubs).
