@@ -16,7 +16,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/fullof-work/mass-sandbox/pkg/binloc"
 )
 
 // dockerManifestEntry describes one image in a docker-archive tar.
@@ -26,12 +25,26 @@ type dockerManifestEntry struct {
 	Layers   []string `json:"Layers"`
 }
 
+// Options tweaks Flatten's environment. Zero value reproduces the
+// historic behaviour (temp dir under $TMPDIR or /tmp).
+type Options struct {
+	// TmpDir overrides the parent of the per-run scratch directory.
+	// Useful when /tmp is small and images are large. Empty → default
+	// (os.MkdirTemp("", ...) which respects $TMPDIR).
+	TmpDir string
+}
+
 // Flatten converts a docker-archive tar stream into an EROFS image.
 // The input must be an uncompressed tar produced by `docker save`.
 // mkfs.erofs is located via locateMkfsErofs; if none is found the call
 // fails rather than falling back silently.
 func Flatten(input io.Reader, outputPath string) error {
-	workDir, err := os.MkdirTemp("", "flatten-*")
+	return FlattenWith(input, outputPath, Options{})
+}
+
+// FlattenWith is the explicit-options form of Flatten.
+func FlattenWith(input io.Reader, outputPath string, opts Options) error {
+	workDir, err := os.MkdirTemp(opts.TmpDir, "flatten-*")
 	if err != nil {
 		return fmt.Errorf("flatten: create temp dir: %w", err)
 	}
@@ -95,12 +108,17 @@ func Flatten(input io.Reader, outputPath string) error {
 
 // FlattenFile converts a docker-archive tar file into an EROFS image.
 func FlattenFile(inputPath, outputPath string) error {
+	return FlattenFileWith(inputPath, outputPath, Options{})
+}
+
+// FlattenFileWith is the explicit-options form of FlattenFile.
+func FlattenFileWith(inputPath, outputPath string, opts Options) error {
 	f, err := os.Open(inputPath)
 	if err != nil {
 		return fmt.Errorf("flatten: open input: %w", err)
 	}
 	defer f.Close()
-	return Flatten(f, outputPath)
+	return FlattenWith(f, outputPath, opts)
 }
 
 // Verify flattens the same input twice and checks byte-identical output.
@@ -376,17 +394,26 @@ func normalizeTimestamps(rootfsDir string) error {
 	})
 }
 
-// locateMkfsErofs resolves the mkfs.erofs binary via the shared binloc
-// helper (env override → exe-dir → PATH). The hint message in the
-// returned error keeps users pointed at `make deps-erofs`.
+// locateMkfsErofs resolves the mkfs.erofs binary with a fixed
+// precedence: $MKFS_EROFS_PATH > directory of running flatten-ctl
+// executable > $PATH. The hint message in the returned error keeps
+// users pointed at `make deps-erofs`.
 func locateMkfsErofs() (string, error) {
-	p, err := binloc.Locate("mkfs.erofs", "MKFS_EROFS_PATH")
-	if err != nil {
-		return "", fmt.Errorf("flatten: mkfs.erofs not found " +
-			"(set MKFS_EROFS_PATH, place it alongside flatten-ctl, " +
-			"or add it to PATH; run `make deps-erofs` to build it)")
+	if p := os.Getenv("MKFS_EROFS_PATH"); p != "" {
+		return p, nil
 	}
-	return p, nil
+	if exe, err := os.Executable(); err == nil {
+		candidate := filepath.Join(filepath.Dir(exe), "mkfs.erofs")
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+	if p, err := exec.LookPath("mkfs.erofs"); err == nil {
+		return p, nil
+	}
+	return "", fmt.Errorf("flatten: mkfs.erofs not found " +
+		"(set MKFS_EROFS_PATH, place it alongside flatten-ctl, " +
+		"or add it to PATH; run `make deps-erofs` to build it)")
 }
 
 // buildImage produces the output image from the flattened rootfs directory
