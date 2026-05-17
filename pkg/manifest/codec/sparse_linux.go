@@ -1,6 +1,6 @@
 //go:build linux
 
-package manifest
+package codec
 
 import (
 	"errors"

@@ -11,7 +11,7 @@
 // Entries cover the data ranges of the original image; holes cover the
 // "no data here" ranges (filesystem holes, qcow2 unallocated, TRIM, ...).
 // Together they tile [0, ImageSize) with no overlap and no gap.
-package manifest
+package codec
 
 import (
 	"encoding/binary"
