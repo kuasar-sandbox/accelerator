@@ -348,7 +348,7 @@ Salt 隔离 dedup 域 —— 同样的明文用不同 salt 派生不同 key → 
 
 - `server_salt` — manifest-ctl 启动时调一次 `store-ctl GetSalt()` 取得
   active-generation salt。Generation 切换时 salt 变,跨代天然隔离。
-- `extra_salt` — `--salt HEX` flag,叠加到上面。
+- `extra_salt` — `--extra-salt <bytes>` flag(§2.3),叠加到上面。
 
 最终:
 
@@ -415,6 +415,13 @@ seal(manifest.key, key_table)
    ↓
 emit Manifest 文件
 ```
+
+上图按单个 chunk 画顺序流,但 derive/encrypt/`Put` 那一段是**并发**执行的:
+ingest 用一个有界 worker pool,并发度取 store 客户端连接池大小(`store.pool`
+——round-robin RPC 调度下真正能同时在途的 `Put` 数就是它)。chunk 切分仍按
+文件顺序、manifest 索引按文件顺序组装、进度回调串行化,所以产物字节序不变;
+后端不暴露连接池信息时回退为串行。这把入库吞吐从"串行单 `Put` 往返"提升到
+"池并发往返",对多 GiB snapshot `--upload` 影响显著(见 [`perf.md`](perf.md) §2.4)。
 
 ### 4.8 读路径(细节)
 

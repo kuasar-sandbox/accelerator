@@ -127,7 +127,9 @@ Flags:
 mode: local
 listen: 0.0.0.0:7070           # wire 数据面
 health_listen: 0.0.0.0:7071    # gRPC 健康检查(可省)
-rpc_timeout: 2s                # 服务端每请求 wall-clock 上限
+rpc_timeout: ""                # 服务端每请求 wall-clock 上限。缺省/空/非法 = 0 =
+                               # 无 per-request deadline:请求只受客户端连接 /
+                               # 调用方取消约束。显式写 Go duration(如 "2s")才设上界
 
 freq:
   counters: 8M                 # CMS sketch 4-bit 计数器数 (8M ≈ 4 MiB)
@@ -209,7 +211,7 @@ tiers:
 origin:
   type: store                  # 唯一合法值;cache-ctl 不直接访问文件系统
   store:
-    endpoint: 10.0.1.50:7060   # store-ctl gRPC endpoint
+    endpoint: 10.0.1.50:7100   # store-ctl gRPC endpoint
     pool: 4                    # 独立 grpc.ClientConn 数(round-robin)
     timeout: 2s
   max_inflight: 16             # 到 origin 的最大并发 RPC 数
@@ -248,7 +250,9 @@ tiers:
 | `health_listen` | gRPC 健康检查监听(`grpc.health.v1.Health`)。省略则不启动 |
 | `pool` | 到单个 peer 的并行 TCP 连接数。wire 是 sync request/response,单连接会把并发请求串行化 |
 | `max_inflight` | 客户端到该 tier 的最大并发对象请求数。embedded 推荐不设;origin 建议 16-32 |
-| `rpc_timeout` | 服务端每请求处理超时。超时后返回 `StatusError`,TieredCache 视作该层 miss 继续下一层 |
+| `rpc_timeout` | 服务端每请求 wall-clock 上限。**缺省/空/非法 = 0 = 无 per-request deadline**:请求只受客户端连接 / 调用方取消约束,不强加任意值。显式设有限值时,超时返回 `StatusError`,TieredCache 视作该层 miss 继续下一层。卡死请求的可观测性改由 `CACHE_CTL_DEBUG` 追踪(§6.5) |
+| `timeout`(tier/origin) | 客户端对该 tier / origin 单次 RPC 的 wall-clock 上限。同 `rpc_timeout` 语义:缺省/空 = 0 = 不设上界,只受调用方 ctx / 连接约束 |
+| `pprof_listen` | 非空时另起一个 HTTP listener 暴露 `/debug/pprof/*`(如 `127.0.0.1:6060`)。**生产留空**;仅离线诊断临时开启(§6.4) |
 
 ## 4. 设计
 
@@ -656,6 +660,29 @@ cache-ctl info --rocks-path /var/cache/accel-l1
 
 RocksDB secondary instance 模式打开 DB,输出 property(estimate-num-keys、
 disk usage、compaction stats)。**与运行中的 cache-ctl 共存**,不需停 daemon。
+
+`pprof_listen` 非空时(§3.5)另起 `/debug/pprof/*` HTTP listener,可
+`go tool pprof` 抓 CPU / heap / goroutine。生产留空,仅排障临时开启。
+
+### 6.5 慢/卡请求追踪(`CACHE_CTL_DEBUG`)
+
+`rpc_timeout` 缺省不设上界(§3.5)后,卡死的后端不再 fail-fast 而是静默
+stall。env 门控的操作 tracer 把它变可观测:
+
+```bash
+CACHE_CTL_DEBUG=1 cache-ctl serve --config cache.yaml       # 开启
+CACHE_CTL_SLOW=2s CACHE_CTL_DEBUG=1 cache-ctl serve ...      # 自定慢阈值
+```
+
+- `CACHE_CTL_DEBUG` truthy 时启用,否则零开销(每请求一次 atomic 读)
+- 每个完成的请求打一行耗时,超过慢阈值(`CACHE_CTL_SLOW`,Go duration,
+  默认 1 s)记 WARN
+- 后台 reporter 周期 dump **仍在飞**且超阈值的请求(op 名 + 已卡时长),
+  卡死的 tier / origin 立即可见,不必等 deadline
+- 覆盖 wire 服务端请求处理(含 tiered fill / origin 回源)
+
+生产默认关闭;与 `pprof_listen` 互补——tracer 看"哪些请求慢/卡",pprof
+看"卡在哪段代码"。
 
 ## 7. 性能特征
 

@@ -149,7 +149,7 @@ store-ctl config generate
 ### 3.1 fs backend
 
 ```yaml
-listen: 127.0.0.1:7060
+listen: 127.0.0.1:7100
 backend: fs
 fs:
   root: /var/store               # 文件系统根目录(必填,init 时创建结构)
@@ -159,7 +159,7 @@ fs:
 ### 3.2 obs backend
 
 ```yaml
-listen: 127.0.0.1:7060
+listen: 127.0.0.1:7100
 backend: obs
 obs:
   bucket: container-accelerator-prod
@@ -170,14 +170,20 @@ obs:
   secret_key: ${OBS_SK}
   verify_content_key: true
   max_inflight: 64                                     # 并发 OBS 调用上限
-  op_timeout: 10s                                      # 单次 OBS 调用超时
+  op_timeout: ""                                       # 单次 OBS 调用 wall-clock 上限。
+                                                       # 缺省/空 = 0 = 无 per-op deadline:
+                                                       # 一次调用只受调用方 ctx(取消 /
+                                                       # 客户端断开)约束,不强加任意值。
+                                                       # 需要硬上界时显式写一个 Go duration
+                                                       # (如 "30s")。慢/卡操作的可观测性
+                                                       # 改由 STORE_CTL_DEBUG 追踪(§5.6)
   max_object_size_bytes: 16777216                      # Get 响应字节上限(默认 16 MiB)
 ```
 
 最小 obs 配置(凭据走 IMDS / `~/.obsconfig`):
 
 ```yaml
-listen: 127.0.0.1:7060
+listen: 127.0.0.1:7100
 backend: obs
 obs:
   bucket: ops-dev
@@ -211,8 +217,8 @@ obs:
 
 数据面与控制面分离:
 
-- **数据面**:gRPC `Put` (客户端流) / `Get` (服务端流) / `GetSalt` 走
-  `listen:` 端口,客户端通过 `pkg/store/client` 连接;
+- **数据面**:gRPC `Put`(客户端流)/ `Get`(服务端流)/ `GetSalt` 走
+  `listen:` 端口,manifest-ctl / cache-ctl 作为 gRPC 客户端连接;
 - **控制面**:`grpc.health.v1.Health` 走 `health_listen:` 端口供探针使用;
 - **运维面**:admin 子命令直接打开后端,**不**经过 gRPC,与运行中的 serve
   共存(读同一份 meta)。
@@ -288,9 +294,11 @@ admin 操作(`Rollout` / `Drop` / `Wipe` / `GenerationStats`)是 Store 类型上
 CAS 失败 → 重读 + 重试,有界次数(默认 5)后报错。这保证多个 store-ctl
 实例并发 init 同一桶时只有一个赢,但稳态运行仍假定单写者。
 
-**defensive wrapper**:`pkg/store/obs` 在 SDK 之上加一层信号量
-(`MaxInflight`)+ 上下文超时(`OpTimeout`)+ 响应大小封顶(`MaxObjectSize`),
-防止 OBS 抖动导致 store-ctl OOM 或队头阻塞。
+**defensive wrapper**:obs backend 在 SDK 之上加一层信号量
+(`max_inflight`)+ 可选 per-op 超时(`op_timeout`,缺省不设上界——只受调用方
+ctx 约束,§3.2)+ 响应大小封顶(`max_object_size_bytes`),防止 OBS 抖动导致
+store-ctl OOM 或队头阻塞。`op_timeout` 不设时,慢/卡调用靠 `STORE_CTL_DEBUG`
+追踪暴露(§5.6),而不是被一个武断的 deadline 提前杀掉。
 
 ### 4.5 凭据自动发现(obs)
 
@@ -411,6 +419,26 @@ OBS_E2E=1 OBS_BUCKET=ops-dev make test-e2e-obs
 
 obs 链路 endpoint/region/AK/SK 自动从 `~/.obsconfig` 取;无凭证时 skip 不
 阻塞 CI。
+
+### 5.6 慢/卡操作追踪(`STORE_CTL_DEBUG`)
+
+`op_timeout` 缺省不设上界(§3.2)后,一个卡死的后端不再 fail-fast,而是
+静默 stall。把这种 stall 变可观测的是一个 env 门控的操作 tracer:
+
+```bash
+STORE_CTL_DEBUG=1 store-ctl serve --config store.yaml      # 开启
+STORE_CTL_SLOW=2s STORE_CTL_DEBUG=1 store-ctl serve ...     # 自定慢阈值
+```
+
+- `STORE_CTL_DEBUG` truthy(非空且非 `0`/`false`)时启用;否则零开销
+  (每 op 一次 atomic 读)
+- 每个完成的 op 打一行耗时;超过慢阈值(`STORE_CTL_SLOW`,Go duration,
+  默认 1 s)的记 WARN
+- 后台 reporter 周期性 dump **仍在飞**且已超阈值的 op(op 名 + 已卡时长),
+  这样 stall 在卡住的后端上立即可见,而不必等一个 deadline
+- 覆盖 obs 的 get / head / put 调用
+
+生产默认关闭;排障时临时开启,定位 OBS 抖动 / 凭据 / 网络导致的长尾。
 
 ## 6. See Also
 
