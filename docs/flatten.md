@@ -50,42 +50,59 @@ OCI layout (`oci:./dir`) 可先经 `skopeo copy oci:./xxx docker-archive:/tmp/x.
 
 ## 2. 命令行接口
 
-两个子命令模式:**默认模式**(展平镜像)用 flag 调用;**`info` 子命令**用于
-检视已生成镜像。
+三个子命令:`export`(展平,可选直接入库)、`verify`(确定性自检)、
+`info`(检视已生成镜像 / `manifest://` 引用)。
 
-### 2.1 默认模式 — 展平
+| 子命令 | 用途 |
+|--------|------|
+| `export` | docker-archive → 确定性 EROFS 文件;`--upload` 时顺带 ingest 进 store 并打印 manifest key |
+| `verify` | 对同一输入展平两次,比对字节级 sha256,确认确定性 |
+| `info` | 读 EROFS superblock + 末尾 ZIP 里的 OCI runtime config 并打印 |
+
+输入 `--input` 统一接受:`-`(stdin 的 docker-archive 流)或本地
+docker-archive tar 路径;`info` 额外接受 `manifest://<hex>`。
+
+### 2.1 `flatten-ctl export`
 
 ```
-flatten-ctl [flags]
+flatten-ctl export --input <path|-> --output <path|-> [flags]
 
-Flags:
-  --image string              镜像输入源 (default "-", stdin docker-archive 流)
-                              格式:
-                                -                          stdin docker-archive
-                                docker-archive:./file.tar  本地 docker save 产物
-                                ./file.tar                 同上,省略 scheme
-  --output string             输出路径 (default "-", stdout)
-  --verify                    展平两次,验证字节级确定性
-  --no-progress               禁用 stderr 进度输出
+  --input <path|->        docker-archive tar;`-` = stdin(默认)
+  --output <path|->       EROFS 输出路径;`-` = stdout。--upload 关闭时必填,
+                          --upload 开启时可省(产物默认丢弃,只要 manifest key)
+  --upload                展平后把 EROFS ingest 进 store,stdout 打印 manifest
+                          key(同时给 --output 则文件也写)
+  --manifest-config <path>  manifest 配置 YAML(覆盖 MANIFEST_CONFIG env);
+                          --upload 必需
+  --tmpdir <D>            每次运行的临时工作目录的父目录(默认 $TMPDIR 或 /tmp);
+                          /tmp 太小、镜像很大时改到大盘
+  --no-progress           禁用 stderr 进度输出
 ```
 
 典型用法:
 
 ```bash
 # docker save 管道 → 单文件输出
-docker save myapp:v1 | flatten-ctl > my-app.erofs
+docker save myapp:v1 | flatten-ctl export --input - --output my-app.erofs
 
-# 显式 docker-archive 文件
-flatten-ctl --image docker-archive:./my-app.tar --output my-app.erofs
+# 本地 docker-archive 文件
+flatten-ctl export --input ./my-app.tar --output my-app.erofs
 
-# 一条管道:docker save → 展平 → 入库
-docker save myapp:v1 | flatten-ctl | manifest-ctl store --manifest app.manifest
+# 展平后直接入库(stdout 即 manifest key)
+docker save myapp:v1 | flatten-ctl export --input - --upload \
+    --manifest-config manifest.yaml > app.key
 
-# 确定性验证(展平两次,比较 sha256)
-flatten-ctl --image /tmp/myapp.tar --verify
+# /tmp 不够大时把暂存挪到大盘
+flatten-ctl export --input ./big.tar --output big.erofs --tmpdir /var/tmp
 ```
 
-`--verify` 的 stderr 输出:
+### 2.2 `flatten-ctl verify`
+
+```
+flatten-ctl verify --input <path|-> [--tmpdir D] [--no-progress]
+```
+
+对同一输入展平两次,比对 sha256,确认字节级确定性。stderr 输出:
 
 ```
 Pass 1: sha256:a1b2c3... (1.2 GiB)
@@ -93,13 +110,15 @@ Pass 2: sha256:a1b2c3... (1.2 GiB)
 DETERMINISTIC
 ```
 
-### 2.2 `flatten-ctl info` — 检视镜像
+### 2.3 `flatten-ctl info` — 检视镜像
 
 ```
-flatten-ctl info [--json] <file>
+flatten-ctl info --input <path|manifest://hex> [--json] [--manifest-config <path>]
 
-Flags:
-  --json                      机器可读 JSON 输出(默认人类可读)
+  --input <path|manifest://hex>  EROFS 文件路径,或 manifest://<hex>
+  --json                         机器可读 JSON 输出(默认人类可读)
+  --manifest-config <path>       manifest 配置 YAML;`manifest://` 输入必需
+                                 (经 cache-ctl + store-ctl 拉回再读 superblock)
 ```
 
 读 EROFS superblock 拿 image size,从末尾 ZIP 解出 OCI runtime config 并
@@ -108,7 +127,7 @@ Flags:
 人类可读输出示例:
 
 ```
-$ flatten-ctl info my-app.erofs
+$ flatten-ctl info --input my-app.erofs
 EROFS image size:  1.2 GiB (1287651328 bytes)
 Architecture:      amd64
 Os:                linux
@@ -154,7 +173,7 @@ JSON 输出示例:
 unzip -p my-app.erofs config.json | jq
 
 # 或者经 flatten-ctl info --json 进 jq
-flatten-ctl info --json my-app.erofs | jq '.config.Entrypoint'
+flatten-ctl info --json --input my-app.erofs | jq '.config.Entrypoint'
 ```
 
 ## 3. 镜像格式
@@ -173,12 +192,12 @@ flatten-ctl info --json my-app.erofs | jq '.config.Entrypoint'
 - **EROFS 读路径**(kernel `mount -t erofs` / vhost-user-blk backend):
   从偏移 0 读 superblock,superblock 自带 `blocks << blkszbits` 的 image
   size,kernel 不读 size 之后的字节,trailing ZIP 自然不可见
-- **ZIP 读路径**(`archive/zip.NewReader(ReaderAt, fileSize)` / `unzip`):
-  从文件**末尾**扫 End-of-Central-Directory(EOCD),内部 offset 都是相对
-  ZIP 起点,EOCD 扫描容忍前缀任意字节,EROFS 段的存在不影响 ZIP 解析
+- **ZIP 读路径**(任意标准 ZIP 工具,如 `unzip`):从文件**末尾**扫
+  End-of-Central-Directory(EOCD),内部 offset 都是相对 ZIP 起点,EOCD
+  扫描容忍前缀任意字节,EROFS 段的存在不影响 ZIP 解析
 
-`erofs_end = blocks × (1 << blkszbits)`,从 superblock 解析(详见
-`flatten.ReadEROFSSize`)。EROFS 镜像 endian-neutral,跨 host arch 可挂载。
+`erofs_end = blocks × (1 << blkszbits)`,从 superblock 解析。EROFS 镜像
+endian-neutral,跨 host arch 可挂载。
 
 ### 3.2 config.json schema
 
@@ -186,7 +205,7 @@ ZIP 内 `config.json` 是 OCI image config 的运行时相关投影。**只保�
 的字段**,跳过 `created` / `author` / `history` / `rootfs.diff_ids` 等会破坏
 跨次确定性的元数据。
 
-字段集合(`pkg/flatten.RuntimeConfig`):
+字段集合(运行时投影 schema):
 
 ```
 Architecture     string                 (passthrough,例如 "amd64" / "arm64")
@@ -216,21 +235,21 @@ Healthcheck      *Healthcheck,omitempty   (Test/Interval/Timeout/StartPeriod/Ret
 
 ZIP 部分:
 
-- 单 entry,`ConfigFileName = "config.json"`
-- `Method = zip.Store`(无压缩,内容直接可见)
-- `Modified = 1980-01-01 00:00 UTC`(zipEpoch 常量,不用 `time.Now()`)
-- `MarshalDeterministic` 走 stdlib `encoding/json`:map keys 按字典序、
-  slice 顺序保留(Env/Cmd/Entrypoint 语义需要)、omitempty 抑制零值
+- 单 entry,文件名固定 `config.json`
+- 无压缩(stored,内容直接可见)
+- 修改时间固定为纪元常量 `1980-01-01 00:00 UTC`,绝不用挂钟
+- 确定性 JSON 序列化:map keys 按字典序、slice 顺序保留(Env/Cmd/Entrypoint
+  语义需要)、零值字段抑制
 
 EROFS 部分见 §4.3 元数据归一化。
 
-两个 `RuntimeConfig` 字段相等 → JSON 字节相等 → ZIP entry 字节相等 → 整文件
+两个运行时投影字段相等 → JSON 字节相等 → ZIP entry 字节相等 → 整文件
 sha256 相等。
 
 ### 3.4 沙箱怎么用 config.json
 
 `sandbox-ctl run` 在启动前从 boot.root.base 文件末尾解 ZIP,拿到
-`RuntimeConfig` 作为 LaunchSpec 的 fallback。`sandbox.yaml` `launch.*`
+运行时投影作为 LaunchSpec 的 fallback。`sandbox.yaml` `launch.*`
 字段优先(yaml override > image config),Env 合并:
 
 | 字段 | 合并规则 |
@@ -253,7 +272,7 @@ docker-archive 是一个 tar:其中包含 `manifest.json` 描述层顺序、若�
 `flatten-ctl`:
 
 1. 解析 `manifest.json` 取到层列表(底→顶顺序)与 image config 路径;
-2. `ExtractRuntimeConfig` 读 image config,投影到 `RuntimeConfig`;
+2. 读 image config,投影出 §3.2 的运行时字段集合;
 3. 按顺序读每个 `layer.tar`,把所有 `tar entry` (header + content) 流式应用到
    一个内存中的虚拟文件树;
 4. 上层 entry 覆盖下层同路径 entry。
@@ -289,8 +308,8 @@ EROFS 自身的格式版本由 `mkfs.erofs` 决定(我们用 erofs-utils 1.9.x);
 `flatten-ctl` 把合并后的虚拟文件树物化到一个临时目录,然后执行
 `bin/<arch>/mkfs.erofs <output> <staging-dir>` 把它编码成 EROFS 镜像。
 
-完成后追加 ZIP:`AppendConfigZip(path, cfg)` 用 `O_APPEND` 打开输出文件,
-`archive/zip.NewWriter` 写一条 STORED 模式的 `config.json` entry。
+完成后追加 ZIP:以 append 方式打开输出文件,在 EROFS 段之后写一条 STORED
+(无压缩)模式的 `config.json` entry(§3.3 的确定性约束)。
 
 `mkfs.erofs` 在 `make build` 时由 `make deps-erofs` 构建到 `bin/<arch>/`,
 flatten-ctl 启动时优先在自己的同目录查找 `mkfs.erofs`,其次走 `PATH`。
