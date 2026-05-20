@@ -3,7 +3,7 @@
 `store-ctl` 是项目里**唯一**对持久层后端(本地文件系统 / 远端 OBS)读写
 的进程。所有数据进出最终都汇聚到这里:`manifest-ctl` 通过 gRPC 把
 chunk 与 Manifest 推过来,`cache-ctl tiered` 在 origin miss 时通过 gRPC
-拉过来。store-ctl 负责后端抽象、generation 生命周期与运维操作。
+拉过来。store-ctl 负责后端抽象与数据面收发;generation 生命周期与运维(即 GC 与代管理控制平面)经其 admin 子命令承载。
 
 ## 1. 概述
 
