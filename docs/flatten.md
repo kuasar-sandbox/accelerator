@@ -59,15 +59,17 @@ OCI layout (`oci:./dir`) 可先经 `skopeo copy oci:./xxx docker-archive:/tmp/x.
 | `verify` | 对同一输入展平两次,比对字节级 sha256,确认确定性 |
 | `info` | 读 EROFS superblock + 末尾 ZIP 里的 OCI runtime config 并打印 |
 
-输入 `--input` 统一接受:`-`(stdin 的 docker-archive 流)或本地
-docker-archive tar 路径;`info` 额外接受 `manifest://<hex>`。
+输入是**位置参数**(匿名),三个子命令统一:`export` / `verify` 省略或
+`-` = stdin 的 docker-archive 流,否则本地 docker-archive tar 路径;`info`
+必填,接受 EROFS 文件路径或 `manifest://<hex>`。位置参数须置于 flags 之后
+(Go stdlib flag 在首个非 flag 实参处停止解析)。
 
 ### 2.1 `flatten-ctl export`
 
 ```
-flatten-ctl export --input <path|-> --output <path|-> [flags]
+flatten-ctl export [flags] <path|->
 
-  --input <path|->        docker-archive tar;`-` = stdin(默认)
+  <path|->                docker-archive tar(位置参数);省略或 `-` = stdin
   --output <path|->       EROFS 输出路径;`-` = stdout。--upload 关闭时必填,
                           --upload 开启时可省(产物默认丢弃,只要 manifest key)
   --upload                展平后把 EROFS ingest 进 store,stdout 打印 manifest
@@ -82,24 +84,24 @@ flatten-ctl export --input <path|-> --output <path|-> [flags]
 典型用法:
 
 ```bash
-# docker save 管道 → 单文件输出
-docker save myapp:v1 | flatten-ctl export --input - --output my-app.erofs
+# docker save 管道 → 单文件输出(省略位置参数 = stdin)
+docker save myapp:v1 | flatten-ctl export --output my-app.erofs
 
-# 本地 docker-archive 文件
-flatten-ctl export --input ./my-app.tar --output my-app.erofs
+# 本地 docker-archive 文件(位置参数在 flags 之后)
+flatten-ctl export --output my-app.erofs ./my-app.tar
 
 # 展平后直接入库(stdout 即 manifest key)
-docker save myapp:v1 | flatten-ctl export --input - --upload \
+docker save myapp:v1 | flatten-ctl export --upload \
     --manifest-config manifest.yaml > app.key
 
 # /tmp 不够大时把暂存挪到大盘
-flatten-ctl export --input ./big.tar --output big.erofs --tmpdir /var/tmp
+flatten-ctl export --output big.erofs --tmpdir /var/tmp ./big.tar
 ```
 
 ### 2.2 `flatten-ctl verify`
 
 ```
-flatten-ctl verify --input <path|-> [--tmpdir D] [--no-progress]
+flatten-ctl verify [--tmpdir D] [--no-progress] <path|->   # 省略/`-` = stdin
 ```
 
 对同一输入展平两次,比对 sha256,确认字节级确定性。stderr 输出:
@@ -113,9 +115,9 @@ DETERMINISTIC
 ### 2.3 `flatten-ctl info` — 检视镜像
 
 ```
-flatten-ctl info --input <path|manifest://hex> [--json] [--manifest-config <path>]
+flatten-ctl info [--json] [--manifest-config <path>] <path|manifest://hex>
 
-  --input <path|manifest://hex>  EROFS 文件路径,或 manifest://<hex>
+  <path|manifest://hex>          EROFS 文件路径,或 manifest://<hex>(位置参数,必填)
   --json                         机器可读 JSON 输出(默认人类可读)
   --manifest-config <path>       manifest 配置 YAML;`manifest://` 输入必需
                                  (经 cache-ctl + store-ctl 拉回再读 superblock)
@@ -127,7 +129,7 @@ flatten-ctl info --input <path|manifest://hex> [--json] [--manifest-config <path
 人类可读输出示例:
 
 ```
-$ flatten-ctl info --input my-app.erofs
+$ flatten-ctl info my-app.erofs
 EROFS image size:  1.2 GiB (1287651328 bytes)
 Architecture:      amd64
 Os:                linux
@@ -173,7 +175,7 @@ JSON 输出示例:
 unzip -p my-app.erofs config.json | jq
 
 # 或者经 flatten-ctl info --json 进 jq
-flatten-ctl info --json --input my-app.erofs | jq '.config.Entrypoint'
+flatten-ctl info --json my-app.erofs | jq '.config.Entrypoint'
 ```
 
 ## 3. 镜像格式

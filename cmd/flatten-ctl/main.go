@@ -3,11 +3,14 @@
 //
 // Subcommands:
 //
-//	flatten-ctl export   --input <path|->  --output <path|-> [--tmpdir D]
-//	                     [--manifest-config <path>] [--upload]
-//	flatten-ctl verify   --input <path|-> [--tmpdir D]
-//	flatten-ctl info     --input <path|manifest://hex> [--json]
-//	                     [--manifest-config <path>]
+//	flatten-ctl export   [--output <path|->] [--tmpdir D]
+//	                     [--manifest-config <path>] [--upload]  <path|->
+//	flatten-ctl verify   [--tmpdir D] [--no-progress]  <path|->
+//	flatten-ctl info     [--json] [--manifest-config <path>]  <path|manifest://hex>
+//
+// The image is a positional arg (flags must precede it — stdlib flag).
+// For export/verify it defaults to `-` (docker-archive on stdin) when
+// omitted; `-` may also be given explicitly.
 //
 // `export --upload` ingests the produced EROFS into the content store
 // and prints the resulting manifest key on stdout (the EROFS itself
@@ -78,13 +81,16 @@ See `+"`flatten-ctl <command> -h`"+` for per-command flags.
 
 func cmdExport(args []string) {
 	fs := flag.NewFlagSet("export", flag.ExitOnError)
-	input := fs.String("input", "-", "docker-archive tar (- for stdin)")
 	output := fs.String("output", "", "EROFS output path (- for stdout, empty = required with --upload off)")
 	tmpDir := fs.String("tmpdir", "", "parent of the per-run scratch directory (default $TMPDIR or /tmp)")
 	manifestCfg := fs.String("manifest-config", "", "manifest config YAML (overrides MANIFEST_CONFIG env)")
 	upload := fs.Bool("upload", false, "after flatten, ingest the EROFS into the store and print the manifest key on stdout")
 	noProgress := fs.Bool("no-progress", false, "suppress progress output")
 	fs.Parse(args)
+	input := fs.Arg(0)
+	if input == "" {
+		input = "-" // default: docker-archive stream on stdin
+	}
 
 	if !*upload && (*output == "" || *output == "/dev/null") {
 		fatal("--output is required when --upload is not set")
@@ -105,7 +111,7 @@ func cmdExport(args []string) {
 		defer os.Remove(outPath)
 	}
 
-	if err := runFlatten(*input, outPath, *tmpDir); err != nil {
+	if err := runFlatten(input, outPath, *tmpDir); err != nil {
 		fatal("%v", err)
 	}
 
@@ -178,14 +184,17 @@ func runFlatten(image, outputPath, tmpDir string) error {
 
 func cmdVerify(args []string) {
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
-	input := fs.String("input", "-", "docker-archive tar (- for stdin)")
 	tmpDir := fs.String("tmpdir", "", "parent of the per-run scratch directory")
 	noProgress := fs.Bool("no-progress", false, "suppress progress output")
 	fs.Parse(args)
+	input := fs.Arg(0)
+	if input == "" {
+		input = "-" // default: docker-archive stream on stdin
+	}
 
 	// Buffer stdin to a temp file so we can seek across two flatten passes.
-	inputPath := *input
-	if *input == "-" {
+	inputPath := input
+	if input == "-" {
 		tmp, err := os.CreateTemp(*tmpDir, "verify-input-*.tar")
 		if err != nil {
 			fatal("create temp: %v", err)
@@ -198,7 +207,7 @@ func cmdVerify(args []string) {
 		tmp.Close()
 		inputPath = tmp.Name()
 	} else {
-		inputPath = strings.TrimPrefix(*input, "docker-archive:")
+		inputPath = strings.TrimPrefix(input, "docker-archive:")
 	}
 
 	tmp1, err := os.CreateTemp(*tmpDir, "verify-pass1-*.img")
@@ -249,40 +258,61 @@ func cmdVerify(args []string) {
 
 func cmdInfo(args []string) {
 	fs := flag.NewFlagSet("info", flag.ExitOnError)
-	input := fs.String("input", "", "EROFS file path or manifest://<hex>")
 	asJSON := fs.Bool("json", false, "machine-readable JSON output")
 	manifestCfg := fs.String("manifest-config", "", "manifest config YAML (overrides MANIFEST_CONFIG env); required for manifest:// inputs")
 	fs.Parse(args)
-	if *input == "" {
-		fatal("--input is required")
+	input := fs.Arg(0)
+	if input == "" {
+		fatal("usage: flatten-ctl info <erofs-path|manifest://hex> [--json] [--manifest-config <file>]")
 	}
 
-	if strings.HasPrefix(*input, "manifest://") {
-		hexKey := strings.TrimPrefix(*input, "manifest://")
+	if strings.HasPrefix(input, "manifest://") {
+		hexKey := strings.TrimPrefix(input, "manifest://")
 		cfg := loadManifestCfg(*manifestCfg)
-		path, cleanup, err := materializeManifest(cfg, hexKey)
+		fc, err := cfg.NewFetcher(cfg.FetchKeyFunc())
+		if err != nil {
+			fatal("fetcher: %v", err)
+		}
+		defer fc.Close()
+		key, err := manifest.ParseHexKey(hexKey)
 		if err != nil {
 			fatal("%v", err)
 		}
-		defer cleanup()
-		printInfo(path, *asJSON)
+		ctx := context.Background()
+		stream, err := fc.Fetch(ctx, key)
+		if err != nil {
+			fatal("fetch manifest: %v", err)
+		}
+		// Read only the EROFS superblock + trailing ZIP directly over
+		// the chunk-granular fetch path — no full materialization.
+		size := int64(stream.ImageSize())
+		printInfo(fetch.NewReaderAt(ctx, stream, size), size, *asJSON)
 		return
 	}
-	printInfo(*input, *asJSON)
-}
 
-func printInfo(path string, asJSON bool) {
-	f, err := os.Open(path)
+	f, err := os.Open(input)
 	if err != nil {
-		fatal("open %s: %v", path, err)
+		fatal("open %s: %v", input, err)
 	}
 	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		fatal("stat %s: %v", input, err)
+	}
+	printInfo(f, st.Size(), *asJSON)
+}
 
-	erofsSize, sbErr := flatten.ReadEROFSSize(f)
+// printInfo reports the EROFS image size and embedded RuntimeConfig from
+// ra. Both flatten.ReadEROFSSize and flatten.ReadConfig need only the
+// superblock and the trailing ZIP, so ra may be a plain *os.File (local
+// path) or a fetch-backed io.ReaderAt (manifest://) — the manifest case
+// then transfers only those few KB, never the whole image.
+func printInfo(ra io.ReaderAt, size int64, asJSON bool) {
+	erofsSize, sbErr := flatten.ReadEROFSSize(ra)
 	if sbErr != nil {
 		fatal("read EROFS superblock: %v", sbErr)
 	}
-	cfg, cfgErr := flatten.ReadConfigFromFile(path)
+	cfg, cfgErr := flatten.ReadConfig(ra, size)
 	if cfgErr != nil && !errors.Is(cfgErr, fs.ErrNotExist) {
 		fatal("read config: %v", cfgErr)
 	}
@@ -300,39 +330,6 @@ func printInfo(path string, asJSON bool) {
 		return
 	}
 	printInfoHuman(erofsSize, cfg)
-}
-
-// materializeManifest fetches the EROFS image addressed by hexKey into
-// a temp file and returns its path plus a cleanup func. We need a
-// regular file because flatten.ReadConfigFromFile / ReadEROFSSize use
-// os.Open + seek-style reads.
-func materializeManifest(cfg *manifest.Config, hexKey string) (string, func(), error) {
-	fc, err := cfg.NewFetcher(cfg.FetchKeyFunc())
-	if err != nil {
-		return "", func() {}, fmt.Errorf("fetcher: %w", err)
-	}
-	defer fc.Close()
-
-	key, err := manifest.ParseHexKey(hexKey)
-	if err != nil {
-		return "", func() {}, err
-	}
-	stream, err := fc.Fetch(context.Background(), key)
-	if err != nil {
-		return "", func() {}, fmt.Errorf("fetch manifest: %w", err)
-	}
-	tf, err := os.CreateTemp("", "flatten-info-*.img")
-	if err != nil {
-		return "", func() {}, fmt.Errorf("create temp: %w", err)
-	}
-	cleanup := func() { os.Remove(tf.Name()) }
-	if err := stream.WriteTo(context.Background(), tf, 0, stream.ImageSize(), fetch.ReadOptions{}); err != nil {
-		tf.Close()
-		cleanup()
-		return "", func() {}, fmt.Errorf("write: %w", err)
-	}
-	tf.Close()
-	return tf.Name(), cleanup, nil
 }
 
 func printInfoHuman(erofsSize uint64, cfg *flatten.RuntimeConfig) {
