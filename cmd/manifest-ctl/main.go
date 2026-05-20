@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/fullof-work/mass-sandbox/pkg/manifest"
 	"github.com/fullof-work/mass-sandbox/pkg/manifest/codec"
@@ -163,19 +164,22 @@ func readManifestData(path string) ([]byte, error) {
 
 func cmdStore(args []string) {
 	fs := flag.NewFlagSet("store", flag.ExitOnError)
-	input := fs.String("input", "-", "input file (- for stdin)")
 	extraSalt := fs.String("extra-salt", "", "optional extra-salt bytes mixed with the store-supplied generation salt")
 	noProgress := fs.Bool("no-progress", false, "suppress progress output")
-	detectHoles := fs.Bool("detect-holes", false, "detect filesystem holes in --input via lseek(SEEK_HOLE/SEEK_DATA) and record them as HoleExtents (file input only — ignored for stdin)")
+	detectHoles := fs.Bool("detect-holes", false, "detect filesystem holes in the input via lseek(SEEK_HOLE/SEEK_DATA) and record them as HoleExtents (file input only — ignored for stdin)")
 	gf := addGlobalFlags(fs)
 	fs.Parse(args)
+	input := fs.Arg(0)
+	if input == "" {
+		input = "-" // default: read data from stdin
+	}
 
 	cfg := loadCfg(*gf.configPath)
 
 	// Resolve input + size. Stdin gets buffered to a temp file so the
 	// chunker can stream over io.Reader and so detect-holes can call
 	// lseek on a real fd (no-op for stdin, but consistent).
-	in, err := openInput(*input)
+	in, err := openInput(input)
 	if err != nil {
 		fatal("open input: %v", err)
 	}
@@ -282,7 +286,6 @@ func cmdStore(args []string) {
 
 func cmdLoad(args []string) {
 	fs := flag.NewFlagSet("load", flag.ExitOnError)
-	keyHex := fs.String("manifest-key", "", "hex content key of the manifest to load (required)")
 	output := fs.String("output", "-", "output file (- for stdout)")
 	offset := fs.Uint64("offset", 0, "byte offset to start reading")
 	length := fs.Uint64("length", 0, "number of bytes to read (0 = remainder)")
@@ -291,8 +294,9 @@ func cmdLoad(args []string) {
 	gf := addGlobalFlags(fs)
 	fs.Parse(args)
 
-	if *keyHex == "" {
-		fatal("--manifest-key is required")
+	keyArg := fs.Arg(0)
+	if keyArg == "" {
+		fatal("usage: manifest-ctl load <hex|manifest://hex> [flags]")
 	}
 	cfg := loadCfg(*gf.configPath)
 
@@ -302,7 +306,7 @@ func cmdLoad(args []string) {
 	}
 	defer fc.Close()
 
-	key, err := manifest.ParseHexKey(*keyHex)
+	key, err := manifest.ParseKeyRef(keyArg)
 	if err != nil {
 		fatal("%v", err)
 	}
@@ -367,16 +371,16 @@ func cmdLoad(args []string) {
 
 func cmdGetManifest(args []string) {
 	fs := flag.NewFlagSet("get-manifest", flag.ExitOnError)
-	keyHex := fs.String("manifest-key", "", "hex content key (required)")
 	output := fs.String("output", "-", "output file (- for stdout)")
 	gf := addGlobalFlags(fs)
 	fs.Parse(args)
-	if *keyHex == "" {
-		fatal("--manifest-key is required")
+	keyArg := fs.Arg(0)
+	if keyArg == "" {
+		fatal("usage: manifest-ctl get-manifest <hex|manifest://hex> [--output -|FILE]")
 	}
 	cfg := loadCfg(*gf.configPath)
 
-	key, err := manifest.ParseHexKey(*keyHex)
+	key, err := manifest.ParseKeyRef(keyArg)
 	if err != nil {
 		fatal("%v", err)
 	}
@@ -404,12 +408,32 @@ func cmdGetManifest(args []string) {
 
 func cmdInfo(args []string) {
 	fs := flag.NewFlagSet("info", flag.ExitOnError)
-	manifestPath := fs.String("manifest", "-", "manifest file (- for stdin)")
+	gf := addGlobalFlags(fs)
 	fs.Parse(args)
+	src := fs.Arg(0)
+	if src == "" {
+		src = "-" // default: manifest bytes on stdin
+	}
 
-	data, err := readManifestData(*manifestPath)
-	if err != nil {
-		fatal("read manifest: %v", err)
+	var data []byte
+	var err error
+	if strings.HasPrefix(src, "manifest://") {
+		// manifest://<hex>: fetch the raw manifest blob from store
+		// (--manifest-config required, as for get-manifest).
+		key, perr := manifest.ParseKeyRef(src)
+		if perr != nil {
+			fatal("%v", perr)
+		}
+		data, err = loadCfg(*gf.configPath).GetManifestBlob(context.Background(), key)
+		if err != nil {
+			fatal("get manifest: %v", err)
+		}
+	} else {
+		// File path, or - / empty = stdin.
+		data, err = readManifestData(src)
+		if err != nil {
+			fatal("read manifest: %v", err)
+		}
 	}
 	m, sealedKT, err := codec.Unmarshal(data)
 	if err != nil {
@@ -535,12 +559,12 @@ func shortSize(n uint64) string {
 
 func cmdVerify(args []string) {
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
-	keyHex := fs.String("manifest-key", "", "hex content key of the manifest to verify (required)")
 	noProgress := fs.Bool("no-progress", false, "suppress progress output")
 	gf := addGlobalFlags(fs)
 	fs.Parse(args)
-	if *keyHex == "" {
-		fatal("--manifest-key is required")
+	keyArg := fs.Arg(0)
+	if keyArg == "" {
+		fatal("usage: manifest-ctl verify <hex|manifest://hex> [flags]")
 	}
 	cfg := loadCfg(*gf.configPath)
 
@@ -550,7 +574,7 @@ func cmdVerify(args []string) {
 	}
 	defer fc.Close()
 
-	key, err := manifest.ParseHexKey(*keyHex)
+	key, err := manifest.ParseKeyRef(keyArg)
 	if err != nil {
 		fatal("%v", err)
 	}

@@ -3,6 +3,7 @@ package manifest
 import (
 	"encoding/hex"
 	"fmt"
+	"strings"
 
 	"github.com/fullof-work/mass-sandbox/pkg/manifest/fetch"
 	"github.com/fullof-work/mass-sandbox/pkg/manifest/ingest"
@@ -24,6 +25,14 @@ func ParseHexKey(s string) (store.ContentKey, error) {
 	}
 	copy(k[:], b)
 	return k, nil
+}
+
+// ParseKeyRef decodes a manifest content key that may carry an optional
+// "manifest://" scheme prefix (the form printed in URIs / passed on
+// CLIs and env). "manifest://<hex>" and bare "<hex>" are equivalent;
+// validation is delegated to ParseHexKey.
+func ParseKeyRef(s string) (store.ContentKey, error) {
+	return ParseHexKey(strings.TrimPrefix(s, "manifest://"))
 }
 
 // HexKey is the inverse of ParseHexKey — formats a ContentKey as 64

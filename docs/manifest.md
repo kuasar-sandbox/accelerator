@@ -65,14 +65,19 @@ Global Flags:
 
 > 写入 manifest blob 始终由 `store` 内部完成,不再有独立的 `put-manifest`
 > 子命令。
+>
+> 输入 / manifest key 均为**位置参数**(匿名):`store` 的数据源、`info`
+> 的 manifest 来源省略或 `-` = stdin;`load` / `get-manifest` / `verify`
+> 以及 `info` 的 key 可带可选 `manifest://` 前缀(`manifest://<hex>` 与
+> 裸 `<hex>` 等价)。位置参数须置于 flags 之后(Go stdlib flag 在首个非
+> flag 实参处停止解析)。
 
 ### 2.3 `manifest-ctl store` — 数据写入
 
 ```
-manifest-ctl store [flags]
+manifest-ctl store [flags] <path|->        # <path|-> 省略或 - = stdin
 
 Flags:
-  --input string              输入路径 (default "-", stdin)
   --extra-salt string         额外 salt 字节,叠加到 generation salt
   --detect-holes              对常规文件 lseek(SEEK_HOLE/SEEK_DATA) 检测稀疏空洞
   --no-progress               禁用进度输出
@@ -93,16 +98,16 @@ manifest key: a1b2c3d4...
 
 ```bash
 # 文件 → manifest key
-MKEY=$(manifest-ctl store --input disk.img)
+MKEY=$(manifest-ctl store disk.img)
 
 # stdin → manifest key
 cat disk.img | manifest-ctl store > disk.key
 
 # docker save → 展平 → 入库(典型管道)
-docker save myapp:v1 | flatten-ctl export --input - --upload > app.key
+docker save myapp:v1 | flatten-ctl export --upload > app.key
 
-# 额外 salt(隔离 dedup 域)
-manifest-ctl store --input snap.bin --extra-salt "tenant-xyz"
+# 额外 salt(隔离 dedup 域;flags 在位置参数前)
+manifest-ctl store --extra-salt "tenant-xyz" snap.bin
 
 # 切换分块 / 加密模式 → 改 YAML
 ```
@@ -110,10 +115,12 @@ manifest-ctl store --input snap.bin --extra-salt "tenant-xyz"
 ### 2.4 `manifest-ctl load` — 数据读取
 
 ```
-manifest-ctl load [flags]
+manifest-ctl load [flags] <hex|manifest://hex>
 
+Args:
+  <hex|manifest://hex>        要加载的 manifest content key(必填;可带可选
+                              manifest:// 前缀)
 Flags:
-  --manifest-key string       要加载的 manifest 的 hex content key(必填)
   --output string             输出路径 (default "-", stdout)
   --offset uint               起始偏移
   --length uint               读取长度 (0 = 整个镜像)
@@ -122,14 +129,17 @@ Flags:
 ```
 
 ```bash
-# 全量还原
-manifest-ctl load --manifest-key a1b2c3d4... --output disk-restored.img
+# 全量还原(flags 在位置参数前)
+manifest-ctl load --output disk-restored.img a1b2c3d4...
 
 # 部分读
-manifest-ctl load --manifest-key a1b2c3d4... --length 4096 | hexdump -C
+manifest-ctl load --length 4096 a1b2c3d4... | hexdump -C
 
 # 稀疏镜像:把 manifest 空洞落成文件空洞
-manifest-ctl load --manifest-key a1b2c3d4... --output disk.img --hole punch
+manifest-ctl load --output disk.img --hole punch a1b2c3d4...
+
+# 也可带 manifest:// 前缀
+manifest-ctl load --output disk.img manifest://a1b2c3d4...
 ```
 
 ### 2.5 `manifest-ctl get-manifest` — 取回 manifest 字节
@@ -138,23 +148,25 @@ manifest-ctl load --manifest-key a1b2c3d4... --output disk.img --hole punch
 线场景)。
 
 ```
-manifest-ctl get-manifest --manifest-key HEX [--output -|FILE]
+manifest-ctl get-manifest [--output -|FILE] <hex|manifest://hex>
 ```
 
 ```bash
-# 拿出来直接看
-manifest-ctl get-manifest --manifest-key a1b2c3d4... | manifest-ctl info --manifest -
+# 拿出来直接看(也可直接 `manifest-ctl info manifest://<hex>`)
+manifest-ctl get-manifest a1b2c3d4... | manifest-ctl info -
 
 # 存档
-manifest-ctl get-manifest --manifest-key a1b2c3d4... --output disk.manifest
+manifest-ctl get-manifest --output disk.manifest a1b2c3d4...
 ```
 
 ### 2.6 `manifest-ctl info`
 
-读取本地 manifest 文件并打印摘要(无需 customer key、无需 store 连接):
+读取 manifest 并打印摘要。位置参数三选一:本地 manifest 文件路径、`-`
+(或省略)= stdin、或 `manifest://<hex>`(从 store 取回 manifest 字节,
+此时需 `--manifest-config`)。前两者无需 customer key、无需 store 连接。
 
 ```
-manifest-ctl info --manifest disk.manifest
+manifest-ctl info [--manifest-config <path>] <file|-|manifest://hex>
 ```
 
 ```
@@ -169,14 +181,15 @@ key table:     655380 bytes (sealed)
 manifest size: 1887436 bytes
 ```
 
-要查看 store 中的 manifest,先 `get-manifest` 取回字节再管道给 `info`。
+查看 store 中的 manifest 直接 `manifest-ctl info manifest://<hex>`(等价于
+旧的 `get-manifest … | info -` 管道)。
 
 ### 2.7 `manifest-ctl verify`
 
 通过 fetch 路径逐 chunk 端到端解密,验证 store 中的 manifest 全可用。
 
 ```
-manifest-ctl verify --manifest-key a1b2c3d4...
+manifest-ctl verify a1b2c3d4...        # 或 manifest://a1b2c3d4...
 ```
 
 ```
