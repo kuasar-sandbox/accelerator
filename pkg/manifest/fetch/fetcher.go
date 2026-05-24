@@ -17,11 +17,12 @@ import (
 // pass a closure that returns a literal.
 type CustomerKeyFunc func() ([32]byte, error)
 
-// Fetcher is the read-side factory: open a Stream for a given content
-// key. One Fetcher per (process, customer-key, cache, decryptor)
-// combination; many Streams per Fetcher (one per manifest read).
+// Fetcher is the read-side factory: open a Stream over one or more content
+// keys (several keys overlay as layers — see Fetch). One Fetcher per
+// (process, customer-key, cache, decryptor) combination; many Streams per
+// Fetcher (one per read).
 type Fetcher interface {
-	Fetch(ctx context.Context, manifestKey store.ContentKey) (Stream, error)
+	Fetch(ctx context.Context, keys ...store.ContentKey) (Stream, error)
 }
 
 // NewFetcher returns a Fetcher bound to the given cache.Getter (which
@@ -41,11 +42,32 @@ type fetcher struct {
 	dec   crypto.Decryptor
 }
 
-// Fetch loads + parses + key-table-unseals the manifest identified by
-// manifestKey, then builds a Stream over its content. Each call is
-// independent — Streams returned by repeated Fetch calls do not share
-// state and may be used concurrently.
-func (f *fetcher) Fetch(ctx context.Context, manifestKey store.ContentKey) (Stream, error) {
+// Fetch opens a Stream over one or more manifests. A single key reads that
+// manifest directly; several keys overlay as layers (manifest://k1:k2:k3):
+// the topmost layer holding data at an offset serves it, declared holes fall
+// through to lower layers, and Size is the maximum over all layers. All layers
+// are unsealed with this Fetcher's customer key.
+//
+// Each call is independent — Streams returned by repeated Fetch calls share
+// no state and may be used concurrently.
+func (f *fetcher) Fetch(ctx context.Context, keys ...store.ContentKey) (Stream, error) {
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("fetch: no manifest key")
+	}
+	subs := make([]Stream, len(keys))
+	for i, k := range keys {
+		s, err := f.fetchOne(ctx, k)
+		if err != nil {
+			return nil, err
+		}
+		subs[i] = s
+	}
+	return NewLayered(subs...), nil
+}
+
+// fetchOne loads, parses, and key-table-unseals a single manifest and builds a
+// single-layer stream over its content.
+func (f *fetcher) fetchOne(ctx context.Context, manifestKey store.ContentKey) (Stream, error) {
 	customerKey, err := f.keyFn()
 	if err != nil {
 		return nil, fmt.Errorf("fetch: customer key: %w", err)
@@ -69,11 +91,10 @@ func (f *fetcher) Fetch(ctx context.Context, manifestKey store.ContentKey) (Stre
 	if err != nil {
 		return nil, fmt.Errorf("fetch: unseal keys: %w", err)
 	}
-	// stream takes a ChunkEncryptor today (legacy interface). Decryptor
-	// is the new narrow surface; in practice both are satisfied by the
-	// same underlying codec impl. Adapt via decryptorAsChunkEncryptor
-	// so the call site doesn't reach into pkg/manifest/crypto internals.
-	return &stream{
+	// manifestStream takes a ChunkEncryptor (legacy interface); the same codec
+	// impl satisfies both it and Decryptor. Adapt so the call site doesn't reach
+	// into pkg/manifest/crypto internals.
+	return &manifestStream{
 		m:         m,
 		cache:     f.cache,
 		encryptor: decryptorAsChunkEncryptor{dec: f.dec},

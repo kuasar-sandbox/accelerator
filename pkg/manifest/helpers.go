@@ -35,6 +35,25 @@ func ParseKeyRef(s string) (store.ContentKey, error) {
 	return ParseHexKey(strings.TrimPrefix(s, "manifest://"))
 }
 
+// ParseKeyRefs decodes a multi-layer manifest reference into one or more
+// content keys. The reference is an optional "manifest://" prefix followed by
+// one or more 64-char hex keys joined by ':' — "manifest://k1:k2:k3" overlays
+// k1 (top) over k2 over k3 (see fetch.Fetcher.Fetch). A single key (no ':')
+// yields a one-element slice, identical to ParseKeyRef. Hex keys never contain
+// ':', so the split is unambiguous.
+func ParseKeyRefs(s string) ([]store.ContentKey, error) {
+	parts := strings.Split(strings.TrimPrefix(s, "manifest://"), ":")
+	keys := make([]store.ContentKey, len(parts))
+	for i, p := range parts {
+		k, err := ParseHexKey(p)
+		if err != nil {
+			return nil, fmt.Errorf("manifest: layer %d: %w", i, err)
+		}
+		keys[i] = k
+	}
+	return keys, nil
+}
+
 // HexKey is the inverse of ParseHexKey — formats a ContentKey as 64
 // lowercase hex chars suitable for CLI output, logs, or env passing.
 func HexKey(k store.ContentKey) string {

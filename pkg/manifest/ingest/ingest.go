@@ -59,7 +59,7 @@ type IngestOption struct {
 	// clusters, TRIM ranges, etc. The chunker never sees these
 	// regions; they appear in the manifest as HoleExtent records and
 	// are reconstructed by the read path according to caller policy
-	// (see fetch.ErrHitHole).
+	// (zero-fill, sparse output, or fall-through across layers).
 	//
 	// When non-empty, r must be an io.ReadSeeker — Ingest seeks past
 	// holes to the next data segment instead of reading & discarding.

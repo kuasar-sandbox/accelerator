@@ -13,12 +13,11 @@ import (
 // aliases are purely import-ergonomic.
 
 type (
-	Manifest    = codec.Manifest
-	ChunkEntry  = codec.ChunkEntry
-	HoleExtent  = codec.HoleExtent
-	ChunkMode   = codec.ChunkMode
-	Stream      = fetch.Stream
-	ReadOptions = fetch.ReadOptions
+	Manifest   = codec.Manifest
+	ChunkEntry = codec.ChunkEntry
+	HoleExtent = codec.HoleExtent
+	ChunkMode  = codec.ChunkMode
+	Stream     = fetch.Stream
 
 	IngestOption = ingest.IngestOption
 	IngestResult = ingest.Result
@@ -31,12 +30,6 @@ const (
 	ChunkModeFixed   = codec.ChunkModeFixed
 	Version1         = codec.Version1
 )
-
-// ErrHitHole is the fetch sentinel for "the requested range
-// intersects a manifest hole". Re-exported so callers can branch on
-// errors.Is(err, manifest.ErrHitHole) without importing the fetch
-// subpackage.
-var ErrHitHole = fetch.ErrHitHole
 
 // Function re-exports for the codec layer. The facade owns the public
 // surface; codec stays the implementation home but callers shouldn't

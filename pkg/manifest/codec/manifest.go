@@ -70,7 +70,8 @@ type ChunkEntry struct {
 // original image. Holes are externally declared (filesystem hole
 // detection, qcow2 unallocated, TRIM ranges, ...); they are NOT
 // derived from chunk content (a chunk of all zeros uses IsZero
-// instead). Read semantics are caller-defined — see fetch.ErrHitHole.
+// instead). Read semantics are caller-defined — the fetch layer
+// zero-fills holes, or falls through to a lower layer when overlaid.
 type HoleExtent struct {
 	Offset uint64
 	Size   uint64 // uint64 so a single extent can span GB-scale gaps

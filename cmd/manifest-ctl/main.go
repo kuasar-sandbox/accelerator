@@ -306,28 +306,29 @@ func cmdLoad(args []string) {
 	}
 	defer fc.Close()
 
-	key, err := manifest.ParseKeyRef(keyArg)
+	keys, err := manifest.ParseKeyRefs(keyArg)
 	if err != nil {
 		fatal("%v", err)
 	}
 
 	ctx := context.Background()
-	stream, err := fc.Fetch(ctx, key)
+	stream, err := fc.Fetch(ctx, keys...)
 	if err != nil {
 		fatal("fetch manifest: %v", err)
 	}
+	defer stream.Close()
 
-	m := stream.Manifest()
+	imageSize := stream.Size()
 	readOffset := *offset
 	readLength := *length
-	if readLength == 0 && m.ImageSize > readOffset {
-		readLength = m.ImageSize - readOffset
+	if readLength == 0 && imageSize > readOffset {
+		readLength = imageSize - readOffset
 	}
-	if readOffset >= m.ImageSize {
-		fatal("offset %d is at or beyond image size %d", readOffset, m.ImageSize)
+	if readOffset >= imageSize {
+		fatal("offset %d is at or beyond image size %d", readOffset, imageSize)
 	}
-	if readOffset+readLength > m.ImageSize {
-		readLength = m.ImageSize - readOffset
+	if readOffset+readLength > imageSize {
+		readLength = imageSize - readOffset
 	}
 
 	out, err := createOutput(*output)
@@ -340,24 +341,70 @@ func cmdLoad(args []string) {
 		}
 	}()
 
-	opts := fetch.ReadOptions{}
-	if !*noProgress {
-		opts.OnProgress = func(done, total int) {
-			pct := float64(done) / float64(total) * 100
-			fmt.Fprintf(os.Stderr, "\rload: %d/%d chunks (%.1f%%)", done, total, pct)
-		}
-	}
 	holeFn, err := makeHolePolicy(*holePolicy, out)
 	if err != nil {
 		fatal("%v", err)
 	}
-	opts.OnHole = holeFn
 
-	if err := stream.WriteTo(ctx, out, readOffset, readLength, opts); err != nil {
-		if errors.Is(err, fetch.ErrHitHole) {
-			fatal("manifest contains a hole; choose a policy with --hole=zero|punch (default --hole=error rejects)")
+	// Write [readOffset, end): walk runs, applying the --hole policy to Hole
+	// runs and reading data/zero spans through the fetch path in windows (each
+	// ReadAt fetches its chunks concurrently; Zero chunks come back as zeros).
+	const window = 4 << 20
+	buf := make([]byte, window)
+	cur := readOffset
+	end := readOffset + readLength
+	progress := func() {
+		if *noProgress {
+			return
 		}
-		fatal("read: %v", err)
+		done := cur - readOffset
+		pct := float64(done) / float64(readLength) * 100
+		fmt.Fprintf(os.Stderr, "\rload: %s/%s (%.1f%%)", formatSize(done), formatSize(readLength), pct)
+	}
+	for cur < end {
+		kind, runEnd, rerr := stream.RunAt(cur, end-cur)
+		if rerr != nil { // io.EOF: cur reached image end
+			break
+		}
+		if kind == fetch.Hole {
+			if holeFn == nil {
+				fatal("manifest contains a hole; choose a policy with --hole=zero|punch (default --hole=error rejects)")
+			}
+			if herr := holeFn(out, cur, runEnd-cur); herr != nil {
+				fatal("hole: %v", herr)
+			}
+			cur = runEnd
+			progress()
+			continue
+		}
+		// Coalesce contiguous non-hole runs so each ReadAt window spans
+		// multiple chunks and fetches them concurrently.
+		spanEnd := runEnd
+		for spanEnd < end {
+			k2, e2, e2err := stream.RunAt(spanEnd, end-spanEnd)
+			if e2err != nil || k2 == fetch.Hole {
+				break
+			}
+			spanEnd = e2
+		}
+		for cur < spanEnd {
+			w := spanEnd - cur
+			if w > window {
+				w = window
+			}
+			n, rerr := stream.ReadAt(ctx, buf[:w], cur)
+			if rerr != nil && !errors.Is(rerr, io.EOF) {
+				fatal("read: %v", rerr)
+			}
+			if _, werr := out.Write(buf[:n]); werr != nil {
+				fatal("write: %v", werr)
+			}
+			cur += uint64(n)
+			progress()
+			if rerr != nil {
+				break // io.EOF: image ended within this span
+			}
+		}
 	}
 	if !*noProgress {
 		fmt.Fprintln(os.Stderr)
@@ -574,53 +621,68 @@ func cmdVerify(args []string) {
 	}
 	defer fc.Close()
 
-	key, err := manifest.ParseKeyRef(keyArg)
+	keys, err := manifest.ParseKeyRefs(keyArg)
 	if err != nil {
 		fatal("%v", err)
 	}
-	stream, err := fc.Fetch(context.Background(), key)
-	if err != nil {
-		fatal("fetch manifest: %v", err)
-	}
 
-	m := stream.Manifest()
-	count := int(m.ChunkCount())
-	verified, skipped, failed := 0, 0, 0
 	ctx := context.Background()
-	buf := make([]byte, m.MaxChunkSize)
-	for i, entry := range m.Entries {
-		if entry.IsZero {
-			skipped++
-			if !*noProgress {
-				fmt.Fprintf(os.Stderr, "\rverify: %d/%d (skip zero)", i+1, count)
+	totalFailed := 0
+	for li, key := range keys {
+		// Enumerate chunks from the raw manifest blob (as `info` does), then
+		// verify each non-zero chunk through the fetch path — fetch, decrypt,
+		// and per-chunk key validation end-to-end.
+		data, derr := cfg.GetManifestBlob(ctx, key)
+		if derr != nil {
+			fatal("layer %d: get manifest: %v", li, derr)
+		}
+		m, _, derr := codec.Unmarshal(data)
+		if derr != nil {
+			fatal("layer %d: unmarshal manifest: %v", li, derr)
+		}
+		stream, ferr := fc.Fetch(ctx, key)
+		if ferr != nil {
+			fatal("layer %d: fetch manifest: %v", li, ferr)
+		}
+		defer stream.Close()
+
+		label := ""
+		if len(keys) > 1 {
+			label = fmt.Sprintf("layer %d ", li)
+		}
+		count := int(m.ChunkCount())
+		verified, skipped, failed := 0, 0, 0
+		buf := make([]byte, m.MaxChunkSize)
+		for i, entry := range m.Entries {
+			if entry.IsZero {
+				skipped++
+				if !*noProgress {
+					fmt.Fprintf(os.Stderr, "\rverify: %s%d/%d (skip zero)", label, i+1, count)
+				}
+				continue
 			}
-			continue
+			if cap(buf) < int(entry.Size) {
+				buf = make([]byte, entry.Size)
+			}
+			buf = buf[:entry.Size]
+			if _, rerr := stream.ReadAt(ctx, buf, entry.Offset); rerr != nil {
+				fmt.Fprintf(os.Stderr, "\n%schunk %d: read failed: %v\n", label, i, rerr)
+				failed++
+				continue
+			}
+			verified++
+			if !*noProgress {
+				fmt.Fprintf(os.Stderr, "\rverify: %s%d/%d", label, i+1, count)
+			}
 		}
-		// Read this chunk through the fetcher; the fetcher fetches,
-		// decrypts, and validates the per-chunk key end-to-end.
-		end := entry.Offset + uint64(entry.Size)
-		if cap(buf) < int(entry.Size) {
-			buf = make([]byte, entry.Size)
-		}
-		buf = buf[:entry.Size]
-		_, err := stream.ReadAt(ctx, buf, entry.Offset)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "\nchunk %d: read failed: %v\n", i, err)
-			failed++
-			continue
-		}
-		_ = end
-		verified++
 		if !*noProgress {
-			fmt.Fprintf(os.Stderr, "\rverify: %d/%d", i+1, count)
+			fmt.Fprintln(os.Stderr)
 		}
+		fmt.Fprintf(os.Stderr, "%sverified: %d  skipped(zero): %d  holes: %d  failed: %d  total chunks: %d\n",
+			label, verified, skipped, len(m.Holes), failed, count)
+		totalFailed += failed
 	}
-	if !*noProgress {
-		fmt.Fprintln(os.Stderr)
-	}
-	fmt.Fprintf(os.Stderr, "verified: %d  skipped(zero): %d  holes: %d  failed: %d  total chunks: %d\n",
-		verified, skipped, len(m.Holes), failed, count)
-	if failed > 0 {
+	if totalFailed > 0 {
 		os.Exit(1)
 	}
 }
