@@ -283,9 +283,10 @@ func cmdInfo(args []string) {
 		if err != nil {
 			fatal("fetch manifest: %v", err)
 		}
+		defer stream.Close()
 		// Read only the EROFS superblock + trailing ZIP directly over
 		// the chunk-granular fetch path — no full materialization.
-		size := int64(stream.ImageSize())
+		size := int64(stream.Size())
 		printInfo(fetch.NewReaderAt(ctx, stream, size), size, *asJSON)
 		return
 	}
