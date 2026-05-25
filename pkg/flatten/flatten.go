@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fullof-work/mass-sandbox/pkg/util"
 )
 
 // dockerManifestEntry describes one image in a docker-archive tar.
@@ -402,18 +403,13 @@ func locateMkfsErofs() (string, error) {
 	if p := os.Getenv("MKFS_EROFS_PATH"); p != "" {
 		return p, nil
 	}
-	if exe, err := os.Executable(); err == nil {
-		candidate := filepath.Join(filepath.Dir(exe), "mkfs.erofs")
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate, nil
-		}
+	p, err := util.LocateBinary("mkfs.erofs")
+	if err != nil {
+		return "", fmt.Errorf("flatten: mkfs.erofs not found " +
+			"(set MKFS_EROFS_PATH, place it alongside flatten-ctl, " +
+			"or add it to PATH; run `make deps-erofs` to build it)")
 	}
-	if p, err := exec.LookPath("mkfs.erofs"); err == nil {
-		return p, nil
-	}
-	return "", fmt.Errorf("flatten: mkfs.erofs not found " +
-		"(set MKFS_EROFS_PATH, place it alongside flatten-ctl, " +
-		"or add it to PATH; run `make deps-erofs` to build it)")
+	return p, nil
 }
 
 // buildImage produces the output image from the flattened rootfs directory
