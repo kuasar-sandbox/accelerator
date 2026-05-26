@@ -260,6 +260,9 @@ sha256 相等。
 | `args` | yaml `launch.args` 优先;为空则取 `Entrypoint[1:] + Cmd` |
 | `env` | image `Env` + yaml `launch.env`,后者覆盖同名 key |
 | `workdir` | yaml `launch.workdir` 优先;为空则取 `WorkingDir` |
+| `user` | yaml `launch.user` 优先;为空则取 `User`(命名用户由 guest 侧解析) |
+| `stop_signal` | yaml `launch.stop_signal` 优先;为空则取 `StopSignal` |
+| `volumes` | image `Volumes` 每个目录并入 `mounts`(等价 `type: empty`),显式 `mounts` 同 target 为准 |
 
 因此 `launch.exec` 不再必填——若 image config 有 Entrypoint/Cmd 即可省略。
 详见 [`sandbox.md`](sandbox.md) §3.3。
