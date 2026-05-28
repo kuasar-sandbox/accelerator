@@ -1,4 +1,4 @@
-package flatten
+package image
 
 import (
 	"encoding/binary"

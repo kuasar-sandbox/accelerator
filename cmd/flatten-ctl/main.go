@@ -34,10 +34,11 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/fullof-work/mass-sandbox/pkg/flatten"
-	"github.com/fullof-work/mass-sandbox/pkg/manifest"
-	"github.com/fullof-work/mass-sandbox/pkg/manifest/fetch"
-	"github.com/fullof-work/mass-sandbox/pkg/manifest/ingest"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/ingest"
+	"github.com/kuasar-sandbox/sandbox-builder/pkg/flatten"
+	"github.com/kuasar-sandbox/sandbox-builder/pkg/image"
 )
 
 const manifestConfigEnv = "MANIFEST_CONFIG"
@@ -304,24 +305,24 @@ func cmdInfo(args []string) {
 }
 
 // printInfo reports the EROFS image size and embedded RuntimeConfig from
-// ra. Both flatten.ReadEROFSSize and flatten.ReadConfig need only the
+// ra. Both image.ReadEROFSSize and image.ReadConfig need only the
 // superblock and the trailing ZIP, so ra may be a plain *os.File (local
 // path) or a fetch-backed io.ReaderAt (manifest://) — the manifest case
 // then transfers only those few KB, never the whole image.
 func printInfo(ra io.ReaderAt, size int64, asJSON bool) {
-	erofsSize, sbErr := flatten.ReadEROFSSize(ra)
+	erofsSize, sbErr := image.ReadEROFSSize(ra)
 	if sbErr != nil {
 		fatal("read EROFS superblock: %v", sbErr)
 	}
-	cfg, cfgErr := flatten.ReadConfig(ra, size)
+	cfg, cfgErr := image.ReadConfig(ra, size)
 	if cfgErr != nil && !errors.Is(cfgErr, fs.ErrNotExist) {
 		fatal("read config: %v", cfgErr)
 	}
 
 	if asJSON {
 		out := struct {
-			ErofsSize uint64                 `json:"erofs_size"`
-			Config    *flatten.RuntimeConfig `json:"config"`
+			ErofsSize uint64               `json:"erofs_size"`
+			Config    *image.RuntimeConfig `json:"config"`
 		}{ErofsSize: erofsSize, Config: cfg}
 		body, err := json.MarshalIndent(out, "", "  ")
 		if err != nil {
@@ -333,7 +334,7 @@ func printInfo(ra io.ReaderAt, size int64, asJSON bool) {
 	printInfoHuman(erofsSize, cfg)
 }
 
-func printInfoHuman(erofsSize uint64, cfg *flatten.RuntimeConfig) {
+func printInfoHuman(erofsSize uint64, cfg *image.RuntimeConfig) {
 	fmt.Printf("EROFS image size:  %s (%d bytes)\n", formatSize(int64(erofsSize)), erofsSize)
 	if cfg == nil {
 		fmt.Println("(no OCI config trailer)")

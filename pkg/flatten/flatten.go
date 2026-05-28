@@ -16,7 +16,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/fullof-work/mass-sandbox/pkg/util"
+	"github.com/kuasar-sandbox/sandbox-builder/internal/util"
+	"github.com/kuasar-sandbox/sandbox-builder/pkg/image"
 )
 
 // dockerManifestEntry describes one image in a docker-archive tar.
@@ -96,11 +97,11 @@ func FlattenWith(input io.Reader, outputPath string, opts Options) error {
 	// extent is described in its superblock; the ZIP trailer is
 	// addressable independently via standard tools (`unzip -l`,
 	// `archive/zip`, `flatten-ctl info`).
-	cfg, err := ExtractRuntimeConfig(archiveDir, entry.Config)
+	cfg, err := image.ExtractRuntimeConfig(archiveDir, entry.Config)
 	if err != nil {
 		return fmt.Errorf("flatten: extract config: %w", err)
 	}
-	if err := AppendConfigZip(outputPath, cfg); err != nil {
+	if err := image.AppendConfigZip(outputPath, cfg); err != nil {
 		return fmt.Errorf("flatten: append config zip: %w", err)
 	}
 
@@ -428,12 +429,12 @@ func buildImage(rootfsDir, outputPath string) error {
 // No compression: raw bytes enable CDC dedup (consistent with PROPOSAL §9.1).
 func buildEROFS(mkfsPath, rootfsDir, outputPath string) error {
 	cmd := exec.Command(mkfsPath,
-		"-Ededupe",       // intra-image file dedup
-		"--chunksize=4096", // chunk-based layout: metadata 7.6MiB→0.6MiB
-		"--all-root",     // force uid/gid=0
-		"-T0",            // fixed timestamp (epoch)
-		"-b4096",         // 4K block size
-		"-x-1",           // disable xattrs
+		"-Ededupe",                                   // intra-image file dedup
+		"--chunksize=4096",                           // chunk-based layout: metadata 7.6MiB→0.6MiB
+		"--all-root",                                 // force uid/gid=0
+		"-T0",                                        // fixed timestamp (epoch)
+		"-b4096",                                     // 4K block size
+		"-x-1",                                       // disable xattrs
 		"-U", "00000000-0000-0000-0000-000000000000", // fixed UUID
 		"--quiet",
 		outputPath,
