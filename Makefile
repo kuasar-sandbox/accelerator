@@ -107,8 +107,10 @@ clean:
 # umbrella's `make test-e2e` which builds + drives every repo's tests.
 SBIN := $(abspath ../kuasar-sandbox/bin/$(TARGET_ARCH))
 
-bench:
-	CGO_ENABLED=0 $(GO) test -bench=. -benchmem -run=^$$ ./...
+bench: deps-rocksdb
+	CGO_CFLAGS="$(CGO_CFLAGS)" \
+	CGO_LDFLAGS="-L$(ROCKS_PREFIX)/lib -lrocksdb -lstdc++ -lm -lpthread -ldl" \
+		$(GO) test -bench=. -benchmem -run=^$$ ./...
 
 test-e2e: test-e2e-cache test-e2e-cluster
 
