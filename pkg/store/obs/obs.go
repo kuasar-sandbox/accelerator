@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fullof-work/mass-sandbox/pkg/store"
-	"github.com/fullof-work/mass-sandbox/pkg/util/optrace"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
+	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util/optrace"
 )
 
 // metaGenerationsKey is the in-bucket path of the generations meta

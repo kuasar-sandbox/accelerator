@@ -8,11 +8,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fullof-work/mass-sandbox/pkg/cache"
-	"github.com/fullof-work/mass-sandbox/pkg/cache/freq"
-	"github.com/fullof-work/mass-sandbox/pkg/cache/runtime"
-	"github.com/fullof-work/mass-sandbox/pkg/store"
-	"github.com/fullof-work/mass-sandbox/pkg/util"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/freq"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/runtime"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
+	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util"
 	grocksdb "github.com/linxGnu/grocksdb"
 )
 

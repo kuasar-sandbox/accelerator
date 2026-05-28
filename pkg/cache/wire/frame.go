@@ -20,7 +20,7 @@ package wire
 import (
 	"sync"
 
-	"github.com/fullof-work/mass-sandbox/pkg/cache"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
 )
 
 // Opcodes identify the operation in a request frame.

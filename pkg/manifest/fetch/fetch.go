@@ -22,10 +22,10 @@ import (
 	"io"
 	"sync"
 
-	"github.com/fullof-work/mass-sandbox/pkg/cache"
-	"github.com/fullof-work/mass-sandbox/pkg/manifest/codec"
-	"github.com/fullof-work/mass-sandbox/pkg/manifest/crypto"
-	"github.com/fullof-work/mass-sandbox/pkg/store"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/codec"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
 // RunKind classifies the effective (overlay-resolved) content at an image

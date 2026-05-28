@@ -4,9 +4,9 @@ import (
 	"context"
 	"sync/atomic"
 
-	"github.com/fullof-work/mass-sandbox/pkg/cache"
-	"github.com/fullof-work/mass-sandbox/pkg/cache/wire"
-	"github.com/fullof-work/mass-sandbox/pkg/store"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/wire"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
 // CacheHandler dispatches wire frames to the appropriate backend.

@@ -3,7 +3,7 @@ package rocks
 import (
 	"sync/atomic"
 
-	"github.com/fullof-work/mass-sandbox/pkg/cache/freq"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/freq"
 )
 
 // sketchCompactionFilter drives RocksDB compaction on the chunk and

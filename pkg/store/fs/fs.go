@@ -28,7 +28,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/fullof-work/mass-sandbox/pkg/store"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
 // ErrKeyMismatch is returned by Put / PutHandle.Commit when the

@@ -7,9 +7,9 @@ import (
 	"io"
 	"testing"
 
-	"github.com/fullof-work/mass-sandbox/pkg/cache"
-	"github.com/fullof-work/mass-sandbox/pkg/manifest/codec"
-	"github.com/fullof-work/mass-sandbox/pkg/store"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/codec"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
 // buildHoleManifest builds a manifest with one entry [0, dataSize), one hole

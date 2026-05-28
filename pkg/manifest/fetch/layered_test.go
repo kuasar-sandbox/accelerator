@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/fullof-work/mass-sandbox/pkg/manifest/codec"
-	"github.com/fullof-work/mass-sandbox/pkg/store"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/codec"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
 // newTestStream builds a single-manifest Stream whose data chunks all decrypt

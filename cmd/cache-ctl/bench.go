@@ -14,9 +14,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fullof-work/mass-sandbox/pkg/cache"
-	"github.com/fullof-work/mass-sandbox/pkg/cache/client"
-	"github.com/fullof-work/mass-sandbox/pkg/store"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/client"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
 // cmdBench runs a concurrency sweep + latency percentiles against a

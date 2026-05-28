@@ -6,10 +6,10 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/fullof-work/mass-sandbox/pkg/manifest/chunker"
-	"github.com/fullof-work/mass-sandbox/pkg/manifest/codec"
-	"github.com/fullof-work/mass-sandbox/pkg/manifest/crypto"
-	"github.com/fullof-work/mass-sandbox/pkg/store"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/chunker"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/codec"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
 // recordingStore is a StoreWriter that records every Put call and

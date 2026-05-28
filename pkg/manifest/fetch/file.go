@@ -6,7 +6,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/fullof-work/mass-sandbox/pkg/manifest/codec"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/codec"
 )
 
 // fileStream is a Stream backed by a local file. It is sparse-aware: holes are

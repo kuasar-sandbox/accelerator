@@ -4,11 +4,11 @@ import (
 	"context"
 	"time"
 
-	"github.com/fullof-work/mass-sandbox/pkg/cache"
-	"github.com/fullof-work/mass-sandbox/pkg/cache/client"
-	"github.com/fullof-work/mass-sandbox/pkg/cache/ec"
-	cachepb "github.com/fullof-work/mass-sandbox/pkg/cache/pb"
-	"github.com/fullof-work/mass-sandbox/pkg/cache/rocks"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/client"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/ec"
+	cachepb "github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/pb"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/rocks"
 )
 
 // TierSpec carries a tier's type plus the one concrete reference that

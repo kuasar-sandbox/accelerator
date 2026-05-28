@@ -6,9 +6,9 @@ import (
 	"io"
 	"time"
 
-	"github.com/fullof-work/mass-sandbox/pkg/cache"
-	"github.com/fullof-work/mass-sandbox/pkg/cache/wire"
-	"github.com/fullof-work/mass-sandbox/pkg/store"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/wire"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
 // Options configures a cache-ctl wire client.

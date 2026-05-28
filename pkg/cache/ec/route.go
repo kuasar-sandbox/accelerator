@@ -5,7 +5,7 @@ import (
 	"sort"
 	"sync/atomic"
 
-	"github.com/fullof-work/mass-sandbox/pkg/store"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
 // router maps shard keys to peers using Maglev consistent hashing.

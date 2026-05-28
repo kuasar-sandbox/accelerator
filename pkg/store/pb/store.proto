@@ -21,7 +21,7 @@ syntax = "proto3";
 
 package cac.store.v1;
 
-option go_package = "github.com/fullof-work/mass-sandbox/pkg/store/pb";
+option go_package = "github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/pb";
 
 service Store {
     // GetSalt returns the server's active generation name and the

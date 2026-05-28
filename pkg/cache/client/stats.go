@@ -1,6 +1,6 @@
 package client
 
-import "github.com/fullof-work/mass-sandbox/pkg/cache"
+import "github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
 
 // Stats returns a snapshot of per-peer counters. The peer ID is passed
 // in by the EC tier at aggregation time; the client layer doesn't own

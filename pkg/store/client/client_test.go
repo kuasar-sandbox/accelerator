@@ -13,10 +13,10 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 
-	"github.com/fullof-work/mass-sandbox/pkg/store"
-	"github.com/fullof-work/mass-sandbox/pkg/store/fs"
-	"github.com/fullof-work/mass-sandbox/pkg/store/pb"
-	storeserver "github.com/fullof-work/mass-sandbox/pkg/store/server"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/fs"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/pb"
+	storeserver "github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/server"
 )
 
 // startBufconnPair stands up a real fs.Store + Server + bufconn

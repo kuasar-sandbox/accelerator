@@ -20,8 +20,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
-	"github.com/fullof-work/mass-sandbox/pkg/store"
-	"github.com/fullof-work/mass-sandbox/pkg/store/pb"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/pb"
 )
 
 // frameSize is the per-message payload cap on the wire for

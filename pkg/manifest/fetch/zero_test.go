@@ -7,9 +7,9 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/fullof-work/mass-sandbox/pkg/cache"
-	"github.com/fullof-work/mass-sandbox/pkg/manifest/codec"
-	"github.com/fullof-work/mass-sandbox/pkg/store"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/codec"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
 // recordingGetter counts Get calls; it lets a test assert the IsZero

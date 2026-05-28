@@ -8,7 +8,7 @@ import (
 	"io"
 	"net"
 
-	"github.com/fullof-work/mass-sandbox/pkg/cache"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
 )
 
 var (

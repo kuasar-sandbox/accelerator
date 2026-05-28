@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/fullof-work/mass-sandbox/pkg/cache"
-	"github.com/fullof-work/mass-sandbox/pkg/cache/client"
-	"github.com/fullof-work/mass-sandbox/pkg/cache/ec"
-	"github.com/fullof-work/mass-sandbox/pkg/cache/rocks"
-	"github.com/fullof-work/mass-sandbox/pkg/cache/runtime"
-	"github.com/fullof-work/mass-sandbox/pkg/cache/server"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/client"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/ec"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/rocks"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/runtime"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/server"
 )
 
 // parseDurationOrDefault parses a Go duration string and falls back to

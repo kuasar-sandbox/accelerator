@@ -1,8 +1,8 @@
 package rocks
 
 import (
-	"github.com/fullof-work/mass-sandbox/pkg/cache/runtime"
-	"github.com/fullof-work/mass-sandbox/pkg/util"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/runtime"
+	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util"
 	grocksdb "github.com/linxGnu/grocksdb"
 )
 

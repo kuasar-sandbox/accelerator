@@ -1,8 +1,8 @@
 package ec
 
 import (
-	"github.com/fullof-work/mass-sandbox/pkg/cache"
-	"github.com/fullof-work/mass-sandbox/pkg/cache/client"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/client"
 )
 
 // peerStater is the subset of client.ShardCloser that exposes per-peer

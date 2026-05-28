@@ -17,7 +17,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/fullof-work/mass-sandbox/pkg/util"
+	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util"
 )
 
 // PageSize is the alignment boundary for chunk boundaries (4 KiB).

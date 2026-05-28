@@ -1,7 +1,7 @@
 package rocks
 
 import (
-	"github.com/fullof-work/mass-sandbox/pkg/cache"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
 )
 
 // Two independent value buffer pools, sized to the typical payload of

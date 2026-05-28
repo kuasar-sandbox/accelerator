@@ -15,9 +15,9 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
-	"github.com/fullof-work/mass-sandbox/pkg/store"
-	"github.com/fullof-work/mass-sandbox/pkg/store/fs"
-	"github.com/fullof-work/mass-sandbox/pkg/store/pb"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/fs"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/pb"
 )
 
 // startBufconnServer wires a Server to a bufconn listener and

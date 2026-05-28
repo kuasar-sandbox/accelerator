@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/fullof-work/mass-sandbox/pkg/cache"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
 	"github.com/klauspost/reedsolomon"
 )
 

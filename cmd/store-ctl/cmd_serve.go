@@ -11,8 +11,8 @@ import (
 
 	"google.golang.org/grpc"
 
-	"github.com/fullof-work/mass-sandbox/pkg/store/pb"
-	"github.com/fullof-work/mass-sandbox/pkg/store/server"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/pb"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/server"
 )
 
 // cmdServe starts the gRPC store daemon and blocks until the

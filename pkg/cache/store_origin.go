@@ -3,7 +3,7 @@ package cache
 import (
 	"context"
 
-	"github.com/fullof-work/mass-sandbox/pkg/store"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
 // storeBackend is the private adapter target for NewStoreOrigin.

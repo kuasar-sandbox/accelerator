@@ -8,7 +8,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/fullof-work/mass-sandbox/pkg/store/obs"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/obs"
 )
 
 // Config is the YAML configuration shared by every store-ctl

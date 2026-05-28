@@ -4,7 +4,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/fullof-work/mass-sandbox/pkg/cache"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
 )
 
 // segmentedBlob is the cache.Blob returned by EC.Get when the data

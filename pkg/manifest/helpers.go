@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/fullof-work/mass-sandbox/pkg/manifest/fetch"
-	"github.com/fullof-work/mass-sandbox/pkg/manifest/ingest"
-	"github.com/fullof-work/mass-sandbox/pkg/store"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/ingest"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
 // ParseHexKey decodes a 64-character hex string into a store.ContentKey.

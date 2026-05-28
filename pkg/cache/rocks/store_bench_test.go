@@ -8,7 +8,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/fullof-work/mass-sandbox/pkg/cache/runtime"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/runtime"
 )
 
 func tempRocksConfig(b *testing.B) runtime.RocksConfig {

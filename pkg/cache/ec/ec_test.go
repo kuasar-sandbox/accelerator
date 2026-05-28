@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/fullof-work/mass-sandbox/pkg/store"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
 func TestEncodeDecodeRoundtrip(t *testing.T) {

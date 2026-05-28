@@ -5,7 +5,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/fullof-work/mass-sandbox/pkg/cache"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
 )
 
 // Conn wraps a net.Conn with buffered reads and direct (writev) writes.

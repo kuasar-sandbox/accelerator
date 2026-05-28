@@ -1,9 +1,9 @@
 package manifest
 
 import (
-	"github.com/fullof-work/mass-sandbox/pkg/manifest/codec"
-	"github.com/fullof-work/mass-sandbox/pkg/manifest/fetch"
-	"github.com/fullof-work/mass-sandbox/pkg/manifest/ingest"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/codec"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/ingest"
 )
 
 // Re-exports of the most commonly used types and functions from the

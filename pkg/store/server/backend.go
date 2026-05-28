@@ -7,7 +7,7 @@ package server
 import (
 	"context"
 
-	"github.com/fullof-work/mass-sandbox/pkg/store"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
 // Backend is the set of operations the store-ctl server needs from
