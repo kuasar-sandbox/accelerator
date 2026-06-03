@@ -1,10 +1,25 @@
-// Package flatten converts OCI container images (docker-archive format) into
-// EROFS filesystem images. It extracts layers in order, applies whiteout
-// semantics, and invokes mkfs.erofs for deterministic output.
+// Package flatten converts OCI container images into deterministic EROFS
+// filesystem images. It applies layers in order, honours whiteout semantics,
+// normalises timestamps, and invokes mkfs.erofs for byte-stable output, then
+// appends the OCI runtime-config projection as a STORED-mode ZIP trailer.
+//
+// The engine is split into a Source (where the ordered layers + config come
+// from) and a single sink (Build). Two sources share that sink:
+//
+//   - the docker-archive source in this package (FlattenWith / FlattenFile),
+//     fed by `docker save` output on disk or stdin;
+//   - the registry source in sibling package pkg/remote, fed by a pulled
+//     image.
+//
+// Routing both through the same Build is what guarantees a registry pull and
+// an equivalent docker-archive flatten produce byte-identical EROFS images.
+// This package stays stdlib-only (plus pkg/image + internal/util); the
+// go-containerregistry dependency lives entirely in pkg/remote.
 package flatten
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/json"
@@ -36,68 +51,76 @@ type Options struct {
 	TmpDir string
 }
 
-// Flatten converts a docker-archive tar stream into an EROFS image.
-// The input must be an uncompressed tar produced by `docker save`.
-// mkfs.erofs is located via locateMkfsErofs; if none is found the call
-// fails rather than falling back silently.
-func Flatten(input io.Reader, outputPath string) error {
-	return FlattenWith(input, outputPath, Options{})
+// LayerOpener opens one layer's *uncompressed* tar stream. The caller
+// closes the returned ReadCloser. Each call should yield a fresh stream
+// positioned at the start of the layer tar.
+type LayerOpener func() (io.ReadCloser, error)
+
+// Source supplies the ordered layers (base→top) and the raw OCI image
+// config JSON for a single image. Both the docker-archive path here and
+// the registry path in pkg/remote implement it so they share Build's
+// deterministic sink.
+type Source interface {
+	// Layers returns layer openers in application order (base first).
+	// Each opener yields an *uncompressed* tar stream.
+	Layers() ([]LayerOpener, error)
+	// ConfigJSON returns the raw OCI image-config JSON document, which
+	// Build projects via image.ExtractRuntimeConfigFromJSON.
+	ConfigJSON() ([]byte, error)
 }
 
-// FlattenWith is the explicit-options form of Flatten.
-func FlattenWith(input io.Reader, outputPath string, opts Options) error {
-	workDir, err := os.MkdirTemp(opts.TmpDir, "flatten-*")
+// Build flattens src into a deterministic EROFS image at outputPath with
+// the OCI runtime-config ZIP appended. It is the single sink shared by
+// every Source. Determinism comes from applying identical uncompressed
+// tar streams in order, normalising all timestamps to the epoch, the
+// fixed mkfs.erofs flags (buildEROFS), and the shared RuntimeConfig
+// projection (image.ExtractRuntimeConfigFromJSON).
+func Build(src Source, outputPath string, opts Options) error {
+	workDir, err := os.MkdirTemp(opts.TmpDir, "flatten-rootfs-*")
 	if err != nil {
 		return fmt.Errorf("flatten: create temp dir: %w", err)
 	}
 	defer os.RemoveAll(workDir)
 
-	archiveDir := filepath.Join(workDir, "archive")
 	rootfsDir := filepath.Join(workDir, "rootfs")
-	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
-		return fmt.Errorf("flatten: mkdir archive: %w", err)
-	}
 	if err := os.MkdirAll(rootfsDir, 0o755); err != nil {
 		return fmt.Errorf("flatten: mkdir rootfs: %w", err)
 	}
 
-	// Step 1: Extract the docker-archive tar.
-	if err := extractTar(input, archiveDir); err != nil {
-		return fmt.Errorf("flatten: extract archive: %w", err)
-	}
-
-	// Step 2: Parse manifest.json to determine layer order and the
-	// path of the OCI image config we'll later embed.
-	entry, err := parseDockerManifestEntry(archiveDir)
+	// Step 1: apply layers in order to build the flattened rootfs.
+	layers, err := src.Layers()
 	if err != nil {
-		return err
+		return fmt.Errorf("flatten: list layers: %w", err)
 	}
-
-	// Step 3: Apply layers in order to build the flattened rootfs.
-	for _, layerPath := range entry.Layers {
-		fullPath := filepath.Join(archiveDir, layerPath)
-		if err := applyLayer(fullPath, rootfsDir); err != nil {
-			return fmt.Errorf("flatten: apply layer %s: %w", layerPath, err)
+	if len(layers) == 0 {
+		return fmt.Errorf("flatten: image has no layers")
+	}
+	for i, open := range layers {
+		if err := applyLayerOpener(open, rootfsDir); err != nil {
+			return fmt.Errorf("flatten: apply layer %d: %w", i, err)
 		}
 	}
 
-	// Step 4: Normalize the rootfs for deterministic output.
+	// Step 2: normalise the rootfs for deterministic output.
 	if err := normalizeTimestamps(rootfsDir); err != nil {
 		return fmt.Errorf("flatten: normalize timestamps: %w", err)
 	}
 
-	// Step 5: Build the EROFS image.
+	// Step 3: build the EROFS image.
 	if err := buildImage(rootfsDir, outputPath); err != nil {
 		return err
 	}
 
-	// Step 6: Extract the runtime-relevant subset of the OCI image
-	// config and append it as a STORED-mode ZIP after the EROFS.
-	// EROFS mount/read remains correct because the EROFS image's
-	// extent is described in its superblock; the ZIP trailer is
-	// addressable independently via standard tools (`unzip -l`,
+	// Step 4: project the OCI image config and append it as a STORED-mode
+	// ZIP after the EROFS. EROFS mount/read remains correct because the
+	// EROFS image's extent is described in its superblock; the ZIP trailer
+	// is addressable independently via standard tools (`unzip -l`,
 	// `archive/zip`, `flatten-ctl info`).
-	cfg, err := image.ExtractRuntimeConfig(archiveDir, entry.Config)
+	cfgJSON, err := src.ConfigJSON()
+	if err != nil {
+		return fmt.Errorf("flatten: read config: %w", err)
+	}
+	cfg, err := image.ExtractRuntimeConfigFromJSON(cfgJSON)
 	if err != nil {
 		return fmt.Errorf("flatten: extract config: %w", err)
 	}
@@ -106,6 +129,25 @@ func FlattenWith(input io.Reader, outputPath string, opts Options) error {
 	}
 
 	return nil
+}
+
+// Flatten converts a docker-archive tar stream into an EROFS image.
+// The input must be a tar produced by `docker save`; layer tars inside
+// may be plain or gzip-compressed. mkfs.erofs is located via
+// locateMkfsErofs; if none is found the call fails rather than falling
+// back silently.
+func Flatten(input io.Reader, outputPath string) error {
+	return FlattenWith(input, outputPath, Options{})
+}
+
+// FlattenWith is the explicit-options form of Flatten.
+func FlattenWith(input io.Reader, outputPath string, opts Options) error {
+	src, cleanup, err := newDockerArchiveSource(input, opts.TmpDir)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	return Build(src, outputPath, opts)
 }
 
 // FlattenFile converts a docker-archive tar file into an EROFS image.
@@ -166,6 +208,55 @@ func Verify(input1, input2 io.ReadSeeker) (bool, string, string, error) {
 	}
 
 	return hash1 == hash2, hash1, hash2, nil
+}
+
+// --- docker-archive source ---
+
+// dockerArchiveSource is a flatten.Source backed by an extracted
+// docker-archive on disk: layer files are read from archiveDir (and
+// transparently un-gzipped if needed), config JSON from the path named in
+// manifest.json's "Config" field.
+type dockerArchiveSource struct {
+	archiveDir string
+	entry      *dockerManifestEntry
+}
+
+// newDockerArchiveSource extracts the docker-archive tar from input into a
+// fresh temp dir under tmpDir, parses manifest.json, and returns a Source
+// over it plus a cleanup func that removes the temp dir. The cleanup is
+// always safe to call (even on error it is a no-op nil).
+func newDockerArchiveSource(input io.Reader, tmpDir string) (*dockerArchiveSource, func(), error) {
+	archiveDir, err := os.MkdirTemp(tmpDir, "flatten-archive-*")
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("flatten: create temp dir: %w", err)
+	}
+	cleanup := func() { os.RemoveAll(archiveDir) }
+
+	if err := extractTar(input, archiveDir); err != nil {
+		cleanup()
+		return nil, func() {}, fmt.Errorf("flatten: extract archive: %w", err)
+	}
+	entry, err := parseDockerManifestEntry(archiveDir)
+	if err != nil {
+		cleanup()
+		return nil, func() {}, err
+	}
+	return &dockerArchiveSource{archiveDir: archiveDir, entry: entry}, cleanup, nil
+}
+
+func (s *dockerArchiveSource) Layers() ([]LayerOpener, error) {
+	openers := make([]LayerOpener, 0, len(s.entry.Layers))
+	for _, layerPath := range s.entry.Layers {
+		full := filepath.Join(s.archiveDir, layerPath)
+		openers = append(openers, func() (io.ReadCloser, error) {
+			return openMaybeGzip(full)
+		})
+	}
+	return openers, nil
+}
+
+func (s *dockerArchiveSource) ConfigJSON() ([]byte, error) {
+	return os.ReadFile(filepath.Join(s.archiveDir, s.entry.Config))
 }
 
 // --- internal helpers ---
@@ -262,31 +353,65 @@ func parseDockerManifestEntry(archiveDir string) (*dockerManifestEntry, error) {
 	return &entries[0], nil
 }
 
-// applyLayer extracts a layer tar onto the rootfs, handling whiteouts.
-// The layer tar may be gzip-compressed.
-func applyLayer(layerPath, rootfsDir string) error {
-	f, err := os.Open(layerPath)
+// openMaybeGzip opens path and, when it is gzip-compressed, wraps it in a
+// gzip reader so the caller always sees an uncompressed tar stream. The
+// returned ReadCloser closes the gzip reader (if any) and the file.
+func openMaybeGzip(path string) (io.ReadCloser, error) {
+	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer f.Close()
-
-	var r io.Reader = f
-	// Detect gzip by reading the magic bytes.
+	// Detect gzip by the magic bytes, then rewind.
 	buf := make([]byte, 2)
 	n, _ := f.Read(buf)
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return err
+		f.Close()
+		return nil, err
 	}
 	if n == 2 && buf[0] == 0x1f && buf[1] == 0x8b {
 		gz, err := gzip.NewReader(f)
 		if err != nil {
-			return fmt.Errorf("gzip open: %w", err)
+			f.Close()
+			return nil, fmt.Errorf("gzip open: %w", err)
 		}
-		defer gz.Close()
-		r = gz
+		return &gzipReadCloser{gz: gz, f: f}, nil
 	}
+	return f, nil
+}
 
+// gzipReadCloser closes both the gzip reader and the underlying file.
+type gzipReadCloser struct {
+	gz *gzip.Reader
+	f  *os.File
+}
+
+func (g *gzipReadCloser) Read(p []byte) (int, error) { return g.gz.Read(p) }
+
+func (g *gzipReadCloser) Close() error {
+	gerr := g.gz.Close()
+	ferr := g.f.Close()
+	if gerr != nil {
+		return gerr
+	}
+	return ferr
+}
+
+// applyLayerOpener opens one layer's uncompressed tar stream and applies
+// it to the rootfs, ensuring the stream is closed afterwards.
+func applyLayerOpener(open LayerOpener, rootfsDir string) error {
+	rc, err := open()
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	return applyLayerTar(rc, rootfsDir)
+}
+
+// applyLayerTar applies a single *uncompressed* layer tar stream onto the
+// rootfs, handling OCI whiteouts. This is the determinism-critical core
+// shared by the docker-archive and registry sources: identical tar bytes
+// in identical order produce an identical rootfs.
+func applyLayerTar(r io.Reader, rootfsDir string) error {
 	tr := tar.NewReader(r)
 	for {
 		hdr, err := tr.Next()
@@ -441,8 +566,16 @@ func buildEROFS(mkfsPath, rootfsDir, outputPath string) error {
 		rootfsDir,
 	)
 	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
+	// Capture stderr so a failure carries mkfs.erofs's own diagnostic rather
+	// than a bare "exit status 1". (On success mkfs may still print benign
+	// notes to stderr — e.g. the "Compression is not enabled" hint — which we
+	// ignore.)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return fmt.Errorf("flatten: mkfs.erofs: %w: %s", err, msg)
+		}
 		return fmt.Errorf("flatten: mkfs.erofs: %w", err)
 	}
 	return nil

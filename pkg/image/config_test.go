@@ -74,9 +74,9 @@ func TestRuntimeConfig_PassThroughArch(t *testing.T) {
 	cases := []struct{ arch, os string }{
 		{"amd64", "linux"},
 		{"arm64", "linux"},
-		{"riscv64", "linux"},  // exotic — must not error
-		{"amd64", "windows"},  // not supported by platform — must not error here
-		{"", ""},              // source image bug — pass through
+		{"riscv64", "linux"}, // exotic — must not error
+		{"amd64", "windows"}, // not supported by platform — must not error here
+		{"", ""},             // source image bug — pass through
 	}
 	for _, tc := range cases {
 		cfg := &RuntimeConfig{Architecture: tc.arch, Os: tc.os}

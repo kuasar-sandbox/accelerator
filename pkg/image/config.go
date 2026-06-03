@@ -83,7 +83,8 @@ type ociImageConfig struct {
 
 // ExtractRuntimeConfig reads the docker-archive's image config JSON
 // (configPath is relative to archiveDir, sourced from manifest.json's
-// "Config" field) and projects it into a RuntimeConfig.
+// "Config" field) and projects it into a RuntimeConfig via
+// ExtractRuntimeConfigFromJSON.
 //
 // Architecture / Os are passed through transparently with no
 // validation. Unknown source fields are dropped.
@@ -92,9 +93,30 @@ func ExtractRuntimeConfig(archiveDir, configPath string) (*RuntimeConfig, error)
 	if err != nil {
 		return nil, fmt.Errorf("read image config %q: %w", configPath, err)
 	}
+	rc, err := ExtractRuntimeConfigFromJSON(data)
+	if err != nil {
+		return nil, fmt.Errorf("image config %q: %w", configPath, err)
+	}
+	return rc, nil
+}
+
+// ExtractRuntimeConfigFromJSON projects a raw OCI image-config JSON
+// document into a RuntimeConfig. It is the single source of the runtime
+// projection, shared by the docker-archive path (ExtractRuntimeConfig
+// reads the file then delegates here) and the registry path, which feeds
+// the image's raw config blob (v1.Image.RawConfigFile) straight in.
+//
+// Keeping the projection in one place is what guarantees a registry pull
+// and an equivalent docker-archive flatten produce byte-identical config
+// trailers. stdlib-only by design — no registry/ggcr types leak into
+// pkg/image (which sandbox-runtime imports).
+//
+// Architecture / Os are passed through transparently with no validation.
+// Unknown source fields are dropped by encoding/json.
+func ExtractRuntimeConfigFromJSON(data []byte) (*RuntimeConfig, error) {
 	var src ociImageConfig
 	if err := json.Unmarshal(data, &src); err != nil {
-		return nil, fmt.Errorf("parse image config %q: %w", configPath, err)
+		return nil, fmt.Errorf("parse image config: %w", err)
 	}
 	rc := &RuntimeConfig{
 		Architecture: src.Architecture,

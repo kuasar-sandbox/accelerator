@@ -22,11 +22,18 @@ Entrypoint / Env / WorkingDir 等启动参数。
 
 ### 1.2 输入与输出
 
-输入:**Docker archive** (`docker save` 产物的 tar 流;OCI layout 暂不直
-接支持,见下)。
+输入,二选一:
+
+- **远程 registry 镜像**——镜像引用如 `nginx:1.27`、`gcr.io/ns/app@sha256:...`;
+  `flatten-ctl` 直接拉取并展平(§2.4),拉取凭据经 `FLATTEN_REGISTRY_*` 环境变量注入,
+  层 blob 落入可跨进程共享的本地 OCI-layout 缓存;
+- **Docker archive**(`docker save` 产物的 tar 流,stdin 或本地文件)。
+
+(OCI layout 目录暂不直读,见 §5.5。)
 
 输出:**单文件**,字节布局 `EROFS 镜像 + 末尾 ZIP archive`(详见 §3 镜像
-格式)。ZIP 内含 OCI runtime config 投影,沙箱启动时直接读取。
+格式)。ZIP 内含 OCI runtime config 投影,沙箱启动时直接读取。**两条源(registry /
+docker-archive)汇入同一展平 sink,同一镜像内容产出逐字节相同的 EROFS。**
 
 不做的事:不签名,不加密,不分块——加密/去重由 `manifest.md` 描述的下一阶
 段处理。
@@ -50,49 +57,70 @@ OCI layout (`oci:./dir`) 可先经 `skopeo copy oci:./xxx docker-archive:/tmp/x.
 
 ## 2. 命令行接口
 
-三个子命令:`export`(展平,可选直接入库)、`verify`(确定性自检)、
-`info`(检视已生成镜像 / `manifest://` 引用)。
+四个子命令:`export`(展平,可选直接入库)、`verify`(确定性自检)、
+`info`(检视已生成镜像 / `manifest://` 引用)、`cache`(检视/回收本地拉取缓存)。
 
 | 子命令 | 用途 |
 |--------|------|
-| `export` | docker-archive → 确定性 EROFS 文件;`--upload` 时顺带 ingest 进 store 并打印 manifest key |
-| `verify` | 对同一输入展平两次,比对字节级 sha256,确认确定性 |
+| `export` | registry 镜像或 docker-archive → 确定性 EROFS;`--upload` 时顺带 ingest 进 store 并打印 manifest key;`--with-referer` 经 Referrers 幂等跳过/回写(§2.4) |
+| `verify` | 对同一输入展平两次,比对字节级 sha256,确认确定性(registry 源:拉一次→展两遍) |
 | `info` | 读 EROFS superblock + 末尾 ZIP 里的 OCI runtime config 并打印 |
+| `cache` | `cache info` 看缓存占用、`cache gc` 按 LRU 回收到上限(§2.5) |
 
-输入是**位置参数**(匿名),三个子命令统一:`export` / `verify` 省略或
-`-` = stdin 的 docker-archive 流,否则本地 docker-archive tar 路径;`info`
-必填,接受 EROFS 文件路径或 `manifest://<hex>`。位置参数须置于 flags 之后
-(Go stdlib flag 在首个非 flag 实参处停止解析)。
+`export` / `verify` 的输入是**位置参数**(匿名),按下列优先级自动判别 registry / 本地:
+
+```
+1. "-"                       → stdin docker-archive
+2. "docker-archive:<path>"   → 本地文件(剥前缀)
+3. os.Stat 命中常规文件       → 本地 docker-archive  (./app.tar、/abs/x.tar 自然命中)
+4. 否则按 name.ParseReference → 远程 registry 引用
+```
+
+歧义(本地文件名恰好形如 `repo:tag`)用 `--registry` / `--archive` 强制。`info` 的位置
+参数必填,接受 EROFS 文件路径或 `manifest://<hex>`。位置参数须置于 flags 之后(Go stdlib
+flag 在首个非 flag 实参处停止解析)。
 
 ### 2.1 `flatten-ctl export`
 
 ```
-flatten-ctl export [flags] <path|->
+flatten-ctl export [flags] <ref|path|->
 
-  <path|->                docker-archive tar(位置参数);省略或 `-` = stdin
+  <ref|path|->            registry 镜像引用,或 docker-archive(省略/`-` = stdin)
   --output <path|->       EROFS 输出路径;`-` = stdout。--upload 关闭时必填,
                           --upload 开启时可省(产物默认丢弃,只要 manifest key)
-  --upload                展平后把 EROFS ingest 进 store,stdout 打印 manifest
-                          key(同时给 --output 则文件也写)
-  --manifest-config <path>  manifest 配置 YAML(覆盖 MANIFEST_CONFIG env);
-                          --upload 必需
-  --tmpdir <D>            每次运行的临时工作目录的父目录(默认 $TMPDIR 或 /tmp);
-                          /tmp 太小、镜像很大时改到大盘
+  --upload                展平后把 EROFS ingest 进 store,stdout 打印 manifest key
+  --manifest-config <p>   manifest 配置 YAML(覆盖 MANIFEST_CONFIG env);--upload 必需
+  --tmpdir <D>            每次运行临时目录的父目录(默认 $TMPDIR 或 /tmp)
   --no-progress           禁用 stderr 进度输出
+
+  # 远程 registry 源(详见 §2.4)
+  --remote-config <p>     远程/缓存/referer 配置 YAML(覆盖 REMOTE_CONFIG env)
+  --print-digest          stdout 打印解析后的源镜像 digest(repo@sha256:..);与 --output - 互斥
+  --registry / --archive  强制把位置参数当 registry 引用 / 本地文件(消歧)
+  --with-referer          registry 源:命中 flatten-manifest referrer 则复用其 manifest
+                          id 跳过重导,否则导出后回写 referrer(需 --upload;§2.4)
 ```
 
 典型用法:
 
 ```bash
+# 远程 registry 镜像 → 单文件
+flatten-ctl export --output nginx.erofs nginx:1.27
+
+# 远程镜像直接入库(stdout 即 manifest key);凭据走环境变量
+export FLATTEN_REGISTRY_USERNAME=robot FLATTEN_REGISTRY_PASSWORD=…
+flatten-ctl export --upload --manifest-config manifest.yaml --remote-config remote.yaml \
+    registry.example.com/team/app@sha256:… > app.key
+
 # docker save 管道 → 单文件输出(省略位置参数 = stdin)
 docker save myapp:v1 | flatten-ctl export --output my-app.erofs
 
 # 本地 docker-archive 文件(位置参数在 flags 之后)
 flatten-ctl export --output my-app.erofs ./my-app.tar
 
-# 展平后直接入库(stdout 即 manifest key)
-docker save myapp:v1 | flatten-ctl export --upload \
-    --manifest-config manifest.yaml > app.key
+# 幂等:已展平过即复用 manifest id,跳过拉取+展平+上传
+flatten-ctl export --upload --with-referer --manifest-config manifest.yaml \
+    --remote-config remote.yaml registry.example.com/team/app:v1 > app.key
 
 # /tmp 不够大时把暂存挪到大盘
 flatten-ctl export --output big.erofs --tmpdir /var/tmp ./big.tar
@@ -177,6 +205,93 @@ unzip -p my-app.erofs config.json | jq
 # 或者经 flatten-ctl info --json 进 jq
 flatten-ctl info --json my-app.erofs | jq '.config.Entrypoint'
 ```
+
+### 2.4 远程拉取、本地缓存与 Referrers 回写
+
+位置参数判定为 registry 引用时(§2 判别规则),`flatten-ctl` 经 [go-containerregistry]
+直接拉取、展平,无需先 `docker save`。所有 registry 行为由 **`--remote-config` YAML**
+(或 `REMOTE_CONFIG` env)配置,密钥不入文件:
+
+```yaml
+platform: linux/amd64          # 空 = 跟随宿主架构(linux/$GOARCH)
+insecure: false                # 私有/dev registry 走 HTTP / 跳过 TLS 校验
+pull_jobs: 4                   # 并发下载层数(下载并行、apply 串行)
+cache:
+  dir: /var/cache/flatten-ctl  # OCI-layout 缓存根;共享=跨任务去重,每任务路径=隔离
+  max_size: 10GiB              # 上限,超出按 LRU 回收;"0" = 不限,仅手动 cache gc
+referer:                       # 仅 --with-referer 用(见下)
+  artifact_type: application/vnd.acme.flatten-manifest.v1+json
+  desc: acme-prod              # 公开 owner 描述
+  key:  acme-prod              # HMAC 消息,默认 == desc
+  validity: 720h               # 可选;写入 valid_at 的过期段
+```
+
+**凭据(命名空间环境变量,匿名回落)**:`FLATTEN_REGISTRY_TOKEN`(Bearer,优先)或
+`FLATTEN_REGISTRY_USERNAME` + `FLATTEN_REGISTRY_PASSWORD`(Basic);都不设则匿名拉公有
+镜像。密钥只走 env(不上 argv、不入配置文件),契合展平数据面节点由管理面按任务下发租户
+拉取凭据的模型(`deployment.md` §5)。
+
+**本地缓存**:标准 **OCI image layout** 目录(`oci-layout` + `index.json` +
+`blobs/<algo>/<hex>`),`crane`/`skopeo` 可直接检视。缓存命中判定 = `blobs/` 下该 digest
+是否存在(内容寻址,多个 `flatten-ctl` 进程共享同一目录天然安全);blob 边下边校 digest、
+原子落盘(temp→rename)。超出 `max_size` 时持 flock 按 LRU(mtime)回收到低水位,并以
+grace 期保护近期写入的 blob 不被并发拉取误删。`cache.dir` 指向共享路径即跨任务去重,指向
+每任务独立路径即隔离——由调用方按需配置。
+
+**多架构**:registry 引用常指 manifest index,按 `platform` 选出具体 image 再展平;
+`Architecture`/`Os` 仍原样投影进 config.json(§3.2),不做校验。
+
+**确定性提醒**:tag 可变,`:latest` 不可复现;可复现构建请钉 `@sha256:`。`export` 把
+解析到的 `repo@sha256:..` 打到 stderr(`--no-progress` 关闭),`--print-digest` 另打到
+stdout。`verify` 对 registry 源先拉一次进缓存,再从同批缓存 blob 展两遍比对——对 tag 只
+与其当前指向一样稳,对 digest 永远稳定。
+
+#### Referrers 回写与幂等跳过(`--with-referer`)
+
+展平产出的 manifest id(= `--upload` 入库的 manifest 内容键)可经 **OCI Referrers API**
+回写到**源镜像所在 repo**,作为 registry 侧、按 owner 作用域的去重备忘,让重复 `export`
+直接复用、跳过拉取+展平+上传。
+
+启用 `--with-referer`(蕴含 `--upload`、需 manifest 配置;deliverable 是 stdout 的
+manifest key,故与 `--output` / `--print-digest` 互斥):
+
+1. 解析源 → 平台镜像 digest `D`;
+2. `Referrers(repo@D)` 按 `artifact_type` 过滤,读各 referrer 注解,匹配 `owner` 且未过期
+   (`valid_at`)→ 直接打印其 `id`,**不拉层 / 不展平 / 不上传**;
+3. 未命中 → 拉取+展平+ingest 得 manifest key → 构造 referrer artifact(subject=`D`、
+   `artifact_type`、注解 `owner`/`id`/`valid_at`)推回源 repo → 打印 key。
+
+referrer 注解:
+
+```
+vnd.acme.flatten-manifest.owner    = <hmac-hex> <referer_desc>
+vnd.acme.flatten-manifest.id       = <manifest_id>                        # ingest 产出的内容键
+vnd.acme.flatten-manifest.valid_at = <import RFC3339>[ <expiry RFC3339>]
+```
+
+其中 `hmac = HMAC-SHA256(key = 客户秘钥 MANIFEST_KEY, msg = referer.key)`——按
+(租户秘钥, referer key) 恒定、导出前即可算、无客户秘钥不可伪造,使不同租户在同一公有 base
+镜像上的 referrer 互不碰撞。
+
+**前提与注意**:OCI 规范要求 referrer 与 subject 同 repo → `--with-referer` 需对**源
+repo 有 push 权限**(面向租户自有 registry;对只读上游写不进会**硬失败**)。referrer
+artifact 含时间戳,本身每次不同,但展平产物 / manifest id 仍确定。对公开 base 镜像,
+referrer(owner token / id / 时间)对能读该 repo 者可见——owner 经 HMAC、id 为不透明内容
+键,但"某 owner 在某时刻展平过该镜像"这一事实会暴露。
+
+[go-containerregistry]: https://github.com/google/go-containerregistry
+
+### 2.5 `flatten-ctl cache` — 检视/回收拉取缓存
+
+```
+flatten-ctl cache info [--remote-config <p>] [--cache-dir <D>]
+flatten-ctl cache gc   [--remote-config <p>] [--cache-dir <D>] [--cache-max-size <S>]
+```
+
+`cache info` 打印缓存目录、blob 数、总占用与上限。`cache gc` 持 flock 按 LRU 回收到配置
+(或 `--cache-max-size` 覆盖)的上限,`"0"` 清空(grace 期内的除外)。缓存目录默认取
+`--remote-config` 的 `cache.dir`,`--cache-dir` 覆盖。常驻场景可由 cron 周期跑 `cache gc`
+强约束上限(`export` 每次拉取后也会顺带回收)。
 
 ## 3. 镜像格式
 
@@ -367,10 +482,12 @@ OCI image config 字段繁多,大量与启动无关:`created` / `author` / `hist
 
 显式投影把"运行时启动需要什么"作为唯一标准,下游可预测。
 
-### 5.5 不实现的功能
+### 5.5 不实现 / 暂不实现的功能
 
-- **OCI layout 直读** —— 上游可用 skopeo 做格式转换,flatten-ctl 不重复
-  这部分基础设施
+- **OCI layout 目录直读** —— `export` 现已支持直接从 registry 拉取(§2.4),且本地
+  拉取缓存本身就是标准 OCI layout 目录;但"把任意 OCI layout 目录当输入展平"仍未
+  直接支持。需要时上游可用 `skopeo copy oci:./dir docker-archive:x.tar` 转换,或
+  `crane push` 到 registry 再拉
 - **镜像签名/加密** —— manifest 层做(`manifest.md`)
 - **层级保留** —— flatten-ctl 输出是合并后的单一 EROFS,层信息丢失。需要
   分层保留的场景(例如增量推送)由 manifest 层 chunk dedup 取代
