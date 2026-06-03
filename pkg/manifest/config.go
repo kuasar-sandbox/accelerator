@@ -69,9 +69,12 @@ type Config struct {
 // field is grouped with future manifest-wide knobs.
 type ManifestSubConfig struct {
 	// Key is the 32-byte customer key, hex-encoded (64 chars). Required
-	// for any ingest or fetch. CustomerKey() / CustomerKeyFunc() parses
-	// + validates the value lazily so an empty Key in the YAML only
-	// trips a call site that actually needs to seal/unseal.
+	// for any ingest or fetch, but may be left empty here and supplied via
+	// the $MANIFEST_KEY environment variable instead — which also overrides
+	// a non-empty value here (see CustomerKeyEnv), so the secret can stay
+	// out of this shared file. CustomerKey() resolves + validates lazily,
+	// so an absent key only trips a call site that actually needs to
+	// seal/unseal.
 	Key string `yaml:"key"`
 }
 

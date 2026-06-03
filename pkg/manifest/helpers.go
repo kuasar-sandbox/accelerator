@@ -3,6 +3,7 @@ package manifest
 import (
 	"encoding/hex"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/fetch"
@@ -60,29 +61,45 @@ func HexKey(k store.ContentKey) string {
 	return hex.EncodeToString(k[:])
 }
 
-// CustomerKey decodes the YAML's manifest.key into a 32-byte array.
-// Returns an error if the field is empty or malformed.
+// CustomerKeyEnv is the environment variable that supplies — and, when
+// set, overrides — the customer key. It lets the sensitive key be sourced
+// out-of-band (env / secrets manager) so the shared MANIFEST_CONFIG file
+// can omit manifest.key entirely. The value is the same form as the YAML
+// field: 64 hex chars (32 bytes), no scheme prefix.
+//
+// It is resolved lazily inside CustomerKey and never written back into the
+// Config, so it is not echoed by `manifest-ctl config show` (which marshals
+// the loaded Config) — the secret stays out of files and command output.
+const CustomerKeyEnv = "MANIFEST_KEY"
+
+// CustomerKey resolves the 32-byte customer key, preferring $MANIFEST_KEY
+// over the YAML's manifest.key (see CustomerKeyEnv). Returns an error if
+// neither is set, or if the resolved value is not 64 hex chars / 32 bytes.
 func (c *Config) CustomerKey() ([32]byte, error) {
 	var k [32]byte
-	if c.Manifest.Key == "" {
-		return k, fmt.Errorf("manifest: customer key required (set manifest.key)")
+	raw := os.Getenv(CustomerKeyEnv)
+	if raw == "" {
+		raw = c.Manifest.Key
 	}
-	raw, err := hex.DecodeString(c.Manifest.Key)
+	if raw == "" {
+		return k, fmt.Errorf("manifest: customer key required (set manifest.key or $%s)", CustomerKeyEnv)
+	}
+	b, err := hex.DecodeString(raw)
 	if err != nil {
 		return k, fmt.Errorf("manifest: decode key: %w", err)
 	}
-	if len(raw) != 32 {
-		return k, fmt.Errorf("manifest: key must be 32 bytes, got %d", len(raw))
+	if len(b) != 32 {
+		return k, fmt.Errorf("manifest: key must be 32 bytes, got %d", len(b))
 	}
-	copy(k[:], raw)
+	copy(k[:], b)
 	return k, nil
 }
 
-// IngestKeyFunc returns an ingest.CustomerKeyFunc that resolves the
-// key lazily from the YAML's manifest.key field. Equivalent to
-// passing func() ([32]byte, error) { return c.CustomerKey() }.
+// IngestKeyFunc returns an ingest.CustomerKeyFunc that resolves the key
+// lazily via CustomerKey ($MANIFEST_KEY, else the YAML's manifest.key).
+// Equivalent to passing func() ([32]byte, error) { return c.CustomerKey() }.
 func (c *Config) IngestKeyFunc() ingest.CustomerKeyFunc { return c.CustomerKey }
 
 // FetchKeyFunc returns a fetch.CustomerKeyFunc that resolves the key
-// lazily from the YAML's manifest.key field.
+// lazily via CustomerKey ($MANIFEST_KEY, else the YAML's manifest.key).
 func (c *Config) FetchKeyFunc() fetch.CustomerKeyFunc { return c.CustomerKey }

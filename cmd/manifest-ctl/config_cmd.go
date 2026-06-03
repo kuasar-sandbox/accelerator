@@ -60,8 +60,11 @@ const defaultYAMLTemplate = `# manifest-ctl / sandbox-ctl shared manifest config
 # environment variable. There is no search path; unset = error.
 
 manifest:
-  # 32-byte hex-encoded customer key (64 hex chars). Required.
+  # 32-byte hex-encoded customer key (64 hex chars).
   # Generate with: openssl rand -hex 32
+  # May be left empty here and supplied via the MANIFEST_KEY environment
+  # variable instead (MANIFEST_KEY also overrides a value set here), so the
+  # secret can stay out of this shared file.
   key: ""
 
 store:

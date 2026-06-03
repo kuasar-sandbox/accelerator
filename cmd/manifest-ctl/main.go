@@ -65,6 +65,9 @@ Configuration:
   Every command (except 'config generate') reads a YAML config file
   via --manifest-config <path> or the MANIFEST_CONFIG environment
   variable. Flag wins; there is no auto-discovery.
+  The sensitive manifest.key may be omitted from the file and supplied
+  via the MANIFEST_KEY environment variable instead (MANIFEST_KEY also
+  overrides a manifest.key set in the file).
 `)
 }
 
