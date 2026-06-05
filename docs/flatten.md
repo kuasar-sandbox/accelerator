@@ -57,8 +57,9 @@ OCI layout (`oci:./dir`) 可先经 `skopeo copy oci:./xxx docker-archive:/tmp/x.
 
 ## 2. 命令行接口
 
-四个子命令:`export`(展平,可选直接入库)、`verify`(确定性自检)、
-`info`(检视已生成镜像 / `manifest://` 引用)、`cache`(检视/回收本地拉取缓存)。
+五个子命令:`export`(展平,可选直接入库)、`verify`(确定性自检)、
+`info`(检视已生成镜像 / `manifest://` 引用)、`cache`(检视/回收本地拉取缓存)、
+`config`(输出/校验 flatten 配置)。
 
 | 子命令 | 用途 |
 |--------|------|
@@ -66,6 +67,7 @@ OCI layout (`oci:./dir`) 可先经 `skopeo copy oci:./xxx docker-archive:/tmp/x.
 | `verify` | 对同一输入展平两次,比对字节级 sha256,确认确定性(registry 源:拉一次→展两遍) |
 | `info` | 读 EROFS superblock + 末尾 ZIP 里的 OCI runtime config 并打印 |
 | `cache` | `cache info` 看缓存占用、`cache gc` 按 LRU 回收到上限(§2.5) |
+| `config` | 输出规范化的 flatten 配置(`--config`/`FLATTEN_CONFIG`),或 `--template` 骨架 |
 
 `export` / `verify` 的输入是**位置参数**(匿名),按下列优先级自动判别 registry / 本地:
 
@@ -90,15 +92,16 @@ flatten-ctl export [flags] <ref|path|->
                           --upload 开启时可省(产物默认丢弃,只要 manifest key)
   --upload                展平后把 EROFS ingest 进 store,stdout 打印 manifest key
   --manifest-config <p>   manifest 配置 YAML(覆盖 MANIFEST_CONFIG env);--upload 必需
-  --tmpdir <D>            每次运行临时目录的父目录(默认 $TMPDIR 或 /tmp)
+  --config <p>            flatten 配置 YAML(覆盖 FLATTEN_CONFIG env):tmpdir/platform/
+                          cache/referer(详见 §2.4)
+  --platform <os/arch>    覆盖配置里的拉取 platform(os/arch[/variant])
   --no-progress           禁用 stderr 进度输出
 
   # 远程 registry 源(详见 §2.4)
-  --remote-config <p>     远程/缓存/referer 配置 YAML(覆盖 REMOTE_CONFIG env)
   --print-digest          stdout 打印解析后的源镜像 digest(repo@sha256:..);与 --output - 互斥
   --registry / --archive  强制把位置参数当 registry 引用 / 本地文件(消歧)
-  --with-referer          registry 源:命中 flatten-manifest referrer 则复用其 manifest
-                          id 跳过重导,否则导出后回写 referrer(需 --upload;§2.4)
+  --with-referer          强制启用幂等 Referrers 流(亦可由配置 referer.enabled 默认开启);
+                          命中则复用 manifest id 跳过重导,否则导出后回写(需 --upload;§2.4)
 ```
 
 典型用法:
@@ -109,7 +112,7 @@ flatten-ctl export --output nginx.erofs nginx:1.27
 
 # 远程镜像直接入库(stdout 即 manifest key);凭据走环境变量
 export FLATTEN_REGISTRY_USERNAME=robot FLATTEN_REGISTRY_PASSWORD=…
-flatten-ctl export --upload --manifest-config manifest.yaml --remote-config remote.yaml \
+flatten-ctl export --upload --manifest-config manifest.yaml --config flatten.yaml \
     registry.example.com/team/app@sha256:… > app.key
 
 # docker save 管道 → 单文件输出(省略位置参数 = stdin)
@@ -118,12 +121,12 @@ docker save myapp:v1 | flatten-ctl export --output my-app.erofs
 # 本地 docker-archive 文件(位置参数在 flags 之后)
 flatten-ctl export --output my-app.erofs ./my-app.tar
 
-# 幂等:已展平过即复用 manifest id,跳过拉取+展平+上传
+# 幂等:已展平过即复用 manifest id,跳过拉取+展平+上传(或在 flatten.yaml 设 referer.enabled: true 省去 --with-referer)
 flatten-ctl export --upload --with-referer --manifest-config manifest.yaml \
-    --remote-config remote.yaml registry.example.com/team/app:v1 > app.key
+    --config flatten.yaml registry.example.com/team/app:v1 > app.key
 
-# /tmp 不够大时把暂存挪到大盘
-flatten-ctl export --output big.erofs --tmpdir /var/tmp ./big.tar
+# /tmp 不够大时在 flatten.yaml 设 tmpdir: /var/tmp,再 --config flatten.yaml
+flatten-ctl export --output big.erofs --config flatten.yaml ./big.tar
 ```
 
 ### 2.2 `flatten-ctl verify`
@@ -209,22 +212,25 @@ flatten-ctl info --json my-app.erofs | jq '.config.Entrypoint'
 ### 2.4 远程拉取、本地缓存与 Referrers 回写
 
 位置参数判定为 registry 引用时(§2 判别规则),`flatten-ctl` 经 [go-containerregistry]
-直接拉取、展平,无需先 `docker save`。所有 registry 行为由 **`--remote-config` YAML**
-(或 `REMOTE_CONFIG` env)配置,密钥不入文件:
+直接拉取、展平,无需先 `docker save`。所有 registry 行为由 **`--config` YAML**
+(或 `FLATTEN_CONFIG` env)配置,密钥不入文件:
 
 ```yaml
-platform: linux/amd64          # 空 = 跟随宿主架构(linux/$GOARCH)
+tmpdir: ""                     # 每次运行临时目录的父目录(空 = $TMPDIR 或 /tmp)
+platform: linux/amd64          # 空 = 跟随宿主架构(linux/$GOARCH);--platform 覆盖
 insecure: false                # 私有/dev registry 走 HTTP / 跳过 TLS 校验
 pull_jobs: 4                   # 并发下载层数(下载并行、apply 串行)
 cache:
-  dir: /var/cache/flatten-ctl  # OCI-layout 缓存根;共享=跨任务去重,每任务路径=隔离
+  dir: ""                      # OCI-layout 持久缓存根;空(默认)= 临时缓存(tmpdir 下,跑完清理)
   max_size: 10GiB              # 上限,超出按 LRU 回收;"0" = 不限,仅手动 cache gc
-referer:                       # 仅 --with-referer 用(见下)
-  artifact_type: application/vnd.acme.flatten-manifest.v1+json
+referer:                       # --with-referer / referer.enabled 用(见下)
+  enabled: false               # 默认启用幂等 Referrers 流(等价命令行 --with-referer)
   desc: acme-prod              # 公开 owner 描述
   key:  acme-prod              # HMAC 消息,默认 == desc
   validity: 720h               # 可选;写入 valid_at 的过期段
 ```
+
+artifact_type 固定为常量 `application/vnd.kuasar.flatten-manifest.v1`(不可配置,保证跨工具/版本一致)。
 
 **凭据(命名空间环境变量,匿名回落)**:`FLATTEN_REGISTRY_TOKEN`(Bearer,优先)或
 `FLATTEN_REGISTRY_USERNAME` + `FLATTEN_REGISTRY_PASSWORD`(Basic);都不设则匿名拉公有
@@ -264,9 +270,9 @@ manifest key,故与 `--output` / `--print-digest` 互斥):
 referrer 注解:
 
 ```
-vnd.acme.flatten-manifest.owner    = <hmac-hex> <referer_desc>
-vnd.acme.flatten-manifest.id       = <manifest_id>                        # ingest 产出的内容键
-vnd.acme.flatten-manifest.valid_at = <import RFC3339>[ <expiry RFC3339>]
+vnd.kuasar.flatten-manifest.owner    = <hmac-hex> <referer_desc>
+vnd.kuasar.flatten-manifest.id       = <manifest_id>                        # ingest 产出的内容键
+vnd.kuasar.flatten-manifest.valid_at = <import RFC3339>[ <expiry RFC3339>]
 ```
 
 其中 `hmac = HMAC-SHA256(key = 客户秘钥 MANIFEST_KEY, msg = referer.key)`——按
@@ -284,13 +290,14 @@ referrer(owner token / id / 时间)对能读该 repo 者可见——owner 经 HM
 ### 2.5 `flatten-ctl cache` — 检视/回收拉取缓存
 
 ```
-flatten-ctl cache info [--remote-config <p>] [--cache-dir <D>]
-flatten-ctl cache gc   [--remote-config <p>] [--cache-dir <D>] [--cache-max-size <S>]
+flatten-ctl cache info [--config <p>] [--cache-dir <D>]
+flatten-ctl cache gc   [--config <p>] [--cache-dir <D>] [--cache-max-size <S>]
 ```
 
-`cache info` 打印缓存目录、blob 数、总占用与上限。`cache gc` 持 flock 按 LRU 回收到配置
+`cache` 子命令面向**持久**缓存(`cache.dir` 显式配置时);默认临时缓存随 `export` 跑完即清，
+无需 gc。`cache info` 打印缓存目录、blob 数、总占用与上限。`cache gc` 持 flock 按 LRU 回收到配置
 (或 `--cache-max-size` 覆盖)的上限,`"0"` 清空(grace 期内的除外)。缓存目录默认取
-`--remote-config` 的 `cache.dir`,`--cache-dir` 覆盖。常驻场景可由 cron 周期跑 `cache gc`
+`--config` 的 `cache.dir`,`--cache-dir` 覆盖。常驻场景可由 cron 周期跑 `cache gc`
 强约束上限(`export` 每次拉取后也会顺带回收)。
 
 ## 3. 镜像格式

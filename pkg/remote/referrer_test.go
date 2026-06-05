@@ -63,9 +63,8 @@ func TestReferrerRoundTrip(t *testing.T) {
 		Insecure: true,
 		Cache:    CacheConfig{Dir: t.TempDir()},
 		Referer: RefererConfig{
-			ArtifactType: "application/vnd.acme.flatten-manifest.v1+json",
-			Desc:         "acme-prod",
-			Key:          "acme-prod",
+			Desc: "acme-prod",
+			Key:  "acme-prod",
 		},
 	}
 	if err := cfg.normalize(); err != nil {

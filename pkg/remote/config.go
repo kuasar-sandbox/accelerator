@@ -29,10 +29,18 @@ const (
 
 // Config is the YAML schema for flatten-ctl's remote-pull, blob-cache, and
 // Referrers behaviour. It mirrors the manifest-config convention: load via
-// LoadConfig from --remote-config or $REMOTE_CONFIG. Secrets never live here
+// LoadConfig from --config or $FLATTEN_CONFIG. Secrets never live here
 // — registry credentials come from FLATTEN_REGISTRY_* env, the HMAC key from
 // the manifest customer key. A missing file is fine: defaults apply.
+// RefererArtifactType is the fixed OCI artifact type of the flatten-manifest
+// referrer. It is a constant (not configurable) so FindReferrer/PutReferrer
+// always agree across tools and versions.
+const RefererArtifactType = "application/vnd.kuasar.flatten-manifest.v1"
+
 type Config struct {
+	// TmpDir is the parent of per-run scratch directories (flatten output, the
+	// ephemeral blob cache). Empty → $TMPDIR or /tmp.
+	TmpDir string `yaml:"tmpdir"`
 	// Platform selects which manifest to pull from a multi-arch index, as
 	// "os/arch[/variant]". Empty follows the host: linux/<runtime.GOARCH>.
 	Platform string `yaml:"platform"`
@@ -57,10 +65,12 @@ type CacheConfig struct {
 	MaxSize string `yaml:"max_size"`
 }
 
-// RefererConfig configures the OCI Referrers write-back (--with-referer).
+// RefererConfig configures the OCI Referrers write-back (--with-referer). The
+// artifact type is fixed (RefererArtifactType), not configurable.
 type RefererConfig struct {
-	// ArtifactType tags the flatten-manifest referrer artifact.
-	ArtifactType string `yaml:"artifact_type"`
+	// Enabled turns on the idempotent OCI-Referrers flow by default (equivalent
+	// to passing --with-referer); the flag can still force it on per-run.
+	Enabled bool `yaml:"enabled"`
 	// Desc is the public owner descriptor appended to the owner annotation.
 	Desc string `yaml:"desc"`
 	// Key is the HMAC message paired with the customer key; defaults to Desc.
@@ -97,9 +107,8 @@ func (c *Config) normalize() error {
 	if c.PullJobs < 1 {
 		c.PullJobs = defaultPullJobs
 	}
-	if c.Cache.Dir == "" {
-		c.Cache.Dir = defaultCacheDir
-	}
+	// Cache is opt-in: an empty cache.dir means "no persistent cache". OpenCache
+	// then uses an ephemeral scratch dir under tmpdir, removed after the run.
 	switch c.Cache.MaxSize {
 	case "":
 		c.maxSize = defaultMaxSize
@@ -127,8 +136,43 @@ func (c *Config) normalize() error {
 	return nil
 }
 
-// CacheDir returns the resolved cache root.
+// CacheDir returns the configured cache root ("" = ephemeral).
 func (c *Config) CacheDir() string { return c.Cache.Dir }
 
 // MaxCacheBytes returns the resolved cache size cap (0 = unlimited).
 func (c *Config) MaxCacheBytes() int64 { return c.maxSize }
+
+// SetPlatform overrides the configured platform (the --platform flag) and
+// re-parses it. Empty is a no-op (keeps the configured/host default).
+func (c *Config) SetPlatform(p string) error {
+	if p == "" {
+		return nil
+	}
+	pl, err := v1.ParsePlatform(p)
+	if err != nil {
+		return fmt.Errorf("remote: platform %q: %w", p, err)
+	}
+	c.Platform, c.platform = p, *pl
+	return nil
+}
+
+// OpenCache opens the blob cache. With cache.dir set it is persistent and the
+// returned cleanup is a no-op; empty (the default) yields an ephemeral cache
+// under tmpdir that cleanup removes. Callers must defer cleanup().
+func (c *Config) OpenCache() (*Cache, func(), error) {
+	dir := c.Cache.Dir
+	cleanup := func() {}
+	if dir == "" {
+		d, err := os.MkdirTemp(c.TmpDir, "flatten-cache-")
+		if err != nil {
+			return nil, nil, fmt.Errorf("remote: ephemeral cache: %w", err)
+		}
+		dir, cleanup = d, func() { os.RemoveAll(d) }
+	}
+	cache, err := OpenCache(dir, c.maxSize)
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	return cache, cleanup, nil
+}

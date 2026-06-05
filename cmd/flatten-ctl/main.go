@@ -45,7 +45,7 @@ import (
 
 const (
 	manifestConfigEnv = "MANIFEST_CONFIG"
-	remoteConfigEnv   = "REMOTE_CONFIG"
+	flattenConfigEnv  = "FLATTEN_CONFIG"
 )
 
 func main() {
@@ -62,6 +62,8 @@ func main() {
 		cmdInfo(os.Args[2:])
 	case "cache":
 		cmdCache(os.Args[2:])
+	case "config":
+		cmdConfig(os.Args[2:])
 	case "-h", "--help", "help":
 		printUsage()
 	default:
@@ -79,6 +81,7 @@ Commands:
   verify   Flatten twice, fail if outputs differ.
   info     Print EROFS metadata + OCI runtime config.
   cache    Inspect or garbage-collect the registry blob cache.
+  config   Emit/validate a flatten config (FLATTEN_CONFIG): tmpdir/platform/cache/referer.
 
 See `+"`flatten-ctl <command> -h`"+` for per-command flags.
 `)
@@ -91,20 +94,29 @@ See `+"`flatten-ctl <command> -h`"+` for per-command flags.
 func cmdExport(args []string) {
 	fs := flag.NewFlagSet("export", flag.ExitOnError)
 	output := fs.String("output", "", "EROFS output path (- for stdout, empty = required with --upload off)")
-	tmpDir := fs.String("tmpdir", "", "parent of the per-run scratch directory (default $TMPDIR or /tmp)")
+	configPath := fs.String("config", "", "flatten config YAML (overrides FLATTEN_CONFIG env): tmpdir/platform/cache/referer (registry sources)")
+	platform := fs.String("platform", "", "override the pull platform (os/arch[/variant]) from the config")
 	manifestCfg := fs.String("manifest-config", "", "manifest config YAML (overrides MANIFEST_CONFIG env)")
 	upload := fs.Bool("upload", false, "after flatten, ingest the EROFS into the store and print the manifest key on stdout")
 	noProgress := fs.Bool("no-progress", false, "suppress progress output")
-	remoteCfg := fs.String("remote-config", "", "remote/cache/referer config YAML (overrides REMOTE_CONFIG env); used when the source is a registry reference")
 	printDigest := fs.Bool("print-digest", false, "print the resolved source image digest (repo@sha256:...) on stdout (registry sources; incompatible with --output -)")
 	forceRegistry := fs.Bool("registry", false, "force the positional arg to be a registry reference")
 	forceArchive := fs.Bool("archive", false, "force the positional arg to be a local docker-archive")
-	withReferer := fs.Bool("with-referer", false, "registry sources: reuse an existing flatten-manifest referrer (skip re-export) else write one back after upload; requires --upload")
+	withReferer := fs.Bool("with-referer", false, "force the idempotent OCI-Referrers flow (also enableable via referer.enabled in --config); requires --upload")
 	fs.Parse(args)
 	input := fs.Arg(0)
 	if input == "" {
 		input = "-" // default: docker-archive stream on stdin
 	}
+
+	cfg, err := remote.LoadConfig(*configPath, flattenConfigEnv)
+	if err != nil {
+		fatal("%v", err)
+	}
+	if err := cfg.SetPlatform(*platform); err != nil {
+		fatal("%v", err)
+	}
+	withRef := *withReferer || cfg.Referer.Enabled
 
 	if !*upload && (*output == "" || *output == "/dev/null") {
 		fatal("--output is required when --upload is not set")
@@ -120,15 +132,15 @@ func cmdExport(args []string) {
 		fatal("--print-digest is incompatible with --output - (both write stdout)")
 	}
 
-	// --with-referer is the registry-backed idempotent upload flow: its
+	// The idempotent OCI-Referrers flow (--with-referer or referer.enabled): its
 	// deliverable is the manifest key on stdout, so it owns its own pull /
 	// flatten / ingest path and returns early.
-	if *withReferer {
+	if withRef {
 		if !remoteSrc {
-			fatal("--with-referer applies only to registry sources")
+			fatal("--with-referer / referer.enabled applies only to registry sources")
 		}
 		if !*upload {
-			fatal("--with-referer requires --upload")
+			fatal("--with-referer / referer.enabled requires --upload")
 		}
 		if *output != "" {
 			fatal("--with-referer is incompatible with --output (deliverable is the manifest key)")
@@ -136,7 +148,7 @@ func cmdExport(args []string) {
 		if *printDigest {
 			fatal("--with-referer is incompatible with --print-digest (stdout carries the manifest key)")
 		}
-		runReferrerExport(input, *tmpDir, *remoteCfg, *manifestCfg, *noProgress)
+		runReferrerExport(input, cfg, *manifestCfg, *noProgress)
 		return
 	}
 
@@ -145,7 +157,7 @@ func cmdExport(args []string) {
 	tmpOut := false
 	outPath := *output
 	if *upload || outPath == "-" {
-		tf, err := os.CreateTemp(*tmpDir, "flatten-out-*.img")
+		tf, err := os.CreateTemp(cfg.TmpDir, "flatten-out-*.img")
 		if err != nil {
 			fatal("create temp output: %v", err)
 		}
@@ -156,11 +168,11 @@ func cmdExport(args []string) {
 	}
 
 	if remoteSrc {
-		if err := runRemoteFlatten(input, outPath, *tmpDir, *remoteCfg, *printDigest, *noProgress); err != nil {
+		if err := runRemoteFlatten(input, outPath, cfg, *printDigest, *noProgress); err != nil {
 			fatal("%v", err)
 		}
 	} else {
-		if err := runFlatten(input, outPath, *tmpDir); err != nil {
+		if err := runFlatten(input, outPath, cfg.TmpDir); err != nil {
 			fatal("%v", err)
 		}
 	}
@@ -190,8 +202,8 @@ func cmdExport(args []string) {
 		return
 	}
 
-	cfg := loadManifestCfg(*manifestCfg)
-	key, err := ingestEROFS(outPath, info.Size(), cfg, *noProgress)
+	mcfg := loadManifestCfg(*manifestCfg)
+	key, err := ingestEROFS(outPath, info.Size(), mcfg, *noProgress)
 	if err != nil {
 		fatal("%v", err)
 	}
@@ -238,11 +250,7 @@ func isRemoteSource(input string, forceRegistry, forceArchive bool) bool {
 // them into outputPath via the same deterministic sink the docker-archive path
 // uses. The resolved repo@sha256 is logged to stderr (unless --no-progress) and
 // echoed to stdout when --print-digest is set.
-func runRemoteFlatten(ref, outputPath, tmpDir, remoteCfgPath string, printDigest, noProgress bool) error {
-	cfg, err := remote.LoadConfig(remoteCfgPath, remoteConfigEnv)
-	if err != nil {
-		return err
-	}
+func runRemoteFlatten(ref, outputPath string, cfg *remote.Config, printDigest, noProgress bool) error {
 	ctx := context.Background()
 	res, err := cfg.Resolve(ctx, ref)
 	if err != nil {
@@ -254,15 +262,16 @@ func runRemoteFlatten(ref, outputPath, tmpDir, remoteCfgPath string, printDigest
 	if printDigest {
 		fmt.Println(res.Digest.String())
 	}
-	cache, err := remote.OpenCache(cfg.CacheDir(), cfg.MaxCacheBytes())
+	cache, cleanup, err := cfg.OpenCache()
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	src, err := cfg.Pull(ctx, res, cache)
 	if err != nil {
 		return err
 	}
-	if err := flatten.Build(src, outputPath, flatten.Options{TmpDir: tmpDir}); err != nil {
+	if err := flatten.Build(src, outputPath, flatten.Options{TmpDir: cfg.TmpDir}); err != nil {
 		return err
 	}
 	return cache.MaybeEvict()
@@ -301,11 +310,7 @@ func ingestEROFS(path string, size int64, mcfg *manifest.Config, noProgress bool
 // manifest id without re-exporting; otherwise pull + flatten + ingest, then
 // write the referrer back to the source repo. Requires manifest config (for
 // the customer key / ingest) and push access to the source repo.
-func runReferrerExport(ref, tmpDir, remoteCfgPath, manifestCfgPath string, noProgress bool) {
-	rcfg, err := remote.LoadConfig(remoteCfgPath, remoteConfigEnv)
-	if err != nil {
-		fatal("%v", err)
-	}
+func runReferrerExport(ref string, rcfg *remote.Config, manifestCfgPath string, noProgress bool) {
 	mcfg := loadManifestCfg(manifestCfgPath)
 	ck, err := mcfg.CustomerKey()
 	if err != nil {
@@ -336,21 +341,22 @@ func runReferrerExport(ref, tmpDir, remoteCfgPath, manifestCfgPath string, noPro
 	}
 
 	// Miss: pull + flatten + ingest, then write the referrer back.
-	cache, err := remote.OpenCache(rcfg.CacheDir(), rcfg.MaxCacheBytes())
+	cache, cleanup, err := rcfg.OpenCache()
 	if err != nil {
 		fatal("%v", err)
 	}
+	defer cleanup()
 	src, err := rcfg.Pull(ctx, res, cache)
 	if err != nil {
 		fatal("%v", err)
 	}
-	tmpOut, err := os.CreateTemp(tmpDir, "flatten-out-*.img")
+	tmpOut, err := os.CreateTemp(rcfg.TmpDir, "flatten-out-*.img")
 	if err != nil {
 		fatal("create temp output: %v", err)
 	}
 	tmpOut.Close()
 	defer os.Remove(tmpOut.Name())
-	if err := flatten.Build(src, tmpOut.Name(), flatten.Options{TmpDir: tmpDir}); err != nil {
+	if err := flatten.Build(src, tmpOut.Name(), flatten.Options{TmpDir: rcfg.TmpDir}); err != nil {
 		fatal("%v", err)
 	}
 	if err := cache.MaybeEvict(); err != nil && !noProgress {
@@ -385,18 +391,18 @@ func cmdVerify(args []string) {
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
 	tmpDir := fs.String("tmpdir", "", "parent of the per-run scratch directory")
 	noProgress := fs.Bool("no-progress", false, "suppress progress output")
-	remoteCfg := fs.String("remote-config", "", "remote/cache config YAML (overrides REMOTE_CONFIG env); used when the source is a registry reference")
+	configPath := fs.String("config", "", "flatten config YAML (overrides FLATTEN_CONFIG env); used when the source is a registry reference")
 	fs.Parse(args)
 	input := fs.Arg(0)
 	if input == "" {
 		input = "-" // default: docker-archive stream on stdin
 	}
 
-	// Registry source: pull once into the shared cache, then flatten twice
-	// from the same cached blobs and compare. (A moving tag is only as
-	// reproducible as the tag; pin @sha256 for a stable check.)
+	// Registry source: pull once into the cache, then flatten twice from the
+	// same cached blobs and compare. (A moving tag is only as reproducible as
+	// the tag; pin @sha256 for a stable check.)
 	if isRemoteSource(input, false, false) {
-		verifyRemote(input, *tmpDir, *remoteCfg, *noProgress)
+		verifyRemote(input, *tmpDir, *configPath, *noProgress)
 		return
 	}
 
@@ -462,8 +468,8 @@ func cmdVerify(args []string) {
 
 // verifyRemote pulls a registry image once into the shared cache, flattens it
 // twice from the same cached blobs, and compares the EROFS hashes.
-func verifyRemote(ref, tmpDir, remoteCfgPath string, noProgress bool) {
-	cfg, err := remote.LoadConfig(remoteCfgPath, remoteConfigEnv)
+func verifyRemote(ref, tmpDir, configPath string, noProgress bool) {
+	cfg, err := remote.LoadConfig(configPath, flattenConfigEnv)
 	if err != nil {
 		fatal("%v", err)
 	}
@@ -472,10 +478,11 @@ func verifyRemote(ref, tmpDir, remoteCfgPath string, noProgress bool) {
 	if err != nil {
 		fatal("%v", err)
 	}
-	cache, err := remote.OpenCache(cfg.CacheDir(), cfg.MaxCacheBytes())
+	cache, cleanup, err := cfg.OpenCache()
 	if err != nil {
 		fatal("%v", err)
 	}
+	defer cleanup()
 	src, err := cfg.Pull(ctx, res, cache)
 	if err != nil {
 		fatal("%v", err)
@@ -699,7 +706,7 @@ func cmdCache(args []string) {
 // openCacheFromFlags resolves the cache directory and size cap from the remote
 // config plus optional overrides, then opens the OCI-layout cache.
 func openCacheFromFlags(remoteCfgPath, cacheDirOverride, maxSizeOverride string) (*remote.Cache, error) {
-	cfg, err := remote.LoadConfig(remoteCfgPath, remoteConfigEnv)
+	cfg, err := remote.LoadConfig(remoteCfgPath, flattenConfigEnv)
 	if err != nil {
 		return nil, err
 	}
@@ -720,7 +727,7 @@ func openCacheFromFlags(remoteCfgPath, cacheDirOverride, maxSizeOverride string)
 
 func cmdCacheInfo(args []string) {
 	fs := flag.NewFlagSet("cache info", flag.ExitOnError)
-	remoteCfg := fs.String("remote-config", "", "remote config YAML (overrides REMOTE_CONFIG env)")
+	remoteCfg := fs.String("config", "", "flatten config YAML (overrides FLATTEN_CONFIG env)")
 	cacheDir := fs.String("cache-dir", "", "cache directory (overrides config)")
 	fs.Parse(args)
 
@@ -744,7 +751,7 @@ func cmdCacheInfo(args []string) {
 
 func cmdCacheGC(args []string) {
 	fs := flag.NewFlagSet("cache gc", flag.ExitOnError)
-	remoteCfg := fs.String("remote-config", "", "remote config YAML (overrides REMOTE_CONFIG env)")
+	remoteCfg := fs.String("config", "", "flatten config YAML (overrides FLATTEN_CONFIG env)")
 	cacheDir := fs.String("cache-dir", "", "cache directory (overrides config)")
 	maxSize := fs.String("cache-max-size", "", "evict LRU blobs down to this size (overrides config; \"0\" = evict all eligible)")
 	noProgress := fs.Bool("no-progress", false, "suppress progress output")

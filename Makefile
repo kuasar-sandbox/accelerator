@@ -6,7 +6,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all build flatten-ctl test vet bench clean help
+.PHONY: all build flatten-ctl test vet bench clean help zot e2e
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -66,8 +66,37 @@ clean:
 bench:
 	CGO_ENABLED=0 $(GO) test -bench=. -benchmem -run=^$$ ./...
 
+# ---------------------------------------------------------------------------
+# e2e (opt-in): exercise flatten-ctl pulling a real image from a real OCI 1.1
+# registry (zot), flattening it, and writing the manifest referrer back. Needs
+# docker (seeds a locally-cached image into zot), mkfs.erofs, curl, network (to
+# download zot), and the sibling sandbox-accelerator (to build store-ctl). Not
+# part of `make test`. Override the seed image with E2E_IMAGE=<repo:tag>.
+# ---------------------------------------------------------------------------
+ZOT_VERSION ?= v2.1.17
+ZOT_BIN     := $(BINDIR)/zot
+ACCEL_DIR   ?= ../sandbox-accelerator
+
+$(ZOT_BIN):
+	@mkdir -p $(BINDIR)
+	curl -fSL --retry 3 -o $(ZOT_BIN) \
+	  "https://github.com/project-zot/zot/releases/download/$(ZOT_VERSION)/zot-linux-$(GO_ARCH)-minimal"
+	@chmod +x $(ZOT_BIN)
+
+zot: $(ZOT_BIN)
+
+e2e: flatten-ctl zot
+	$(MAKE) -C $(ACCEL_DIR) store-ctl
+	FLATTEN_CTL="$(abspath $(BINDIR)/flatten-ctl)" \
+	STORE_CTL="$(abspath $(ACCEL_DIR)/bin/$(TARGET_ARCH)/store-ctl)" \
+	ZOT_BIN="$(abspath $(ZOT_BIN))" \
+	  bash test/e2e/run.sh
+
 help:
 	@echo "sandbox-builder. Targets:"
 	@echo "  build / flatten-ctl   build the OCI→EROFS CLI (pure Go)"
 	@echo "  test / vet / clean"
+	@echo "  zot                   download a zot (OCI 1.1) registry binary into bin/"
+	@echo "  e2e                   registry pull + flatten + referrer e2e (needs docker, mkfs.erofs)"
+	@echo "  E2E_IMAGE             cached image the e2e seeds into zot (default python:3.12-alpine)"
 	@echo "  TARGET_ARCH           x86_64 (default) | aarch64"

@@ -18,14 +18,14 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/types"
 )
 
-// Annotation keys on the flatten-manifest referrer (the vnd.acme.* namespace
-// from the design). owner ties the stored id to its owner via an HMAC; id is
-// the accelerator manifest content key; valid_at records the import time and
-// an optional expiry.
+// Annotation keys on the flatten-manifest referrer (the vnd.kuasar.* namespace,
+// matching RefererArtifactType). owner ties the stored id to its owner via an
+// HMAC; id is the accelerator manifest content key; valid_at records the import
+// time and an optional expiry.
 const (
-	AnnOwner   = "vnd.acme.flatten-manifest.owner"
-	AnnID      = "vnd.acme.flatten-manifest.id"
-	AnnValidAt = "vnd.acme.flatten-manifest.valid_at"
+	AnnOwner   = "vnd.kuasar.flatten-manifest.owner"
+	AnnID      = "vnd.kuasar.flatten-manifest.id"
+	AnnValidAt = "vnd.kuasar.flatten-manifest.valid_at"
 )
 
 // Owner identifies a flatten-manifest referrer's owner.
@@ -37,7 +37,7 @@ type Owner struct {
 
 func (c *Config) refererOwner() Owner {
 	return Owner{
-		ArtifactType: c.Referer.ArtifactType,
+		ArtifactType: RefererArtifactType,
 		Desc:         c.Referer.Desc,
 		Key:          c.Referer.Key,
 	}
@@ -62,7 +62,7 @@ func (o Owner) ownerValue(customerKey []byte) string {
 func (c *Config) FindReferrer(ctx context.Context, subj *Resolved, customerKey []byte) (id string, ok bool, err error) {
 	o := c.refererOwner()
 	if o.ArtifactType == "" {
-		return "", false, errors.New("remote: referer.artifact_type is required for --with-referer")
+		return "", false, errors.New("remote: referrer artifact type is empty")
 	}
 	want := o.ownerValue(customerKey)
 	idx, err := ggcrremote.Referrers(subj.Digest, c.remoteOpts(ctx)...)
@@ -125,7 +125,7 @@ func (c *Config) manifestAnnotations(ctx context.Context, repo name.Repository, 
 func (c *Config) PutReferrer(ctx context.Context, subj *Resolved, id string, customerKey []byte) error {
 	o := c.refererOwner()
 	if o.ArtifactType == "" {
-		return errors.New("remote: referer.artifact_type is required for --with-referer")
+		return errors.New("remote: referrer artifact type is empty")
 	}
 
 	validAt, err := c.validAtValue()
@@ -149,6 +149,12 @@ func (c *Config) PutReferrer(ctx context.Context, subj *Resolved, id string, cus
 	// type as its artifactType when the artifactType field is absent, so the
 	// WithFilter("artifactType", ...) lookup in FindReferrer still matches.
 	art := mutate.ConfigMediaType(empty.Image, types.MediaType(o.ArtifactType))
+	// Force an OCI image manifest. empty.Image serialises as a Docker schema2
+	// manifest by default, which has no `subject` field semantics — a compliant
+	// OCI 1.1 registry (e.g. zot) then ignores the subject and never indexes the
+	// referrer (the in-memory test registry's tag-schema fallback hides this).
+	// Only an OCI image manifest carries a subject the Referrers API honours.
+	art = mutate.MediaType(art, types.OCIManifestSchema1)
 	annotated := mutate.Annotations(art, anns)
 	withSubject := mutate.Subject(annotated, sd.Descriptor)
 	img, ok := withSubject.(v1.Image)
