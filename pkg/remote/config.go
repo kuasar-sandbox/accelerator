@@ -22,7 +22,6 @@ import (
 )
 
 const (
-	defaultCacheDir = "/var/cache/flatten-ctl"
 	defaultMaxSize  = 10 << 30 // 10 GiB
 	defaultPullJobs = 4
 )

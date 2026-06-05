@@ -3,10 +3,12 @@
 //
 // Subcommands:
 //
-//	flatten-ctl export   [--output <path|->] [--tmpdir D]
-//	                     [--manifest-config <path>] [--upload]  <path|->
+//	flatten-ctl export   [--output <path|->] [--config <path>]
+//	                     [--manifest-config <path>] [--upload] [--with-referer]  <path|->
 //	flatten-ctl verify   [--tmpdir D] [--no-progress]  <path|->
 //	flatten-ctl info     [--json] [--manifest-config <path>]  <path|manifest://hex>
+//	flatten-ctl cache    gc | info
+//	flatten-ctl config   [--config <path>] [--template] [-o <file>]
 //
 // The image is a positional arg (flags must precede it — stdlib flag).
 // For export/verify it defaults to `-` (docker-archive on stdin) when
