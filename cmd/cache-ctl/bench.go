@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"flag"
 	"fmt"
+	mrand "math/rand"
 	"os"
 	"runtime"
 	"runtime/pprof"
@@ -18,6 +19,27 @@ import (
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/client"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
+
+// selectKey chooses the next read key per the access pattern, optionally
+// drawing a cold (L2-miss → origin/L3) key with probability missRatio. warm
+// keys are prefilled AND warmed into the bench target (L2 hits); cold keys live
+// only in origin, so reading one misses L2 and falls through to L3.
+func selectKey(access string, warm, cold [][32]byte, missRatio float64, rng *mrand.Rand, zipf *mrand.Zipf, i int) [32]byte {
+	if missRatio > 0 && len(cold) > 0 && rng.Float64() < missRatio {
+		return cold[rng.Intn(len(cold))]
+	}
+	switch access {
+	case "zipf":
+		if zipf != nil {
+			return warm[zipf.Uint64()]
+		}
+		return warm[i%len(warm)]
+	case "uniform":
+		return warm[rng.Intn(len(warm))]
+	default: // seq
+		return warm[i%len(warm)]
+	}
+}
 
 // cmdBench runs a concurrency sweep + latency percentiles against a
 // cache-ctl endpoint. See docs/cache.md for a full flag reference.
@@ -42,6 +64,11 @@ func cmdBench(args []string) {
 	cpuProfile := fs.String("cpu-profile", "", "write CPU profile to file (scoped to the bench window)")
 	heapProfile := fs.String("heap-profile", "", "write heap profile to file after the bench window")
 	traceFile := fs.String("trace", "", "write execution trace to file (scoped to the bench window)")
+	access := fs.String("access", "seq", "get/mixed read key access pattern: seq|uniform|zipf (zipf models hot base-layer skew)")
+	zipfS := fs.Float64("zipf-s", 1.1, "Zipf skew exponent s (>1; higher = more skew) when --access zipf")
+	coldPrefill := fs.Int("cold-prefill", 0, "extra keys prefilled to --prefill-endpoint ONLY (not warmed into the bench target) — L2-miss → origin/L3 targets")
+	missRatio := fs.Float64("miss-ratio", 0, "fraction of reads that hit cold keys → L2 miss → origin/L3 (needs --cold-prefill>0 and --prefill-endpoint)")
+	timeout := fs.Duration("timeout", 10*time.Second, "per-op client TCP deadline; raise for a slow/stalling origin during large prefills (a sustained 512KiB write burst can stall RocksDB past 10s)")
 	fs.Parse(args)
 
 	// Resolve --mode default based on whether a separate prefill
@@ -57,6 +84,24 @@ func cmdBench(args []string) {
 		}
 	} else if *mode == "" {
 		*mode = "mixed"
+	}
+
+	if *access != "seq" && *access != "uniform" && *access != "zipf" {
+		fatal("--access must be seq|uniform|zipf")
+	}
+	if *access == "zipf" && *zipfS <= 1.0 {
+		fatal("--zipf-s must be > 1 for --access zipf")
+	}
+	if *missRatio < 0 || *missRatio > 1 {
+		fatal("--miss-ratio must be in [0,1]")
+	}
+	if *missRatio > 0 {
+		if *coldPrefill <= 0 {
+			fatal("--miss-ratio requires --cold-prefill > 0")
+		}
+		if *prefillEndpoint == "" {
+			fatal("--miss-ratio requires --prefill-endpoint (cold keys must live only in origin)")
+		}
 	}
 
 	// Resolve the bench target endpoint with env fallback. prefill /
@@ -77,7 +122,7 @@ func cmdBench(args []string) {
 	// pool and reuses instead of falling through to the "oversized"
 	// fresh-make path (which would defeat pooling entirely).
 	benchBlobPool := cache.NewPool(*valueSize)
-	opts := client.Options{Pool: *concurrency, Timeout: 10 * time.Second, BlobPool: benchBlobPool}
+	opts := client.Options{Pool: *concurrency, Timeout: *timeout, BlobPool: benchBlobPool}
 
 	// Prefill client: writes land here. Falls back to the bench
 	// endpoint when --prefill-endpoint is empty, preserving the
@@ -127,12 +172,22 @@ func cmdBench(args []string) {
 	value := make([]byte, *valueSize)
 	rand.Read(value)
 	keys := make([][32]byte, *prefill)
+	coldKeys := make([][32]byte, *coldPrefill)
 	if *mode != "put" {
 		fmt.Fprintf(os.Stderr, "Prefilling %d objects (%d bytes each) to %s ...\n", *prefill, *valueSize, prefillEP)
 		for i := range keys {
 			keys[i] = sha256.Sum256(fmt.Appendf(nil, "bench-key-%d", i))
 			if err := prefillClient.Fill(context.Background(), store.Partition(*namespace), keys[i], value); err != nil {
 				fatal("prefill put: %v", err)
+			}
+		}
+		if *coldPrefill > 0 {
+			fmt.Fprintf(os.Stderr, "Prefilling %d cold objects to %s (origin only — L2-miss targets) ...\n", *coldPrefill, prefillEP)
+			for i := range coldKeys {
+				coldKeys[i] = sha256.Sum256(fmt.Appendf(nil, "bench-cold-%d", i))
+				if err := prefillClient.Fill(context.Background(), store.Partition(*namespace), coldKeys[i], value); err != nil {
+					fatal("cold prefill put: %v", err)
+				}
 			}
 		}
 		if *prefillEndpoint != "" {
@@ -232,6 +287,11 @@ func cmdBench(args []string) {
 			localSamples := make([]int64, 0, 10000)
 			var localOps, localErrors int64
 			i := 0
+			rng := mrand.New(mrand.NewSource(int64(workerID) + 1))
+			var zipf *mrand.Zipf
+			if *access == "zipf" && len(keys) > 1 {
+				zipf = mrand.NewZipf(rng, *zipfS, 1.0, uint64(len(keys)-1))
+			}
 			for {
 				select {
 				case <-ctx.Done():
@@ -249,7 +309,7 @@ func cmdBench(args []string) {
 
 				switch *mode {
 				case "get":
-					k := keys[i%len(keys)]
+					k := selectKey(*access, keys, coldKeys, *missRatio, rng, zipf, i)
 					_, blob, err := benchReader.Get(ctx, store.Partition(*namespace), k)
 					if err == nil && blob != nil {
 						blob.Release()
@@ -266,7 +326,7 @@ func cmdBench(args []string) {
 						fatal("--mode mixed requires bench target to accept writes")
 					}
 					if i%2 == 0 {
-						k := keys[i%len(keys)]
+						k := selectKey(*access, keys, coldKeys, *missRatio, rng, zipf, i)
 						_, blob, err := benchReader.Get(ctx, store.Partition(*namespace), k)
 						if err == nil && blob != nil {
 							blob.Release()

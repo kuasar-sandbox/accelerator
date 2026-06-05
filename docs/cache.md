@@ -105,7 +105,32 @@ Flags:
   --prefill int             get/mixed 模式预写对象数 (default 1000)
   --prefill-endpoint string 独立预写端点(默认同 --endpoint)
   --info-endpoint string    bench 窗口计数显示端点
+  --access string           "seq" | "uniform" | "zipf" 读访问模式 (default "seq")
+  --zipf-s float            Zipf 偏斜指数 s (>1,越大越偏;仅 --access zipf) (default 1.1)
+  --cold-prefill int        额外只写 prefill 端点、不暖 bench 目标的冷 key 数(喂 L2-miss → L3)
+  --miss-ratio float        命中冷 key 的读比例 → L2 miss → 透传 origin/L3 (需 --cold-prefill>0 + --prefill-endpoint)
+  --timeout duration        客户端 per-op TCP deadline (default 10s;慢/卡 origin 大数据集 prefill 须调大)
 ```
+
+#### 基准方法学(L2 内存/磁盘路径、L3 透传、aging)
+
+多机端到端压测见 `test/scripts/bench_cache_remote.sh`(部署 N shard + origin + tiered,跑并发扫);
+资源瓶颈归因配 `test/scripts/procmon.sh`(无依赖 /proc 采样 cpu/diskstats/net)+ `proc_analyze.py`。要点:
+
+- **测「L2 命中(内存)」vs「L2 落盘」**靠工作集与 BlockCache(= `rocks.disk_bytes × mem_ratio`)之比控制:
+  工作集 ≪ BlockCache → 全 RAM 命中;工作集 ≫ BlockCache(调小 `mem_ratio`)→ shard rocksdb 真实磁盘随机读。
+- **`--access`**:`uniform` 把读均摊到整个工作集 → 暴露磁盘路径;`zipf` 模拟真实热点偏斜——但
+  **偏斜过强会把热集塞进 BlockCache、反而掩盖磁盘路径**,测盘须用 `uniform`(或工作集远大于 cache)。
+- **陷阱:EC tier 命中率 ≠ 命中 RAM**。EC hit% 只表示数据在 shard 集群里;BlockCache miss 时磁盘读
+  发生在 shard rocksdb 内部、对该计数不可见。**判定是否落盘必须看 shard 主机的磁盘 IOPS(procmon `rd_iops`)**,不能看 hit%。
+- **L3 透传建模**:`--cold-prefill N`(只写 origin、不暖 L2)+ `--miss-ratio f`,约 f 比例的读命中冷 key →
+  L2 miss → 透传 origin。冷池要 > 压测窗内的冷读次数,否则 read-through 把重复冷读暖回 L2、实测透传率低于注入值。
+- **测 aging/磁盘淘汰**:淘汰是频率式(见 §4.5,丢 `freq ≤ threshold` 的冷 key),**与 `disk_bytes` 容量无关**。
+  短压测(总 ops ≪ `freq.reset_after`)不会触发——sketch 不衰减、无「冷」key;须用长窗 + 偏斜访问让冷尾衰减到阈值。
+- **两个瓶颈区(结构性,与具体硬件无关)**:① 全 BlockCache 命中时,`value-size × EC 数据分片`扇入会先打满
+  **tiered 节点网卡**(吞吐随并发饱和、延迟按 Little 定律线性增);② 工作集溢出落盘时,**shard 磁盘随机读**
+  成为瓶颈,且经 EC `k`-of-`n` 同步等待放大尾延迟。两端 CPU 通常都不是瓶颈。容量规划核心 = 让热集驻留
+  BlockCache——命中与落盘的吞吐、p99 可差一个数量级。
 
 ## 3. 配置
 

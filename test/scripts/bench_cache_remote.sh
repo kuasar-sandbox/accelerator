@@ -57,8 +57,8 @@ set -euo pipefail
 #                     undefined behaviour.)
 #
 # Example:
-#   SHARDS="192.168.1.129 192.168.1.35 192.168.1.11 192.168.1.120 192.168.1.139" \
-#   ORIGIN_HOST=192.168.1.60 TIERED_HOST=192.168.1.60 BENCH_HOST=192.168.1.60 \
+#   SHARDS="shard1 shard2 shard3 shard4 shard5" \
+#   ORIGIN_HOST=cache-host TIERED_HOST=cache-host BENCH_HOST=cache-host \
 #   bash test/scripts/bench_cache_remote.sh all
 
 # ── Config ────────────────────────────────────────────────────────────────
@@ -73,9 +73,26 @@ REMOTE_DIR="${REMOTE_DIR:-cache-bench}"
 RESULTS_DIR="${RESULTS_DIR:-build/test-results}"
 
 VALUE_SIZE="${VALUE_SIZE:-524288}"
-PREFILL="${PREFILL:-500}"
+PREFILL="${PREFILL:-8000}"            # warm working set; ×VALUE_SIZE ≈ 4 GiB (> host RAM → forces real disk reads)
 DURATION="${DURATION:-30s}"
-CONCS="${CONCS:-1 2 4 8}"
+CONCS="${CONCS:-4 16 64}"             # sweep toward the saturation knee
+
+# Access realism (cache-ctl bench --access/--miss-ratio):
+ACCESS="${ACCESS:-zipf}"              # seq|uniform|zipf — zipf models hot base-layer skew
+ZIPF_S="${ZIPF_S:-1.1}"
+MISS_RATIO="${MISS_RATIO:-0.01}"      # ~1% of reads miss L2 → origin/L3 (cold path)
+COLD_PREFILL="${COLD_PREFILL:-1000}"  # origin-only cold key pool feeding the miss path
+TIMEOUT="${TIMEOUT:-10s}"             # per-op client deadline; raise (e.g. 120s) for a slow origin whose RocksDB stalls under a large sequential prefill
+
+# L2 shard RocksDB — production-shaped, scaled to the host. A small BlockCache
+# vs a >-RAM working set + direct_reads ⇒ real on-disk random reads (not page-
+# cache hits). Shrink SHARD_DISK to force capacity eviction (aging runs).
+SHARD_DISK="${SHARD_DISK:-16GiB}"
+SHARD_MEM_RATIO="${SHARD_MEM_RATIO:-0.016}"   # BlockCache ≈ disk_bytes × ratio ≈ 256 MiB
+DIRECT_READS="${DIRECT_READS:-true}"
+BLOOM_BITS="${BLOOM_BITS:-15}"
+SHARD_BLOCK_SIZE="${SHARD_BLOCK_SIZE:-128KiB}"
+ORIGIN_DISK="${ORIGIN_DISK:-32GiB}"
 
 EC_DATA="${EC_DATA:-4}"
 EC_PARITY="${EC_PARITY:-1}"
@@ -177,10 +194,11 @@ freq:
   reset_after: 100K
 rocks:
   path: \$HOME/${REMOTE_DIR}/rocks-shard
-  disk_bytes: 8GiB
-  mem_ratio: 0.1
-  direct_reads: false
-  bloom_bits: 10
+  disk_bytes: ${SHARD_DISK}
+  mem_ratio: ${SHARD_MEM_RATIO}
+  direct_reads: ${DIRECT_READS}
+  block_size: ${SHARD_BLOCK_SIZE}
+  bloom_bits: ${BLOOM_BITS}
 EOF
 }
 
@@ -197,10 +215,10 @@ freq:
   disable_eviction: true
 rocks:
   path: \$HOME/${REMOTE_DIR}/rocks-origin
-  disk_bytes: 16GiB
-  mem_ratio: 0.1
-  direct_reads: false
-  bloom_bits: 10
+  disk_bytes: ${ORIGIN_DISK}
+  mem_ratio: 0.01
+  direct_reads: ${DIRECT_READS}
+  bloom_bits: ${BLOOM_BITS}
 EOF
 }
 
@@ -423,7 +441,7 @@ cmd_bench() {
     ssh_run "$BENCH_HOST" "mkdir -p ~/${REMOTE_DIR}/results && rm -f ~/${REMOTE_DIR}/results/bench-c*.*"
 
     for C in $CONCS; do
-        log "bench concurrency=$C duration=$DURATION value=$VALUE_SIZE prefill=$PREFILL"
+        log "bench c=$C dur=$DURATION value=$VALUE_SIZE warm=$PREFILL cold=$COLD_PREFILL access=$ACCESS miss=$MISS_RATIO"
         ssh_run "$BENCH_HOST" "cd ~/${REMOTE_DIR} && ./cache-ctl bench \
             --endpoint $tiered_ep \
             --prefill-endpoint $origin_ep \
@@ -433,6 +451,9 @@ cmd_bench() {
             --value-size $VALUE_SIZE \
             --mode get \
             --prefill $PREFILL \
+            --access $ACCESS --zipf-s $ZIPF_S \
+            --cold-prefill $COLD_PREFILL --miss-ratio $MISS_RATIO \
+            --timeout $TIMEOUT \
             --cpu-profile results/bench-c${C}.cpu.pprof \
             --heap-profile results/bench-c${C}.heap.pprof \
             2>&1 | tee results/bench-c${C}.log"
@@ -455,7 +476,7 @@ cmd_report() {
     local timestamp; timestamp=$(date -u +'%Y-%m-%d %H:%M UTC')
 
     # Collect per-concurrency rows
-    local rows="" peer_rows=""
+    local rows="" peer_rows="" cache_rows=""
     for C in $CONCS; do
         local f="$RESULTS_DIR/bench-c${C}.log"
         [ -f "$f" ] || { log "WARN: $f missing, skipping"; continue; }
@@ -471,6 +492,16 @@ cmd_report() {
         apo=$( grep -E '^\s*allocs/op:'  "$f" | awk '{print $2}')
         bpo=$( grep -E '^\s*bytes/op:'   "$f" | awk '{print $2}')
         rows+="| $C | $ops | $thr ops/s | $bw MiB/s | $p50 us | $p99 | $p999 | ${errs:-0} | ${apo:-?} | ${bpo:-?} |"$'\n'
+
+        # L2 (EC tier) hit-rate + L3 (origin) fall-through — the core cache
+        # metrics this harness exists to measure. tier-0 row: hits misses
+        # fills errors hit%. origin row: hits(=L2-miss fall-through) misses.
+        local l2hit l2fills l3ft l3pct
+        l2hit=$(  grep -E '^[[:space:]]*tier-0\b' "$f" | awk '{print $7}')
+        l2fills=$(grep -E '^[[:space:]]*tier-0\b' "$f" | awk '{print $5}')
+        l3ft=$(   grep -E '^[[:space:]]*origin\b' "$f" | awk '{print $3}')
+        l3pct=$(awk -v a="${l3ft:-0}" -v b="${ops:-0}" 'BEGIN{if(b>0)printf "%.3f%%",100*a/b; else printf "-"}')
+        cache_rows+="| $C | ${l2hit:-?} | ${l2fills:-?} | ${l3ft:-0} | $l3pct |"$'\n'
 
         # Extract peer rows (5 lines after 'ec peers:')
         while IFS= read -r line; do
@@ -510,6 +541,14 @@ EOF
 | conc | ops | throughput | bandwidth | p50 | p99 | p99.9 | errors | allocs/op | bytes/op |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 $rows
+
+## L2/L3 缓存行为
+
+L2(EC tier)命中率 = 在 tiered 客户端 EC 层命中的比例；L3 透传 = L2 未命中、回落到 origin(L3)的读次数及其占总 ops 的比例（≈ \`--miss-ratio\` 注入率，因 read-through 把重复冷读暖入 L2 会略低）。
+
+| conc | L2(EC) 命中率 | L2 回填(fills) | L3 透传次数 | L3 透传占比 |
+|---:|---:|---:|---:|---:|
+$cache_rows
 
 ## Per-peer 行为
 
