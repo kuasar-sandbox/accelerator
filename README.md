@@ -11,7 +11,7 @@ rootfs，并在镜像尾部追加运行时配置（STORED-mode ZIP）。是
 | `pkg/image` | **轻量读取面**：`RuntimeConfig` 类型、`ReadConfig`/`AppendConfigZip`/`ReadEROFSSize`、`ExtractRuntimeConfigFromJSON`。供工具与 `sandbox-runtime` 读取/inspect 展平镜像 | 仅 stdlib |
 | `pkg/flatten` | 展平引擎：`Source` 接口 + 确定性 `Build` sink（OCI→EROFS，调用 `mkfs.erofs`）+ `Verify` | `pkg/image`、`internal/util` |
 | `pkg/remote` | **远程拉取面**：registry 拉取 + 平台选择 + env 凭据 + OCI-layout blob 缓存（并发预取 / 原子写 / LRU 淘汰）+ OCI Referrers 回写与幂等跳过。产出 `flatten.Source` | go-containerregistry、`pkg/flatten` |
-| `cmd/flatten-ctl` | CLI：`export`/`verify`/`info`/`cache`；`--upload` 经 `sandbox-accelerator/pkg/manifest` ingest 进 store | accelerator SDK、`pkg/remote` |
+| `cmd/flatten-ctl` | CLI：`export`/`verify`/`info`/`cache`/`config`；`--upload` 经 `sandbox-accelerator/pkg/manifest` ingest 进 store | accelerator SDK、`pkg/remote` |
 
 依赖洁净：`sandbox-runtime` 只 import `pkg/image`（stdlib-only，读取镜像内嵌的
 RuntimeConfig）；go-containerregistry **只落在 `pkg/remote`**，不进 `pkg/image` /
@@ -23,10 +23,15 @@ RuntimeConfig）；go-containerregistry **只落在 `pkg/remote`**，不进 `pkg
 ```bash
 make flatten-ctl     # 纯 Go（CGO_ENABLED=0）
 make vet test
+make e2e             # opt-in：下载 zot，跑 test/e2e/ 打通真实 OCI-1.1 registry 拉取+展平+回写
 ```
 
 运行期需要 `mkfs.erofs`（由 `sandbox-deps` 的 `deps/build-erofs.sh` 产出），放到 PATH
 或 `flatten-ctl` 同目录。
+
+端到端用例 `make e2e`（`test/e2e/`）经 `make zot` 拉一份 zot registry 二进制，让
+`flatten-ctl` 从真实 OCI-1.1 registry 拉取、展平并回写 Referrers；非 `make test` 的一
+部分，需 docker / `mkfs.erofs` / 网络与同级 `sandbox-accelerator`。
 
 ## 依赖
 

@@ -67,7 +67,7 @@ OCI layout (`oci:./dir`) 可先经 `skopeo copy oci:./xxx docker-archive:/tmp/x.
 | `verify` | 对同一输入展平两次,比对字节级 sha256,确认确定性(registry 源:拉一次→展两遍) |
 | `info` | 读 EROFS superblock + 末尾 ZIP 里的 OCI runtime config 并打印 |
 | `cache` | `cache info` 看缓存占用、`cache gc` 按 LRU 回收到上限(§2.5) |
-| `config` | 输出规范化的 flatten 配置(`--config`/`FLATTEN_CONFIG`),或 `--template` 骨架 |
+| `config` | 输出规范化的 flatten 配置(`--config`/`FLATTEN_CONFIG`,加载即校验),或 `--template` 骨架;`-o <file>` 写文件(默认 stdout) |
 
 `export` / `verify` 的输入是**位置参数**(匿名),按下列优先级自动判别 registry / 本地:
 
@@ -224,7 +224,7 @@ cache:
   dir: ""                      # OCI-layout 持久缓存根;空(默认)= 临时缓存(tmpdir 下,跑完清理)
   max_size: 10GiB              # 上限,超出按 LRU 回收;"0" = 不限,仅手动 cache gc
 referer:                       # --with-referer / referer.enabled 用(见下)
-  enabled: false               # 默认启用幂等 Referrers 流(等价命令行 --with-referer)
+  enabled: false               # 置 true 默认启用幂等 Referrers 流(等价命令行 --with-referer)
   desc: acme-prod              # 公开 owner 描述
   key:  acme-prod              # HMAC 消息,默认 == desc
   validity: 720h               # 可选;写入 valid_at 的过期段
@@ -291,7 +291,7 @@ referrer(owner token / id / 时间)对能读该 repo 者可见——owner 经 HM
 
 ```
 flatten-ctl cache info [--config <p>] [--cache-dir <D>]
-flatten-ctl cache gc   [--config <p>] [--cache-dir <D>] [--cache-max-size <S>]
+flatten-ctl cache gc   [--config <p>] [--cache-dir <D>] [--cache-max-size <S>] [--no-progress]
 ```
 
 `cache` 子命令面向**持久**缓存(`cache.dir` 显式配置时);默认临时缓存随 `export` 跑完即清，
@@ -438,8 +438,9 @@ EROFS 自身的格式版本由 `mkfs.erofs` 决定(我们用 erofs-utils 1.9.x);
 完成后追加 ZIP:以 append 方式打开输出文件,在 EROFS 段之后写一条 STORED
 (无压缩)模式的 `config.json` entry(§3.3 的确定性约束)。
 
-`mkfs.erofs` 在 `make build` 时由 `make deps-erofs` 构建到 `bin/<arch>/`,
-flatten-ctl 启动时优先在自己的同目录查找 `mkfs.erofs`,其次走 `PATH`。
+`mkfs.erofs` 由 `sandbox-deps` 仓构建产出(`make -C ../sandbox-deps erofs`);本仓
+`make build` 只构建 flatten-ctl。flatten-ctl 启动时优先在自己的同目录查找
+`mkfs.erofs`,其次走 `PATH`。
 
 EROFS 格式 endian-neutral,所以 host arch 与 target arch 无关——任何
 `mkfs.erofs` 都能产出可被任何 arch guest 挂载的镜像。
@@ -520,6 +521,6 @@ OCI image config 字段繁多,大量与启动无关:`created` / `author` / `hist
   沙箱 启动时如何使用 ZIP trailer 中的 OCI runtime config
 - [`sandbox.md`](sandbox.md) §boot.root.base —— 用展平镜像作为 sandbox
   的只读根
-- [`build.md`](build.md) —— `make deps-erofs` 构建 mkfs.erofs;
-  `make build` 把 flatten-ctl 与 mkfs.erofs 一并打到 `bin/<arch>/`
+- [`build.md`](build.md) —— `sandbox-deps` 构建 mkfs.erofs(`make -C ../sandbox-deps
+  erofs`);本仓 `make build` 只构建 flatten-ctl,运行期经同目录 / `PATH` 定位 mkfs.erofs
 - `PROPOSAL.md` §10.4 —— 展平在系统中的位置与目标
