@@ -77,7 +77,7 @@ type OBSConfig struct {
 	MaxInflight int `yaml:"max_inflight"`
 
 	// OpTimeout is the per-call wall-clock budget (Go duration
-	// string, e.g. "10s"). Default 10s.
+	// string, e.g. "10s"). Empty/absent = 0 = no per-op deadline.
 	OpTimeout string `yaml:"op_timeout"`
 
 	// MaxObjectSize bounds Get response bytes. Default 16 MiB.
