@@ -174,12 +174,24 @@ version:       1
 image size:    10.0 GiB (10737418240 bytes)
 chunk mode:    cdc
 chunk count:   20480
-min chunk:     63.5 KiB
-max chunk:     1.0 MiB
+zero chunks:   0 (0 B)
+holes:         0 (0 B)
+min chunk:     63.5 KiB    (configured)
+max chunk:     1.0 MiB    (configured)
 avg chunk:     524.0 KiB
+
+size distribution (data chunks):
+       min(N)          P1          P5         P25         P50         P75         P95         P99      max(N)
+  63.5K(1)       128.0K      256.0K      384.0K      512.0K      640.0K      896.0K        1.0M     1.0M(412)
+  (max == configured max — 412/20480 (2.0%) chunks are forced CDC cuts)
 key table:     655380 bytes (sealed)
 manifest size: 1887436 bytes
 ```
+
+`min chunk` / `max chunk` 标 `(configured)` 是因为它们来自 Manifest 头里记录的
+**配置值**,不是实测;实测分布在下面的百分位表里(只统计非 zero 的数据 chunk,
+`min(N)` / `max(N)` 括号内是取到该极值的 chunk 数;最后一行仅当实测最大值正好
+等于配置上限时出现,提示有多少 chunk 是被 CDC 强制切的)。
 
 查看 store 中的 manifest 直接 `manifest-ctl info manifest://<hex>`(等价于
 旧的 `get-manifest … | info -` 管道)。
@@ -254,7 +266,10 @@ crypto:
 字段说明:
 
 - `manifest.key` — 客户密钥,**Manifest 中密钥表的密封密钥**。**不参与
-  chunk 加密或寻址**。loss → 整个 Manifest 不可读。
+  chunk 加密或寻址**。loss → 整个 Manifest 不可读。可留空,改由
+  `$MANIFEST_KEY` 环境变量提供——这是密钥的**主要交付方式**,且 `$MANIFEST_KEY`
+  存在时**覆盖**此处 YAML 的值(密钥懒解析、不写回 Config,故不会被
+  `config show` 回显)。两者皆空时,真正用到密封/解封的命令才报错。
 - `store.endpoint` — manifest-ctl 不直接读写持久层;所有 chunk / Manifest
   I/O 通过这个 gRPC 客户端打到 store-ctl 守护进程。
 - `cache.endpoint` — 空则 manifest-ctl `load` 路径直走 store gRPC;非空则
@@ -265,13 +280,21 @@ crypto:
 
 ### 3.2 加载顺序
 
-CLI flag 与对应环境变量是仅有的两种来源,**没有自动查找**:
+**配置文件**的来源只有 CLI flag 与对应环境变量两种,**没有自动查找**:
 
 ```
 --manifest-config FILE     ┐
                            ├─ 优先级:flag > env;两者皆缺则报错
 MANIFEST_CONFIG            ┘   (config generate 除外)
 ```
+
+**customer key 是例外**:它可以来自配置文件的 `manifest.key`,**也可以**来自
+`$MANIFEST_KEY` 环境变量,且后者存在时覆盖前者(§3.1)——所以即便共享的
+MANIFEST_CONFIG 不含 key,命令仍能拿到密钥。
+
+除文件外,`pkg/manifest.ParseConfig` 还支持从**内存 YAML 字节**装配 Config
+(例如经 config-socket 投递给 sandbox-ctl),endpoint / crypto 等参数无需落盘;
+customer key 通常由调用方单独设到 `Config.Manifest.Key`。
 
 不再支持单字段 CLI overrides(`--manifest-key` / `--chunk-mode` 等已移除)
 —— 切换分块或加密模式直接改 YAML。

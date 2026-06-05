@@ -204,8 +204,7 @@ obs:
 ┌──────── store-ctl 进程 ────────────────────────┐
 │                                                  │
 │  gRPC server (listen)                            │
-│   ├ StoreServer (Put/Get/GetSalt)               │
-│   └ Health server (health_listen)               │
+│   └ StoreServer (Put/Get/GetSalt)               │
 │                                                  │
 │  Backend                                         │
 │   ├ fs:  filepath I/O at root                   │
@@ -215,11 +214,12 @@ obs:
 └──────────────────────────────────────────────────┘
 ```
 
-数据面与控制面分离:
+数据面与运维面分离:
 
-- **数据面**:gRPC `Put`(客户端流)/ `Get`(服务端流)/ `GetSalt` 走
-  `listen:` 端口,manifest-ctl / cache-ctl 作为 gRPC 客户端连接;
-- **控制面**:`grpc.health.v1.Health` 走 `health_listen:` 端口供探针使用;
+- **数据面**:`serve` 在单个 `listen:` 端口上只注册 Store 这一个 gRPC 服务,
+  含 `Put`(客户端流)/ `Get`(服务端流)/ `GetSalt`,manifest-ctl / cache-ctl
+  作为 gRPC 客户端连接;**没有**独立的 health listener(store-ctl 无
+  `health_listen` 字段);
 - **运维面**:admin 子命令直接打开后端,**不**经过 gRPC,与运行中的 serve
   共存(读同一份 meta)。
 

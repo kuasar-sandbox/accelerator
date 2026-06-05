@@ -26,8 +26,9 @@ Bloom Filter 全部常驻内存)。
 
 ### 1.2 一句话原则
 
-- **数据面**:自定义 wire 协议(39 B 请求头 / 8 B 响应头,5 个 opcode)。
-- **控制面**:gRPC 标准 health 探活独立端口。
+- **数据面**:自定义 wire 协议(39 B 请求头 / 8 B 响应头,6 个 opcode)。
+- **控制面**:`health_listen` 独立端口同时跑两个 gRPC 服务——标准 `health.v1.Health`
+  探活,以及 `cache.v1.Info`(`Get` 拉运行时计数快照 + `WaitFills` 等待 fill 排空)。
 - **存储引擎**:RocksDB(BlobDB 旁路大 value),关闭压缩(密文熵高)。
 - **写入语义**:强制准入,无应用层 LRU/SLRU。淘汰由 CompactionFilter 在
   后台按 CMS 频率统计驱动。
@@ -78,12 +79,14 @@ cache-ctl shard put --endpoint host:port --namespace chunk --hash HEX --idx N --
 
 ```
 cache-ctl ping --endpoint host:port            # gRPC 健康探测 (--endpoint 指向 health_listen)
-cache-ctl info --endpoint host:port            # 实时 stats(同 health_listen)
+cache-ctl info --endpoint host:port [--json]   # 实时 stats(同 health_listen);--json 输出原始 JSON
 cache-ctl info --rocks-path PATH               # 离线只读打开 RocksDB,查看属性
 ```
 
-`ping` / `info --endpoint` 是**控制面**端口(`health_listen`,典型 7071),
-**不是**数据端口——它调 gRPC `health.v1.Health/Check`,不走 wire 协议。
+`ping` / `info --endpoint` 都指向**控制面**端口(`health_listen`,典型 7071),
+**不是**数据端口,都不走 wire 协议。两者调不同 gRPC 服务:`ping` 调
+`health.v1.Health/Check`;`info --endpoint` 调 `cache.v1.Info/Get`,把运行时计数
+快照拉回来(`--json` 输出原始 JSON,否则人类可读表格)。
 `info --rocks-path` 走 RocksDB secondary instance(只读并行打开),不打扰
 运行中的 cache-ctl。
 
@@ -98,18 +101,22 @@ cache-ctl bench --endpoint host:port [flags]
 
 Flags:
   --concurrency int         (default 8)
-  --duration duration       (default "10s")
+  --duration duration       Go duration (default 10s)
   --value-size int          (default 262144)  # 256 KiB
-  --mode string             "get" | "put" | "mixed" (default "mixed")
+  --mode string             "get" | "put" | "mixed";默认空,--prefill-endpoint 为空时解析为
+                            "mixed",否则强制 "get"(显式传 put/mixed + 独立 prefill 端点报错)
   --namespace string        "chunk" | "manifest"
   --prefill int             get/mixed 模式预写对象数 (default 1000)
   --prefill-endpoint string 独立预写端点(默认同 --endpoint)
-  --info-endpoint string    bench 窗口计数显示端点
+  --info-endpoint string    bench 目标的 Info gRPC 端点(HealthListen);开启 bench 窗口计数显示
   --access string           "seq" | "uniform" | "zipf" 读访问模式 (default "seq")
   --zipf-s float            Zipf 偏斜指数 s (>1,越大越偏;仅 --access zipf) (default 1.1)
   --cold-prefill int        额外只写 prefill 端点、不暖 bench 目标的冷 key 数(喂 L2-miss → L3)
   --miss-ratio float        命中冷 key 的读比例 → L2 miss → 透传 origin/L3 (需 --cold-prefill>0 + --prefill-endpoint)
   --timeout duration        客户端 per-op TCP deadline (default 10s;慢/卡 origin 大数据集 prefill 须调大)
+  --cpu-profile string      bench 窗口内写 CPU profile 到文件
+  --heap-profile string     bench 窗口结束后写 heap profile 到文件
+  --trace string            bench 窗口内写执行 trace 到文件
 ```
 
 #### 基准方法学(L2 内存/磁盘路径、L3 透传、aging)
@@ -222,8 +229,8 @@ tiers:
 
   - type: ec                   # EC 客户端 → shard 集群
     cluster:
-      data_shards: 4           # RS k=4
-      parity_shards: 1         # RS m=1 → 总 5 分片,25% 开销
+      data_shards: 4           # RS k=4(空/≤0 → 默认 4;见下「分片数自动收敛」)
+      parity_shards: 1         # RS m=1 → 总 5 分片,25% 开销(空/≤0 → 默认 1)
       peers:
         - {id: l2-01, endpoint: 10.0.1.11:7070}
         - {id: l2-02, endpoint: 10.0.1.12:7070}
@@ -234,7 +241,7 @@ tiers:
       timeout: 2s
 
 origin:
-  type: store                  # 唯一合法值;cache-ctl 不直接访问文件系统
+  type: store                  # store | upstream(见 §3.4「upstream 层」);cache-ctl 不直接访问文件系统
   store:
     endpoint: 10.0.1.50:7100   # store-ctl gRPC endpoint
     pool: 4                    # 独立 grpc.ClientConn 数(round-robin)
@@ -244,7 +251,22 @@ origin:
 
 `origin.type: store` 把 cache-ctl 的 L3 fallback 指向一个 store-ctl 守护
 进程——所有 origin miss 都通过 gRPC `Get` 流式拉回。cache-ctl 进程**没有
-任何**文件系统读写权限,所有持久化都集中在 store-ctl。
+任何**文件系统读写权限,所有持久化都集中在 store-ctl。origin 另一合法值是
+`type: upstream`(指向另一台 cache-ctl wire 端点,见下「upstream 层」)。
+
+#### 分片数自动收敛(clamp)
+
+EC 每个对象恰好放 `data + parity` 个分片(一片一 peer,Maglev 定位),因此
+`data + parity` 不能超过 `len(peers)`——否则每次 Get 都在路由阶段失败
+("need N nodes but only M")。构造 EC tier 时(`data≤0→4`、`parity≤0→1` 默认补全
+之后)若发现 `data + parity > len(peers)=n`,自动把方案收敛到 n 个 peer 并打一条
+WARN,**优先保住 parity(容错)、缩小 data**:
+
+- `parity < n` → `data = n - parity`(保留配置的 parity);
+- `parity ≥ n` → `data = 1, parity = n-1`(parity 单独都放不下,退化为最大冗余;
+  `n == 1` 时即 `1+0`,无冗余单 peer 直通——分片缺失就是 miss,读写仍正常);
+- `data + parity ≤ n` 原样保留(每对象扇出小于 peer 数是合法且可能有意为之:
+  对象散布在 peer 子集上做负载均衡,每次 Get 读的分片更少 → EC 尾延迟放大更小)。
 
 #### upstream 层(可选)
 
@@ -272,7 +294,8 @@ tiers:
 | 参数 | 说明 |
 |---|---|
 | `listen` | wire 数据面 TCP 监听 |
-| `health_listen` | gRPC 健康检查监听(`grpc.health.v1.Health`)。省略则不启动 |
+| `health_listen` | gRPC 控制面监听,同端口跑两个服务:`health.v1.Health`(探活)+ `cache.v1.Info`(`Get` 拉计数快照 / `WaitFills` 等 fill 排空)。省略则两者都不启动 |
+| `freq.disable_eviction` | bool。关掉频率式 compaction-filter 淘汰:sketch 仍维护(供 stats),但 filter 永不挂载,任何 key 都不会按访问计数被淘汰。用于某台 local cache-ctl 充当下游 tiered 的 origin(bench 场景)——写入落一次就必须留住 |
 | `pool` | 到单个 peer 的并行 TCP 连接数。wire 是 sync request/response,单连接会把并发请求串行化 |
 | `max_inflight` | 客户端到该 tier 的最大并发对象请求数。embedded 推荐不设;origin 建议 16-32 |
 | `rpc_timeout` | 服务端每请求 wall-clock 上限。**缺省/空/非法 = 0 = 无 per-request deadline**:请求只受客户端连接 / 调用方取消约束,不强加任意值。显式设有限值时,超时返回 `StatusError`,TieredCache 视作该层 miss 继续下一层。卡死请求的可观测性改由 `CACHE_CTL_DEBUG` 追踪(§6.5) |
@@ -327,6 +350,7 @@ Request  (固定 39 B 头 + 可选 Value):
   0   TotalLen     u32   整帧字节数
   4   Opcode       u8    0x01 ObjectGet / 0x02 ObjectPut
                           0x03 ShardGet  / 0x04 ShardPut / 0x05 Ping
+                          0x06 CancelRequest(取消在途请求)
   5   Namespace    u8    0x01 chunk / 0x02 manifest(Ping 忽略)
   6   Flags        u8    保留
   7   Hash         32 B  SHA256(ciphertext);Ping 时全 0
@@ -335,7 +359,7 @@ Request  (固定 39 B 头 + 可选 Value):
 
 Response (固定 8 B 头 + 可选 ErrMsg + 可选 Value):
   0   TotalLen     u32
-  4   Status       u8    0x00 Hit / 0x01 Miss / 0x02 Error
+  4   Status       u8    0x00 Hit / 0x01 Miss / 0x02 Error / 0x03 Cancelled
   5   Reserved     u8
   6   ErrLen       u16   仅 Status=Error 时 > 0
   8   ErrMsg       UTF-8 文本,仅 Error
@@ -366,11 +390,20 @@ tier chain 全 miss、tiered 收到 Put)都返回 `StatusError` + 文本
 把 `StatusError` 当成该层 miss,确保 tier chain 的可用性不被单层瞬时故障
 拉低——下一层只要能响应,读请求整体就能成功。
 
+#### 请求取消(CancelRequest / StatusCancelled)
+
+客户端可在请求在途时发一个 `CancelRequest`(0x06)帧,服务端据此提前中止
+正在处理的请求并回 `StatusCancelled`(0x03):取消会 cancel 该请求的处理
+ctx(命中 ctx 的后端——tier chain 远端跳、origin IO——随之中断),已在该连接
+上排队的待处理请求也一并回 `StatusCancelled`。这是 EC hedge 取消慢 peer 的
+机制——`data` 个分片先到即可解码,其余在途 ShardGet 被取消,不必干等。
+
 #### 不提供的操作
 
 - **Delete**:内容寻址下不删除,淘汰由 §4.4 频率 sketch + CompactionFilter
   异步处理。
-- **AdminService / Stats**:运行时指标走结构化日志;离线诊断用
+- **AdminService**:无独立 admin RPC。运行时计数通过控制面 `cache.v1.Info/Get`
+  拉(pull-only,见 §1.2 / §6.3),不再有周期性 stderr 统计日志;离线诊断用
   `cache-ctl info --rocks-path` 直接打开 RocksDB(secondary instance 模式)。
 - **Streaming**:所有请求/响应都是 one-shot;Get/Put 的 value 上限由
   `MaxFrameSize` 限制,超大对象必须在上层分片(EC tier 的职责)。
@@ -661,21 +694,20 @@ cache-ctl serve --config /etc/cache/tiered.yaml
 
 `SIGINT` / `SIGTERM` 关闭序列:
 
-1. 若启用健康服务,先把 gRPC health 状态置 `NOT_SERVING`(让编排器立刻
+1. 若启用控制面,先把 gRPC health 状态置 `NOT_SERVING`(让编排器立刻
    下线);
-2. 结构化日志输出最后一条快照,停止周期定时器;
-3. wire server graceful stop:排空 in-flight,硬上限 5 s;
-4. gRPC 健康 server graceful stop;
-5. tier chain 反序级联关闭(embedded → ec → upstream),local/shard 模式
-   下的 RocksDB。
+2. wire server graceful stop:排空 in-flight,硬上限 5 s;
+3. gRPC 控制面 server graceful stop(Health + Info 同在该 server);
+4. tiered 模式调 `TieredCache.Close()` 取消在途 async fill;tier chain 反序
+   级联关闭(embedded → ec → upstream),local/shard 模式下关 RocksDB。
 
-### 6.3 结构化日志
+### 6.3 运行时计数(pull-only)
 
-每 N 秒向 stderr 输出 JSON 行:
-
-```json
-{"ts":"2026-04-10T03:00:00Z","mode":"tiered","hits":12345,"misses":67,"puts":89,"evictions":5}
-```
+运行时计数不再周期性向 stderr 输出——改为按需经控制面 `cache.v1.Info/Get`
+拉取(`health_listen` 端口,见 §1.2)。`cache-ctl info --endpoint host:port`
+即取一次快照(`--json` 出原始 JSON,否则人类可读表格),含 server hits/misses/
+fills、各 tier 与 origin 计数、EC 各 peer 计数、embedded/local/shard 的 RocksDB
+CF 属性。bench 脚本用同一服务取 bench 窗口前后的 delta。
 
 ### 6.4 离线诊断
 
@@ -706,6 +738,10 @@ CACHE_CTL_SLOW=2s CACHE_CTL_DEBUG=1 cache-ctl serve ...      # 自定慢阈值
   卡死的 tier / origin 立即可见,不必等 deadline
 - 覆盖 wire 服务端请求处理(含 tiered fill / origin 回源)
 
+另有 `CACHE_CTL_TIMING=1`(进程启动时读)开启 EC.Get 的分阶段耗时日志
+(LocateN / fan-out / decode 各段 + 各分片到达偏移),按 1% 采样,默认关、热
+路径零开销。专测 EC hedge 的扇入与尾延迟,与上面的 `CACHE_CTL_DEBUG` 正交。
+
 生产默认关闭;与 `pprof_listen` 互补——tracer 看"哪些请求慢/卡",pprof
 看"卡在哪段代码"。
 
@@ -724,8 +760,9 @@ CACHE_CTL_SLOW=2s CACHE_CTL_DEBUG=1 cache-ctl serve ...      # 自定慢阈值
 
 ## 8. See Also
 
-- [`store.md`](store.md) — tiered 模式 origin 是 store gRPC 客户端;cache-ctl
-  自身**没有**任何文件系统读写权限,所有持久化集中在 store-ctl
+- [`store.md`](store.md) — tiered 模式 origin = `store`(store gRPC 客户端)或
+  `upstream`(另一台 cache-ctl);store 形态下 cache-ctl 自身**没有**任何文件系统
+  读写权限,所有持久化集中在 store-ctl
 - [`manifest.md`](manifest.md) — manifest-ctl 通过 wire ObjectGet 调 cache-ctl
   tiered;Manifest 内 chunk hash = 这里的 wire Hash 字段
 - [`perf.md`](perf.md) §cache — 实测延迟与吞吐基线
