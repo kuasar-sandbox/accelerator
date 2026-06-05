@@ -112,6 +112,13 @@ func New(cfg Config) (Interface, error) {
 	if parity <= 0 {
 		parity = 1
 	}
+	// Fit the scheme to the peer count. data+parity > len(peers) would make
+	// every Get fail at routing ("need N nodes but only M"); clamp to fit.
+	if nd, np, clamped := clampShardsToPeers(data, parity, len(cfg.Cluster.Peers)); clamped {
+		log.Printf("ec: data+parity (%d+%d) exceeds %d peers; clamped to %d+%d",
+			data, parity, len(cfg.Cluster.Peers), nd, np)
+		data, parity = nd, np
+	}
 
 	enc, err := newEncoder(data, parity)
 	if err != nil {
