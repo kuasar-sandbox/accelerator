@@ -40,3 +40,15 @@ func LoadConfig(flagPath, envName string) (*Config, error) {
 	}
 	return &cfg, nil
 }
+
+// ParseConfig parses a manifest config from an in-memory YAML document (e.g.
+// delivered to sandbox-ctl over the config-socket), so endpoints and crypto
+// params need not be read from disk. The customer key is typically supplied
+// separately and set on Config.Manifest.Key by the caller.
+func ParseConfig(data []byte) (*Config, error) {
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("manifest: parse config bytes: %w", err)
+	}
+	return &cfg, nil
+}
