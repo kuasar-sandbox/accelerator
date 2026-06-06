@@ -280,6 +280,40 @@ func (c *Config) GetManifestBlob(ctx context.Context, key store.ContentKey) ([]b
 	return data, nil
 }
 
+// CheckManifest verifies a manifest layer is PRESENT and sealed under the
+// CURRENT customer key (MANIFEST_KEY) — WITHOUT fetching any chunks. It gets the
+// manifest blob (one cache/store round-trip), unmarshals it, and unseals the
+// per-chunk key table under CustomerKey(): the AES-GCM unseal authenticates the
+// key, so a wrong/inconsistent customer key fails here deterministically.
+//
+// Returns nil when the layer exists and the key is consistent; a "not found"
+// error when the blob is absent; an unseal error when it was sealed under a
+// different key. It does NOT read chunks, so a manifest whose chunks belong to a
+// PURGED store generation still passes — use a full Fetcher read (the
+// manifest-ctl verify path) when chunk presence must also be proven.
+func (c *Config) CheckManifest(ctx context.Context, key store.ContentKey) error {
+	blob, err := c.GetManifestBlob(ctx, key)
+	if err != nil {
+		return err
+	}
+	m, sealedKT, err := codec.Unmarshal(blob)
+	if err != nil {
+		return fmt.Errorf("manifest %s: parse: %w", HexKey(key), err)
+	}
+	ck, err := c.CustomerKey()
+	if err != nil {
+		return err
+	}
+	_, dec, err := crypto.New(c.Crypto)
+	if err != nil {
+		return fmt.Errorf("manifest: crypto: %w", err)
+	}
+	if _, err := codec.UnsealKeys(m, sealedKT, ck, dec); err != nil {
+		return fmt.Errorf("manifest %s: key inconsistent (unseal failed under current MANIFEST_KEY): %w", HexKey(key), err)
+	}
+	return nil
+}
+
 // Ensure compile-time that the package's store/codec types are still
 // reachable; the alias file (alias.go) re-exports them for callers
 // that want a single import.
