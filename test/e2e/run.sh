@@ -128,6 +128,12 @@ is_hex64() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
 # preflight
 # --------------------------------------------------------------------------
 log "preflight"
+# flatten-ctl preserves the image's real uid/gid (chown), which needs root —
+# re-exec under sudo so the flattened rootfs keeps ownership (e.g. /home/<user>).
+if [ "$(id -u)" -ne 0 ]; then
+	command -v sudo >/dev/null 2>&1 || skip "not root and sudo unavailable (flatten preserves ownership; needs root)"
+	exec sudo -nE "$0" "$@"
+fi
 have curl || skip "curl not found"
 have docker || skip "docker not found"
 docker info >/dev/null 2>&1 || skip "docker not usable (daemon down or no permission)"

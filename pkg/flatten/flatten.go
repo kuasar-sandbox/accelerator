@@ -456,6 +456,9 @@ func applyLayerTar(r io.Reader, rootfsDir string) error {
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return err
 			}
+			if err := applyOwnerMode(target, hdr, true); err != nil {
+				return err
+			}
 		case tar.TypeReg:
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
@@ -465,12 +468,18 @@ func applyLayerTar(r io.Reader, rootfsDir string) error {
 			if err := writeFile(target, hdr.FileInfo().Mode(), tr); err != nil {
 				return err
 			}
+			if err := applyOwnerMode(target, hdr, true); err != nil {
+				return err
+			}
 		case tar.TypeSymlink:
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
 			os.Remove(target)
 			if err := os.Symlink(hdr.Linkname, target); err != nil {
+				return err
+			}
+			if err := applyOwnerMode(target, hdr, false); err != nil {
 				return err
 			}
 		case tar.TypeLink:
@@ -482,8 +491,34 @@ func applyLayerTar(r io.Reader, rootfsDir string) error {
 			if err := os.Link(linkTarget, target); err != nil {
 				return err
 			}
+			// hardlink shares the target inode's owner/mode; nothing to set here.
 		}
 	}
+}
+
+// applyOwnerMode preserves the tar entry's ownership and (for non-symlinks) mode
+// onto target, so the flattened image keeps the source image's real uid/gid and
+// permission bits — e.g. /tmp stays 1777 and /home/<user> stays user-owned, so a
+// non-root guest user can write to its home. Owner is set BEFORE mode because
+// chown clears setuid/setgid and the chmod restores them.
+//
+// Preserving the image's real uid/gid requires root (CAP_CHOWN); the e2b build
+// runs flatten-ctl in the root sandbox-builder unit. An unprivileged flatten
+// fails here with a clear error rather than silently producing an image whose
+// ownership is all wrong (the previous --all-root behaviour).
+func applyOwnerMode(target string, hdr *tar.Header, chmod bool) error {
+	if err := os.Lchown(target, hdr.Uid, hdr.Gid); err != nil {
+		return fmt.Errorf("chown %s -> %d:%d (preserving image ownership requires root/CAP_CHOWN): %w",
+			hdr.Name, hdr.Uid, hdr.Gid, err)
+	}
+	if chmod {
+		// hdr.FileInfo().Mode() carries permission + setuid/setgid/sticky; os.Chmod
+		// applies those and ignores the type bits.
+		if err := os.Chmod(target, hdr.FileInfo().Mode()); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // clearDirectory removes all entries inside dir but keeps dir itself.
@@ -554,12 +589,18 @@ func buildImage(rootfsDir, outputPath string) error {
 // No compression: raw bytes enable CDC dedup (consistent with PROPOSAL §9.1).
 func buildEROFS(mkfsPath, rootfsDir, outputPath string) error {
 	cmd := exec.Command(mkfsPath,
-		"-Ededupe",                                   // intra-image file dedup
-		"--chunksize=4096",                           // chunk-based layout: metadata 7.6MiB→0.6MiB
-		"--all-root",                                 // force uid/gid=0
-		"-T0",                                        // fixed timestamp (epoch)
-		"-b4096",                                     // 4K block size
-		"-x-1",                                       // disable xattrs
+		"-Ededupe",         // intra-image file dedup
+		"--chunksize=4096", // chunk-based layout: metadata 7.6MiB→0.6MiB
+		// NOTE: no --all-root. The image's real uid/gid/mode is preserved by
+		// applyLayerTar (chown+chmod from the layer tar headers) so a non-root
+		// guest user can write to its home; mkfs.erofs records that ownership.
+		// Determinism holds: ownership comes from the (fixed) image layers, and
+		// flatten runs as root in the sandbox-builder unit. (The runtime erofs —
+		// sandbox-init, all root — is built by separate shell scripts that keep
+		// --all-root; this Go path is image-flatten only.)
+		"-T0",                                         // fixed timestamp (epoch)
+		"-b4096",                                      // 4K block size
+		"-x-1",                                        // disable xattrs
 		"-U", "00000000-0000-0000-0000-000000000000", // fixed UUID
 		"--quiet",
 		outputPath,
