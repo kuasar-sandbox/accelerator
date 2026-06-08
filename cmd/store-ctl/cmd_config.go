@@ -61,7 +61,9 @@ const storeConfigTemplate = `# store-ctl daemon configuration.
 # Reference this file via --config or the STORE_CONFIG environment
 # variable. There is no auto-discovery; unset = error.
 
-# gRPC listen address (host:port).
+# gRPC listen address. "host:port" for TCP, or a Unix socket path
+# ("/run/sandbox/store.sock" or "unix:///run/sandbox/store.sock"); clients then
+# set store.endpoint to the same path (or its unix:/// form).
 listen: 127.0.0.1:7100
 
 # Backend: fs | obs.

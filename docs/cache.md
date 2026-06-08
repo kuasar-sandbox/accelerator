@@ -29,6 +29,10 @@ Bloom Filter 全部常驻内存)。
 - **数据面**:自定义 wire 协议(39 B 请求头 / 8 B 响应头,6 个 opcode)。
 - **控制面**:`health_listen` 独立端口同时跑两个 gRPC 服务——标准 `health.v1.Health`
   探活,以及 `cache.v1.Info`(`Get` 拉运行时计数快照 + `WaitFills` 等待 fill 排空)。
+- **监听地址**:`listen` / `health_listen` 均取 `host:port`(TCP)或一个 Unix
+  socket 路径(`/run/sandbox/cache.sock` 或 `unix:///...`;为 socket 时启动清死
+  socket、chmod 0600)。数据面客户端 `cache.endpoint` 填同址即可;控制面经 socket
+  时,`ping` / `info --endpoint` 用 `unix:///` 形式。
 - **存储引擎**:RocksDB(BlobDB 旁路大 value),关闭压缩(密文熵高)。
 - **写入语义**:强制准入,无应用层 LRU/SLRU。淘汰由 CompactionFilter 在
   后台按 CMS 频率统计驱动。
@@ -157,8 +161,8 @@ Flags:
 
 ```yaml
 mode: local
-listen: 0.0.0.0:7070           # wire 数据面
-health_listen: 0.0.0.0:7071    # gRPC 健康检查(可省)
+listen: 0.0.0.0:7070           # wire 数据面;host:port 或 Unix socket(/run/sandbox/cache.sock 或 unix:///...)
+health_listen: 0.0.0.0:7071    # gRPC 健康检查(可省);同支持 Unix socket 路径
 rpc_timeout: ""                # 服务端每请求 wall-clock 上限。缺省/空/非法 = 0 =
                                # 无 per-request deadline:请求只受客户端连接 /
                                # 调用方取消约束。显式写 Go duration(如 "2s")才设上界

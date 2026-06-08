@@ -94,8 +94,13 @@ store-ctl init --config FILE --generation G
 store-ctl serve --config FILE
 ```
 
-绑定 yaml `listen:` 端口接受 gRPC。active generation 在 daemon 生命周期
-内**不变**,换代见 §2.5。
+绑定 yaml `listen:` 接受 gRPC。`listen` 取 `host:port`(TCP)或一个 Unix
+socket 路径(`/run/sandbox/store.sock` 或 `unix:///run/sandbox/store.sock`)——
+为 socket 时,启动会建好父目录、清掉**上次遗留的死 socket**(仅当该路径本身是
+无人监听的 socket;活动 socket 报 "address already in use",非 socket 路径绝不
+删)、bind 后 chmod 0600(节点内同用户访问);客户端 `store.endpoint` 填同一路径
+即可(裸路径或 `unix:///` 形式皆可,见 manifest.md §3)。active generation 在
+daemon 生命周期内**不变**,换代见 §2.5。
 
 ### 2.5 `store-ctl rollout`
 

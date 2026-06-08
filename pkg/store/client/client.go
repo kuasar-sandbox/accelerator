@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -51,11 +52,12 @@ func New(endpoint string, pool int, timeout time.Duration) (*Client, error) {
 	if pool <= 0 {
 		pool = 4
 	}
+	target := normalizeTarget(endpoint)
 	conns := make([]*grpc.ClientConn, 0, pool)
 	stubs := make([]pb.StoreClient, 0, pool)
 	for i := 0; i < pool; i++ {
 		cc, err := grpc.NewClient(
-			endpoint,
+			target,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		)
 		if err != nil {
@@ -213,6 +215,21 @@ func (c *Client) Put(ctx context.Context, partition store.Partition, key store.C
 		return false, fmt.Errorf("store: Put close: %w", err)
 	}
 	return resp.GetIsNew(), nil
+}
+
+// normalizeTarget rewrites a Unix-socket endpoint into gRPC's canonical
+// "unix:///abs" target so a bare path ("/run/store.sock") or the cache client's
+// "unix://path" form dials the same way; an explicit "unix:"/"unix-abstract:"
+// scheme and any "host:port" pass through unchanged for gRPC's own resolver.
+func normalizeTarget(endpoint string) string {
+	switch {
+	case strings.HasPrefix(endpoint, "unix:"):
+		return endpoint // gRPC resolves unix:/unix:///unix-abstract: natively
+	case strings.HasPrefix(endpoint, "/"):
+		return "unix://" + endpoint // absolute path -> unix:///abs
+	default:
+		return endpoint
+	}
 }
 
 func storePartitionToProto(p store.Partition) (pb.Partition, error) {

@@ -68,10 +68,13 @@ const cacheConfigTemplate = `# cache-ctl daemon configuration.
 # Mode: local | shard | tiered.
 mode: tiered
 
-# Wire data plane.
+# Wire data plane. "host:port" for TCP, or a Unix socket path
+# ("/run/sandbox/cache.sock" or "unix:///run/sandbox/cache.sock"); clients set
+# cache.endpoint to the same.
 listen: 127.0.0.1:7070
 
-# Health + Info gRPC.
+# Health + Info gRPC. "host:port" or a Unix socket path (same forms as listen);
+# ping / info --endpoint then dial the unix:/// form.
 health_listen: 127.0.0.1:7071
 
 # Per-RPC timeout for client connections.

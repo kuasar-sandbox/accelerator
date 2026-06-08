@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -27,6 +26,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/client"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/ec"
@@ -299,7 +299,7 @@ func cmdServe(args []string) {
 	// forwards a per-request deadline into HandleFrame so tiered-mode
 	// remote hops can be cancelled when a request exceeds the budget.
 	ws := server.NewWireServer(handler, 120*time.Second, cfg.ParseRPCTimeout())
-	dataLis, err := net.Listen("tcp", cfg.Listen)
+	dataLis, err := util.Listen(cfg.Listen)
 	if err != nil {
 		fatal("listen %s: %v", cfg.Listen, err)
 	}
@@ -325,7 +325,7 @@ func cmdServe(args []string) {
 		}
 		cachepb.RegisterInfoServer(grpcServer, infoSrv)
 
-		healthLis, err := net.Listen("tcp", cfg.HealthListen)
+		healthLis, err := util.Listen(cfg.HealthListen)
 		if err != nil {
 			fatal("listen health %s: %v", cfg.HealthListen, err)
 		}

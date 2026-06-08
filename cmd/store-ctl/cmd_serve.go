@@ -4,13 +4,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"net"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"google.golang.org/grpc"
 
+	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/pb"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/server"
 )
@@ -52,7 +52,7 @@ func cmdServe(args []string) {
 	gs := grpc.NewServer()
 	pb.RegisterStoreServer(gs, srv)
 
-	lis, err := net.Listen("tcp", cfg.Listen)
+	lis, err := util.Listen(cfg.Listen)
 	if err != nil {
 		fatal("listen %s: %v", cfg.Listen, err)
 	}

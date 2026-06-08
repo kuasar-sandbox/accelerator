@@ -243,11 +243,12 @@ manifest-ctl config generate
 manifest:
   key: "0a1b2c3d..."              # 32 字节 hex 客户密钥;Manifest 内嵌的密钥表用它密封
 store:
-  endpoint: 127.0.0.1:7100        # store-ctl gRPC 端点(必填)
+  endpoint: 127.0.0.1:7100        # store-ctl 端点(必填):host:port 或 Unix socket
+                                  # (/run/sandbox/store.sock 或 unix:///...);须与 store-ctl listen 一致
   pool: 4                         # 客户端并行 grpc.ClientConn 数 (round-robin)
   timeout: 5s                     # 单次 store RPC 超时
 cache:
-  endpoint: 127.0.0.1:7070        # 空 = 跳过 cache 层、直接走 store
+  endpoint: 127.0.0.1:7070        # 空 = 跳过 cache 层、直接走 store;同支持 Unix socket 路径
   pool: 4
   timeout: 2s
 chunker:
@@ -271,9 +272,13 @@ crypto:
   存在时**覆盖**此处 YAML 的值(密钥懒解析、不写回 Config,故不会被
   `config show` 回显)。两者皆空时,真正用到密封/解封的命令才报错。
 - `store.endpoint` — manifest-ctl 不直接读写持久层;所有 chunk / Manifest
-  I/O 通过这个 gRPC 客户端打到 store-ctl 守护进程。
+  I/O 通过这个 gRPC 客户端打到 store-ctl 守护进程。取 `host:port`(TCP)或一个
+  Unix socket(裸路径 `/run/sandbox/store.sock` 会被规范化为 gRPC 的
+  `unix:///run/sandbox/store.sock`,显式 `unix:` 形式原样透传)——与 store-ctl
+  的 `listen` 同址(同机经 socket 免 TCP 栈)。
 - `cache.endpoint` — 空则 manifest-ctl `load` 路径直走 store gRPC;非空则
-  通过 wire 协议穿 cache-ctl。
+  通过 wire 协议穿 cache-ctl。同样接受 `host:port` 或 Unix socket 路径
+  (`unix://path` 或裸 `/path`),与 cache-ctl 的 `listen` 同址。
 - `chunker.mode` — `cdc`(FastCDC,变长)或 `fixed`(固定大小)。详见 §4.1。
 - `crypto.chunk` / `crypto.manifest` — chunk 与 Manifest 各自的加密模式
   (§4.3 / §4.4)。fake 是性能基线模式,不要在生产打开。
