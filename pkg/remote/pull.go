@@ -43,12 +43,18 @@ func nameOpts(insecure bool) []name.Option {
 }
 
 func (c *Config) remoteOpts(ctx context.Context) []ggcrremote.Option {
-	return []ggcrremote.Option{
+	opts := []ggcrremote.Option{
 		ggcrremote.WithContext(ctx),
 		ggcrremote.WithAuth(authenticator()),
 		ggcrremote.WithPlatform(c.platform),
 		ggcrremote.WithJobs(c.PullJobs),
 	}
+	// A custom transport (TLS CA / skip-verify) must apply to every request,
+	// including the CDN blob redirects where MITM proxies swap the cert.
+	if c.transport != nil {
+		opts = append(opts, ggcrremote.WithTransport(c.transport))
+	}
+	return opts
 }
 
 // Resolve parses ref, contacts the registry, selects the configured platform
@@ -111,20 +117,10 @@ func (c *Config) Pull(ctx context.Context, res *Resolved, cache *Cache) (flatten
 		return nil, fmt.Errorf("remote: layers %s: %w", res.Digest, err)
 	}
 
+	// Pass 1: resolve every layer's digest + media type and note which ones
+	// are cache misses, so the download progress total is known up front.
 	refs := make([]layerRef, len(layers))
-	sem := make(chan struct{}, c.PullJobs)
-	var (
-		wg       sync.WaitGroup
-		mu       sync.Mutex
-		firstErr error
-	)
-	record := func(err error) {
-		mu.Lock()
-		if firstErr == nil {
-			firstErr = err
-		}
-		mu.Unlock()
-	}
+	var misses []int
 	for i, l := range layers {
 		d, err := l.Digest()
 		if err != nil {
@@ -135,9 +131,31 @@ func (c *Config) Pull(ctx context.Context, res *Resolved, cache *Cache) (flatten
 			return nil, fmt.Errorf("remote: layer media type: %w", err)
 		}
 		refs[i] = layerRef{digest: d, mt: mt}
-		if cache.Has(d) {
-			continue
+		if !cache.Has(d) {
+			misses = append(misses, i)
 		}
+	}
+
+	// Pass 2: download the misses concurrently (bounded by PullJobs),
+	// reporting each completion through OnPullProgress.
+	toPull := len(misses)
+	sem := make(chan struct{}, c.PullJobs)
+	var (
+		wg     sync.WaitGroup
+		mu     sync.Mutex
+		errVal error
+		done   int
+	)
+	record := func(err error) {
+		mu.Lock()
+		if errVal == nil {
+			errVal = err
+		}
+		mu.Unlock()
+	}
+	for _, i := range misses {
+		l := layers[i]
+		d := refs[i].digest
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(l v1.Layer, d v1.Hash) {
@@ -150,12 +168,20 @@ func (c *Config) Pull(ctx context.Context, res *Resolved, cache *Cache) (flatten
 			}
 			if _, err := cache.Put(d, rc); err != nil {
 				record(err)
+				return
+			}
+			mu.Lock()
+			done++
+			n := done
+			mu.Unlock()
+			if c.OnPullProgress != nil {
+				c.OnPullProgress(n, toPull)
 			}
 		}(l, d)
 	}
 	wg.Wait()
-	if firstErr != nil {
-		return nil, firstErr
+	if errVal != nil {
+		return nil, errVal
 	}
 
 	return &registrySource{cache: cache, configJSON: cfgBytes, layers: refs}, nil

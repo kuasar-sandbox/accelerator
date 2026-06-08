@@ -49,6 +49,18 @@ type Options struct {
 	// Useful when /tmp is small and images are large. Empty → default
 	// (os.MkdirTemp("", ...) which respects $TMPDIR).
 	TmpDir string
+
+	// Progress, if non-nil, receives coarse stage notifications during a
+	// flatten so a caller (the CLI) can render progress; the library stays
+	// silent when nil. stage is a short token; done/total carry per-stage
+	// detail:
+	//   - "extract-archive" (docker-archive source only): running / total
+	//     bytes extracted from the input tar (total is 0 when the input is a
+	//     pipe whose size isn't known ahead of time). Fires frequently — the
+	//     consumer throttles its own output.
+	//   - "apply-layers": 1-based layer index in done, layer count in total.
+	//   - "build-erofs" / "append-config": done=total=0.
+	Progress func(stage string, done, total int)
 }
 
 // LayerOpener opens one layer's *uncompressed* tar stream. The caller
@@ -96,6 +108,9 @@ func Build(src Source, outputPath string, opts Options) error {
 		return fmt.Errorf("flatten: image has no layers")
 	}
 	for i, open := range layers {
+		if opts.Progress != nil {
+			opts.Progress("apply-layers", i+1, len(layers))
+		}
 		if err := applyLayerOpener(open, rootfsDir); err != nil {
 			return fmt.Errorf("flatten: apply layer %d: %w", i, err)
 		}
@@ -107,6 +122,9 @@ func Build(src Source, outputPath string, opts Options) error {
 	}
 
 	// Step 3: build the EROFS image.
+	if opts.Progress != nil {
+		opts.Progress("build-erofs", 0, 0)
+	}
 	if err := buildImage(rootfsDir, outputPath); err != nil {
 		return err
 	}
@@ -116,6 +134,9 @@ func Build(src Source, outputPath string, opts Options) error {
 	// EROFS image's extent is described in its superblock; the ZIP trailer
 	// is addressable independently via standard tools (`unzip -l`,
 	// `archive/zip`, `flatten-ctl info`).
+	if opts.Progress != nil {
+		opts.Progress("append-config", 0, 0)
+	}
 	cfgJSON, err := src.ConfigJSON()
 	if err != nil {
 		return fmt.Errorf("flatten: read config: %w", err)
@@ -142,7 +163,7 @@ func Flatten(input io.Reader, outputPath string) error {
 
 // FlattenWith is the explicit-options form of Flatten.
 func FlattenWith(input io.Reader, outputPath string, opts Options) error {
-	src, cleanup, err := newDockerArchiveSource(input, opts.TmpDir)
+	src, cleanup, err := newDockerArchiveSource(input, opts)
 	if err != nil {
 		return err
 	}
@@ -222,17 +243,32 @@ type dockerArchiveSource struct {
 }
 
 // newDockerArchiveSource extracts the docker-archive tar from input into a
-// fresh temp dir under tmpDir, parses manifest.json, and returns a Source
+// fresh temp dir under opts.TmpDir, parses manifest.json, and returns a Source
 // over it plus a cleanup func that removes the temp dir. The cleanup is
-// always safe to call (even on error it is a no-op nil).
-func newDockerArchiveSource(input io.Reader, tmpDir string) (*dockerArchiveSource, func(), error) {
-	archiveDir, err := os.MkdirTemp(tmpDir, "flatten-archive-*")
+// always safe to call (even on error it is a no-op nil). When opts.Progress is
+// set it reports extraction progress as the "extract-archive" stage, with the
+// running and total byte counts (total is the input file size when input is a
+// regular file — `docker save … > img.tar` or stdin redirected from one — and
+// 0 for a pipe, where the size isn't known ahead of time).
+func newDockerArchiveSource(input io.Reader, opts Options) (*dockerArchiveSource, func(), error) {
+	archiveDir, err := os.MkdirTemp(opts.TmpDir, "flatten-archive-*")
 	if err != nil {
 		return nil, func() {}, fmt.Errorf("flatten: create temp dir: %w", err)
 	}
 	cleanup := func() { os.RemoveAll(archiveDir) }
 
-	if err := extractTar(input, archiveDir); err != nil {
+	var onBytes func(done int64)
+	if opts.Progress != nil {
+		var total int64
+		if f, ok := input.(*os.File); ok {
+			if fi, err := f.Stat(); err == nil && fi.Mode().IsRegular() {
+				total = fi.Size()
+			}
+		}
+		onBytes = func(done int64) { opts.Progress("extract-archive", int(done), int(total)) }
+	}
+
+	if err := extractTar(input, archiveDir, onBytes); err != nil {
 		cleanup()
 		return nil, func() {}, fmt.Errorf("flatten: extract archive: %w", err)
 	}
@@ -261,8 +297,13 @@ func (s *dockerArchiveSource) ConfigJSON() ([]byte, error) {
 
 // --- internal helpers ---
 
-// extractTar extracts all entries from a tar stream into destDir.
-func extractTar(r io.Reader, destDir string) error {
+// extractTar extracts all entries from a tar stream into destDir. When onBytes
+// is non-nil it is invoked with the running count of bytes consumed from r as
+// extraction proceeds (callers throttle their own rendering).
+func extractTar(r io.Reader, destDir string, onBytes func(done int64)) error {
+	if onBytes != nil {
+		r = &countingReader{r: r, onRead: onBytes}
+	}
 	tr := tar.NewReader(r)
 	for {
 		hdr, err := tr.Next()
@@ -311,6 +352,24 @@ func extractTar(r io.Reader, destDir string) error {
 			}
 		}
 	}
+}
+
+// countingReader wraps r and reports the running total of bytes read after
+// each Read via onRead. onRead must be cheap — it fires per Read call, so any
+// throttling of the rendered output happens on the consumer side.
+type countingReader struct {
+	r      io.Reader
+	n      int64
+	onRead func(done int64)
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	m, err := c.r.Read(p)
+	if m > 0 {
+		c.n += int64(m)
+		c.onRead(c.n)
+	}
+	return m, err
 }
 
 // writeFile creates or truncates a file and writes data from r.
@@ -598,9 +657,9 @@ func buildEROFS(mkfsPath, rootfsDir, outputPath string) error {
 		// flatten runs as root in the sandbox-builder unit. (The runtime erofs —
 		// sandbox-init, all root — is built by separate shell scripts that keep
 		// --all-root; this Go path is image-flatten only.)
-		"-T0",                                         // fixed timestamp (epoch)
-		"-b4096",                                      // 4K block size
-		"-x-1",                                        // disable xattrs
+		"-T0",                                        // fixed timestamp (epoch)
+		"-b4096",                                     // 4K block size
+		"-x-1",                                       // disable xattrs
 		"-U", "00000000-0000-0000-0000-000000000000", // fixed UUID
 		"--quiet",
 		outputPath,

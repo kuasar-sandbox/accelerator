@@ -11,11 +11,15 @@
 package remote
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"net/http"
 	"os"
 	"runtime"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	ggcrremote "github.com/google/go-containerregistry/pkg/v1/remote"
 	"gopkg.in/yaml.v3"
 
 	"github.com/kuasar-sandbox/sandbox-builder/internal/util"
@@ -47,11 +51,35 @@ type Config struct {
 	Insecure bool `yaml:"insecure"`
 	// PullJobs bounds concurrent layer downloads. <1 → defaultPullJobs.
 	PullJobs int           `yaml:"pull_jobs"`
+	TLS      TLSConfig     `yaml:"tls"`
 	Cache    CacheConfig   `yaml:"cache"`
 	Referer  RefererConfig `yaml:"referer"`
 
-	platform v1.Platform // parsed from Platform in normalize
-	maxSize  int64       // parsed from Cache.MaxSize (bytes; 0 = unlimited)
+	// OnPullProgress, if non-nil, is invoked as each missing layer blob
+	// finishes downloading in Pull, with the running (done, total) count of
+	// layers that needed fetching (cache hits are not counted). Set by the
+	// CLI to render pull progress; not serialised.
+	OnPullProgress func(done, total int) `yaml:"-"`
+
+	platform  v1.Platform       // parsed from Platform in normalize
+	maxSize   int64             // parsed from Cache.MaxSize (bytes; 0 = unlimited)
+	transport http.RoundTripper // built from TLS in normalize; nil = ggcr default
+}
+
+// TLSConfig tunes how the HTTPS transport verifies certificates when pulling.
+// It applies to every registry request and, crucially, to the CDN blob
+// redirects (e.g. *.cloudfront.docker.com) — an intercepting corporate proxy
+// re-signs those with a private CA, which the default system trust store
+// rejects. (This is distinct from the registry-scheme switch Insecure, which
+// only allows plain-HTTP registries and does not affect TLS verification.)
+type TLSConfig struct {
+	// CACert is a path to an extra CA bundle (PEM, may hold several certs)
+	// added to the system trust store — the secure way to trust a MITM
+	// proxy's private CA. Empty → system store only.
+	CACert string `yaml:"ca_cert"`
+	// InsecureSkipVerify disables certificate verification entirely. The
+	// blunt escape hatch when the proxy CA isn't available; prefer CACert.
+	InsecureSkipVerify bool `yaml:"insecure_skip_verify"`
 }
 
 // CacheConfig configures the shared OCI-layout blob cache.
@@ -132,7 +160,45 @@ func (c *Config) normalize() error {
 	if c.Referer.Key == "" {
 		c.Referer.Key = c.Referer.Desc
 	}
+	tr, err := c.buildTransport()
+	if err != nil {
+		return err
+	}
+	c.transport = tr
 	return nil
+}
+
+// buildTransport returns a custom HTTP transport when TLS tuning is requested
+// (a CA bundle and/or skip-verify), or nil to let ggcr use its default. It
+// clones ggcr's DefaultTransport so proxy-from-env, dialer, and timeout tuning
+// are preserved, and only overrides TLSClientConfig.
+func (c *Config) buildTransport() (http.RoundTripper, error) {
+	if c.TLS.CACert == "" && !c.TLS.InsecureSkipVerify {
+		return nil, nil
+	}
+	base, ok := ggcrremote.DefaultTransport.(*http.Transport)
+	if !ok {
+		base, _ = http.DefaultTransport.(*http.Transport)
+	}
+	tr := base.Clone()
+
+	tlsCfg := &tls.Config{InsecureSkipVerify: c.TLS.InsecureSkipVerify} //nolint:gosec // opt-in for MITM proxies via config
+	if c.TLS.CACert != "" {
+		pem, err := os.ReadFile(c.TLS.CACert)
+		if err != nil {
+			return nil, fmt.Errorf("remote: tls.ca_cert %q: %w", c.TLS.CACert, err)
+		}
+		pool, err := x509.SystemCertPool()
+		if err != nil || pool == nil {
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("remote: tls.ca_cert %q: no PEM certificates found", c.TLS.CACert)
+		}
+		tlsCfg.RootCAs = pool
+	}
+	tr.TLSClientConfig = tlsCfg
+	return tr, nil
 }
 
 // CacheDir returns the configured cache root ("" = ephemeral).

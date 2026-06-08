@@ -154,6 +154,14 @@ func cmdExport(args []string) {
 		return
 	}
 
+	// Preserving the source image's file ownership needs root/CAP_CHOWN
+	// (applyOwnerMode); check it up front so an unprivileged run fails fast
+	// here instead of partway through the first layer's chown — after a
+	// potentially expensive pull + extract.
+	if err := flatten.RequireOwnershipCap(); err != nil {
+		fatal("%v", err)
+	}
+
 	// Resolve output path: when --output is "-" or empty (+upload), use
 	// a temp file we can re-open after FlattenFile finishes.
 	tmpOut := false
@@ -174,7 +182,7 @@ func cmdExport(args []string) {
 			fatal("%v", err)
 		}
 	} else {
-		if err := runFlatten(input, outPath, cfg.TmpDir); err != nil {
+		if err := runFlatten(input, outPath, cfg.TmpDir, *noProgress); err != nil {
 			fatal("%v", err)
 		}
 	}
@@ -216,8 +224,8 @@ func cmdExport(args []string) {
 	_ = tmpOut
 }
 
-func runFlatten(image, outputPath, tmpDir string) error {
-	opts := flatten.Options{TmpDir: tmpDir}
+func runFlatten(image, outputPath, tmpDir string, noProgress bool) error {
+	opts := flatten.Options{TmpDir: tmpDir, Progress: flattenProgress(!noProgress)}
 	if image == "-" {
 		return flatten.FlattenWith(os.Stdin, outputPath, opts)
 	}
@@ -269,11 +277,13 @@ func runRemoteFlatten(ref, outputPath string, cfg *remote.Config, printDigest, n
 		return err
 	}
 	defer cleanup()
+	cfg.OnPullProgress = pullProgress(!noProgress)
 	src, err := cfg.Pull(ctx, res, cache)
 	if err != nil {
 		return err
 	}
-	if err := flatten.Build(src, outputPath, flatten.Options{TmpDir: cfg.TmpDir}); err != nil {
+	opts := flatten.Options{TmpDir: cfg.TmpDir, Progress: flattenProgress(!noProgress)}
+	if err := flatten.Build(src, outputPath, opts); err != nil {
 		return err
 	}
 	return cache.MaybeEvict()
@@ -295,7 +305,9 @@ func ingestEROFS(path string, size int64, mcfg *manifest.Config, noProgress bool
 	}
 	defer in.Close()
 
-	res, err := ing.Ingest(context.Background(), in, uint64(size), ingest.IngestOption{})
+	res, err := ing.Ingest(context.Background(), in, uint64(size), ingest.IngestOption{
+		OnProgress: byteProgress(!noProgress, "erofs"),
+	})
 	if err != nil {
 		return "", fmt.Errorf("ingest: %w", err)
 	}
@@ -342,12 +354,19 @@ func runReferrerExport(ref string, rcfg *remote.Config, manifestCfgPath string, 
 		return
 	}
 
-	// Miss: pull + flatten + ingest, then write the referrer back.
+	// Miss: pull + flatten + ingest, then write the referrer back. The flatten
+	// preserves image file ownership, so it needs root/CAP_CHOWN — check before
+	// the expensive pull rather than partway through the first layer's chown.
+	// (A referrer hit above returns without flattening and needs no privilege.)
+	if err := flatten.RequireOwnershipCap(); err != nil {
+		fatal("%v", err)
+	}
 	cache, cleanup, err := rcfg.OpenCache()
 	if err != nil {
 		fatal("%v", err)
 	}
 	defer cleanup()
+	rcfg.OnPullProgress = pullProgress(!noProgress)
 	src, err := rcfg.Pull(ctx, res, cache)
 	if err != nil {
 		fatal("%v", err)
@@ -358,7 +377,8 @@ func runReferrerExport(ref string, rcfg *remote.Config, manifestCfgPath string, 
 	}
 	tmpOut.Close()
 	defer os.Remove(tmpOut.Name())
-	if err := flatten.Build(src, tmpOut.Name(), flatten.Options{TmpDir: rcfg.TmpDir}); err != nil {
+	opts := flatten.Options{TmpDir: rcfg.TmpDir, Progress: flattenProgress(!noProgress)}
+	if err := flatten.Build(src, tmpOut.Name(), opts); err != nil {
 		fatal("%v", err)
 	}
 	if err := cache.MaybeEvict(); err != nil && !noProgress {

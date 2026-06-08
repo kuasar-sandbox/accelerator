@@ -96,6 +96,9 @@ func TestCrossSourceByteEqual(t *testing.T) {
 	if !mkfsAvailable() {
 		t.Skip("mkfs.erofs not found (set MKFS_EROFS_PATH or add to PATH); cross-source equality runs in e2e")
 	}
+	if err := flatten.RequireOwnershipCap(); err != nil {
+		t.Skipf("flatten preserves image file ownership and needs root/CAP_CHOWN (%v); cross-source equality runs in e2e/CI", err)
+	}
 	host := startRegistry(t)
 	img := syntheticImage(t)
 	ref := host + "/test/equal:v1"
