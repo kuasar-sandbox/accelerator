@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util"
+	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util/obstat"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/client"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/ec"
@@ -310,7 +311,9 @@ func cmdServe(args []string) {
 	// for probes, Info for structured counter snapshots consumed by
 	// bench scripts and cache-ctl info --endpoint.
 	var grpcServer *grpc.Server
-	var healthSrv interface{ SetServingStatus(string, healthgrpc.HealthCheckResponse_ServingStatus) }
+	var healthSrv interface {
+		SetServingStatus(string, healthgrpc.HealthCheckResponse_ServingStatus)
+	}
 	if cfg.HealthListen != "" {
 		grpcServer = grpc.NewServer()
 		hsrv := server.RegisterHealth(grpcServer)
@@ -348,7 +351,18 @@ func cmdServe(args []string) {
 	}
 
 	// Runtime stats are served on-demand via the Info gRPC service (registered
-	// on the Health listener in Step 3); no periodic stderr logging.
+	// on the Health listener in Step 3). On top of that, an adaptive stats line
+	// is printed to stderr each period that saw traffic (silent when idle) —
+	// concurrency, bandwidth, latency p50/p99/max, hit cascade, and rocksdb
+	// gauges. stats_interval=0/off disables it. Stopped on shutdown.
+	var statsRocks rocks.Interface = primaryRocks
+	if tieredComps != nil {
+		statsRocks = tieredComps.EmbeddedStore
+	}
+	statsCtx, statsCancel := context.WithCancel(context.Background())
+	defer statsCancel()
+	go obstat.RunAdaptive(statsCtx, cfg.StatsIntervalDur(),
+		cacheSampler(cfg.Mode, ws, tieredCache, statsRocks), log.Printf)
 
 	// Signal handling.
 	//
@@ -749,4 +763,3 @@ func (b *tieredBackend) Fill(ctx context.Context, p store.Partition, key store.C
 // handler can return "writes not supported" before the generic
 // empty-value check.
 func (b *tieredBackend) RejectsWrites() bool { return true }
-

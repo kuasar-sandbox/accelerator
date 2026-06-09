@@ -4,12 +4,34 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/obs"
 )
+
+// defaultStatsInterval is the base period for the adaptive stats line when
+// stats_interval is unset.
+const defaultStatsInterval = 30 * time.Second
+
+// StatsIntervalDur parses stats_interval. Empty/absent → 30s (on by default);
+// "0"/"off"/"none" → 0 (disabled); any valid Go duration overrides; an invalid
+// value falls back to the default rather than silently disabling output.
+func (c *Config) StatsIntervalDur() time.Duration {
+	switch strings.ToLower(strings.TrimSpace(c.StatsInterval)) {
+	case "":
+		return defaultStatsInterval
+	case "0", "off", "none", "disabled":
+		return 0
+	}
+	d, err := time.ParseDuration(c.StatsInterval)
+	if err != nil || d <= 0 {
+		return defaultStatsInterval
+	}
+	return d
+}
 
 // Config is the YAML configuration shared by every store-ctl
 // subcommand. Two backend flavours, selected by `backend:`:
@@ -28,6 +50,11 @@ type Config struct {
 
 	// Backend selects the backing storage. "fs" or "obs". Required.
 	Backend string `yaml:"backend"`
+
+	// StatsInterval is the base period for the adaptive stats line the
+	// daemon prints to stderr (silent when there was no traffic in the
+	// window). Empty/absent → 30s (on by default); "0"/"off" disables it.
+	StatsInterval string `yaml:"stats_interval"`
 
 	// FS / OBS hold backend-specific config. Exactly one is read,
 	// keyed by Backend.

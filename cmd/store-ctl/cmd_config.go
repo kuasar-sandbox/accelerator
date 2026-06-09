@@ -69,6 +69,11 @@ listen: 127.0.0.1:7100
 # Backend: fs | obs.
 backend: fs
 
+# Periodic adaptive stats line to stderr: each period with traffic prints one
+# summary (rates, bandwidth, latency p50/p99/max, inflight); idle periods are
+# silent. Default 30s; "0"/"off" disables.
+# stats_interval: 30s
+
 # Filesystem backend (when backend: fs).
 fs:
   root: /var/lib/store-ctl

@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -11,6 +12,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util"
+	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util/obstat"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/pb"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/server"
 )
@@ -62,6 +64,12 @@ func cmdServe(args []string) {
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- gs.Serve(lis) }()
+
+	// Periodic adaptive stats line (stderr). Silent in windows with no traffic;
+	// stopped on shutdown via statsCancel. stats_interval=0/off disables it.
+	statsCtx, statsCancel := context.WithCancel(context.Background())
+	defer statsCancel()
+	go obstat.RunAdaptive(statsCtx, cfg.StatsIntervalDur(), storeSampler(srv), log.Printf)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

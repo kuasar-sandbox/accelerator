@@ -6,6 +6,7 @@ import (
 	"errors"
 	"hash"
 	"io"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -27,6 +28,8 @@ type Server struct {
 	salt      [32]byte
 	gen       string
 	verifyKey bool
+
+	stats Stats
 }
 
 // Options configures a new Server.
@@ -60,6 +63,7 @@ func New(opts Options) (*Server, error) {
 // The salt derivation algorithm is a server-side concern; clients
 // combine this salt with any extra salt they control.
 func (s *Server) GetSalt(ctx context.Context, _ *pb.GetSaltRequest) (*pb.GetSaltResponse, error) {
+	s.stats.saltN.Add(1)
 	return &pb.GetSaltResponse{
 		Generation: s.gen,
 		Salt:       s.salt[:],
@@ -69,23 +73,36 @@ func (s *Server) GetSalt(ctx context.Context, _ *pb.GetSaltRequest) (*pb.GetSalt
 // Get streams a stored object back to the caller. Miss → NotFound,
 // hit → one or more GetResponse messages with byte chunks.
 func (s *Server) Get(req *pb.GetRequest, stream pb.Store_GetServer) error {
+	s.stats.inflight.Add(1)
+	start := time.Now()
+	defer func() {
+		s.stats.inflight.Add(-1)
+		s.stats.getN.Add(1)
+		s.stats.getHist.Record(time.Since(start))
+	}()
+
 	partition, err := protoPartitionToStore(req.GetPartition())
 	if err != nil {
+		s.stats.errN.Add(1)
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
 	var key store.ContentKey
 	if len(req.GetKey()) != len(key) {
+		s.stats.errN.Add(1)
 		return status.Errorf(codes.InvalidArgument, "key must be %d bytes, got %d", len(key), len(req.GetKey()))
 	}
 	copy(key[:], req.GetKey())
 
 	found, data, err := s.backend.Get(stream.Context(), partition, key)
 	if err != nil {
+		s.stats.errN.Add(1)
 		return status.Errorf(codes.Internal, "backend get: %v", err)
 	}
 	if !found {
 		return status.Error(codes.NotFound, "")
 	}
+	s.stats.getHits.Add(1)
+	s.stats.getBytes.Add(uint64(len(data)))
 
 	// Stream the bytes out in 256 KiB frames.
 	for off := 0; off < len(data); off += sendFrameSize {
@@ -109,21 +126,33 @@ func (s *Server) Get(req *pb.GetRequest, stream pb.Store_GetServer) error {
 // Backend's PutHandle, optionally re-hashed for verification, and
 // atomic-renamed at the end.
 func (s *Server) Put(stream pb.Store_PutServer) error {
+	s.stats.inflight.Add(1)
+	start := time.Now()
+	defer func() {
+		s.stats.inflight.Add(-1)
+		s.stats.putN.Add(1)
+		s.stats.putHist.Record(time.Since(start))
+	}()
+
 	// 1. Receive header.
 	first, err := stream.Recv()
 	if err != nil {
+		s.stats.errN.Add(1)
 		return status.Errorf(codes.InvalidArgument, "put: recv header: %v", err)
 	}
 	header := first.GetHeader()
 	if header == nil {
+		s.stats.errN.Add(1)
 		return status.Error(codes.InvalidArgument, "put: first message must be a header")
 	}
 	partition, err := protoPartitionToStore(header.GetPartition())
 	if err != nil {
+		s.stats.errN.Add(1)
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
 	var key store.ContentKey
 	if len(header.GetKey()) != len(key) {
+		s.stats.errN.Add(1)
 		return status.Errorf(codes.InvalidArgument, "key must be %d bytes, got %d", len(key), len(header.GetKey()))
 	}
 	copy(key[:], header.GetKey())
@@ -134,12 +163,14 @@ func (s *Server) Put(stream pb.Store_PutServer) error {
 	// may have Sent everything already; CloseAndRecv still returns
 	// the response we emit here).
 	if s.backend.Exists(partition, key) {
+		s.stats.putDedup.Add(1)
 		return stream.SendAndClose(&pb.PutResponse{IsNew: false})
 	}
 
 	// 3. Open a streaming-Put handle; bytes land directly on disk.
 	handle, err := s.backend.OpenPut(partition)
 	if err != nil {
+		s.stats.errN.Add(1)
 		return status.Errorf(codes.Internal, "open put: %v", err)
 	}
 	var hasher hash.Hash
@@ -148,12 +179,14 @@ func (s *Server) Put(stream pb.Store_PutServer) error {
 	}
 
 	// 4. Drain data frames until stream end.
+	var nbytes uint64
 	for {
 		msg, err := stream.Recv()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
+			s.stats.errN.Add(1)
 			_ = handle.Abort()
 			return status.Errorf(codes.Internal, "put: recv data: %v", err)
 		}
@@ -162,15 +195,18 @@ func (s *Server) Put(stream pb.Store_PutServer) error {
 			// An empty data frame is allowed (noop) but we do NOT
 			// accept a second PutHeader mid-stream.
 			if msg.GetHeader() != nil {
+				s.stats.errN.Add(1)
 				_ = handle.Abort()
 				return status.Error(codes.InvalidArgument, "put: header after data")
 			}
 			continue
 		}
 		if _, err := handle.Write(data); err != nil {
+			s.stats.errN.Add(1)
 			_ = handle.Abort()
 			return status.Errorf(codes.Internal, "put: write: %v", err)
 		}
+		nbytes += uint64(len(data))
 		if hasher != nil {
 			hasher.Write(data)
 		}
@@ -183,8 +219,10 @@ func (s *Server) Put(stream pb.Store_PutServer) error {
 	}
 	isNew, err := handle.Commit(key, verifyDigest)
 	if err != nil {
+		s.stats.errN.Add(1)
 		return status.Errorf(codes.InvalidArgument, "put: commit: %v", err)
 	}
+	s.stats.putBytes.Add(nbytes)
 	return stream.SendAndClose(&pb.PutResponse{IsNew: isNew})
 }
 

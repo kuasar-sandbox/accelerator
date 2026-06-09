@@ -4,6 +4,7 @@ package runtime
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -11,25 +12,29 @@ import (
 
 // Config is the top-level YAML configuration for cache-ctl serve.
 type Config struct {
-	Mode         string     `yaml:"mode"`          // "local" | "shard" | "tiered"
-	Listen       string     `yaml:"listen"`        // e.g. "0.0.0.0:7070" (wire data)
-	HealthListen string     `yaml:"health_listen"` // e.g. "0.0.0.0:7071" (gRPC health)
-	RPCTimeout   string     `yaml:"rpc_timeout"`   // e.g. "2s"
+	Mode         string `yaml:"mode"`          // "local" | "shard" | "tiered"
+	Listen       string `yaml:"listen"`        // e.g. "0.0.0.0:7070" (wire data)
+	HealthListen string `yaml:"health_listen"` // e.g. "0.0.0.0:7071" (gRPC health)
+	RPCTimeout   string `yaml:"rpc_timeout"`   // e.g. "2s"
+	// StatsInterval is the base period for the adaptive stats line printed to
+	// stderr (silent in windows with no traffic). Empty/absent → 30s (on by
+	// default); "0"/"off" disables it.
+	StatsInterval string `yaml:"stats_interval"`
 	// PprofListen, if non-empty, binds an HTTP listener that serves
 	// /debug/pprof/{profile,heap,goroutine,...}. Intended for
 	// perf investigation — leave empty in production.
-	PprofListen string `yaml:"pprof_listen"` // e.g. "127.0.0.1:6060"
-	Freq       FreqConfig `yaml:"freq"`
-	Rocks      RocksConfig `yaml:"rocks"`  // used by local, shard, and embedded tier
-	Tiers      []TierConfig `yaml:"tiers"` // tiered mode only
-	Origin     *OriginConfig `yaml:"origin"` // tiered mode only
+	PprofListen string        `yaml:"pprof_listen"` // e.g. "127.0.0.1:6060"
+	Freq        FreqConfig    `yaml:"freq"`
+	Rocks       RocksConfig   `yaml:"rocks"`  // used by local, shard, and embedded tier
+	Tiers       []TierConfig  `yaml:"tiers"`  // tiered mode only
+	Origin      *OriginConfig `yaml:"origin"` // tiered mode only
 }
 
 // FreqConfig holds CMS frequency sketch parameters.
 type FreqConfig struct {
-	Counters        string `yaml:"counters"`         // e.g. "8M"
-	ResetAfter      string `yaml:"reset_after"`      // e.g. "1M"
-	ResetInterval   string `yaml:"reset_interval"`   // e.g. "1h"
+	Counters        string `yaml:"counters"`       // e.g. "8M"
+	ResetAfter      string `yaml:"reset_after"`    // e.g. "1M"
+	ResetInterval   string `yaml:"reset_interval"` // e.g. "1h"
 	EvictThreshold  int    `yaml:"evict_threshold"`
 	PersistInterval string `yaml:"persist_interval"` // e.g. "5m"
 	// DisableEviction turns off the frequency-based compaction filter
@@ -60,8 +65,8 @@ type RocksConfig struct {
 
 // TierConfig describes one tier in a tiered-mode tier chain.
 type TierConfig struct {
-	Type        string      `yaml:"type"`         // "embedded" | "upstream" | "ec"
-	MaxInflight int         `yaml:"max_inflight"` // 0 = unlimited
+	Type        string `yaml:"type"`         // "embedded" | "upstream" | "ec"
+	MaxInflight int    `yaml:"max_inflight"` // 0 = unlimited
 
 	// embedded
 	Rocks *RocksConfig `yaml:"rocks"`
@@ -213,6 +218,27 @@ func (c *Config) ParseRPCTimeout() time.Duration {
 	d, err := time.ParseDuration(c.RPCTimeout)
 	if err != nil || d <= 0 {
 		return 0
+	}
+	return d
+}
+
+// defaultStatsInterval is the base period for the adaptive stats line when
+// stats_interval is unset.
+const defaultStatsInterval = 30 * time.Second
+
+// StatsIntervalDur parses stats_interval. Empty/absent → 30s (on by default);
+// "0"/"off"/"none" → 0 (disabled); a valid Go duration overrides; an invalid
+// value falls back to the default rather than silently disabling output.
+func (c *Config) StatsIntervalDur() time.Duration {
+	switch strings.ToLower(strings.TrimSpace(c.StatsInterval)) {
+	case "":
+		return defaultStatsInterval
+	case "0", "off", "none", "disabled":
+		return 0
+	}
+	d, err := time.ParseDuration(c.StatsInterval)
+	if err != nil || d <= 0 {
+		return defaultStatsInterval
 	}
 	return d
 }

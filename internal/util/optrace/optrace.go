@@ -1,9 +1,10 @@
 // Package optrace is an opt-in, env-gated operation tracer for the
 // store/cache daemons. With no per-op timeout by default, a wedged
 // backend no longer fails fast — it just stalls. This makes the stall
-// observable: every traced op logs its duration (WARN over a slow
-// threshold) and a background reporter periodically dumps the ops that
-// are still in flight and how long they have been stuck.
+// observable WITHOUT a line per op: a completed op logs only when it
+// crossed the slow threshold, and a background reporter periodically dumps
+// the ops still in flight and how long they have been stuck. Steady-state
+// throughput/latency belongs to the daemon's periodic stats line, not here.
 //
 // Disabled (the default) it adds one atomic load per op and nothing
 // else — Begin returns a shared no-op closure.
@@ -82,10 +83,12 @@ func (t *Tracer) Begin(op string) func() {
 		t.mu.Lock()
 		delete(t.inflight, id)
 		t.mu.Unlock()
+		// Only slow ops are logged per-completion; fast ops stay silent so a
+		// busy daemon's debug output isn't drowned in a line per op. Aggregate
+		// throughput/latency is the periodic stats line's job; per-op tracing
+		// is reserved for the outliers (SLOW here, STUCK in reporter).
 		if d >= t.slow {
 			log.Printf("[%s] optrace: SLOW op=%s dur=%s", t.name, op, d.Round(time.Millisecond))
-		} else {
-			log.Printf("[%s] optrace: op=%s dur=%s", t.name, op, d.Round(time.Millisecond))
 		}
 	}
 }

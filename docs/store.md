@@ -156,6 +156,7 @@ store-ctl config generate
 ```yaml
 listen: 127.0.0.1:7100
 backend: fs
+stats_interval: 30s              # 周期自适应统计行(§5.7);缺省 30s,"0"/"off" 关闭
 fs:
   root: /var/store               # 文件系统根目录(必填,init 时创建结构)
   verify_content_key: true       # 默认 true
@@ -437,13 +438,35 @@ STORE_CTL_SLOW=2s STORE_CTL_DEBUG=1 store-ctl serve ...     # 自定慢阈值
 
 - `STORE_CTL_DEBUG` truthy(非空且非 `0`/`false`)时启用;否则零开销
   (每 op 一次 atomic 读)
-- 每个完成的 op 打一行耗时;超过慢阈值(`STORE_CTL_SLOW`,Go duration,
-  默认 1 s)的记 WARN
+- **只有超过慢阈值**(`STORE_CTL_SLOW`,Go duration,默认 1 s)的 op 打一行
+  (WARN);快 op 静默——稳态吞吐/时延看 §5.7 的周期统计行,这里只盯异常长尾
 - 后台 reporter 周期性 dump **仍在飞**且已超阈值的 op(op 名 + 已卡时长),
   这样 stall 在卡住的后端上立即可见,而不必等一个 deadline
 - 覆盖 obs 的 get / head / put 调用
 
 生产默认关闭;排障时临时开启,定位 OBS 抖动 / 凭据 / 网络导致的长尾。
+
+### 5.7 周期自适应统计行(`stats_interval`)
+
+daemon 默认每 30 s(`stats_interval`,§3)向 stderr 打一行运行时统计,**仿
+sandbox-ctl 的自适应输出**:有流量的周期打一行汇总,无流量的周期**静默**,启动
+后先以 2 s 快采样捕捉冷启突发,空闲两拍后退回基准周期。`stats_interval: 0`/`off`
+关闭。一行含:
+
+- **吞吐**:get / put / salt 的每秒速率(自适应单位 1.2k/3.4M)
+- **带宽**:get 出向、put 入向字节速率(MiB/s),put 去重比例
+- **时延分布**:get / put 各自的 p50 / p99 / max(窗口直方图,桶同 sandbox-ctl)
+- **并发**:`inflight`(当前在飞 Get+Put 计数)
+- **错误**:本周期返回 gRPC 错误的请求数(`err`,0 时省略)
+
+示例:
+
+```
+store stat | get 1.2k/s 92%hit 180MiB/s p50 80µs/p99 900µs/max 4.1ms · put 340/s 410MiB/s dedup 22% p50 1.2ms/p99 14ms/max 60ms | inflight 7
+```
+
+与 §5.6 的 `STORE_CTL_DEBUG` 正交:统计行给稳态全貌(默认开),tracer 给异常
+长尾(opt-in)。
 
 ## 6. See Also
 

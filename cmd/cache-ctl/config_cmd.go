@@ -80,6 +80,11 @@ health_listen: 127.0.0.1:7071
 # Per-RPC timeout for client connections.
 rpc_timeout: 5s
 
+# Periodic adaptive stats line to stderr: each period with traffic prints one
+# summary (rates, bandwidth, latency p50/p99/max, inflight/conns, hit cascade,
+# rocksdb gauges); idle periods are silent. Default 30s; "0"/"off" disables.
+# stats_interval: 30s
+
 freq:
   counters: 1M       # CMS sketch size for admission heuristic
   reset_after: 100K  # halving cadence

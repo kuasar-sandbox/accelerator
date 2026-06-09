@@ -7,8 +7,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/wire"
 	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util/optrace"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/wire"
 )
 
 // WireServer accepts TCP/UDS connections and serves cache RPCs using the
@@ -78,6 +78,17 @@ func (s *WireServer) untrackConn(c net.Conn) {
 	defer s.connsMu.Unlock()
 	delete(s.conns, c)
 }
+
+// ConnCount returns the number of currently-tracked client connections, for the
+// periodic stats line.
+func (s *WireServer) ConnCount() int {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	return len(s.conns)
+}
+
+// Handler exposes the wire handler so the stats printer can read its counters.
+func (s *WireServer) Handler() *CacheHandler { return s.handler }
 
 func (s *WireServer) serveConn(c net.Conn) {
 	if !s.trackConn(c) {

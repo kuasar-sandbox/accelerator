@@ -163,6 +163,7 @@ Flags:
 mode: local
 listen: 0.0.0.0:7070           # wire 数据面;host:port 或 Unix socket(/run/sandbox/cache.sock 或 unix:///...)
 health_listen: 0.0.0.0:7071    # gRPC 健康检查(可省);同支持 Unix socket 路径
+stats_interval: 30s            # 周期自适应统计行(§6.6);缺省 30s,"0"/"off" 关闭
 rpc_timeout: ""                # 服务端每请求 wall-clock 上限。缺省/空/非法 = 0 =
                                # 无 per-request deadline:请求只受客户端连接 /
                                # 调用方取消约束。显式写 Go duration(如 "2s")才设上界
@@ -299,6 +300,7 @@ tiers:
 |---|---|
 | `listen` | wire 数据面 TCP 监听 |
 | `health_listen` | gRPC 控制面监听,同端口跑两个服务:`health.v1.Health`(探活)+ `cache.v1.Info`(`Get` 拉计数快照 / `WaitFills` 等 fill 排空)。省略则两者都不启动 |
+| `stats_interval` | 周期自适应 stderr 统计行的基准周期(§6.6)。缺省/空 = 30s(默认开);`0`/`off` 关闭。有流量的周期打一行(吞吐/带宽/时延 p50/p99/max/并发/命中级联/rocks 量规),空闲周期静默 |
 | `freq.disable_eviction` | bool。关掉频率式 compaction-filter 淘汰:sketch 仍维护(供 stats),但 filter 永不挂载,任何 key 都不会按访问计数被淘汰。用于某台 local cache-ctl 充当下游 tiered 的 origin(bench 场景)——写入落一次就必须留住 |
 | `pool` | 到单个 peer 的并行 TCP 连接数。wire 是 sync request/response,单连接会把并发请求串行化 |
 | `max_inflight` | 客户端到该 tier 的最大并发对象请求数。embedded 推荐不设;origin 建议 16-32 |
@@ -406,9 +408,10 @@ ctx(命中 ctx 的后端——tier chain 远端跳、origin IO——随之中断
 
 - **Delete**:内容寻址下不删除,淘汰由 §4.4 频率 sketch + CompactionFilter
   异步处理。
-- **AdminService**:无独立 admin RPC。运行时计数通过控制面 `cache.v1.Info/Get`
-  拉(pull-only,见 §1.2 / §6.3),不再有周期性 stderr 统计日志;离线诊断用
-  `cache-ctl info --rocks-path` 直接打开 RocksDB(secondary instance 模式)。
+- **AdminService**:无独立 admin RPC。运行时计数可通过控制面 `cache.v1.Info/Get`
+  按需拉(pull-only,见 §1.2 / §6.3),另有默认开启的周期自适应 stderr 统计行
+  (§6.6,`stats_interval`);离线诊断用 `cache-ctl info --rocks-path` 直接打开
+  RocksDB(secondary instance 模式)。
 - **Streaming**:所有请求/响应都是 one-shot;Get/Put 的 value 上限由
   `MaxFrameSize` 限制,超大对象必须在上层分片(EC tier 的职责)。
 
@@ -707,11 +710,12 @@ cache-ctl serve --config /etc/cache/tiered.yaml
 
 ### 6.3 运行时计数(pull-only)
 
-运行时计数不再周期性向 stderr 输出——改为按需经控制面 `cache.v1.Info/Get`
-拉取(`health_listen` 端口,见 §1.2)。`cache-ctl info --endpoint host:port`
-即取一次快照(`--json` 出原始 JSON,否则人类可读表格),含 server hits/misses/
-fills、各 tier 与 origin 计数、EC 各 peer 计数、embedded/local/shard 的 RocksDB
-CF 属性。bench 脚本用同一服务取 bench 窗口前后的 delta。
+精确累计计数按需经控制面 `cache.v1.Info/Get` 拉取(`health_listen` 端口,见
+§1.2)。`cache-ctl info --endpoint host:port` 即取一次快照(`--json` 出原始
+JSON,否则人类可读表格),含 server hits/misses/fills、各 tier 与 origin 计数、
+EC 各 peer 计数、embedded/local/shard 的 RocksDB CF 属性。bench 脚本用同一服务
+取 bench 窗口前后的 delta。日常**观察**则看 §6.6 的周期统计行(默认开),无需主
+动拉。
 
 ### 6.4 离线诊断
 
@@ -736,8 +740,8 @@ CACHE_CTL_SLOW=2s CACHE_CTL_DEBUG=1 cache-ctl serve ...      # 自定慢阈值
 ```
 
 - `CACHE_CTL_DEBUG` truthy 时启用,否则零开销(每请求一次 atomic 读)
-- 每个完成的请求打一行耗时,超过慢阈值(`CACHE_CTL_SLOW`,Go duration,
-  默认 1 s)记 WARN
+- **只有超过慢阈值**(`CACHE_CTL_SLOW`,Go duration,默认 1 s)的请求打一行
+  (WARN);快请求静默——稳态吞吐/时延看 §6.6 的周期统计行,这里只盯异常长尾
 - 后台 reporter 周期 dump **仍在飞**且超阈值的请求(op 名 + 已卡时长),
   卡死的 tier / origin 立即可见,不必等 deadline
 - 覆盖 wire 服务端请求处理(含 tiered fill / origin 回源)
@@ -745,6 +749,32 @@ CACHE_CTL_SLOW=2s CACHE_CTL_DEBUG=1 cache-ctl serve ...      # 自定慢阈值
 另有 `CACHE_CTL_TIMING=1`(进程启动时读)开启 EC.Get 的分阶段耗时日志
 (LocateN / fan-out / decode 各段 + 各分片到达偏移),按 1% 采样,默认关、热
 路径零开销。专测 EC hedge 的扇入与尾延迟,与上面的 `CACHE_CTL_DEBUG` 正交。
+
+### 6.6 周期自适应统计行(`stats_interval`)
+
+daemon 默认每 30 s(`stats_interval`,§3)向 stderr 打一行运行时统计,**仿
+sandbox-ctl 的自适应输出**:有流量的周期打一行汇总,无流量的周期**静默**,启动
+后先以 2 s 快采样捕捉冷启突发,空闲两拍后退回基准周期。`stats_interval: 0`/`off`
+关闭。一行含:
+
+- **吞吐**:get / put 的每秒速率(自适应单位 1.2k/3.4M)
+- **带宽**:get 出向、put 入向字节速率(MiB/s)
+- **命中**:本周期 server `hit%`;tiered 模式附命中级联(`hits L0 88% L1 6%
+  origin 6%`,见各层命中占比)
+- **时延分布**:get / put 各自 p50 / p99 / max(窗口直方图,桶同 sandbox-ctl)
+- **并发**:`inflight`(在飞 get+put)、`conns`(当前 wire 连接数)
+- **RocksDB 量规**:各 CF 的 keys / live-data-size / 运行中 compaction 数
+- **错误**:本周期返回 `StatusError` 的请求数(`err`,0 时省略)
+
+示例:
+
+```
+cache stat tiered | get 5.1k/s 620MiB/s p50 40µs/p99 700µs/max 9ms · hit 94% · put 220/s 30MiB/s p50 1.1ms/p99 8ms/max 40ms | inflight 18 conns 6 | hits L0 88% L1 6% origin 6% | rocks chunk 1.2M keys/3.4GiB
+```
+
+与 §6.3 的 pull-only Info 互补:统计行给稳态全貌(默认开、自适应、低噪),Info
+给精确累计快照(bench / 脚本按需拉);与 §6.5 的 `CACHE_CTL_DEBUG` 正交(后者
+只打异常长尾)。
 
 生产默认关闭;与 `pprof_listen` 互补——tracer 看"哪些请求慢/卡",pprof
 看"卡在哪段代码"。
