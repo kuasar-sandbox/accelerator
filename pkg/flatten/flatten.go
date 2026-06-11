@@ -646,8 +646,8 @@ func buildImage(rootfsDir, outputPath string) error {
 // Uses chunk-based layout (-Ededupe --chunksize=4096) to minimize metadata size and
 // stabilize data block offsets across images, maximizing CDC cross-image dedup.
 // No compression: raw bytes enable CDC dedup (consistent with kuasar-sandbox.md §5 design matrix).
-func buildEROFS(mkfsPath, rootfsDir, outputPath string) error {
-	cmd := exec.Command(mkfsPath,
+func buildEROFS(mkfsPath, rootfsDir, outputPath string, extra ...string) error {
+	args := []string{
 		"-Ededupe",         // intra-image file dedup
 		"--chunksize=4096", // chunk-based layout: metadata 7.6MiB→0.6MiB
 		// NOTE: no --all-root. The image's real uid/gid/mode is preserved by
@@ -662,9 +662,10 @@ func buildEROFS(mkfsPath, rootfsDir, outputPath string) error {
 		"-x-1",                                       // disable xattrs
 		"-U", "00000000-0000-0000-0000-000000000000", // fixed UUID
 		"--quiet",
-		outputPath,
-		rootfsDir,
-	)
+	}
+	args = append(args, extra...)
+	args = append(args, outputPath, rootfsDir)
+	cmd := exec.Command(mkfsPath, args...)
 	cmd.Stdout = io.Discard
 	// Capture stderr so a failure carries mkfs.erofs's own diagnostic rather
 	// than a bare "exit status 1". (On success mkfs may still print benign

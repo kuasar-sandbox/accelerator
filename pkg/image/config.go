@@ -149,3 +149,55 @@ func ExtractRuntimeConfigFromJSON(data []byte) (*RuntimeConfig, error) {
 func (c *RuntimeConfig) MarshalDeterministic() ([]byte, error) {
 	return json.Marshal(c)
 }
+
+// WrapRuntimeConfigJSON normalizes a user-supplied runtime-config
+// document to the OCI image-config shape ExtractRuntimeConfigFromJSON
+// expects. Two input shapes are accepted and sniffed by their
+// top-level keys:
+//
+//   - an OCI image config (lowercase "architecture"/"os", the runtime
+//     fields nested under "config") — returned as-is;
+//   - an already-projected RuntimeConfig (the config.json this package
+//     appends to images, e.g. `unzip -p old.erofs config.json`) —
+//     re-nested losslessly.
+//
+// An empty document projects to an empty RuntimeConfig either way.
+func WrapRuntimeConfigJSON(data []byte) ([]byte, error) {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(data, &top); err != nil {
+		return nil, fmt.Errorf("parse runtime config: %w", err)
+	}
+	has := func(keys ...string) bool {
+		for _, k := range keys {
+			if _, ok := top[k]; ok {
+				return true
+			}
+		}
+		return false
+	}
+	if has("config", "rootfs", "history", "created", "architecture", "os") {
+		return data, nil // OCI image config
+	}
+	if !has("Architecture", "Os", "User", "Env", "Entrypoint", "Cmd", "WorkingDir",
+		"ExposedPorts", "Volumes", "StopSignal", "Labels", "Healthcheck") {
+		return data, nil // nothing recognizable ({} etc): treat as OCI
+	}
+	var rc RuntimeConfig
+	if err := json.Unmarshal(data, &rc); err != nil {
+		return nil, fmt.Errorf("parse projected runtime config: %w", err)
+	}
+	var oci ociImageConfig
+	oci.Architecture = rc.Architecture
+	oci.Os = rc.Os
+	oci.Config.User = rc.User
+	oci.Config.Env = rc.Env
+	oci.Config.Entrypoint = rc.Entrypoint
+	oci.Config.Cmd = rc.Cmd
+	oci.Config.WorkingDir = rc.WorkingDir
+	oci.Config.ExposedPorts = rc.ExposedPorts
+	oci.Config.Volumes = rc.Volumes
+	oci.Config.StopSignal = rc.StopSignal
+	oci.Config.Labels = rc.Labels
+	oci.Config.Healthcheck = rc.Healthcheck
+	return json.Marshal(&oci)
+}

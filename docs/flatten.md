@@ -22,18 +22,22 @@ Entrypoint / Env / WorkingDir 等启动参数。
 
 ### 1.2 输入与输出
 
-输入,二选一:
+输入,三选一:
 
 - **远程 registry 镜像**——镜像引用如 `nginx:1.27`、`gcr.io/ns/app@sha256:...`;
   `flatten-ctl` 直接拉取并展平(§2.4),拉取凭据经 `FLATTEN_REGISTRY_*` 环境变量注入,
   层 blob 落入可跨进程共享的本地 OCI-layout 缓存;
-- **Docker archive**(`docker save` 产物的 tar 流,stdin 或本地文件)。
+- **Docker archive**(`docker save` 产物的 tar 流,stdin 或本地文件);
+- **已展平的 rootfs 目录**——位置参数是一个本地目录时,mkfs.erofs 直接就地读取
+  该目录出图,零拷贝、不改源树(§2.1 的目录源小节)。
 
 (OCI layout 目录暂不直读,见 §5.5。)
 
 输出:**单文件**,字节布局 `EROFS 镜像 + 末尾 ZIP archive`(详见 §3 镜像
-格式)。ZIP 内含 OCI runtime config 投影,沙箱启动时直接读取。**两条源(registry /
-docker-archive)汇入同一展平 sink,同一镜像内容产出逐字节相同的 EROFS。**
+格式)。ZIP 内含 OCI runtime config 投影,沙箱启动时直接读取。**registry 与
+docker-archive 两条层源汇入同一展平 sink,同一镜像内容产出逐字节相同的 EROFS;
+目录源同样确定性(同一棵树两次导出字节相同,mtime 由 `-T0 --ignore-mtime` 在
+mkfs 层归一,不触碰源树)。**
 
 不做的事:不签名,不加密,不分块——加密/去重由 `manifest.md` 描述的下一阶
 段处理。
@@ -110,6 +114,12 @@ flatten-ctl export [flags] <ref|path|->
   --registry / --archive  强制把位置参数当 registry 引用 / 本地文件(消歧)
   --with-referer          强制启用幂等 Referrers 流(亦可由配置 referer.enabled 默认开启);
                           命中则复用 manifest id 跳过重导,否则导出后回写(需 --upload;§2.4)
+
+  # rootfs 目录源(位置参数是本地目录时;见下文)
+  --skip <rel>            排除 rootfs 内的该路径(节点连同子树,mkfs --exclude-path 语义);可重复
+  --skip-mounts           排除严格位于 rootfs 之下的全部挂载点(/proc/self/mountinfo)
+  --runtime-config <p>    追加的 runtime config JSON:OCI image config 或已投影的
+                          config.json(按顶层键自动识别);不给则空配置
 ```
 
 典型用法:
@@ -135,6 +145,26 @@ flatten-ctl export --upload --with-referer --manifest-config manifest.yaml \
 
 # /tmp 不够大时在 flatten.yaml 设 tmpdir: /var/tmp,再 --config flatten.yaml
 flatten-ctl export --output big.erofs --config flatten.yaml ./big.tar
+```
+
+**rootfs 目录源**。位置参数 stat 为目录时走第三条源:mkfs.erofs **就地读取**
+该目录——没有 staging 拷贝,源树永不被修改(时间戳归一靠 `-T0 --ignore-mtime`
+在镜像层完成),保留属主只需要对树的读权限(导出完整 rootfs 用 root 跑)。被
+`--skip` / `--skip-mounts` 排除的路径**节点整体消失**(目录本身也不在镜像里);
+输出文件落在 rootfs 内时自动排除自身。导出 `/` 必须带 `--skip-mounts`(否则会
+走读 /proc、/sys)。registry 专属 flags(`--platform`/`--print-digest`/
+`--registry`/`--archive`/`--with-referer`)与目录源互斥。
+
+```bash
+# 把一台机器/一个 guest 的根做成沙箱镜像(挂载点全部剔除)
+flatten-ctl export --skip-mounts --runtime-config config.json -output host.erofs /
+
+# 从准备好的 rootfs 目录出图,剔除缓存目录;config 直接复用旧镜像里的投影
+unzip -p old.erofs config.json > rc.json
+flatten-ctl export --skip var/cache --runtime-config rc.json -output new.erofs /srv/rootfs
+
+# --upload 同样可用:目录 → EROFS → store,stdout 打 manifest key
+flatten-ctl export --skip-mounts --upload --manifest-config m.yaml /srv/rootfs
 ```
 
 ### 2.2 `flatten-ctl verify`
@@ -321,6 +351,55 @@ flatten-ctl cache gc   [--config <p>] [--cache-dir <D>] [--cache-max-size <S>] [
 (或 `--cache-max-size` 覆盖)的上限,`"0"` 清空(grace 期内的除外)。缓存目录默认取
 `--config` 的 `cache.dir`,`--cache-dir` 覆盖。常驻场景可由 cron 周期跑 `cache gc`
 强约束上限(`export` 每次拉取后也会顺带回收)。
+
+### 2.6 `flatten-ctl tar` — tar 流组装/提取
+
+通用 tar 工具面:把指定文件组装成 tar 流,或从 tar 流提取——稀疏文件全程保持
+(创建侧 GNU PAX sparse 1.0 编码,提取侧还原空洞),适合搬运快照盘、向镜像树
+注入/取出文件。引擎是 **GNU tar**(≥1.28):wire 格式、稀疏编码、`..`/symlink
+逃逸加固全部委托给它,本仓不维护任何格式代码。二进制定位:`TAR_PATH` env →
+flatten-ctl 同目录 → PATH,首次使用时探测版本与 GNU 身份;`sandbox-deps` 的
+`make tar` 产出随发布包分发的静态版。
+
+```
+flatten-ctl tar create  [-f tarfile] [--chown u:g] [--chmod 755] 规则...
+flatten-ctl tar extract [-f tarfile] [--chown u:g] [--chmod 755] [规则...]
+
+  -f / --file             归档文件;默认 `-`:create 写 stdout,extract 读 stdin
+  --chown u:g             所有条目改属主(仅数字 uid:gid)
+  --chmod 755             所有条目改权限(八进制,含 setuid/setgid/sticky;目录同样生效)
+```
+
+规则 = `tar内路径[:外部路径]`,冒号左边永远是 tar 内名字、右边是外部世界,
+两个方向不变(create 取右存左,extract 取左写右):
+
+| 形式 | 含义 |
+|---|---|
+| `p` | 内外同名(≡ `p:p`) |
+| `in:out` | 重命名 |
+| `in:-` | 外部是本进程 stdio(create 从 stdin 取内容,extract 流向 stdout;至多一条) |
+| `dir/` | 目录规则:dir 及其下全部内容 |
+| `dir/:out[/]` | 目录前缀重命名 |
+| `dir/:` | ≡ `dir/:$PWD/` |
+| `:dir/` | 整个归档根映射到 dir/ |
+
+`create` 规则必填、按给定顺序进归档(每条规则一次 tar 调用,流在条目边界拼接);
+`extract` 不给规则取全部到当前目录。属主/权限默认保留来源;mtime 保留,
+atime/ctime 不记录、PAX 扩展头名固定,同一输入两次 create 字节相同。
+提取时 chown/chmod 由后处理完成(GNU 无解包期改属主)。
+
+```bash
+# 稀疏快照盘 → 归档(2 MiB 稀疏盘 → ~12 KiB) → 异地还原(空洞回来)
+flatten-ctl tar create -f snap.tar disk/:/var/lib/sandbox/disks/
+flatten-ctl tar extract -f snap.tar "disk/:/restore/disks/"
+
+# 从归档流单抽一个文件到 stdout / 把 stdin 塞成归档里的一个条目
+flatten-ctl tar extract -f a.tar etc/app.yaml:- | less
+gen-config | flatten-ctl tar create app/config.yaml:- > cfg.tar
+
+# 组装时统一属主与权限
+flatten-ctl tar create --chown 0:0 --chmod 644 etc/:./conf.d/ > etc.tar
+```
 
 ## 3. 镜像格式
 

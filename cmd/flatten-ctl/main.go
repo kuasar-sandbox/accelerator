@@ -66,6 +66,8 @@ func main() {
 		cmdCache(os.Args[2:])
 	case "config":
 		cmdConfig(os.Args[2:])
+	case "tar":
+		cmdTar(os.Args[2:])
 	case "-h", "--help", "help":
 		printUsage()
 	default:
@@ -84,6 +86,7 @@ Commands:
   info     Print EROFS metadata + OCI runtime config.
   cache    Inspect or garbage-collect the registry blob cache.
   config   Emit/validate a flatten config (FLATTEN_CONFIG): tmpdir/platform/cache/referer.
+  tar      Assemble files into / extract files from a tar stream (sparse-preserving; GNU tar engine).
 
 See `+"`flatten-ctl <command> -h`"+` for per-command flags.
 `)
@@ -105,10 +108,18 @@ func cmdExport(args []string) {
 	forceRegistry := fs.Bool("registry", false, "force the positional arg to be a registry reference")
 	forceArchive := fs.Bool("archive", false, "force the positional arg to be a local docker-archive")
 	withReferer := fs.Bool("with-referer", false, "force the idempotent OCI-Referrers flow (also enableable via referer.enabled in --config); requires --upload")
+	var skips stringList
+	fs.Var(&skips, "skip", "rootfs-dir source: exclude this path (relative to the rootfs, node and subtree); repeatable")
+	skipMounts := fs.Bool("skip-mounts", false, "rootfs-dir source: exclude every mount point under the rootfs")
+	runtimeConfig := fs.String("runtime-config", "", "rootfs-dir source: runtime config JSON to append (OCI image config or a projected config.json)")
 	fs.Parse(args)
 	input := fs.Arg(0)
 	if input == "" {
 		input = "-" // default: docker-archive stream on stdin
+	}
+	dirSrc := false
+	if st, err := os.Stat(input); err == nil && st.IsDir() {
+		dirSrc = true
 	}
 
 	cfg, err := remote.LoadConfig(*configPath, flattenConfigEnv)
@@ -118,7 +129,9 @@ func cmdExport(args []string) {
 	if err := cfg.SetPlatform(*platform); err != nil {
 		fatal("%v", err)
 	}
-	withRef := *withReferer || cfg.Referer.Enabled
+	// referer.enabled in a shared config is a registry-source concern;
+	// a rootfs-directory source ignores it (only the explicit flag errors).
+	withRef := !dirSrc && (*withReferer || cfg.Referer.Enabled)
 
 	if !*upload && (*output == "" || *output == "/dev/null") {
 		fatal("--output is required when --upload is not set")
@@ -126,7 +139,20 @@ func cmdExport(args []string) {
 	if *forceRegistry && *forceArchive {
 		fatal("--registry and --archive are mutually exclusive")
 	}
-	remoteSrc := isRemoteSource(input, *forceRegistry, *forceArchive)
+	if dirSrc {
+		for flagName, set := range map[string]bool{
+			"--registry": *forceRegistry, "--archive": *forceArchive,
+			"--print-digest": *printDigest, "--with-referer": *withReferer,
+			"--platform": *platform != "",
+		} {
+			if set {
+				fatal("%s does not apply to a rootfs-directory source", flagName)
+			}
+		}
+	} else if len(skips) > 0 || *skipMounts || *runtimeConfig != "" {
+		fatal("--skip / --skip-mounts / --runtime-config apply only to a rootfs-directory source")
+	}
+	remoteSrc := !dirSrc && isRemoteSource(input, *forceRegistry, *forceArchive)
 	if *printDigest && !remoteSrc {
 		fatal("--print-digest applies only to registry sources")
 	}
@@ -157,9 +183,13 @@ func cmdExport(args []string) {
 	// Preserving the source image's file ownership needs root/CAP_CHOWN
 	// (applyOwnerMode); check it up front so an unprivileged run fails fast
 	// here instead of partway through the first layer's chown — after a
-	// potentially expensive pull + extract.
-	if err := flatten.RequireOwnershipCap(); err != nil {
-		fatal("%v", err)
+	// potentially expensive pull + extract. A rootfs-directory source never
+	// chowns (mkfs.erofs records the source inodes' ownership as read), so
+	// it only needs read access to the tree.
+	if !dirSrc {
+		if err := flatten.RequireOwnershipCap(); err != nil {
+			fatal("%v", err)
+		}
 	}
 
 	// Resolve output path: when --output is "-" or empty (+upload), use
@@ -177,11 +207,16 @@ func cmdExport(args []string) {
 		defer os.Remove(outPath)
 	}
 
-	if remoteSrc {
+	switch {
+	case dirSrc:
+		if err := runDirFlatten(input, outPath, cfg.TmpDir, skips, *skipMounts, *runtimeConfig, *noProgress); err != nil {
+			fatal("%v", err)
+		}
+	case remoteSrc:
 		if err := runRemoteFlatten(input, outPath, cfg, *printDigest, *noProgress); err != nil {
 			fatal("%v", err)
 		}
-	} else {
+	default:
 		if err := runFlatten(input, outPath, cfg.TmpDir, *noProgress); err != nil {
 			fatal("%v", err)
 		}
@@ -222,6 +257,36 @@ func cmdExport(args []string) {
 	// Belt and braces: tmpOut already covered by defer, but make the
 	// intent explicit when --upload finishes without --output.
 	_ = tmpOut
+}
+
+// stringList is a repeatable string flag.
+type stringList []string
+
+func (s *stringList) String() string     { return strings.Join(*s, ",") }
+func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
+
+// runDirFlatten exports an already-flattened rootfs directory
+// (flatten.BuildFromDir): mkfs.erofs reads the tree in place — no
+// staging copy, no source mutation.
+func runDirFlatten(root, outputPath, tmpDir string, skips []string, skipMounts bool, runtimeConfig string, noProgress bool) error {
+	dopts := flatten.DirOptions{
+		Skip:       skips,
+		SkipMounts: skipMounts,
+	}
+	if !noProgress {
+		dopts.Warnf = func(format string, a ...any) {
+			fmt.Fprintf(os.Stderr, format+"\n", a...)
+		}
+	}
+	if runtimeConfig != "" {
+		data, err := os.ReadFile(runtimeConfig)
+		if err != nil {
+			return fmt.Errorf("--runtime-config: %w", err)
+		}
+		dopts.ConfigJSON = data
+	}
+	opts := flatten.Options{TmpDir: tmpDir, Progress: flattenProgress(!noProgress)}
+	return flatten.BuildFromDir(root, outputPath, opts, dopts)
 }
 
 func runFlatten(image, outputPath, tmpDir string, noProgress bool) error {
