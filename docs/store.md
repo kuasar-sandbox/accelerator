@@ -1,4 +1,4 @@
-# store — 远端存储代理设计
+# store — 持久层读写代理
 
 `store-ctl` 是项目里**唯一**对持久层后端(本地文件系统 / 远端 OBS)读写
 的进程。所有数据进出最终都汇聚到这里:`manifest-ctl` 通过 gRPC 把
@@ -9,15 +9,15 @@ chunk 与 Manifest 推过来,`cache-ctl tiered` 在 origin miss 时通过 gRPC
 
 ### 1.1 为什么需要单独的 store 进程
 
-跨 sandbox / 跨 manifest-ctl / 跨 cache-ctl 进程的物理字节,必须由**单一
-进程**协调写入,以下问题才能成立:
+跨 sandbox / 跨 manifest-ctl / 跨 cache-ctl 进程的物理字节,必须收敛到
+**单一进程**写入,才能同时满足:
 
 - **唯一写者**:fs / obs 后端的物理字节写入需要协调,否则 dedup 元数据
   (`__meta/generations`)与 staged 临时文件可能被并发修改坏掉;
 - **后端可替换**:本地开发用 fs,生产用 OBS,manifest-ctl / cache-ctl 不
   该感知差异;切换后端不能改客户端代码;
 - **代次管理**:租户隔离靠 generation 划分(同代去重、跨代隔离),线上
-  要支持"开新代"和"决扫旧代"两个低频但关键的操作;
+  要支持"开新代"和"清退旧代"两个低频但关键的操作;
 - **完整性可验证**:写入路径要能在服务端重算 ContentKey,拒绝 hash 算错
   的请求,免得污染整代去重域。
 
@@ -216,7 +216,7 @@ obs:
 │   ├ fs:  filepath I/O at root                   │
 │   └ obs: aws-sdk-go-v2/s3 to OBS                │
 │                                                  │
-│  __meta/generations  ←──── 唯一写者             │
+│  __meta/generations  ←──── single writer        │
 └──────────────────────────────────────────────────┘
 ```
 
@@ -411,20 +411,20 @@ OBS 延迟加到每次客户端 Get 上。详见 [`cache.md`](cache.md)。
 ### 5.4 容量监控(obs)
 
 OBS 不限对象数,监控 bucket 计费即可。chunk 路径下对象数 ≈ 唯一 chunk
-数(高去重场景 < 100K /节点 /月,见 PROPOSAL §6.6 容量规划)。
+数(高去重场景 < 100K /节点 /月,见 `kuasar-sandbox/docs/kuasar-sandbox.md`
+§7.3 存储与带宽推算)。
 
 ### 5.5 e2e 验证
 
 ```bash
-# fs backend 链路
-make test-e2e
-
-# obs backend 链路(需要凭据)
-OBS_E2E=1 OBS_BUCKET=ops-dev make test-e2e-obs
+make test-e2e        # = test-e2e-cache + test-e2e-cluster(fs 后端全链路)
 ```
 
-obs 链路 endpoint/region/AK/SK 自动从 `~/.obsconfig` 取;无凭证时 skip 不
-阻塞 CI。
+`test/e2e/e2e_cache.sh` 以 fs 后端 store-ctl 为 sidecar,覆盖 manifest-ctl ↔
+cache-ctl(local / shard / tiered)↔ store-ctl 全链路;`e2e_cluster_rolling.sh`
+验证 EC 集群 SIGHUP 滚动换 peer 后读全部成功、且不穿透 store-ctl origin。
+obs 后端无独立 e2e:凭据发现 / 签名 / meta CAS 由 `pkg/store/obs` 单元测试
+(内置 fake S3)覆盖。
 
 ### 5.6 慢/卡操作追踪(`STORE_CTL_DEBUG`)
 
@@ -474,6 +474,6 @@ store stat | get 1.2k/s 92%hit 180MiB/s p50 80µs/p99 900µs/max 4.1ms · put 34
   与 store-ctl 交互;chunk 加密在客户端发生
 - [`cache.md`](cache.md) — `tiered` 模式的 origin 是一个 store gRPC 客户端
   指向 store-ctl
-- [`build.md`](build.md) — store-ctl 是纯 Go 二进制,`make build` /
-  `make store-ctl` 产出
-- `PROPOSAL.md` §6.6 — 存储模型与容量规划
+- 仓根 `README.md` / `Makefile` — 构建:store-ctl 是纯 Go 二进制,
+  `make store-ctl`(或 `make build`)产出
+- `kuasar-sandbox/docs/kuasar-sandbox.md` §7.3 — 存储模型与容量推算

@@ -1,4 +1,4 @@
-# cache — 缓存系统设计
+# cache — 分层内容缓存
 
 `cache-ctl` 是项目里**跨 sandbox 共享**的内容缓存层。它把客户端反复
 读取的 chunk 在节点本地与节点间集群里重复使用,把热路径延迟从远端
@@ -24,11 +24,11 @@ Agent 应用的镜像(1–5 GiB)和内存快照(~512 MiB)存储在远端 OBS,直
 次穿透到 OBS。5 TiB 磁盘容量范围内,任何请求最多 1 次随机 IO(Index 与
 Bloom Filter 全部常驻内存)。
 
-### 1.2 一句话原则
+### 1.2 设计原则
 
 - **数据面**:自定义 wire 协议(39 B 请求头 / 8 B 响应头,6 个 opcode)。
-- **控制面**:`health_listen` 独立端口同时跑两个 gRPC 服务——标准 `health.v1.Health`
-  探活,以及 `cache.v1.Info`(`Get` 拉运行时计数快照 + `WaitFills` 等待 fill 排空)。
+- **控制面**:`health_listen` 独立端口同时跑两个 gRPC 服务——标准 `grpc.health.v1.Health`
+  探活,以及 `cac.cache.v1.Info`(`Get` 拉运行时计数快照 + `WaitFills` 等待 fill 排空)。
 - **监听地址**:`listen` / `health_listen` 均取 `host:port`(TCP)或一个 Unix
   socket 路径(`/run/sandbox/cache.sock` 或 `unix:///...`;为 socket 时启动清死
   socket、chmod 0600)。数据面客户端 `cache.endpoint` 填同址即可;控制面经 socket
@@ -68,16 +68,21 @@ cache-ctl object put --endpoint host:port --namespace chunk --hash HEX --value F
 ```
 
 `--endpoint` 与 `CACHE_ENDPOINT` 二选一;`get` 输出到 stdout;
-`--value -` 从 stdin 读。
+`--value -` 从 stdin 读。`put` 不可连 tiered(拒绝写,§3.1)。
 
 ### 2.4 `cache-ctl shard` — EC 分片操作
 
 连 `shard` 端点:
 
 ```
-cache-ctl shard get --endpoint host:port --namespace chunk --hash HEX --idx N
-cache-ctl shard put --endpoint host:port --namespace chunk --hash HEX --idx N --value FILE|-
+cache-ctl shard get --endpoint host:port --namespace chunk --hash HEX
+cache-ctl shard put --endpoint host:port --namespace chunk --hash HEX --idx N --total M --value FILE|-
 ```
+
+`get` 不带分片编号——返回该 peer 实际持有的分片(`idx`/`total` 打到 stderr,
+分片数据到 stdout)。`put` 把裸分片数据按 `[idx][total]` 前缀封装后写入
+(`--total` 默认 5,须 `--idx < --total`),是单 peer 的调试入口;真实写入由
+fill-aside 经 `EncodePrefixed` 完成。
 
 ### 2.5 `cache-ctl ping` / `info`
 
@@ -89,8 +94,8 @@ cache-ctl info --rocks-path PATH               # 离线只读打开 RocksDB,查�
 
 `ping` / `info --endpoint` 都指向**控制面**端口(`health_listen`,典型 7071),
 **不是**数据端口,都不走 wire 协议。两者调不同 gRPC 服务:`ping` 调
-`health.v1.Health/Check`;`info --endpoint` 调 `cache.v1.Info/Get`,把运行时计数
-快照拉回来(`--json` 输出原始 JSON,否则人类可读表格)。
+`grpc.health.v1.Health/Check`;`info --endpoint` 调 `cac.cache.v1.Info/Get`,把运行时
+计数快照拉回来(`--json` 输出原始 JSON,否则人类可读表格)。
 `info --rocks-path` 走 RocksDB secondary instance(只读并行打开),不打扰
 运行中的 cache-ctl。
 
@@ -246,7 +251,7 @@ tiers:
       timeout: 2s
 
 origin:
-  type: store                  # store | upstream(见 §3.4「upstream 层」);cache-ctl 不直接访问文件系统
+  type: store                  # store | upstream(见下文「upstream 层」);cache-ctl 不直接访问文件系统
   store:
     endpoint: 10.0.1.50:7100   # store-ctl gRPC endpoint
     pool: 4                    # 独立 grpc.ClientConn 数(round-robin)
@@ -299,7 +304,7 @@ tiers:
 | 参数 | 说明 |
 |---|---|
 | `listen` | wire 数据面 TCP 监听 |
-| `health_listen` | gRPC 控制面监听,同端口跑两个服务:`health.v1.Health`(探活)+ `cache.v1.Info`(`Get` 拉计数快照 / `WaitFills` 等 fill 排空)。省略则两者都不启动 |
+| `health_listen` | gRPC 控制面监听,同端口跑两个服务:`grpc.health.v1.Health`(探活)+ `cac.cache.v1.Info`(`Get` 拉计数快照 / `WaitFills` 等 fill 排空)。省略则两者都不启动 |
 | `stats_interval` | 周期自适应 stderr 统计行的基准周期(§6.6)。缺省/空 = 30s(默认开);`0`/`off` 关闭。有流量的周期打一行(吞吐/带宽/时延 p50/p99/max/并发/命中级联/rocks 量规),空闲周期静默 |
 | `freq.disable_eviction` | bool。关掉频率式 compaction-filter 淘汰:sketch 仍维护(供 stats),但 filter 永不挂载,任何 key 都不会按访问计数被淘汰。用于某台 local cache-ctl 充当下游 tiered 的 origin(bench 场景)——写入落一次就必须留住 |
 | `pool` | 到单个 peer 的并行 TCP 连接数。wire 是 sync request/response,单连接会把并发请求串行化 |
@@ -408,7 +413,7 @@ ctx(命中 ctx 的后端——tier chain 远端跳、origin IO——随之中断
 
 - **Delete**:内容寻址下不删除,淘汰由 §4.4 频率 sketch + CompactionFilter
   异步处理。
-- **AdminService**:无独立 admin RPC。运行时计数可通过控制面 `cache.v1.Info/Get`
+- **AdminService**:无独立 admin RPC。运行时计数可通过控制面 `cac.cache.v1.Info/Get`
   按需拉(pull-only,见 §1.2 / §6.3),另有默认开启的周期自适应 stderr 统计行
   (§6.6,`stats_interval`);离线诊断用 `cache-ctl info --rocks-path` 直接打开
   RocksDB(secondary instance 模式)。
@@ -486,13 +491,13 @@ CompactionFilter,filter 通过 CGO 回调 `ShouldEvict(key)` 查询 sketch——
 低于阈值(默认 1)的 key 被物理删除。
 
 ```
-每次 Get/Put:
+every Get/Put:
     sketch.Touch(key)                   # O(1), 4-bit counter increment
 
-每 reset_after 次 Touch 或 reset_interval 时间(先到先触发):
-    sketch.Reset()                      # 所有 counter 减半
+every reset_after Touches OR every reset_interval (first wins):
+    sketch.Reset()                      # halve all counters
 
-RocksDB 后台 Compaction(chunk + manifest CF 都挂 filter):
+RocksDB background compaction (filter on both chunk + manifest CF):
     for each key in SST:
         if sketch.ShouldEvict(key):
             return Remove
@@ -541,25 +546,25 @@ manifest-ctl load
    ▼
 fetch.Fetcher.WriteTo()
    │
-   ├─ manifest 二分查找确定 chunk 索引
-   ├─ 并发 N 个 goroutine
-   │   └─ 每 goroutine:
+   ├─ binary-search manifest index for chunk range
+   ├─ spawn N goroutines
+   │   └─ per goroutine:
    │       ├─ client.ObjectGet(key) ─── wire ───► cache-ctl tiered
    │       │                                    │
    │       │                                    ▼
    │       │                               TieredCache.Get(ctx, p, key)
    │       │                                    │
    │       │                                    ├─ tier 0: embedded.Get(key)
-   │       │                                    │   HIT → 返回密文
+   │       │                                    │   HIT → return ciphertext
    │       │                                    ├─ tier 1: ec.Get(key)
    │       │                                    │   5 × wire ShardGet
-   │       │                                    │   ≥4 返回 → RS Reconstruct
+   │       │                                    │   ≥4 arrive → RS Reconstruct
    │       │                                    └─ origin: store.Get(key)
-   │       │                                        HIT → 返回 + fill-aside 所有上层
+   │       │                                        HIT → return + fill-aside upper tiers
    │       ├─ crypto.Decrypt(key, ciphertext)
-   │       └─ 写结果通道
+   │       └─ send to result channel
    │
-   └─ 按序读结果通道,写出
+   └─ read result channel in order, write out
 ```
 
 ### 4.7 fill-aside
@@ -567,27 +572,31 @@ fetch.Fetcher.WriteTo()
 读路径上 layer i 命中时,回填所有**更上层**的 cache tier(序号 < i):
 
 ```
-TieredCache.Get 命中 layer i  (layer 0..N-1 = tiers, N = origin):
+TieredCache.Get hit at layer i  (layer 0..N-1 = tiers, N = origin):
     upper = min(i, N)
     for j := upper-1; j >= 0; j--:
-        startFill(j, partition, key, blob)   # async, 30s timeout, fire-and-forget
+        startFill(j, partition, key, blob)   # async, fire-and-forget
 ```
 
 **Blob 生命周期**:startFill 不共用调用方的 blob,而是 **Clone** 出独立
 handle 给 fill goroutine,`defer cloned.Release()`。原 blob 由 Get 调用
 方持有直到外层 wire 响应写完。两者引用计数独立。
 
-**异步、fire-and-forget**:读路径不等写完成(30 s 超时);**幂等**:重
-复 fill 无副作用(rocks Put 覆盖,wire ShardPut 覆盖)。
+**异步、fire-and-forget**:读路径不等写完成。fill 默认**无 deadline**——
+goroutine 挂在 TieredCache 的 baseCtx 下,关停时 `Close()` 统一取消(§6.2),
+卡死的 origin 不会泄漏 fill goroutine;控制面 Info 服务的 `WaitFills` 可等待
+在途 fill 排空。**幂等**:重复 fill 无副作用(rocks Put 覆盖,wire ShardPut
+覆盖)。
 
 #### EC 分片缺失修复
 
 ```
 ec.Get(key):
-    5 × wire ShardGet → 并发
-    ├─ 5 成功:RS Reconstruct → HIT
-    ├─ 4 成功 + 1 缺失:Reconstruct → HIT,异步回填缺失分片
-    └─ 3 成功 + 2 缺失:无法重建 → MISS;origin HIT 后 fill-aside 重编码所有 5 分片
+    5 × wire ShardGet, concurrent
+    ├─ 5 ok:           RS Reconstruct → HIT
+    ├─ 4 ok + 1 miss:  Reconstruct → HIT, backfill missing shard async
+    └─ 3 ok + 2 miss:  cannot rebuild → MISS; on origin HIT fill-aside
+                       re-encodes all 5 shards
 ```
 
 ### 4.8 强制准入语义
@@ -612,11 +621,11 @@ EC 客户端只在 tiered 的 tier chain 中使用。
 
 #### Padding
 
-原始 chunk 大小可能不被 4 整除:
+原始 chunk 大小可能不被数据分片数(k)整除:
 
 1. 写入 4 字节 little-endian 长度前缀;
-2. Pad 到 4 的倍数;
-3. RS Split → 4 个数据分片;
+2. Pad 到 k 的倍数;
+3. RS Split → k 个数据分片;
 4. 重建后按长度前缀截断。
 
 #### Maglev 一致性哈希
@@ -653,13 +662,12 @@ parity(RS(4+1) parity=1),读路径 fallthrough origin——正确但慢。
 
 wire handler 对所有 opcode 都响应,因此 `ObjectPut` 发到 shard 模式节点
 **不会**被协议层拦截,会真正写入该节点的 RocksDB。这是有意设计——
-`shard` 的语义是部署意图而非协议约束,集成测试让它同时承载两类操作反而
-是特性。真正需要防误写的是 tiered 模式,由 §3.1 表中"写操作:拒绝"
-分支兜底。
+`shard` 的语义是部署意图而非协议约束。真正需要防误写的是 tiered 模式,
+由 §3.1 表中"写操作:拒绝"分支兜底。
 
 ## 5. 内存预算
 
-### L1(tiered 进程内嵌 embedded tier)
+### 5.1 L1(tiered 进程内嵌 embedded tier)
 
 | 区域 | 1 TiB / 1% ratio | 100 GiB / 1% ratio |
 |---|---|---|
@@ -669,7 +677,7 @@ wire handler 对所有 opcode 都响应,因此 `ObjectPut` 发到 shard 模式�
 | OS Page Cache | 0(DirectReads) | 0 |
 | **总** | **< 16 GiB** | **< 1.7 GiB** |
 
-### L2(shard 专用节点)
+### 5.2 L2(shard 专用节点)
 
 500 GiB RAM / 5 TiB SSD 机型:
 
@@ -710,7 +718,7 @@ cache-ctl serve --config /etc/cache/tiered.yaml
 
 ### 6.3 运行时计数(pull-only)
 
-精确累计计数按需经控制面 `cache.v1.Info/Get` 拉取(`health_listen` 端口,见
+精确累计计数按需经控制面 `cac.cache.v1.Info/Get` 拉取(`health_listen` 端口,见
 §1.2)。`cache-ctl info --endpoint host:port` 即取一次快照(`--json` 出原始
 JSON,否则人类可读表格),含 server hits/misses/fills、各 tier 与 origin 计数、
 EC 各 peer 计数、embedded/local/shard 的 RocksDB CF 属性。bench 脚本用同一服务
@@ -744,11 +752,14 @@ CACHE_CTL_SLOW=2s CACHE_CTL_DEBUG=1 cache-ctl serve ...      # 自定慢阈值
   (WARN);快请求静默——稳态吞吐/时延看 §6.6 的周期统计行,这里只盯异常长尾
 - 后台 reporter 周期 dump **仍在飞**且超阈值的请求(op 名 + 已卡时长),
   卡死的 tier / origin 立即可见,不必等 deadline
-- 覆盖 wire 服务端请求处理(含 tiered fill / origin 回源)
+- 覆盖 wire 服务端请求处理(一次请求一个 op;tier 链遍历与 origin 回源都在其内)
 
 另有 `CACHE_CTL_TIMING=1`(进程启动时读)开启 EC.Get 的分阶段耗时日志
 (LocateN / fan-out / decode 各段 + 各分片到达偏移),按 1% 采样,默认关、热
 路径零开销。专测 EC hedge 的扇入与尾延迟,与上面的 `CACHE_CTL_DEBUG` 正交。
+
+两者生产默认关闭;与 `pprof_listen`(§6.4)互补——tracer 看"哪些请求慢/卡",
+pprof 看"卡在哪段代码"。
 
 ### 6.6 周期自适应统计行(`stats_interval`)
 
@@ -776,12 +787,9 @@ cache stat tiered | get 5.1k/s 620MiB/s p50 40µs/p99 700µs/max 9ms · hit 94% 
 给精确累计快照(bench / 脚本按需拉);与 §6.5 的 `CACHE_CTL_DEBUG` 正交(后者
 只打异常长尾)。
 
-生产默认关闭;与 `pprof_listen` 互补——tracer 看"哪些请求慢/卡",pprof
-看"卡在哪段代码"。
-
 ## 7. 性能特征
 
-延迟目标(由 [`perf.md`](perf.md) 测量):
+延迟目标(实测基线与已采纳优化见 `kuasar-sandbox/docs/perf.md` §1):
 
 | 指标 | P50 | P99 |
 |---|---|---|
@@ -799,6 +807,7 @@ cache stat tiered | get 5.1k/s 620MiB/s p50 40µs/p99 700µs/max 9ms · hit 94% 
   读写权限,所有持久化集中在 store-ctl
 - [`manifest.md`](manifest.md) — manifest-ctl 通过 wire ObjectGet 调 cache-ctl
   tiered;Manifest 内 chunk hash = 这里的 wire Hash 字段
-- [`perf.md`](perf.md) §cache — 实测延迟与吞吐基线
-- [`build.md`](build.md) — `make cache-ctl`(CGO + RocksDB)
-- `PROPOSAL.md` §6.8 — 缓存模型与命中率目标
+- `kuasar-sandbox/docs/perf.md` §1 — cache 子系统实测延迟/吞吐基线与优化记录
+- 仓根 `README.md` / `Makefile` — 构建:`make cache-ctl`(CGO,自动
+  `deps-rocksdb` 后静态链 librocksdb;本仓唯一 CGO 二进制)
+- `kuasar-sandbox/docs/kuasar-sandbox.md` §4.5 — 缓存模型与命中率目标

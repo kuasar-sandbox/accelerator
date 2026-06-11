@@ -1,4 +1,4 @@
-# manifest — 本地存储访问设计
+# manifest — 内容寻址存储的统一出入口
 
 `manifest-ctl` 是数据进出"内容寻址存储"的统一入口。任何字节流(EROFS
 镜像、内存快照、磁盘镜像、用户文件)经 manifest-ctl `store` 写入后,产出
@@ -23,7 +23,7 @@
 读取方向相反:`manifest-ctl load` 从 Manifest 取 chunk 列表 → 经 cache-ctl
 (若配置)穿到 store-ctl `Get` → 解密 → 输出明文流。
 
-### 1.2 一句话原则
+### 1.2 设计原则
 
 - **写入路径**:`io.Reader → chunker → encrypt → store.Put → Manifest`
 - **读取路径**:`Manifest → fetch → decrypt → io.Writer`
@@ -63,14 +63,11 @@ Global Flags:
 | `config show`   | 打印解析后的配置 YAML |
 | `config generate` | 输出带注释的配置模板 |
 
-> 写入 manifest blob 始终由 `store` 内部完成,不再有独立的 `put-manifest`
-> 子命令。
->
-> 输入 / manifest key 均为**位置参数**(匿名):`store` 的数据源、`info`
-> 的 manifest 来源省略或 `-` = stdin;`load` / `get-manifest` / `verify`
-> 以及 `info` 的 key 可带可选 `manifest://` 前缀(`manifest://<hex>` 与
-> 裸 `<hex>` 等价)。位置参数须置于 flags 之后(Go stdlib flag 在首个非
-> flag 实参处停止解析)。
+输入 / manifest key 均为**位置参数**(匿名):`store` 的数据源、`info`
+的 manifest 来源省略或 `-` = stdin;`load` / `get-manifest` / `verify`
+以及 `info` 的 key 可带可选 `manifest://` 前缀(`manifest://<hex>` 与
+裸 `<hex>` 等价)。位置参数须置于 flags 之后(Go stdlib flag 在首个非
+flag 实参处停止解析)。
 
 ### 2.3 `manifest-ctl store` — 数据写入
 
@@ -176,7 +173,7 @@ chunk mode:    cdc
 chunk count:   20480
 zero chunks:   0 (0 B)
 holes:         0 (0 B)
-min chunk:     63.5 KiB    (configured)
+min chunk:     128.0 KiB    (configured)
 max chunk:     1.0 MiB    (configured)
 avg chunk:     524.0 KiB
 
@@ -193,15 +190,15 @@ manifest size: 1887436 bytes
 `min(N)` / `max(N)` 括号内是取到该极值的 chunk 数;最后一行仅当实测最大值正好
 等于配置上限时出现,提示有多少 chunk 是被 CDC 强制切的)。
 
-查看 store 中的 manifest 直接 `manifest-ctl info manifest://<hex>`(等价于
-旧的 `get-manifest … | info -` 管道)。
+查看 store 中的 manifest 直接 `manifest-ctl info manifest://<hex>`,等价于
+`get-manifest … | info -` 管道。
 
 ### 2.7 `manifest-ctl verify`
 
 通过 fetch 路径逐 chunk 端到端解密,验证 store 中的 manifest 全可用。
 
 ```
-manifest-ctl verify a1b2c3d4...        # 或 manifest://a1b2c3d4...
+manifest-ctl verify [--no-progress] a1b2c3d4...        # 或 manifest://a1b2c3d4...
 ```
 
 ```
@@ -289,8 +286,8 @@ crypto:
 
 ```
 --manifest-config FILE     ┐
-                           ├─ 优先级:flag > env;两者皆缺则报错
-MANIFEST_CONFIG            ┘   (config generate 除外)
+                           ├─ precedence: flag > env; error when both absent
+MANIFEST_CONFIG            ┘   (except `config generate`)
 ```
 
 **customer key 是例外**:它可以来自配置文件的 `manifest.key`,**也可以**来自
@@ -301,8 +298,7 @@ MANIFEST_CONFIG 不含 key,命令仍能拿到密钥。
 (例如经 config-socket 投递给 sandbox-ctl),endpoint / crypto 等参数无需落盘;
 customer key 通常由调用方单独设到 `Config.Manifest.Key`。
 
-不再支持单字段 CLI overrides(`--manifest-key` / `--chunk-mode` 等已移除)
-—— 切换分块或加密模式直接改 YAML。
+无单字段 CLI override —— 切换分块或加密模式直接改 YAML。
 
 ## 4. 设计
 
@@ -316,9 +312,12 @@ customer key 通常由调用方单独设到 `Config.Manifest.Key`。
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `min` | 64 KiB  | 切点的最小长度;小于此值不切 |
+| `min` | 128 KiB | 切点的最小长度;小于此值不切 |
 | `avg` | 512 KiB | 期望平均长度;Gear mask 按此值设置 |
 | `max` | 1 MiB   | 切点的最大长度;到此强制切 |
+
+三个尺寸(以及 fixed 的 `size`)都必须是 4 KiB(page)的整数倍,否则配置
+解析报错。
 
 性质:对**插入/删除**有局部性 —— 在文件中段插入若干字节,只影响附近若干
 个 chunk 的边界,其余 chunk 边界与之前一致 → dedup 命中率高。
@@ -339,14 +338,14 @@ customer key 通常由调用方单独设到 `Config.Manifest.Key`。
 #### Key 派生
 
 ```
-key   = SHA256(salt || plaintext)        # convergent key
-nonce = key[:12]                           # AES-CTR IV
-salt  = SHA256(server_salt || extra_salt)  # 见 §4.5
+salt = server_salt (+ extra_salt mixing)   # 见 §4.5
+key  = SHA256(salt || plaintext)           # convergent key
 ```
 
-由 `salt + plaintext` 决定 chunk 的密钥与 IV,因此同 salt 域内同 plaintext
-必然产出同 ciphertext;同 ciphertext → 同 ContentKey(= `SHA256(ciphertext)`)
-→ store 上同一份字节。
+AES-CTR 的 IV 取全零——key 本身已由 `(salt, plaintext)` 唯一决定,同一
+key 永远只加密同一明文,(key, IV) 对不会复用。由 `salt + plaintext` 决定
+chunk 的密钥,因此同 salt 域内同 plaintext 必然产出同 ciphertext;同
+ciphertext → 同 ContentKey(= `SHA256(ciphertext)`)→ store 上同一份字节。
 
 #### Content key
 
@@ -360,8 +359,8 @@ YAML `crypto.chunk`:
 
 | 模式 | 行为 | 用途 |
 |---|---|---|
-| `aes`  | `[flag=0x01] + AES-256-CTR(key, IV, plaintext)` | 生产默认 |
-| `fake` | `[flag=0x00] + HMAC(key, plaintext)[:32] + plaintext` | 性能基线;不要在生产打开 |
+| `aes`  | `[flag=0x01] + AES-256-CTR(key, plaintext)`(IV 全零,§4.2) | 生产默认 |
+| `fake` | `[flag=0x00] + HMAC-SHA256(key, plaintext) + plaintext` | 性能基线;不要在生产打开 |
 
 `fake` 模式专为对比测量收敛寻址 / 去重 / 上传开销时,排除 AES 加密的
 CPU 影响 —— 由于密文 = 明文,生产部署不应允许使用。flag byte 在解密时
@@ -388,43 +387,50 @@ Salt 隔离 dedup 域 —— 同样的明文用不同 salt 派生不同 key → 
 实际 salt 由两部分组合:
 
 - `server_salt` — manifest-ctl 启动时调一次 `store-ctl GetSalt()` 取得
-  active-generation salt。Generation 切换时 salt 变,跨代天然隔离。
+  active-generation salt(服务端从 generation ID 派生:
+  `SHA256("accelerator-salt-v1" || generation_id)`)。Generation 切换时
+  salt 变,跨代天然隔离。
 - `extra_salt` — `--extra-salt <bytes>` flag(§2.3),叠加到上面。
 
 最终:
 
 ```
-final_salt = SHA256(server_salt || extra_salt)
+final_salt = server_salt                                                       # extra_salt 为空
+final_salt = SHA256("accelerator-extra-salt-v1" || server_salt || extra_salt)  # extra_salt 非空
 ```
 
 `extra_salt` 用于在同一 generation 内做更细粒度隔离(例如多租户)。
 
 ### 4.6 Manifest 二进制格式
 
-Manifest 是一段紧凑的小型二进制:
+Manifest 是一段紧凑的小型二进制(整数 little-endian):
 
 ```
-   ┌──────────────── header ──────────────────┐
-   │  magic        "MANI"   4 B               │
-   │  version      u32      4 B               │
-   │  chunk_mode   u8       1 B               │   0 = cdc  /  1 = fixed
-   │  chunk_avg    u32      4 B               │
-   │  chunk_min    u32      4 B               │
-   │  chunk_max    u32      4 B               │
-   │  image_size   u64      8 B               │
-   │  chunk_count  u32      4 B               │
-   │  ...                                     │
-   ├──────────── chunk index ─────────────────┤   sorted by image_offset
-   │  for each chunk:                         │
-   │     image_offset   u64                   │   (implicit — derivable from cumulative)
-   │     plain_len      u32                   │
-   │     cipher_hash    32 B                  │   store addressing key
-   │     flags          u8                    │   zero-chunk / aes / fake bit
-   ├───────────── key table ──────────────────┤   sealed with the customer key
-   │  AES-GCM( manifest.key,                  │
-   │           [ key_0[32], key_1[32], … ] )  │
-   └──────────────────────────────────────────┘
+   ┌──────────────── header (64 B) ───────────────┐
+   │  magic            "MANI"   4 B               │
+   │  version          u8       1 B               │
+   │  chunk_mode       u8       1 B               │   1 = cdc  /  2 = fixed
+   │  image_size       u64      8 B               │
+   │  chunk_count      u32      4 B               │
+   │  chunk_min/max    u32 × 2  8 B               │   configured bounds
+   │  key_table off/len, hole_count, holes off    │
+   │  (reserved padding to 64 B)                  │
+   ├──────── chunk index (56 B per entry) ────────┤   sorted by image_offset
+   │  image_offset     u64                        │
+   │  plain_len        u32                        │
+   │  flags            u32                        │   bit0 = zero-chunk
+   │  cipher_hash      32 B                       │   store addressing key
+   ├──────── hole extents (16 B per hole) ────────┤   entries + holes tile
+   │  offset u64 / size u64                       │   [0, image_size) exactly
+   ├───────────── key table ──────────────────────┤   sealed with the customer key
+   │  AES-GCM( manifest.key,                      │
+   │           [ key_0[32], key_1[32], … ] )      │
+   └──────────────────────────────────────────────┘
 ```
+
+零 chunk(明文全零,flags bit0)不加密、不入库、不占密钥表条目,读取时本地
+合成零字节;hole 是外部声明的"无数据"区间(文件系统空洞等),与数据 chunk
+无重叠、无缝隙地铺满整个镜像。
 
 读路径:解析 header → 二分查找 chunk index 定位 offset → 用 `manifest.key`
 解密 key table 得每 chunk 的对称 key → store/cache.Get(cipher_hash) → 解
@@ -436,25 +442,25 @@ Manifest 是一段紧凑的小型二进制:
 io.Reader
    │
    ▼
-chunker (cdc | fixed)        ← 按 mode 切
+chunker (cdc | fixed)        ← split per configured mode
    │  → plaintext_chunk[i]
    ▼
-crypto.derive(salt, plain)   ← key, nonce
+crypto.derive(salt, plain)
    │  → key, ciphertext
    ▼
 sha256(ciphertext)           ← ContentKey
    │
    ▼
 store-ctl Put(partition=chunk, key=ContentKey, ciphertext)
-   │  服务端先 Exists → dedup 命中即跳过 upload(SendAndClose)
-   │  否则流式 Write 到临时 → atomic rename 到 chunk/{gen}/aa/bb/<hash>
+   │  server checks Exists first → dedup hit skips upload (SendAndClose)
+   │  else stream-write to tmp → atomic rename to chunk/{gen}/aa/bb/<hash>
    ▼
-manifest.append(chunk_meta, key)   ← 累积索引 + 密钥表
+manifest.append(chunk_meta, key)   ← accumulate index + key table
    │
    ▼
 seal(manifest.key, key_table)
    ↓
-emit Manifest 文件
+emit Manifest
 ```
 
 上图按单个 chunk 画顺序流,但 derive/encrypt/`Put` 那一段是**并发**执行的:
@@ -462,7 +468,8 @@ ingest 用一个有界 worker pool,并发度取 store 客户端连接池大小(`
 ——round-robin RPC 调度下真正能同时在途的 `Put` 数就是它)。chunk 切分仍按
 文件顺序、manifest 索引按文件顺序组装、进度回调串行化,所以产物字节序不变;
 后端不暴露连接池信息时回退为串行。这把入库吞吐从"串行单 `Put` 往返"提升到
-"池并发往返",对多 GiB snapshot `--upload` 影响显著(见 [`perf.md`](perf.md) §2.4)。
+"池并发往返",对多 GiB snapshot `--upload` 影响显著(实测见
+`kuasar-sandbox/docs/perf.md` §2.4)。
 
 ### 4.8 读路径(细节)
 
@@ -495,8 +502,8 @@ io.Writer
 
 ## 5. 性能特征
 
-测量入口:[`perf.md`](perf.md) §cache(冷/热 L1 状态下 manifest-ctl
-load 端到端时长)。
+测量入口:`kuasar-sandbox/docs/perf.md` §2.1–2.2(冷/热 L1 状态下
+manifest:// 加载端到端时长)。
 
 主要决定项:
 
@@ -510,8 +517,8 @@ load 端到端时长)。
 - [`store.md`](store.md) — manifest-ctl 通过 gRPC 把字节落到 store-ctl
 - [`cache.md`](cache.md) — `load` 路径可选穿 cache-ctl 加速;cache-ctl 自身
   以 manifest 同款客户端从 store 取 chunk
-- [`flatten.md`](flatten.md) — 镜像展平后通常用 `flatten-ctl | manifest-ctl
-  store` 入库
-- [`sandbox.md`](sandbox.md) — 沙箱通过 `manifest://<key>` 引用磁盘 base
-  与快照
-- `PROPOSAL.md` §6.3-6.7 — Manifest 抽象在系统中的位置
+- `sandbox-builder/docs/flatten.md` — 镜像展平后经
+  `flatten-ctl export --upload` 入库
+- `sandbox-runtime/docs/sandbox.md` — 沙箱通过 `manifest://<key>` 引用磁盘
+  base 与快照
+- `kuasar-sandbox/docs/kuasar-sandbox.md` §4.1–4.4 — Manifest 抽象在系统中的位置
