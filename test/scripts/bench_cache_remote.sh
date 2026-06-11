@@ -11,7 +11,7 @@ set -euo pipefail
 #
 # Prerequisites on the operator's workstation:
 #   - Passwordless SSH (pubkey in ~/.ssh/authorized_keys on every host)
-#   - bin/cache-ctl built via `make build-cgo` (statically linked C/C++)
+#   - bin/cache-ctl built via `make cache-ctl` (statically linked C/C++)
 #
 # Prerequisites on each remote host:
 #   - glibc >= build machine's glibc (binary is dynamic-glibc only)

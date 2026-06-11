@@ -299,7 +299,7 @@ func cmdLoad(args []string) {
 
 	keyArg := fs.Arg(0)
 	if keyArg == "" {
-		fatal("usage: manifest-ctl load <hex|manifest://hex> [flags]")
+		fatal("usage: manifest-ctl load [flags] <hex|manifest://hex>")
 	}
 	cfg := loadCfg(*gf.configPath)
 
@@ -426,7 +426,7 @@ func cmdGetManifest(args []string) {
 	fs.Parse(args)
 	keyArg := fs.Arg(0)
 	if keyArg == "" {
-		fatal("usage: manifest-ctl get-manifest <hex|manifest://hex> [--output -|FILE]")
+		fatal("usage: manifest-ctl get-manifest [--output -|FILE] <hex|manifest://hex>")
 	}
 	cfg := loadCfg(*gf.configPath)
 
@@ -614,7 +614,7 @@ func cmdVerify(args []string) {
 	fs.Parse(args)
 	keyArg := fs.Arg(0)
 	if keyArg == "" {
-		fatal("usage: manifest-ctl verify <hex|manifest://hex> [flags]")
+		fatal("usage: manifest-ctl verify [flags] <hex|manifest://hex>")
 	}
 	cfg := loadCfg(*gf.configPath)
 
