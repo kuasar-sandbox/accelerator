@@ -645,7 +645,7 @@ func buildImage(rootfsDir, outputPath string) error {
 // buildEROFS invokes mkfs.erofs to produce a deterministic, dedup-friendly EROFS image.
 // Uses chunk-based layout (-Ededupe --chunksize=4096) to minimize metadata size and
 // stabilize data block offsets across images, maximizing CDC cross-image dedup.
-// No compression: raw bytes enable CDC dedup (consistent with PROPOSAL §9.1).
+// No compression: raw bytes enable CDC dedup (consistent with kuasar-sandbox.md §5 design matrix).
 func buildEROFS(mkfsPath, rootfsDir, outputPath string) error {
 	cmd := exec.Command(mkfsPath,
 		"-Ededupe",         // intra-image file dedup

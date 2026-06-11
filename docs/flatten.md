@@ -1,7 +1,7 @@
 # flatten — 容器镜像展平工具
 
 把多层 OCI/Docker 镜像合并(展平)成单个 EROFS 文件系统镜像,作为
-`manifest-ctl` 的输入,或直接挂为沙箱 blk0 base。
+`manifest-ctl` 的输入,或直接作为沙箱的只读根(`boot.root.base`)挂载。
 
 `flatten-ctl` 强调**确定性**——同一镜像每次展平出字节级相同的输出,
 保证后续 chunk dedup、manifest content-key 跨次稳定。输出文件**自带 OCI
@@ -41,19 +41,17 @@ docker-archive)汇入同一展平 sink,同一镜像内容产出逐字节相同�
 ### 1.3 在系统中的位置
 
 ```
-   ┌─ docker save ──┐     ┌─ flatten-ctl ───────────┐     ┌─ manifest-ctl store ──────┐
-   │  layered tar   │────►│  layer iter + merge     │────►│  chunk + crypto + dedup   │
-   └────────────────┘     │  whiteout handling      │     │  → store-ctl gRPC Put     │
-                          │  mtime → 0              │     └───────────────────────────┘
-                          │  mkfs.erofs             │
-                          │  + append config zip    │     ┌─ sandbox-ctl run ─────────┐
-                          └─────────────────────────┘     │  blk0.base = file://...   │
-                                                          │             or manifest://│
-                                                          └───────────────────────────┘
+   ┌─ registry image ─┐
+   │  repo@sha256:..  │──┐    ┌─ flatten-ctl ───────────┐     ┌─ manifest-ctl store ──────┐
+   └──────────────────┘  ├───►│  pull / layer iter      │────►│  chunk + crypto + dedup   │
+   ┌─ docker save ────┐  │    │  merge + whiteout       │     │  → store-ctl gRPC Put     │
+   │  layered tar     │──┘    │  mtime → 0              │     └───────────────────────────┘
+   └──────────────────┘       │  mkfs.erofs             │
+                              │  + append config zip    │     ┌─ sandbox-ctl run ─────────┐
+                              └─────────────────────────┘     │  boot.root.base =         │
+                                                              │    file:// | manifest://  │
+                                                              └───────────────────────────┘
 ```
-
-OCI layout (`oci:./dir`) 可先经 `skopeo copy oci:./xxx docker-archive:/tmp/x.tar`
-转成 docker-archive 再喂 flatten-ctl。
 
 ## 2. 命令行接口
 
@@ -82,6 +80,16 @@ OCI layout (`oci:./dir`) 可先经 `skopeo copy oci:./xxx docker-archive:/tmp/x.
 参数必填,接受 EROFS 文件路径或 `manifest://<hex>`。位置参数须置于 flags 之后(Go stdlib
 flag 在首个非 flag 实参处停止解析)。
 
+展平保留镜像内文件的属主与权限位(§4.3),因此 `export`/`verify` 需要 root 或
+`CAP_CHOWN`;`export` 启动时即预检,避免昂贵的拉取+解包后才在首层 chown 上失败
+(`--with-referer` 命中即复用 manifest id、不展平,无需特权)。`info`/`cache`/`config`
+不需要特权。
+
+进度与诊断一律走 stderr,stdout 只承载交付物(EROFS 流 / manifest key /
+`--print-digest` 的 digest);`export`/`verify`/`cache gc` 经 `--no-progress` 关闭。
+拉取按层打 `pull: <done>/<total> layers`(只计缓存未命中的层),展平按阶段打
+`flatten: ...`,`--upload` 上传打 `upload: ...`(百分比+速率);字节型进度 2s 节流。
+
 ### 2.1 `flatten-ctl export`
 
 ```
@@ -93,7 +101,7 @@ flatten-ctl export [flags] <ref|path|->
   --upload                展平后把 EROFS ingest 进 store,stdout 打印 manifest key
   --manifest-config <p>   manifest 配置 YAML(覆盖 MANIFEST_CONFIG env);--upload 必需
   --config <p>            flatten 配置 YAML(覆盖 FLATTEN_CONFIG env):tmpdir/platform/
-                          cache/referer(详见 §2.4)
+                          tls/cache/referer(详见 §2.4)
   --platform <os/arch>    覆盖配置里的拉取 platform(os/arch[/variant])
   --no-progress           禁用 stderr 进度输出
 
@@ -132,16 +140,19 @@ flatten-ctl export --output big.erofs --config flatten.yaml ./big.tar
 ### 2.2 `flatten-ctl verify`
 
 ```
-flatten-ctl verify [--tmpdir D] [--no-progress] <path|->   # 省略/`-` = stdin
+flatten-ctl verify [--tmpdir D] [--config <p>] [--no-progress] <ref|path|->   # 省略/`-` = stdin
 ```
 
-对同一输入展平两次,比对 sha256,确认字节级确定性。stderr 输出:
+对同一输入展平两次,比对 sha256,确认字节级确定性。registry 引用时 `--config` 提供
+拉取配置(platform/TLS/缓存,§2.4),先拉一次进缓存、再从同批 blob 展两遍。stderr 输出:
 
 ```
 Pass 1: sha256:a1b2c3... (1.2 GiB)
 Pass 2: sha256:a1b2c3... (1.2 GiB)
 DETERMINISTIC
 ```
+
+两遍不一致时打印 `NOT DETERMINISTIC` 并以退出码 1 结束。
 
 ### 2.3 `flatten-ctl info` — 检视镜像
 
@@ -151,11 +162,11 @@ flatten-ctl info [--json] [--manifest-config <path>] <path|manifest://hex>
   <path|manifest://hex>          EROFS 文件路径,或 manifest://<hex>(位置参数,必填)
   --json                         机器可读 JSON 输出(默认人类可读)
   --manifest-config <path>       manifest 配置 YAML;`manifest://` 输入必需
-                                 (经 cache-ctl + store-ctl 拉回再读 superblock)
 ```
 
 读 EROFS superblock 拿 image size,从末尾 ZIP 解出 OCI runtime config 并
-打印。
+打印。`manifest://` 输入经 cache-ctl/store-ctl 的 fetch 路径按 chunk 粒度只读
+superblock 与尾部 ZIP,不取回整个镜像。
 
 人类可读输出示例:
 
@@ -218,8 +229,11 @@ flatten-ctl info --json my-app.erofs | jq '.config.Entrypoint'
 ```yaml
 tmpdir: ""                     # 每次运行临时目录的父目录(空 = $TMPDIR 或 /tmp)
 platform: linux/amd64          # 空 = 跟随宿主架构(linux/$GOARCH);--platform 覆盖
-insecure: false                # 私有/dev registry 走 HTTP / 跳过 TLS 校验
+insecure: false                # 允许走纯 HTTP 的 registry(dev/私有);不影响 TLS 证书校验
 pull_jobs: 4                   # 并发下载层数(下载并行、apply 串行)
+tls:                           # HTTPS 证书校验(registry 与 CDN blob 重定向均生效,见下)
+  ca_cert: ""                  # 追加信任的 CA bundle 路径(PEM,可含多证书)
+  insecure_skip_verify: false  # 完全关闭证书校验(不安全;优先用 ca_cert)
 cache:
   dir: ""                      # OCI-layout 持久缓存根;空(默认)= 临时缓存(tmpdir 下,跑完清理)
   max_size: 10GiB              # 上限,超出按 LRU 回收;"0" = 不限,仅手动 cache gc
@@ -235,7 +249,13 @@ artifact_type 固定为常量 `application/vnd.kuasar.flatten-manifest.v1`(不�
 **凭据(命名空间环境变量,匿名回落)**:`FLATTEN_REGISTRY_TOKEN`(Bearer,优先)或
 `FLATTEN_REGISTRY_USERNAME` + `FLATTEN_REGISTRY_PASSWORD`(Basic);都不设则匿名拉公有
 镜像。密钥只走 env(不上 argv、不入配置文件),契合展平数据面节点由管理面按任务下发租户
-拉取凭据的模型(`deployment.md` §5)。
+拉取凭据的模型(`kuasar-sandbox/docs/deployment.md` §5)。
+
+**TLS(`tls.*`)**:作用于全部 HTTPS 请求——既包括 registry API,也包括层 blob 的 CDN
+重定向(拦截式代理会用私有 CA 重签这些证书,系统信任库默认拒绝)。`ca_cert` 把额外的
+PEM CA bundle 追加进系统信任库,是信任此类私有根 CA 的正路;`insecure_skip_verify`
+整体关闭证书校验,仅作 CA 不可得时的逃生口。与 `insecure` 正交:后者只决定 registry
+是否可走纯 HTTP,不影响 TLS 校验。
 
 **本地缓存**:标准 **OCI image layout** 目录(`oci-layout` + `index.json` +
 `blobs/<algo>/<hex>`),`crane`/`skopeo` 可直接检视。缓存命中判定 = `blobs/` 下该 digest
@@ -258,14 +278,16 @@ stdout。`verify` 对 registry 源先拉一次进缓存,再从同批缓存 blob 
 回写到**源镜像所在 repo**,作为 registry 侧、按 owner 作用域的去重备忘,让重复 `export`
 直接复用、跳过拉取+展平+上传。
 
-启用 `--with-referer`(蕴含 `--upload`、需 manifest 配置;deliverable 是 stdout 的
+启用 `--with-referer`(需同时给 `--upload` 与 manifest 配置;交付物是 stdout 的
 manifest key,故与 `--output` / `--print-digest` 互斥):
 
 1. 解析源 → 平台镜像 digest `D`;
-2. `Referrers(repo@D)` 按 `artifact_type` 过滤,读各 referrer 注解,匹配 `owner` 且未过期
-   (`valid_at`)→ 直接打印其 `id`,**不拉层 / 不展平 / 不上传**;
-3. 未命中 → 拉取+展平+ingest 得 manifest key → 构造 referrer artifact(subject=`D`、
-   `artifact_type`、注解 `owner`/`id`/`valid_at`)推回源 repo → 打印 key。
+2. `Referrers(repo@D)` 取各 referrer 注解(描述符不带注解的 tag-schema 回落,先按
+   `artifact_type` 过滤再回读其 manifest),匹配 `owner` 且未过期(`valid_at`)→ 直接
+   打印其 `id`,**不拉层 / 不展平 / 不上传**;查询失败仅告警并回退完整导出;
+3. 未命中 → 拉取+展平+ingest 得 manifest key → 构造 referrer artifact(OCI image
+   manifest:subject=`D`、artifact type 经 config media type 承载、注解
+   `owner`/`id`/`valid_at`)推回源 repo → 打印 key。
 
 referrer 注解:
 
@@ -294,7 +316,7 @@ flatten-ctl cache info [--config <p>] [--cache-dir <D>]
 flatten-ctl cache gc   [--config <p>] [--cache-dir <D>] [--cache-max-size <S>] [--no-progress]
 ```
 
-`cache` 子命令面向**持久**缓存(`cache.dir` 显式配置时);默认临时缓存随 `export` 跑完即清，
+`cache` 子命令面向**持久**缓存(`cache.dir` 显式配置时);默认临时缓存随 `export` 跑完即清,
 无需 gc。`cache info` 打印缓存目录、blob 数、总占用与上限。`cache gc` 持 flock 按 LRU 回收到配置
 (或 `--cache-max-size` 覆盖)的上限,`"0"` 清空(grace 期内的除外)。缓存目录默认取
 `--config` 的 `cache.dir`,`--cache-dir` 覆盖。常驻场景可由 cron 周期跑 `cache gc`
@@ -372,37 +394,27 @@ sha256 相等。
 
 ### 3.4 沙箱怎么用 config.json
 
-`sandbox-ctl run` 在启动前从 boot.root.base 文件末尾解 ZIP,拿到
-运行时投影作为 LaunchSpec 的 fallback。`sandbox.yaml` `launch.*`
-字段优先(yaml override > image config),Env 合并:
-
-| 字段 | 合并规则 |
-|------|---------|
-| `exec` | yaml `launch.exec` 优先;为空则取 `Entrypoint[0]`(或 `Cmd[0]`,若 Entrypoint 空) |
-| `args` | yaml `launch.args` 优先;为空则取 `Entrypoint[1:] + Cmd` |
-| `env` | image `Env` + yaml `launch.env`,后者覆盖同名 key |
-| `workdir` | yaml `launch.workdir` 优先;为空则取 `WorkingDir` |
-| `user` | yaml `launch.user` 优先;为空则取 `User`(命名用户由 guest 侧解析) |
-| `stop_signal` | yaml `launch.stop_signal` 优先;为空则取 `StopSignal` |
-| `volumes` | image `Volumes` 每个目录并入 `mounts`(等价 `type: empty`),显式 `mounts` 同 target 为准 |
-
-因此 `launch.exec` 不再必填——若 image config 有 Entrypoint/Cmd 即可省略。
-详见 [`sandbox.md`](sandbox.md) §3.3。
+`sandbox-ctl run` 在启动前从 boot.root.base 文件末尾解 ZIP,拿到运行时投影作为
+LaunchSpec 的 fallback:`sandbox.yaml` `launch.*` 字段优先,`Env` 取镜像在下、
+override 在上的合并,`Volumes` 并入 `mounts`。因此 image config 有 Entrypoint/Cmd
+时 `launch.exec` 即可省略。合并规则的权威定义见 [`sandbox.md`](sandbox.md) §3.3。
 
 ## 4. 算法
 
 ### 4.1 layer 迭代
 
-docker-archive 是一个 tar:其中包含 `manifest.json` 描述层顺序、若干
-`*/layer.tar` 是各层 tarball、`*/json` 是层元信息(image config)。
+展平引擎以 `Source` 抽象输入:Source 给出底→顶有序的层(每层一条**未压缩** tar 流)
+与原始 OCI image config JSON,两个实现共享同一个确定性 sink(`Build`):
 
-`flatten-ctl`:
+- **docker-archive**:输入 tar 内含 `manifest.json`(层顺序 + image config 路径)与
+  各层 tarball;先解到临时目录,按 `manifest.json` 顺序逐层打开(gzip 层透明解压);
+- **registry**(`pkg/remote`):层 blob 经本地 OCI-layout 缓存,按媒体类型解压
+  (gzip/zstd)成同样的未压缩 tar 流(§2.4)。
 
-1. 解析 `manifest.json` 取到层列表(底→顶顺序)与 image config 路径;
-2. 读 image config,投影出 §3.2 的运行时字段集合;
-3. 按顺序读每个 `layer.tar`,把所有 `tar entry` (header + content) 流式应用到
-   一个内存中的虚拟文件树;
-4. 上层 entry 覆盖下层同路径 entry。
+`Build` 把每层 tar entry 流式应用到磁盘上的临时 staging rootfs:上层 entry 覆盖下层
+同路径 entry;每个 entry 落盘后按 tar 头 chown+chmod 保留属主与权限位(含
+setuid/setgid/sticky;先 chown 后 chmod,因为 chown 会清掉 setuid/setgid)——
+这一步要求 root/CAP_CHOWN(§2)。image config 按 §3.2 投影,最后追加进 ZIP。
 
 ### 4.2 whiteout 处理
 
@@ -411,7 +423,7 @@ OCI 镜像规范用特殊文件名表达"删除":
 - `.wh.<name>` —— 删除同目录下的 `<name>`(file 或 dir);
 - `.wh..wh..opq` —— 把所在目录标记为 opaque(其下所有底层条目都不可见)。
 
-`flatten-ctl` 在合并时识别这两类 marker,把对应条目从虚拟文件树中移除,然
+`flatten-ctl` 在合并时识别这两类 marker,把对应条目从 staging rootfs 中移除,然
 后**不**把 marker 本身写进输出——最终 EROFS 只看到合并后的可见文件。
 
 ### 4.3 元数据归一化(确定性的关键)
@@ -420,27 +432,36 @@ OCI 镜像规范用特殊文件名表达"删除":
 
 | 字段 | 处理 |
 |---|---|
-| mtime / atime / ctime | 全部归零(epoch 0) |
-| uid / gid | 保留原值(应用语义敏感) |
+| mtime / atime | 归零(epoch 0);EROFS 侧另以 `-T0` 固定全部时间戳 |
+| uid / gid / mode | 保留原值(应用语义敏感:`/tmp` 须 1777、`/home/<user>` 须 user 属主)——按层 tar 头 chown+chmod,需 root/CAP_CHOWN(§2) |
 | inode 编号 | 由 `mkfs.erofs` 按确定顺序分配 |
 | 文件遍历顺序 | 字典序(`mkfs.erofs` 内部) |
-| hardlink | 归并到内容寻址(同 content + 同 metadata → 同 inode) |
-| 扩展属性(xattr) | 保留;按 key 字典序写入 |
+| hardlink | 在 staging 上重建为真实硬链接(同 inode);`-Ededupe` 另对重复数据块去重 |
+| 扩展属性(xattr) | 不写入(`-x-1` 禁用;层 tar 中的 xattr 不应用) |
 
 EROFS 自身的格式版本由 `mkfs.erofs` 决定(我们用 erofs-utils 1.9.x);项目
 固化此版本,确保跨节点构建结果一致。
 
 ### 4.4 mkfs.erofs 调用
 
-`flatten-ctl` 把合并后的虚拟文件树物化到一个临时目录,然后执行
-`bin/<arch>/mkfs.erofs <output> <staging-dir>` 把它编码成 EROFS 镜像。
+`Build` 对 staging rootfs 执行 `mkfs.erofs`,flag 集固定:
+
+```
+mkfs.erofs -Ededupe --chunksize=4096 -T0 -b4096 -x-1 \
+    -U 00000000-0000-0000-0000-000000000000 --quiet <output> <staging-dir>
+```
+
+- `-Ededupe --chunksize=4096` —— 镜像内数据块去重 + chunk 化布局,缩小元数据体积、
+  稳定数据块偏移,最大化下游 CDC 跨镜像去重;
+- 不压缩 —— 原始字节才能被 CDC 分块跨镜像去重;
+- `-T0` / 固定 UUID / `-x-1` —— 固定时间戳、固定 UUID、禁 xattr,消除非确定性来源。
 
 完成后追加 ZIP:以 append 方式打开输出文件,在 EROFS 段之后写一条 STORED
 (无压缩)模式的 `config.json` entry(§3.3 的确定性约束)。
 
 `mkfs.erofs` 由 `sandbox-deps` 仓构建产出(`make -C ../sandbox-deps erofs`);本仓
-`make build` 只构建 flatten-ctl。flatten-ctl 启动时优先在自己的同目录查找
-`mkfs.erofs`,其次走 `PATH`。
+`make build` 只构建 flatten-ctl。运行期定位优先级:`MKFS_EROFS_PATH` 环境变量 >
+flatten-ctl 同目录 > `PATH`。
 
 EROFS 格式 endian-neutral,所以 host arch 与 target arch 无关——任何
 `mkfs.erofs` 都能产出可被任何 arch guest 挂载的镜像。
@@ -499,16 +520,13 @@ OCI image config 字段繁多,大量与启动无关:`created` / `author` / `hist
 - **镜像签名/加密** —— manifest 层做(`manifest.md`)
 - **层级保留** —— flatten-ctl 输出是合并后的单一 EROFS,层信息丢失。需要
   分层保留的场景(例如增量推送)由 manifest 层 chunk dedup 取代
-- **动态平台选择** —— flatten-ctl 是字节级转换,Architecture/Os passthrough。
-  多 arch 镜像选择由调用方决定(例如 `docker save --platform=...`)
 
 ## 6. 性能特征
 
 构建时间:与镜像大小近似线性,主要成本在 layer tar 解压 + mkfs.erofs。
 1 GiB 镜像 ~3-5 秒(SSD)。ZIP append 步骤 < 10 ms(单 entry,无压缩)。
 
-确定性测试 (`--verify`):同镜像两次展平输出 sha256 一致,所有发布 build 跑
-此检查。
+确定性自检(`verify` 子命令):同镜像两次展平,比对输出 sha256 一致。
 
 `flatten-ctl info` 不解压 EROFS,仅读 superblock(128 字节)+ ZIP EOCD 扫描
 + 单 entry 解压,亚毫秒级。
@@ -523,4 +541,4 @@ OCI image config 字段繁多,大量与启动无关:`created` / `author` / `hist
   的只读根
 - [`build.md`](build.md) —— `sandbox-deps` 构建 mkfs.erofs(`make -C ../sandbox-deps
   erofs`);本仓 `make build` 只构建 flatten-ctl,运行期经同目录 / `PATH` 定位 mkfs.erofs
-- `PROPOSAL.md` §10.4 —— 展平在系统中的位置与目标
+- `kuasar-sandbox/docs/kuasar-sandbox.md` §2.2 / §3.1 —— 展平在系统中的位置与目标
