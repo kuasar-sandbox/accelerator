@@ -495,6 +495,42 @@ func TestMemberNotFound(t *testing.T) {
 	}
 }
 
+// TestExtractFromRedirectedStdin: a shell `< archive.tar` hands the
+// process a regular-file stdin whose Name() is "/dev/stdin"; the
+// engine must resolve the real path (or spool) so the tar child does
+// not read its own fd 0.
+func TestExtractFromRedirectedStdin(t *testing.T) {
+	requireTar(t)
+	src := buildTree(t)
+	archive := filepath.Join(t.TempDir(), "a.tar")
+	f, err := os.Create(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Create(f, []Rule{{Tar: "", FS: src, Prefix: true}}, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	in, err := os.Open(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	stdinLike := os.NewFile(in.Fd(), "/dev/stdin") // what a redirected stdin looks like
+
+	var out bytes.Buffer
+	// sub/f2.txt, not f1.txt: the latter is stored as a hardlink member
+	// (its twin sorts first) and -xO of a link member is empty by GNU
+	// semantics.
+	if err := Extract(stdinLike, []Rule{{Tar: "sub/f2.txt", FS: "-"}}, Options{Stdout: &out}); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "world" {
+		t.Errorf("stdout = %q", out.String())
+	}
+}
+
 func TestExtractAllNoRules(t *testing.T) {
 	requireTar(t)
 	src := buildTree(t)

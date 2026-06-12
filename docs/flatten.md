@@ -377,7 +377,7 @@ flatten-ctl tar extract [-f tarfile] [--chown u:g] [--chmod 755] [规则...]
 |---|---|
 | `p` | 内外同名(≡ `p:p`) |
 | `in:out` | 重命名 |
-| `in:-` | 外部是本进程 stdio(create 从 stdin 取内容,extract 流向 stdout;至多一条) |
+| `in:-` | 外部是本进程 stdio(create 从 stdin 取内容,extract 流向 stdout;至多一条;`in` 若以硬链接成员存储则输出为空,GNU `-xO` 语义) |
 | `dir/` | 目录规则:dir 及其下全部内容 |
 | `dir/:out[/]` | 目录前缀重命名 |
 | `dir/:` | ≡ `dir/:$PWD/` |

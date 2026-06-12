@@ -375,11 +375,20 @@ func minimalCover(members []sel) []string {
 }
 
 // archiveFile returns a path to the archive content, spooling r to a
-// temp file unless it already is one.
+// temp file unless it already is a regular file with a real path. The
+// path must be resolved through /proc/self/fd, not f.Name(): a
+// redirected stdin reports "/dev/stdin", which a tar child process
+// would resolve to its own fd 0.
 func archiveFile(r io.Reader, tmpDir string) (string, func(), error) {
 	if f, ok := r.(*os.File); ok {
 		if st, err := f.Stat(); err == nil && st.Mode().IsRegular() {
-			return f.Name(), func() {}, nil
+			p, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd()))
+			if err == nil && strings.HasPrefix(p, "/") {
+				if pst, err := os.Stat(p); err == nil && os.SameFile(st, pst) {
+					return p, func() {}, nil
+				}
+			}
+			// fall through: spool (non-linux, deleted file, ...)
 		}
 	}
 	tmp, err := os.CreateTemp(tmpDir, "tar-extract-*")
@@ -475,10 +484,13 @@ func tarFail(op string, rl Rule, err error, stderr *bytes.Buffer) error {
 	if what == "" {
 		what = rl.FS
 	}
-	if msg != "" {
-		return fmt.Errorf("tar %s %s: %w: %s", op, what, err, msg)
+	if what != "" {
+		what = " " + what
 	}
-	return fmt.Errorf("tar %s %s: %w", op, what, err)
+	if msg != "" {
+		return fmt.Errorf("tar %s%s: %w: %s", op, what, err, msg)
+	}
+	return fmt.Errorf("tar %s%s: %w", op, what, err)
 }
 
 // postChownChmod applies the Chown/Chmod overrides over the extracted
