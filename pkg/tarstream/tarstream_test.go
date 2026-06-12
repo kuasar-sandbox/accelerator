@@ -467,3 +467,55 @@ func TestWriteToDeterministic(t *testing.T) {
 		t.Error("two emissions differ")
 	}
 }
+
+func TestProbeHoles(t *testing.T) {
+	dir := t.TempDir()
+	if !sparseSupported(t, dir) {
+		t.Skip("filesystem does not keep holes")
+	}
+	logical, holes := fixture()
+	p := filepath.Join(dir, "img.raw")
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	f.WriteAt(logical[:8192], 0)
+	f.WriteAt(logical[1<<20:(1<<20)+4096], 1<<20)
+	f.Truncate(int64(len(logical)))
+
+	got, err := ProbeHoles(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(holes) {
+		t.Fatalf("holes = %v, want %v", got, holes)
+	}
+	for i := range holes {
+		if got[i] != holes[i] {
+			t.Fatalf("holes = %v, want %v", got, holes)
+		}
+	}
+	// Offset restored; probe → WriteTo round-trip works directly.
+	var buf bytes.Buffer
+	if err := WriteTo(&buf, "img.raw", f, got); err != nil {
+		t.Fatal(err)
+	}
+	ts, err := ReadSeekFrom(bytes.NewReader(buf.Bytes()), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := io.ReadAll(ts)
+	if err != nil || !bytes.Equal(all, logical) {
+		t.Errorf("probe→write→read mismatch: %v", err)
+	}
+
+	// Dense file probes to nil.
+	d := filepath.Join(dir, "dense")
+	df, _ := os.Create(d)
+	df.Write(bytes.Repeat([]byte("x"), 8192))
+	defer df.Close()
+	if h, err := ProbeHoles(df); err != nil || h != nil {
+		t.Errorf("dense probe = %v, %v", h, err)
+	}
+}
