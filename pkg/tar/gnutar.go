@@ -1,6 +1,7 @@
 package tar
 
 import (
+	stdtar "archive/tar"
 	"bytes"
 	"fmt"
 	"io"
@@ -242,6 +243,14 @@ func Extract(r io.Reader, rules []Rule, o Options) error {
 	if len(rules) == 0 {
 		rules = []Rule{{Tar: "", FS: ".", Prefix: true}}
 	}
+	// Fully streaming special case: a single stdio file rule needs no
+	// listing pass, no spool file and no GNU binary — the stdlib
+	// reader scans the stream once and copies the member to stdout
+	// (sparse members arrive as their logical bytes, which is exactly
+	// what a byte stream wants).
+	if len(rules) == 1 && !rules[0].Prefix && rules[0].FS == "-" {
+		return extractStdioStream(r, rules[0], &o)
+	}
 	bin, err := LocateTar()
 	if err != nil {
 		return err
@@ -372,6 +381,36 @@ func minimalCover(members []sel) []string {
 		}
 	}
 	return out
+}
+
+// extractStdioStream copies one member's content to the stdio sink in
+// a single in-process pass. A member stored as a hardlink yields empty
+// output (it carries no data — same as GNU -xO, see the docs).
+func extractStdioStream(r io.Reader, rl Rule, o *Options) error {
+	tr := stdtar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return fmt.Errorf("tar extract: %q not found in archive", rl.Tar)
+		}
+		if err != nil {
+			return err
+		}
+		norm, err := normalizeTarPath(hdr.Name)
+		if err != nil || norm != rl.Tar {
+			continue
+		}
+		switch hdr.Typeflag {
+		case stdtar.TypeReg:
+			_, err := io.Copy(o.stdout(), tr)
+			return err
+		case stdtar.TypeLink:
+			return nil // no data on a hardlink member (GNU -xO semantics)
+		default:
+			o.warnf("tar: %s is not a regular file; nothing written to stdout", norm)
+			return nil
+		}
+	}
 }
 
 // archiveFile returns a path to the archive content, spooling r to a

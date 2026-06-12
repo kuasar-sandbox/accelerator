@@ -517,7 +517,14 @@ func TestExtractFromRedirectedStdin(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer in.Close()
-	stdinLike := os.NewFile(in.Fd(), "/dev/stdin") // what a redirected stdin looks like
+	// Dup the fd: os.NewFile takes ownership, and two *os.File over one
+	// fd would double-close it (corrupting whatever reuses the number).
+	dupFD, err := syscall.Dup(int(in.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdinLike := os.NewFile(uintptr(dupFD), "/dev/stdin") // what a redirected stdin looks like
+	defer stdinLike.Close()
 
 	var out bytes.Buffer
 	// sub/f2.txt, not f1.txt: the latter is stored as a hardlink member
@@ -528,6 +535,47 @@ func TestExtractFromRedirectedStdin(t *testing.T) {
 	}
 	if out.String() != "world" {
 		t.Errorf("stdout = %q", out.String())
+	}
+}
+
+// TestExtractStdioStreaming: a single x:- rule must work on a
+// non-seekable stream (no spool, no listing pass), including sparse
+// members which arrive as logical bytes.
+func TestExtractStdioStreaming(t *testing.T) {
+	requireTar(t) // create still drives GNU tar
+	dir := t.TempDir()
+	if !sparseSupported(t, dir) {
+		t.Skip("filesystem does not keep holes")
+	}
+	src := filepath.Join(dir, "img.raw")
+	mkSparse(t, src)
+	var buf bytes.Buffer
+	if err := Create(&buf, []Rule{{Tar: "disk/img.raw", FS: src}}, Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	pr, pw := io.Pipe() // genuinely non-seekable
+	go func() {
+		pw.Write(buf.Bytes())
+		pw.Close()
+	}()
+	var out bytes.Buffer
+	if err := Extract(pr, []Rule{{Tar: "disk/img.raw", FS: "-"}}, Options{Stdout: &out}); err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(out.Bytes(), want) {
+		t.Errorf("streamed content mismatch: %d vs %d bytes", out.Len(), len(want))
+	}
+
+	// Not-found still surfaces on the streaming path.
+	if err := Extract(bytes.NewReader(buf.Bytes()),
+		[]Rule{{Tar: "no/such", FS: "-"}}, Options{Stdout: io.Discard}); err == nil ||
+		!strings.Contains(err.Error(), "not found") {
+		t.Errorf("want not-found error, got %v", err)
 	}
 }
 

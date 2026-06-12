@@ -388,6 +388,13 @@ flatten-ctl tar extract [-f tarfile] [--chown u:g] [--chmod 755] [规则...]
 atime/ctime 不记录、PAX 扩展头名固定,同一输入两次 create 字节相同。
 提取时 chown/chmod 由后处理完成(GNU 无解包期改属主)。
 
+流式与落盘边界:`extract 单条 x:- 规则`走纯进程内单遍流(stdlib 解码,零临时
+文件、不依赖 tar 二进制,管道输入可用);其余 extract 形态因需要"先列表再选材"
+两遍读,非 seekable 输入(管道)会整档落一次临时文件,`-f 文件`/重定向文件则
+直接按路径读、零拷贝。`create 的 x:-` 受 tar 格式约束(条目头先含 size,一次性
+流长度未知)必须先把 stdin 落一次临时文件再入档——这是格式决定的下界;tmpdir
+经 `--config` 可配。
+
 ```bash
 # 稀疏快照盘 → 归档(2 MiB 稀疏盘 → ~12 KiB) → 异地还原(空洞回来)
 flatten-ctl tar create -f snap.tar disk/:/var/lib/sandbox/disks/
