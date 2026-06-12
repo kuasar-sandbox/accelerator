@@ -1,0 +1,469 @@
+package tarstream
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"maps"
+	"strconv"
+	"strings"
+)
+
+// ReadFrom locates the entry called name in the tar stream r (an empty
+// name takes the first regular file entry) and returns its sequential
+// logical view: Read yields size bytes with holes reading as zeros,
+// pulling only the packed data from r. One pass, nothing buffered
+// beyond a block.
+func ReadFrom(r io.Reader, name string) (Reader, error) {
+	m, err := locate(r, name, func(n int64) error {
+		_, err := io.CopyN(io.Discard, r, n)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &seqView{
+		meta: *m,
+		src:  io.LimitReader(r, m.stored-m.mapLen),
+	}, nil
+}
+
+// ReadSeekFrom is ReadFrom over a seekable stream: the returned view
+// supports random access by mapping logical offsets straight onto the
+// packed data region inside rs — no extraction, no copies. The view
+// owns rs's seek position; do not use rs elsewhere while reading.
+func ReadSeekFrom(rs io.ReadSeeker, name string) (ReadSeeker, error) {
+	m, err := locate(rs, name, func(n int64) error {
+		_, err := rs.Seek(n, io.SeekCurrent)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	dataStart, err := rs.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return nil, err
+	}
+	v := &seekView{meta: *m, rs: rs, dataStart: dataStart}
+	v.packedPrefix = make([]int64, len(m.extents)+1)
+	for i, e := range m.extents {
+		v.packedPrefix[i+1] = v.packedPrefix[i] + e.Size
+	}
+	return v, nil
+}
+
+// meta describes the located entry.
+type meta struct {
+	name    string
+	logical int64    // logical file size
+	stored  int64    // stored entry size (map + packed data)
+	mapLen  int64    // sparse map bytes consumed from the stored region
+	extents []extent // data extents in logical offsets (dense: one run)
+	holes   []Hole   // canonical hole map (nil = dense)
+}
+
+// locate scans entries until it finds the wanted one, leaving r
+// positioned at the start of its packed data (the sparse map, when
+// present, has been consumed). skip advances r across unselected
+// content.
+func locate(r io.Reader, want string, skip func(n int64) error) (*meta, error) {
+	want = normalizeName(want)
+	var blk [512]byte
+	pax := map[string]string{}
+	longName := ""
+	sawZero := false
+	for {
+		if _, err := io.ReadFull(r, blk[:]); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return nil, ErrNotFound
+			}
+			return nil, err
+		}
+		if isZeroBlock(blk[:]) {
+			if sawZero {
+				return nil, ErrNotFound // end of archive
+			}
+			sawZero = true
+			continue
+		}
+		sawZero = false
+		if string(blk[257:262]) != "ustar" {
+			return nil, fmt.Errorf("tarstream: not a tar header (bad magic)")
+		}
+
+		typeflag := blk[156]
+		size, err := parseNumeric(blk[124:136])
+		if err != nil {
+			return nil, fmt.Errorf("tarstream: bad size field: %w", err)
+		}
+		padded := (size + 511) &^ 511
+
+		switch typeflag {
+		case 'x': // PAX extended header for the next entry
+			recs, err := readPAX(r, size, padded)
+			if err != nil {
+				return nil, err
+			}
+			maps.Copy(pax, recs)
+			continue
+		case 'g': // global header: not interpreted
+			if err := skip(padded); err != nil {
+				return nil, err
+			}
+			continue
+		case 'L': // GNU longname: data is the next entry's name
+			data := make([]byte, size)
+			if _, err := io.ReadFull(r, data); err != nil {
+				return nil, err
+			}
+			if err := skip(padded - size); err != nil {
+				return nil, err
+			}
+			longName = strings.TrimRight(string(data), "\x00")
+			continue
+		case 'K': // GNU longlink: irrelevant here
+			if err := skip(padded); err != nil {
+				return nil, err
+			}
+			continue
+		case 'S': // legacy GNU binary sparse: cannot even be skipped safely
+			return nil, ErrUnsupportedEncoding
+		}
+
+		// A real entry: resolve its effective name and stored size.
+		effName := pax["GNU.sparse.name"]
+		if effName == "" {
+			effName = pax["path"]
+		}
+		if effName == "" {
+			effName = longName
+		}
+		if effName == "" {
+			effName = ustarName(blk[:])
+		}
+		effName = normalizeName(effName)
+		stored := size
+		if s, ok := pax["size"]; ok {
+			v, err := strconv.ParseInt(s, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("tarstream: bad pax size: %w", err)
+			}
+			stored = v
+		}
+		entryPAX := pax
+		pax = map[string]string{}
+		longName = ""
+
+		regular := typeflag == '0' || typeflag == 0
+		matched := effName == want || (want == "" && regular)
+		if !matched {
+			if err := skip((stored + 511) &^ 511); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if !regular {
+			return nil, fmt.Errorf("tarstream: entry %q is not a regular file", effName)
+		}
+		if _, old := entryPAX["GNU.sparse.numblocks"]; old {
+			return nil, ErrUnsupportedEncoding
+		}
+		if _, old := entryPAX["GNU.sparse.map"]; old {
+			return nil, ErrUnsupportedEncoding
+		}
+
+		if entryPAX["GNU.sparse.major"] == "1" && entryPAX["GNU.sparse.minor"] == "0" {
+			realsize, err := strconv.ParseInt(entryPAX["GNU.sparse.realsize"], 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("tarstream: bad GNU.sparse.realsize: %w", err)
+			}
+			extents, mapLen, err := readSparseMap(r, realsize)
+			if err != nil {
+				return nil, err
+			}
+			return &meta{
+				name:    effName,
+				logical: realsize,
+				stored:  stored,
+				mapLen:  mapLen,
+				extents: extents,
+				holes:   extentsToHoles(realsize, extents),
+			}, nil
+		}
+
+		m := &meta{name: effName, logical: stored, stored: stored}
+		if stored > 0 {
+			m.extents = []extent{{Offset: 0, Size: stored}}
+		}
+		return m, nil
+	}
+}
+
+// readSparseMap parses the GNU PAX sparse 1.0 map that prefixes the
+// stored data: decimal extent count, then offset/size per line,
+// consumed in whole 512-byte blocks. Zero-length extents (GNU's
+// trailing sentinel) are dropped.
+func readSparseMap(r io.Reader, realsize int64) ([]extent, int64, error) {
+	var (
+		blk    [512]byte
+		buf    []byte
+		mapLen int64
+	)
+	next := func() (int64, error) {
+		for {
+			if i := bytes.IndexByte(buf, '\n'); i >= 0 {
+				v, err := strconv.ParseInt(string(buf[:i]), 10, 64)
+				if err != nil || v < 0 {
+					return 0, fmt.Errorf("tarstream: bad sparse map value %q", buf[:i])
+				}
+				buf = buf[i+1:]
+				return v, nil
+			}
+			if len(buf) > 64 { // a decimal never runs this long
+				return 0, fmt.Errorf("tarstream: malformed sparse map")
+			}
+			if _, err := io.ReadFull(r, blk[:]); err != nil {
+				return 0, fmt.Errorf("tarstream: sparse map: %w", err)
+			}
+			mapLen += 512
+			buf = append(buf, blk[:]...)
+		}
+	}
+	count, err := next()
+	if err != nil {
+		return nil, 0, err
+	}
+	if count > 1<<20 {
+		return nil, 0, fmt.Errorf("tarstream: absurd sparse extent count %d", count)
+	}
+	var extents []extent
+	var pos int64
+	for range count {
+		off, err := next()
+		if err != nil {
+			return nil, 0, err
+		}
+		sz, err := next()
+		if err != nil {
+			return nil, 0, err
+		}
+		if sz == 0 {
+			continue // sentinel
+		}
+		if off < pos || off+sz > realsize {
+			return nil, 0, fmt.Errorf("tarstream: sparse extent [%d,+%d) out of order or bounds", off, sz)
+		}
+		extents = append(extents, extent{Offset: off, Size: sz})
+		pos = off + sz
+	}
+	return extents, mapLen, nil
+}
+
+// readPAX reads and parses a PAX extended header's records.
+func readPAX(r io.Reader, size, padded int64) (map[string]string, error) {
+	if size > 1<<20 {
+		return nil, fmt.Errorf("tarstream: absurd PAX header size %d", size)
+	}
+	data := make([]byte, padded)
+	if _, err := io.ReadFull(r, data); err != nil {
+		return nil, err
+	}
+	data = data[:size]
+	recs := map[string]string{}
+	for len(data) > 0 {
+		sp := bytes.IndexByte(data, ' ')
+		if sp <= 0 {
+			return nil, fmt.Errorf("tarstream: malformed PAX record")
+		}
+		n, err := strconv.Atoi(string(data[:sp]))
+		if err != nil || n <= sp || int64(n) > int64(len(data)) || data[n-1] != '\n' {
+			return nil, fmt.Errorf("tarstream: malformed PAX record length")
+		}
+		kv := data[sp+1 : n-1]
+		eq := bytes.IndexByte(kv, '=')
+		if eq < 0 {
+			return nil, fmt.Errorf("tarstream: malformed PAX record (no =)")
+		}
+		recs[string(kv[:eq])] = string(kv[eq+1:])
+		data = data[n:]
+	}
+	return recs, nil
+}
+
+// ustarName joins the ustar prefix and name fields.
+func ustarName(blk []byte) string {
+	name := strings.TrimRight(string(blk[0:100]), "\x00")
+	prefix := strings.TrimRight(string(blk[345:500]), "\x00")
+	if prefix != "" {
+		return prefix + "/" + name
+	}
+	return name
+}
+
+// parseNumeric decodes a ustar numeric field: NUL/space-terminated
+// octal, or GNU base-256 when the high bit of the first byte is set.
+func parseNumeric(b []byte) (int64, error) {
+	if len(b) > 0 && b[0]&0x80 != 0 {
+		var v int64
+		v = int64(b[0] & 0x7f)
+		for _, c := range b[1:] {
+			v = v<<8 | int64(c)
+		}
+		return v, nil
+	}
+	s := strings.Trim(string(b), " \x00")
+	if s == "" {
+		return 0, nil
+	}
+	return strconv.ParseInt(s, 8, 64)
+}
+
+func isZeroBlock(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// normalizeName strips leading "/" and "./" so stored-name dialects
+// compare equal.
+func normalizeName(s string) string {
+	for {
+		switch {
+		case strings.HasPrefix(s, "/"):
+			s = strings.TrimPrefix(s, "/")
+		case strings.HasPrefix(s, "./"):
+			s = strings.TrimPrefix(s, "./")
+		default:
+			return s
+		}
+	}
+}
+
+// seqView is the one-pass logical view over a non-seekable source.
+type seqView struct {
+	meta
+	src    io.Reader // packed data, already bounded to stored-mapLen
+	pos    int64
+	extIdx int
+}
+
+func (v *seqView) Name() string  { return v.meta.name }
+func (v *seqView) Size() int64   { return v.logical }
+func (v *seqView) Holes() []Hole { return append([]Hole(nil), v.holes...) }
+
+func (v *seqView) Read(p []byte) (int, error) {
+	if v.pos >= v.logical {
+		return 0, io.EOF
+	}
+	for v.extIdx < len(v.extents) && v.pos >= v.extents[v.extIdx].Offset+v.extents[v.extIdx].Size {
+		v.extIdx++
+	}
+	// Zero region: before the next extent, or the trailing hole.
+	zeroEnd := v.logical
+	if v.extIdx < len(v.extents) && v.pos < v.extents[v.extIdx].Offset {
+		zeroEnd = v.extents[v.extIdx].Offset
+	} else if v.extIdx < len(v.extents) {
+		// Inside the current extent: read packed bytes.
+		e := v.extents[v.extIdx]
+		n := int64(len(p))
+		if rest := e.Offset + e.Size - v.pos; rest < n {
+			n = rest
+		}
+		read, err := v.src.Read(p[:n])
+		if read > 0 {
+			v.pos += int64(read)
+			return read, nil
+		}
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		return 0, err
+	}
+	n := int64(len(p))
+	if rest := zeroEnd - v.pos; rest < n {
+		n = rest
+	}
+	clear(p[:n])
+	v.pos += n
+	return int(n), nil
+}
+
+// seekView is the random-access logical view over a seekable source.
+type seekView struct {
+	meta
+	rs           io.ReadSeeker
+	dataStart    int64   // absolute offset of the packed data region
+	packedPrefix []int64 // prefix sums of extent sizes
+	pos          int64
+}
+
+func (v *seekView) Name() string  { return v.meta.name }
+func (v *seekView) Size() int64   { return v.logical }
+func (v *seekView) Holes() []Hole { return append([]Hole(nil), v.holes...) }
+
+func (v *seekView) Seek(offset int64, whence int) (int64, error) {
+	var base int64
+	switch whence {
+	case io.SeekStart:
+		base = 0
+	case io.SeekCurrent:
+		base = v.pos
+	case io.SeekEnd:
+		base = v.logical
+	default:
+		return 0, fmt.Errorf("tarstream: bad whence %d", whence)
+	}
+	n := base + offset
+	if n < 0 {
+		return 0, fmt.Errorf("tarstream: negative seek position")
+	}
+	v.pos = n
+	return n, nil
+}
+
+func (v *seekView) Read(p []byte) (int, error) {
+	if v.pos >= v.logical {
+		return 0, io.EOF
+	}
+	// Find the extent at or after pos.
+	idx := 0
+	for idx < len(v.extents) && v.pos >= v.extents[idx].Offset+v.extents[idx].Size {
+		idx++
+	}
+	if idx < len(v.extents) && v.pos >= v.extents[idx].Offset {
+		// Data: map the logical position into the packed region.
+		e := v.extents[idx]
+		packed := v.packedPrefix[idx] + (v.pos - e.Offset)
+		n := int64(len(p))
+		if rest := e.Offset + e.Size - v.pos; rest < n {
+			n = rest
+		}
+		if _, err := v.rs.Seek(v.dataStart+packed, io.SeekStart); err != nil {
+			return 0, err
+		}
+		read, err := v.rs.Read(p[:n])
+		if read > 0 {
+			v.pos += int64(read)
+			return read, nil
+		}
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		return 0, err
+	}
+	// Hole (or trailing hole): zeros until the next extent or EOF.
+	zeroEnd := v.logical
+	if idx < len(v.extents) {
+		zeroEnd = v.extents[idx].Offset
+	}
+	n := int64(len(p))
+	if rest := zeroEnd - v.pos; rest < n {
+		n = rest
+	}
+	clear(p[:n])
+	v.pos += n
+	return int(n), nil
+}

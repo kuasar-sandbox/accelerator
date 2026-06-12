@@ -14,6 +14,7 @@
 | `pkg/manifest` (+ `codec`/`crypto`/`chunker`/`fetch`/`ingest`) | 分块 + 收敛加密 + 内容寻址的读写 SDK |
 | `pkg/store` + `pkg/store/client` | 远端存储代理的接口与客户端 |
 | `pkg/cache` + `pkg/cache/client` | 分层缓存的接口与客户端 |
+| `pkg/tarstream` | 单文件稀疏流的 tar 信封:`WriteTo`(逻辑视图+洞图 → GNU PAX sparse 1.0,仅数据字节上线)/ `ReadFrom`(顺序)/ `ReadSeekFrom`(在 tar 内零拷贝随机访问),洞图精确取回;互操作 GNU tar 与 archive/tar |
 
 重后端(`*/server`、`pkg/cache/rocks`、`pkg/cache/ec`、`pkg/store/obs`、`pkg/store/fs`)
 只在守护进程与 `cmd/` 内编译,不进入下游闭包。
