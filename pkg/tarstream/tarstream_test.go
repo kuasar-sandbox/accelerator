@@ -459,6 +459,37 @@ func TestWriteToValidation(t *testing.T) {
 	}
 }
 
+// TestReadFromUpgrade: ReadFrom over a seekable source returns a view
+// that also implements ReadSeeker; over a plain reader it does not.
+func TestReadFromUpgrade(t *testing.T) {
+	logical, holes := fixture()
+	archive := mustWrite(t, "x", logical, holes)
+
+	ts, err := ReadFrom(bytes.NewReader(archive), "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs, ok := ts.(ReadSeeker)
+	if !ok {
+		t.Fatal("seekable source must yield a ReadSeeker view")
+	}
+	if _, err := rs.Seek(1<<20, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(rs, buf); err != nil || !bytes.Equal(buf, []byte("BBBB")) {
+		t.Errorf("seek-read = %q, %v", buf, err)
+	}
+
+	ts, err = ReadFrom(readerOnly{bytes.NewReader(archive)}, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ts.(io.Seeker); ok {
+		t.Error("plain reader source must not yield a Seeker view")
+	}
+}
+
 func TestWriteToDeterministic(t *testing.T) {
 	logical, holes := fixture()
 	a := mustWrite(t, "x", logical, holes)

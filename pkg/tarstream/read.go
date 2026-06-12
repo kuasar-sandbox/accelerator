@@ -10,11 +10,20 @@ import (
 )
 
 // ReadFrom locates the entry called name in the tar stream r (an empty
-// name takes the first regular file entry) and returns its sequential
-// logical view: Read yields size bytes with holes reading as zeros,
-// pulling only the packed data from r. One pass, nothing buffered
-// beyond a block.
+// name takes the first regular file entry) and returns its logical
+// view: Read yields size bytes with holes reading as zeros, pulling
+// only the packed data from r. When r also implements io.ReadSeeker
+// the call upgrades to ReadSeekFrom — the returned Reader then also
+// implements ReadSeeker (type-assert to use it). Otherwise the view is
+// one sequential pass with nothing buffered beyond a block.
 func ReadFrom(r io.Reader, name string) (Reader, error) {
+	if rs, ok := r.(io.ReadSeeker); ok {
+		ts, err := ReadSeekFrom(rs, name)
+		if err != nil {
+			return nil, err
+		}
+		return ts, nil
+	}
 	m, err := locate(r, name, func(n int64) error {
 		_, err := io.CopyN(io.Discard, r, n)
 		return err
