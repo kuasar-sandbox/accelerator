@@ -124,8 +124,9 @@ it from stdin. Rules are "in-tar-path[:outside-path]":
   :dir/             the whole archive root mapped to dir/
 
 Sparse files keep their holes (GNU --sparse, PAX 1.0) on create and
-get them back on extract. create requires a rule list; extract without
-rules takes everything. Needs GNU tar >= 1.28 ($TAR_PATH, next to this
-binary, or PATH).
+get them back on extract — including dense zero runs. create requires
+a rule list and GNU tar >= 1.28 ($TAR_PATH, next to this binary, or
+PATH); extract is pure in-process streaming (no tar binary, pipes need
+no spooling) and without rules takes everything.
 `)
 }

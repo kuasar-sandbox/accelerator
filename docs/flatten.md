@@ -356,10 +356,15 @@ flatten-ctl cache gc   [--config <p>] [--cache-dir <D>] [--cache-max-size <S>] [
 
 通用 tar 工具面:把指定文件组装成 tar 流,或从 tar 流提取——稀疏文件全程保持
 (创建侧 GNU PAX sparse 1.0 编码,提取侧还原空洞),适合搬运快照盘、向镜像树
-注入/取出文件。引擎是 **GNU tar**(≥1.28):wire 格式、稀疏编码、`..`/symlink
-逃逸加固全部委托给它,本仓不维护任何格式代码。二进制定位:`TAR_PATH` env →
-flatten-ctl 同目录 → PATH,首次使用时探测版本与 GNU 身份;`sandbox-deps` 的
-`make tar` 产出随发布包分发的静态版。
+注入/取出文件。本仓不维护任何格式代码,两个方向引擎不同:
+
+- **create = exec GNU tar**(≥1.28):稀疏编码与 wire 格式委托给它(stdlib 无
+  稀疏写 API)。二进制定位 `TAR_PATH` env → flatten-ctl 同目录 → PATH,首次使用
+  探测版本与 GNU 身份;`sandbox-deps` 的 `make tar` 产随发布包分发的静态版。
+- **extract = 纯 Go 单遍流式**:stdlib reader 解码(三代稀疏编码透明还原),逐
+  条目匹配落盘——不依赖 tar 二进制,管道输入零落盘;零段一律落成空洞,**包括
+  稠密编码的全零数据**(GNU 解包做不到这点);`..` 成员跳过告警,穿 symlink 写出
+  是硬错误。
 
 ```
 flatten-ctl tar create  [-f tarfile] [--chown u:g] [--chmod 755] 规则...
@@ -388,12 +393,10 @@ flatten-ctl tar extract [-f tarfile] [--chown u:g] [--chmod 755] [规则...]
 atime/ctime 不记录、PAX 扩展头名固定,同一输入两次 create 字节相同。
 提取时 chown/chmod 由后处理完成(GNU 无解包期改属主)。
 
-流式与落盘边界:`extract 单条 x:- 规则`走纯进程内单遍流(stdlib 解码,零临时
-文件、不依赖 tar 二进制,管道输入可用);其余 extract 形态因需要"先列表再选材"
-两遍读,非 seekable 输入(管道)会整档落一次临时文件,`-f 文件`/重定向文件则
-直接按路径读、零拷贝。`create 的 x:-` 受 tar 格式约束(条目头先含 size,一次性
-流长度未知)必须先把 stdin 落一次临时文件再入档——这是格式决定的下界;tmpdir
-经 `--config` 可配。
+流式与落盘边界:**extract 全形态单遍流式零落盘**(含管道输入)。`create 的
+x:-` 受 tar 格式约束(条目头先含 size,一次性流长度未知)必须先把 stdin 落一次
+临时文件再入档——这是格式决定的下界;tmpdir 经 `--config` 可配。条目重叠多条
+规则时最具体者胜(精确文件规则 > 最长目录前缀)。
 
 ```bash
 # 稀疏快照盘 → 归档(2 MiB 稀疏盘 → ~12 KiB) → 异地还原(空洞回来)

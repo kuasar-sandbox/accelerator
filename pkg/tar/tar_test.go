@@ -579,6 +579,93 @@ func TestExtractStdioStreaming(t *testing.T) {
 	}
 }
 
+// TestExtractTreeFromPipe: the general (non-stdio) extract shapes are
+// single-pass too — a whole tree materializes from a genuinely
+// non-seekable stream.
+func TestExtractTreeFromPipe(t *testing.T) {
+	requireTar(t)
+	src := buildTree(t)
+	var buf bytes.Buffer
+	if err := Create(&buf, []Rule{{Tar: "", FS: src, Prefix: true}}, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	pr, pw := io.Pipe()
+	go func() {
+		pw.Write(buf.Bytes())
+		pw.Close()
+	}()
+	dst := t.TempDir()
+	if err := Extract(pr, []Rule{{Tar: "", FS: dst, Prefix: true}}, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dst, "sub/deep/f3.txt")); string(got) != "deep" {
+		t.Errorf("sub/deep/f3.txt = %q", got)
+	}
+	if target, err := os.Readlink(filepath.Join(dst, "sub/link")); err != nil || target != "f2.txt" {
+		t.Errorf("symlink = %q, %v", target, err)
+	}
+}
+
+// TestDenseZerosBecomeHoles: zero runs land as holes even when the
+// archive stored them densely (a capability GNU -x does not have).
+func TestDenseZerosBecomeHoles(t *testing.T) {
+	dir := t.TempDir()
+	if !sparseSupported(t, dir) {
+		t.Skip("filesystem does not keep holes")
+	}
+	var buf bytes.Buffer
+	tw := stdtar.NewWriter(&buf)
+	payload := make([]byte, 256<<10) // zeros with a little data in front
+	copy(payload, "data")
+	if err := tw.WriteHeader(&stdtar.Header{Name: "z.bin", Mode: 0o644, Size: int64(len(payload))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	tw.Close()
+
+	out := filepath.Join(dir, "z.bin")
+	if err := Extract(bytes.NewReader(buf.Bytes()), []Rule{{Tar: "z.bin", FS: out}}, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Stat(out, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Blocks*512 >= int64(len(payload)) {
+		t.Errorf("zero run not punched: %d blocks for %d bytes", st.Blocks, len(payload))
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Error("content mismatch")
+	}
+}
+
+// TestExtractFifo: special nodes materialize via mknod.
+func TestExtractFifo(t *testing.T) {
+	var buf bytes.Buffer
+	tw := stdtar.NewWriter(&buf)
+	if err := tw.WriteHeader(&stdtar.Header{Name: "p/pipe", Typeflag: stdtar.TypeFifo, Mode: 0o600}); err != nil {
+		t.Fatal(err)
+	}
+	tw.Close()
+	dst := t.TempDir()
+	if err := Extract(bytes.NewReader(buf.Bytes()), []Rule{{Tar: "", FS: dst, Prefix: true}}, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Lstat(filepath.Join(dst, "p/pipe"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode()&os.ModeNamedPipe == 0 {
+		t.Errorf("not a fifo: %v", st.Mode())
+	}
+}
+
 func TestExtractAllNoRules(t *testing.T) {
 	requireTar(t)
 	src := buildTree(t)

@@ -27,8 +27,9 @@ make e2e             # opt-in:从真实 OCI-1.1 registry(zot)拉取+展平+Refer
 ```
 
 运行期需要 `mkfs.erofs`(由 `sandbox-deps` 的 `deps/build-erofs.sh` 产出),定位优先级
-`MKFS_EROFS_PATH` env > `flatten-ctl` 同目录 > `PATH`;`tar` 子命令同理需要 GNU tar
-≥1.28(`TAR_PATH` env > 同目录 > `PATH`,`sandbox-deps` 的 `make tar` 产静态版)。
+`MKFS_EROFS_PATH` env > `flatten-ctl` 同目录 > `PATH`;`tar create` 同理需要 GNU tar
+≥1.28(`TAR_PATH` env > 同目录 > `PATH`,`sandbox-deps` 的 `make tar` 产静态版;
+`tar extract` 纯 Go 流式,无此依赖)。
 展平保留镜像内文件属主(chown),`export`/`verify` 需以 root(或 CAP_CHOWN)运行;
 rootfs 目录源只读源树,无 chown,完整 rootfs 导出同样建议 root(读权限)。
 
