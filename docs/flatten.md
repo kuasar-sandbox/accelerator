@@ -399,11 +399,9 @@ x:-` 受 tar 格式约束(条目头先含 size,一次性流长度未知)必须�
 规则时最具体者胜(精确文件规则 > 最长目录前缀)。
 
 编程接口补充:size 与洞图**已知**的调用方(内存中的稀疏盘抽象)不受上述 create
-下界约束——`pkg/tar` 导出 `StreamWriter.WriteSparse(hdr, data io.ReadSeeker,
-holes []Hole)`,纯 Go 把逻辑视图直接发射成 GNU PAX sparse 1.0 条目(字节镜像
-GNU 产物,含尾部哨兵段),只有数据段流经输出、零落盘零外部依赖;普通条目经同一
-StreamWriter 混排。互操作由三方测试钉死:GNU tar 解包、stdlib reader、本包
-Extract。
+下界约束——单文件稀疏流的封装/装载 API 在依赖根
+`sandbox-accelerator/pkg/tarstream`(`WriteTo`/`ReadFrom`/`ReadSeekFrom`,洞图
+精确往返、tar 内零拷贝随机访问),本仓与各下游仓均可 import。
 
 ```bash
 # 稀疏快照盘 → 归档(2 MiB 稀疏盘 → ~12 KiB) → 异地还原(空洞回来)
