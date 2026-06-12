@@ -86,7 +86,7 @@ Commands:
   info     Print EROFS metadata + OCI runtime config.
   cache    Inspect or garbage-collect the registry blob cache.
   config   Emit/validate a flatten config (FLATTEN_CONFIG): tmpdir/platform/cache/referer.
-  tar      Assemble files into / extract files from a tar stream (sparse-preserving; GNU tar engine).
+  tar      Extract files from a tar stream / package one sparse file as a tarstream (pure Go).
 
 See `+"`flatten-ctl <command> -h`"+` for per-command flags.
 `)

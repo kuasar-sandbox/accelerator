@@ -11,7 +11,7 @@ rootfs,并在镜像尾部追加运行时配置(STORED-mode ZIP)。是
 | `pkg/image` | **轻量读取面**:`RuntimeConfig` 类型、`ReadConfig`/`AppendConfigZip`/`ReadEROFSSize`、`ExtractRuntimeConfigFromJSON`。供工具与 `sandbox-runtime` 读取/inspect 展平镜像 | 仅 stdlib |
 | `pkg/flatten` | 展平引擎:`Source` 接口 + 确定性 `Build` sink(OCI→EROFS,调用 `mkfs.erofs`)+ `Verify` | `pkg/image`、`internal/util` |
 | `pkg/remote` | **远程拉取面**:registry 拉取 + 平台选择 + env 凭据 + TLS CA 配置 + OCI-layout blob 缓存(并发下载 / 原子写 / LRU 淘汰)+ OCI Referrers 回写与幂等跳过。产出 `flatten.Source` | go-containerregistry、`pkg/flatten` |
-| `pkg/tar` | **tar 工具面**:规则化组装/提取 tar 流(`Rule`+`Create`/`Extract`),稀疏保持、重命名、stdio——create=exec GNU tar(≥1.28,`LocateTar` 三级定位),extract=纯 Go 单遍流式;单文件稀疏流的程序化封装/装载见 `sandbox-accelerator/pkg/tarstream` | 仅 stdlib(仅 create 运行期依赖 GNU tar) |
+| `pkg/tar` | **tar 提取面**:从任意 tar 流取文件(`Rule`+`Extract`),纯 Go 单遍流式,稀疏/稠密零段一律落洞,重命名与 stdio 规则;单文件稀疏流的封装/装载见 `sandbox-accelerator/pkg/tarstream` | stdlib + `pkg/tarstream`(测试) |
 | `cmd/flatten-ctl` | CLI:`export`(registry/docker-archive/rootfs 目录三源)/`verify`/`info`/`cache`/`config`/`tar`;`--upload` 经 `sandbox-accelerator/pkg/manifest` ingest 进 store | accelerator SDK、`pkg/remote`、`pkg/tar` |
 
 依赖洁净:`sandbox-runtime` 只 import `pkg/image`(stdlib-only,读取镜像内嵌的
@@ -28,9 +28,8 @@ make e2e             # opt-in:从真实 OCI-1.1 registry(zot)拉取+展平+Refer
 ```
 
 运行期需要 `mkfs.erofs`(由 `sandbox-deps` 的 `deps/build-erofs.sh` 产出),定位优先级
-`MKFS_EROFS_PATH` env > `flatten-ctl` 同目录 > `PATH`;`tar create` 同理需要 GNU tar
-≥1.28(`TAR_PATH` env > 同目录 > `PATH`,`sandbox-deps` 的 `make tar` 产静态版;
-`tar extract` 纯 Go 流式,无此依赖)。
+`MKFS_EROFS_PATH` env > `flatten-ctl` 同目录 > `PATH`;`tar extract`/`tar stream`
+纯 Go,无外部依赖。
 展平保留镜像内文件属主(chown),`export`/`verify` 需以 root(或 CAP_CHOWN)运行;
 rootfs 目录源只读源树,无 chown,完整 rootfs 导出同样建议 root(读权限)。
 

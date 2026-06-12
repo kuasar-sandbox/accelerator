@@ -66,14 +66,8 @@ type Options struct {
 	// included.
 	Chmod *fs.FileMode
 
-	// Stdin / Stdout back the "-" side of stdio rules; nil means
-	// os.Stdin / os.Stdout.
-	Stdin  io.Reader
+	// Stdout backs the "-" side of stdio rules; nil means os.Stdout.
 	Stdout io.Writer
-
-	// TmpDir hosts the spool file Create needs for a stdin-sourced
-	// entry (tar headers need the size up front). Empty → os.TempDir.
-	TmpDir string
 
 	// Warnf, when non-nil, receives non-fatal diagnostics (skipped
 	// sockets, unprivileged chown downgrades). nil silences them.
@@ -84,13 +78,6 @@ func (o *Options) warnf(format string, args ...any) {
 	if o.Warnf != nil {
 		o.Warnf(format, args...)
 	}
-}
-
-func (o *Options) stdin() io.Reader {
-	if o.Stdin != nil {
-		return o.Stdin
-	}
-	return os.Stdin
 }
 
 func (o *Options) stdout() io.Writer {

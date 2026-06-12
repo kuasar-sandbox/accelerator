@@ -352,69 +352,61 @@ flatten-ctl cache gc   [--config <p>] [--cache-dir <D>] [--cache-max-size <S>] [
 `--config` 的 `cache.dir`,`--cache-dir` 覆盖。常驻场景可由 cron 周期跑 `cache gc`
 强约束上限(`export` 每次拉取后也会顺带回收)。
 
-### 2.6 `flatten-ctl tar` — tar 流组装/提取
+### 2.6 `flatten-ctl tar` — tar 流提取与单文件稀疏流
 
-通用 tar 工具面:把指定文件组装成 tar 流,或从 tar 流提取——稀疏文件全程保持
-(创建侧 GNU PAX sparse 1.0 编码,提取侧还原空洞),适合搬运快照盘、向镜像树
-注入/取出文件。本仓不维护任何格式代码,两个方向引擎不同:
-
-- **create = exec GNU tar**(≥1.28):稀疏编码与 wire 格式委托给它(stdlib 无
-  稀疏写 API)。二进制定位 `TAR_PATH` env → flatten-ctl 同目录 → PATH,首次使用
-  探测版本与 GNU 身份;`sandbox-deps` 的 `make tar` 产随发布包分发的静态版。
-- **extract = 纯 Go 单遍流式**:stdlib reader 解码(三代稀疏编码透明还原),逐
-  条目匹配落盘——不依赖 tar 二进制,管道输入零落盘;零段一律落成空洞,**包括
-  稠密编码的全零数据**(GNU 解包做不到这点);`..` 成员跳过告警,穿 symlink 写出
-  是硬错误。
+tar 工具面,两个方向都是**纯 Go、零 tar 二进制依赖**:
 
 ```
-flatten-ctl tar create  [-f tarfile] [--chown u:g] [--chmod 755] 规则...
 flatten-ctl tar extract [-f tarfile] [--chown u:g] [--chmod 755] [规则...]
-
-  -f / --file             归档文件;默认 `-`:create 写 stdout,extract 读 stdin
-  --chown u:g             所有条目改属主(仅数字 uid:gid)
-  --chmod 755             所有条目改权限(八进制,含 setuid/setgid/sticky;目录同样生效)
+flatten-ctl tar stream  [-f tarfile] [tar内名[:源]]
 ```
 
-规则 = `tar内路径[:外部路径]`,冒号左边永远是 tar 内名字、右边是外部世界,
-两个方向不变(create 取右存左,extract 取左写右):
+**extract** 从任意 tar 流取文件:对输入单遍流式(stdlib 解码,管道零落盘),
+稀疏成员与稠密零段一律落成空洞;`..` 成员跳过告警,穿 symlink 写出是硬错误;
+条目命中多条规则时最具体者胜。规则 = `tar内路径[:外部路径]`:
 
 | 形式 | 含义 |
 |---|---|
-| `p` | 内外同名(≡ `p:p`) |
-| `in:out` | 重命名 |
-| `in:-` | 外部是本进程 stdio(create 从 stdin 取内容,extract 流向 stdout;至多一条;`in` 若以硬链接成员存储则输出为空,GNU `-xO` 语义) |
+| `p` | 内外同名 |
+| `in:out` | 把条目 in 写到路径 out |
+| `in:-` | 条目内容流向 stdout(至多一条;硬链接成员无数据体,输出为空) |
 | `dir/` | 目录规则:dir 及其下全部内容 |
 | `dir/:out[/]` | 目录前缀重命名 |
-| `dir/:` | ≡ `dir/:$PWD/` |
+| `dir/:` | 解到当前目录 |
 | `:dir/` | 整个归档根映射到 dir/ |
 
-`create` 规则必填、按给定顺序进归档(每条规则一次 tar 调用,流在条目边界拼接);
-`extract` 不给规则取全部到当前目录。属主/权限默认保留来源;mtime 保留,
-atime/ctime 不记录、PAX 扩展头名固定,同一输入两次 create 字节相同。
-提取时 chown/chmod 由后处理完成(GNU 无解包期改属主)。
+不给规则取全部到当前目录;`--chown/--chmod` 改写每个落盘条目的属主/权限。
 
-流式与落盘边界:**extract 全形态单遍流式零落盘**(含管道输入)。`create 的
-x:-` 受 tar 格式约束(条目头先含 size,一次性流长度未知)必须先把 stdin 落一次
-临时文件再入档——这是格式决定的下界;tmpdir 经 `--config` 可配。条目重叠多条
-规则时最具体者胜(精确文件规则 > 最长目录前缀)。
+**stream** 把**一个文件**封装为 tarstream(单文件稀疏 tar,
+`sandbox-accelerator/pkg/tarstream`),稀疏自动检测——文件源经 SEEK_HOLE 探洞,
+stdin 源先落临时文件并按零段打洞(tar 头先含 size,一次性流长度未知,这是格式
+下界;tmpdir 经 `--config` 可配)。参数 = `tar内名[:源]`:
 
-编程接口补充:size 与洞图**已知**的调用方(内存中的稀疏盘抽象)不受上述 create
-下界约束——单文件稀疏流的封装/装载 API 在依赖根
-`sandbox-accelerator/pkg/tarstream`(`WriteTo`/`ReadFrom`/`ReadSeekFrom`,洞图
-精确往返、tar 内零拷贝随机访问),本仓与各下游仓均可 import。
+| 形式 | 含义 |
+|---|---|
+| (缺省) 或 `-` | ≡ `-:-`:条目名 "-",内容来自 stdin |
+| `path/to/file` | ≡ `file:path/to/file`(以 basename 命名) |
+| `:源` | ≡ `-:源` |
+| `名:-` | 条目名指定,内容来自 stdin |
+| `名:源` | 全显式 |
+
+产物本身是合法 tar:`extract`、GNU tar、`archive/tar` 都能读回;空洞只占
+map 字节,不占流量。
 
 ```bash
-# 稀疏快照盘 → 归档(2 MiB 稀疏盘 → ~12 KiB) → 异地还原(空洞回来)
-flatten-ctl tar create -f snap.tar disk/:/var/lib/sandbox/disks/
-flatten-ctl tar extract -f snap.tar "disk/:/restore/disks/"
+# 稀疏快照盘 → tarstream → 异地还原(空洞全程保持;16G 逻辑/100M 数据只传 ~100M)
+flatten-ctl tar stream -f snap.tar /var/lib/sandbox/disks/overlay.img
+flatten-ctl tar extract -f snap.tar "overlay.img:/restore/overlay.img"
 
-# 从归档流单抽一个文件到 stdout / 把 stdin 塞成归档里的一个条目
-flatten-ctl tar extract -f a.tar etc/app.yaml:- | less
-gen-config | flatten-ctl tar create app/config.yaml:- > cfg.tar
+# 管道对管道:生成器 → tarstream → 提取(stdin 源经零段检测自动稀疏化)
+gen-disk | flatten-ctl tar stream disk.img:- | flatten-ctl tar extract disk.img:-
 
-# 组装时统一属主与权限
-flatten-ctl tar create --chown 0:0 --chmod 644 etc/:./conf.d/ > etc.tar
+# 程序化读写(含洞图精确取回、tar 内随机访问)见 sandbox-accelerator/pkg/tarstream
 ```
+
+编程接口:size 与洞图已知的调用方不需要 stdin 落盘下界——
+`sandbox-accelerator/pkg/tarstream` 的 `WriteTo`/`ReadFrom`/`ReadSeekFrom`/
+`ProbeHoles`(洞图精确往返、tar 内零拷贝随机访问),本仓与各下游仓均可 import。
 
 ## 3. 镜像格式
 

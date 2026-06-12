@@ -1,14 +1,13 @@
-// Package tar assembles files into and extracts files from tar
-// streams by driving a GNU tar binary — sparse files (GNU PAX 1.0
-// hole encoding on create, hole restore on extract), the wire format
-// and its security hardening all stay tar's problem; the package owns
-// nothing format-shaped. It contributes the rule vocabulary (left side
-// = in-tar path, right side = filesystem path, or "-" for the process
-// stdio), deterministic invocation flags, and stream plumbing.
+// Package tar extracts files from tar streams: pure Go, single pass
+// over any io.Reader (the stdlib reader decodes every sparse encoding
+// into logical bytes), entries matched and materialized on the fly —
+// pipes need no spooling and no tar binary is involved. Zero runs land
+// as holes whether the archive encoded them or not. Selection and
+// renaming use Rules: left side = in-tar path, right side = filesystem
+// path, or "-" for the process stdout.
 //
-// The binary is discovered via $TAR_PATH, next to the running
-// executable, then $PATH, and must be GNU tar >= 1.28 (see LocateTar);
-// sandbox-deps ships a static build.
+// Producing tar streams is out of scope here: single sparse files
+// travel via sandbox-accelerator/pkg/tarstream (WriteTo/ReadFrom).
 package tar
 
 import (
