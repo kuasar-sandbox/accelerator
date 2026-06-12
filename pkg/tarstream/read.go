@@ -67,6 +67,44 @@ func SourceFrom(r io.Reader, name string) (sparse.Source, string, error) {
 	return &sourceView{m: &v.meta, seq: v}, v.meta.name, nil
 }
 
+// ReadSeekFromIndex is ReadSeekFrom addressing the entry by ordinal
+// instead of name: index counts the real entries of the archive in
+// order (meta entries — PAX, GNU longname/longlink, global headers —
+// are not counted), exactly the sequence archive/tar's Reader.Next
+// yields. It exists so a consumer iterating an archive with the
+// stdlib reader can re-locate the Nth member here and recover what
+// the stdlib hides (the sparse hole map).
+func ReadSeekFromIndex(rs io.ReadSeeker, index int) (ReadSeeker, error) {
+	m, err := locateAt(rs, index, seekSkip(rs))
+	if err != nil {
+		return nil, err
+	}
+	return seekViewFrom(rs, m)
+}
+
+// SourceAt locates the entry called name (empty: first regular file
+// entry) and opens it as a CONCURRENT random-access sparse.Source
+// over ra: RunAt serves the envelope's hole map, ReadAt is pure
+// offset arithmetic plus ra.ReadAt — as safe for concurrent use as ra
+// itself (an *os.File is). The entry's name is returned alongside.
+func SourceAt(ra io.ReaderAt, name string) (sparse.Source, string, error) {
+	sr := io.NewSectionReader(ra, 0, 1<<62)
+	m, err := locate(sr, name, seekSkip(sr))
+	if err != nil {
+		return nil, "", err
+	}
+	dataStart, err := sr.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return nil, "", err
+	}
+	return &readerAtSource{
+		meta:         *m,
+		ra:           ra,
+		dataStart:    dataStart,
+		packedPrefix: packedPrefix(m.extents),
+	}, m.name, nil
+}
+
 func newSeqView(r io.Reader, name string) (*seqView, error) {
 	m, err := locate(r, name, func(n int64) error {
 		_, err := io.CopyN(io.Discard, r, n)
@@ -82,23 +120,39 @@ func newSeqView(r io.Reader, name string) (*seqView, error) {
 }
 
 func newSeekView(rs io.ReadSeeker, name string) (*seekView, error) {
-	m, err := locate(rs, name, func(n int64) error {
-		_, err := rs.Seek(n, io.SeekCurrent)
-		return err
-	})
+	m, err := locate(rs, name, seekSkip(rs))
 	if err != nil {
 		return nil, err
 	}
+	return seekViewFrom(rs, m)
+}
+
+// seekSkip returns a locate skip function that advances rs in place.
+func seekSkip(rs io.Seeker) func(int64) error {
+	return func(n int64) error {
+		_, err := rs.Seek(n, io.SeekCurrent)
+		return err
+	}
+}
+
+// seekViewFrom builds the random-access view for an entry locate has
+// just positioned rs at (start of packed data).
+func seekViewFrom(rs io.ReadSeeker, m *meta) (*seekView, error) {
 	dataStart, err := rs.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return nil, err
 	}
-	v := &seekView{meta: *m, rs: rs, dataStart: dataStart}
-	v.packedPrefix = make([]int64, len(m.extents)+1)
-	for i, e := range m.extents {
-		v.packedPrefix[i+1] = v.packedPrefix[i] + e.Size
+	return &seekView{meta: *m, rs: rs, dataStart: dataStart, packedPrefix: packedPrefix(m.extents)}, nil
+}
+
+// packedPrefix returns prefix sums of extent sizes: packedPrefix[i] is
+// the packed-region offset where extent i's bytes begin.
+func packedPrefix(extents []extent) []int64 {
+	p := make([]int64, len(extents)+1)
+	for i, e := range extents {
+		p[i+1] = p[i] + e.Size
 	}
-	return v, nil
+	return p
 }
 
 // meta describes the located entry.
@@ -111,16 +165,34 @@ type meta struct {
 	holes   []sparse.Extent // canonical hole map (nil = dense)
 }
 
-// locate scans entries until it finds the wanted one, leaving r
-// positioned at the start of its packed data (the sparse map, when
-// present, has been consumed). skip advances r across unselected
-// content.
+// locate scans entries until it finds the one named want (empty: the
+// first regular file entry), leaving r positioned at the start of its
+// packed data (the sparse map, when present, has been consumed). skip
+// advances r across unselected content.
 func locate(r io.Reader, want string, skip func(n int64) error) (*meta, error) {
 	want = normalizeName(want)
+	return locateMatch(r, skip, func(name string, _ int, regular bool) bool {
+		return name == want || (want == "" && regular)
+	})
+}
+
+// locateAt scans entries until the index-th real entry (0-based; meta
+// entries are not counted — the same sequence archive/tar yields).
+func locateAt(r io.Reader, index int, skip func(n int64) error) (*meta, error) {
+	return locateMatch(r, skip, func(_ string, ordinal int, _ bool) bool {
+		return ordinal == index
+	})
+}
+
+// locateMatch is the scanning core behind locate/locateAt: match is
+// consulted once per real entry with its effective name, ordinal and
+// regular-ness; the first match must be a regular file.
+func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, ordinal int, regular bool) bool) (*meta, error) {
 	var blk [512]byte
 	pax := map[string]string{}
 	longName := ""
 	sawZero := false
+	ordinal := 0
 	for {
 		if _, err := io.ReadFull(r, blk[:]); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -204,7 +276,8 @@ func locate(r io.Reader, want string, skip func(n int64) error) (*meta, error) {
 		longName = ""
 
 		regular := typeflag == '0' || typeflag == 0
-		matched := effName == want || (want == "" && regular)
+		matched := match(effName, ordinal, regular)
+		ordinal++
 		if !matched {
 			if err := skip((stored + 511) &^ 511); err != nil {
 				return nil, err
@@ -553,7 +626,13 @@ func (s *sourceView) Size() uint64 { return uint64(s.m.logical) }
 // stored extent, Hole everywhere else. Zero is never produced — the
 // envelope has no such state.
 func (s *sourceView) RunAt(offset, limit uint64) (sparse.RunKind, uint64, error) {
-	size := uint64(s.m.logical)
+	return s.m.runAt(offset, limit)
+}
+
+// runAt classifies one run of the entry's logical view from its
+// extent map: Data inside a stored extent, Hole everywhere else.
+func (m *meta) runAt(offset, limit uint64) (sparse.RunKind, uint64, error) {
+	size := uint64(m.logical)
 	if offset >= size {
 		return 0, 0, io.EOF
 	}
@@ -561,21 +640,11 @@ func (s *sourceView) RunAt(offset, limit uint64) (sparse.RunKind, uint64, error)
 	if limEnd < offset || limEnd > size {
 		limEnd = size
 	}
-	// First extent that ends past offset.
-	ext := s.m.extents
-	lo, hi := 0, len(ext)
-	for lo < hi {
-		mid := (lo + hi) / 2
-		if uint64(ext[mid].Offset+ext[mid].Size) <= offset {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	if lo == len(ext) {
+	idx := m.extentAt(offset)
+	if idx == len(m.extents) {
 		return sparse.Hole, limEnd, nil // trailing hole
 	}
-	e := ext[lo]
+	e := m.extents[idx]
 	if offset < uint64(e.Offset) { // gap before the extent
 		end := uint64(e.Offset)
 		if end > limEnd {
@@ -588,6 +657,88 @@ func (s *sourceView) RunAt(offset, limit uint64) (sparse.RunKind, uint64, error)
 		end = limEnd
 	}
 	return sparse.Data, end, nil
+}
+
+// extentAt returns the index of the first extent that ends past
+// offset (== len(extents) when offset is in the trailing hole).
+func (m *meta) extentAt(offset uint64) int {
+	lo, hi := 0, len(m.extents)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if uint64(m.extents[mid].Offset+m.extents[mid].Size) <= offset {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
+// readerAtSource is the concurrent random-access sparse.Source over an
+// io.ReaderAt (SourceAt). It holds no mutable state: every ReadAt is
+// offset arithmetic plus ra.ReadAt, so concurrency is inherited from
+// ra.
+type readerAtSource struct {
+	meta
+	ra           io.ReaderAt
+	dataStart    int64   // absolute offset of the packed data region
+	packedPrefix []int64 // prefix sums of extent sizes
+}
+
+func (s *readerAtSource) Size() uint64 { return uint64(s.logical) }
+
+func (s *readerAtSource) RunAt(offset, limit uint64) (sparse.RunKind, uint64, error) {
+	return s.meta.runAt(offset, limit)
+}
+
+func (s *readerAtSource) ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	size := uint64(s.logical)
+	if offset >= size {
+		return 0, io.EOF
+	}
+	n := len(buf)
+	var eof error
+	if offset+uint64(n) > size {
+		n = int(size - offset)
+		eof = io.EOF
+	}
+	p := buf[:n]
+	pos := int64(offset)
+	for len(p) > 0 {
+		idx := s.extentAt(uint64(pos))
+		if idx < len(s.extents) && pos >= s.extents[idx].Offset {
+			// Data: map the logical position into the packed region.
+			e := s.extents[idx]
+			packed := s.packedPrefix[idx] + (pos - e.Offset)
+			m := int64(len(p))
+			if rest := e.Offset + e.Size - pos; rest < m {
+				m = rest
+			}
+			read, err := s.ra.ReadAt(p[:m], s.dataStart+packed)
+			if err != nil && (err != io.EOF || int64(read) < m) {
+				return 0, fmt.Errorf("tarstream: packed read @ %d: %w", pos, err)
+			}
+			p = p[m:]
+			pos += m
+			continue
+		}
+		// Hole (or trailing hole): zeros until the next extent or EOF.
+		zeroEnd := s.logical
+		if idx < len(s.extents) {
+			zeroEnd = s.extents[idx].Offset
+		}
+		m := int64(len(p))
+		if rest := zeroEnd - pos; rest < m {
+			m = rest
+		}
+		clear(p[:m])
+		p = p[m:]
+		pos += m
+	}
+	return n, eof
 }
 
 func (s *sourceView) ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error) {

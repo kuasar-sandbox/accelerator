@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 
@@ -658,5 +659,147 @@ func TestFileRoundTrip(t *testing.T) {
 		if gotHoles[i] != holes[i] {
 			t.Fatalf("round-trip holes = %v, want %v", gotHoles, holes)
 		}
+	}
+}
+
+func TestSourceAt(t *testing.T) {
+	logical, holes := fixture()
+	archive := mustWrite(t, "img", logical, holes)
+	ctx := context.Background()
+
+	src, name, err := SourceAt(bytes.NewReader(archive), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "img" || src.Size() != uint64(len(logical)) {
+		t.Fatalf("meta = %q/%d", name, src.Size())
+	}
+	// Run sweep mirrors the hole map.
+	var runs []sparse.Extent
+	for off := uint64(0); ; {
+		kind, end, err := src.RunAt(off, src.Size())
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if kind == sparse.Hole {
+			runs = append(runs, sparse.Extent{Offset: off, Size: end - off})
+		}
+		off = end
+	}
+	if len(runs) != len(holes) {
+		t.Fatalf("hole runs = %v, want %v", runs, holes)
+	}
+	for i := range holes {
+		if runs[i] != holes[i] {
+			t.Fatalf("hole runs = %v, want %v", runs, holes)
+		}
+	}
+
+	// Concurrent random reads must all see the right bytes.
+	var wg sync.WaitGroup
+	errs := make(chan error, 16)
+	offsets := []uint64{0, 4096, 8192 - 8, 1 << 19, (1 << 20) - 8, 1 << 20, (1 << 20) + 4096 - 8, 3<<20 - 64}
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			off := offsets[i%len(offsets)]
+			buf := make([]byte, 64)
+			n, err := src.ReadAt(ctx, buf, off)
+			if err != nil && err != io.EOF {
+				errs <- err
+				return
+			}
+			if !bytes.Equal(buf[:n], logical[off:off+uint64(n)]) {
+				errs <- fmt.Errorf("mismatch @ %d", off)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	// Past-EOF and clipped reads.
+	buf := make([]byte, 128)
+	if n, err := src.ReadAt(ctx, buf, src.Size()); n != 0 || err != io.EOF {
+		t.Fatalf("past-EOF = (%d, %v)", n, err)
+	}
+	if n, err := src.ReadAt(ctx, buf, src.Size()-32); n != 32 || err != io.EOF {
+		t.Fatalf("clipped = (%d, %v)", n, err)
+	}
+}
+
+// TestReadSeekFromIndex: ordinal addressing matches archive/tar's
+// entry sequence, recovering the hole map the stdlib reader hides.
+func TestReadSeekFromIndex(t *testing.T) {
+	logical, holes := fixture()
+
+	// [0]=dense "first", [1]=dir, [2]=dense "second", [3]=sparse img.
+	var buf bytes.Buffer
+	tw := stdtar.NewWriter(&buf)
+	tw.WriteHeader(&stdtar.Header{Name: "first", Mode: 0o644, Size: 3})
+	tw.Write([]byte("111"))
+	tw.WriteHeader(&stdtar.Header{Name: "d/", Typeflag: stdtar.TypeDir, Mode: 0o755})
+	tw.WriteHeader(&stdtar.Header{Name: "second", Mode: 0o644, Size: 5})
+	tw.Write([]byte("22222"))
+	tw.Flush() // no Close: the sparse member's WriteTo carries the trailer
+	buf.Write(mustWrite(t, "img", logical, holes))
+	archive := buf.Bytes()
+
+	// Ordinal alignment oracle: archive/tar sees 4 entries.
+	tr := stdtar.NewReader(bytes.NewReader(archive))
+	count := 0
+	var names []string
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, hdr.Name)
+		count++
+	}
+	if count != 4 {
+		t.Fatalf("stdlib sees %d entries (%v), want 4", count, names)
+	}
+
+	ts, err := ReadSeekFromIndex(bytes.NewReader(archive), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ts.Name() != "img" || ts.Size() != int64(len(logical)) {
+		t.Fatalf("meta = %q/%d", ts.Name(), ts.Size())
+	}
+	gotHoles := ts.Holes()
+	for i := range holes {
+		if gotHoles[i] != holes[i] {
+			t.Fatalf("holes = %v, want %v", gotHoles, holes)
+		}
+	}
+	got, err := io.ReadAll(ts)
+	if err != nil || !bytes.Equal(got, logical) {
+		t.Fatalf("content mismatch: %v", err)
+	}
+
+	// Index 0 = dense file; index 1 = directory (not a regular file).
+	ts0, err := ReadSeekFromIndex(bytes.NewReader(archive), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := io.ReadAll(ts0); string(got) != "111" {
+		t.Fatalf("index 0 = %q", got)
+	}
+	if _, err := ReadSeekFromIndex(bytes.NewReader(archive), 1); err == nil {
+		t.Fatal("directory entry must be rejected")
+	}
+	if _, err := ReadSeekFromIndex(bytes.NewReader(archive), 9); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("past-end index = %v, want ErrNotFound", err)
 	}
 }

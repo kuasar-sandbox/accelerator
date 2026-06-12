@@ -3,7 +3,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -13,12 +12,15 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/codec"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/tarstream"
 )
 
 const manifestConfigEnv = "MANIFEST_CONFIG"
@@ -53,9 +55,10 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, `Usage: manifest-ctl <command> [flags]
 
 Commands:
-  store          Ingest a file into the content store; the manifest blob is
-                 uploaded automatically and the hex content key is printed.
-  load           Reconstruct (part of) an image from a manifest key (or file).
+  store          Ingest a tarstream artifact (file or stdin) into the content
+                 store; holes come from the envelope's map. Prints the hex key.
+  load           Reconstruct (a window of) an image from a manifest key as a
+                 tarstream artifact (holes ride the envelope losslessly).
   get-manifest   Fetch a manifest blob by hex content key.
   info           Print manifest metadata.
   verify         Verify chunk integrity against a manifest.
@@ -103,29 +106,11 @@ func fatal(format string, args ...any) {
 // Common helpers
 // ---------------------------------------------------------------------------
 
-func openInput(path string) (*os.File, error) {
-	if path == "" || path == "-" {
-		return os.Stdin, nil
-	}
-	return os.Open(path)
-}
-
 func createOutput(path string) (*os.File, error) {
 	if path == "" || path == "-" {
 		return os.Stdout, nil
 	}
 	return os.Create(path)
-}
-
-func inputSize(f *os.File) (uint64, error) {
-	info, err := f.Stat()
-	if err != nil {
-		return 0, err
-	}
-	if info.Mode().IsRegular() {
-		return uint64(info.Size()), nil
-	}
-	return 0, nil
 }
 
 func formatSize(n uint64) string {
@@ -170,66 +155,37 @@ func cmdStore(args []string) {
 	fs := flag.NewFlagSet("store", flag.ExitOnError)
 	extraSalt := fs.String("extra-salt", "", "optional extra-salt bytes mixed with the store-supplied generation salt")
 	noProgress := fs.Bool("no-progress", false, "suppress progress output")
-	detectHoles := fs.Bool("detect-holes", false, "detect filesystem holes in the input via lseek(SEEK_HOLE/SEEK_DATA) and record them as manifest hole extents (file input only — ignored for stdin)")
 	gf := addGlobalFlags(fs)
 	fs.Parse(args)
 	input := fs.Arg(0)
 	if input == "" {
-		input = "-" // default: read data from stdin
+		input = "-" // default: read the artifact from stdin
 	}
 
 	cfg := loadCfg(*gf.configPath)
 
-	// Resolve the input as a sparse.Source. Stdin is consumed in
-	// memory (one-pass dense source — its byte count is the size);
-	// files are positioned-read in place, with the hole map probed
-	// from filesystem metadata when --detect-holes is set.
-	in, err := openInput(input)
-	if err != nil {
-		fatal("open input: %v", err)
-	}
-	defer func() {
-		if in != os.Stdin {
-			in.Close()
-		}
-	}()
+	// The input is a tarstream artifact (the platform container for
+	// images and snapshots): the envelope carries size + hole map, so
+	// stdin streams straight through one-pass with nothing buffered,
+	// and files are positioned-read in place. Holes come from the
+	// envelope — never detected from the filesystem or content.
 	var (
 		src  sparse.Source
 		size uint64
 	)
-	if in == os.Stdin {
-		data, err := io.ReadAll(in)
+	if input == "-" {
+		s, _, err := tarstream.SourceFrom(os.Stdin, "")
 		if err != nil {
-			fatal("read stdin: %v", err)
+			fatal("stdin: not a tarstream artifact: %v", err)
 		}
-		size = uint64(len(data))
-		src = sparse.Dense(bytes.NewReader(data), size)
-		if *detectHoles {
-			fmt.Fprintln(os.Stderr, "warn: --detect-holes ignored for non-regular input")
-		}
+		src, size = s, s.Size()
 	} else {
-		size, err = inputSize(in)
+		stream, err := fetch.OpenTarStream(input)
 		if err != nil {
-			fatal("stat input: %v", err)
+			fatal("%v", err)
 		}
-		var holes []sparse.Extent
-		if *detectHoles {
-			if fi, _ := in.Stat(); fi != nil && fi.Mode().IsRegular() {
-				holes, err = sparse.ProbeHoles(in)
-				if err != nil {
-					fatal("detect holes: %v", err)
-				}
-				if !*noProgress {
-					fmt.Fprintf(os.Stderr, "detected %d hole extent(s) in input\n", len(holes))
-				}
-			} else {
-				fmt.Fprintln(os.Stderr, "warn: --detect-holes ignored for non-regular input")
-			}
-		}
-		src, err = sparse.NewSource(in, size, holes)
-		if err != nil {
-			fatal("input source: %v", err)
-		}
+		defer stream.Close()
+		src, size = stream, stream.Size()
 	}
 
 	// Optional extra-salt closure — nil when --extra-salt is empty.
@@ -288,10 +244,10 @@ func cmdStore(args []string) {
 func cmdLoad(args []string) {
 	fs := flag.NewFlagSet("load", flag.ExitOnError)
 	output := fs.String("output", "-", "output file (- for stdout)")
-	offset := fs.Uint64("offset", 0, "byte offset to start reading")
-	length := fs.Uint64("length", 0, "number of bytes to read (0 = remainder)")
+	name := fs.String("name", "image", "entry name inside the emitted tarstream artifact")
+	offset := fs.Uint64("offset", 0, "byte offset of the window to load")
+	length := fs.Uint64("length", 0, "window length (0 = remainder)")
 	noProgress := fs.Bool("no-progress", false, "suppress progress output")
-	holePolicy := fs.String("hole", "error", "hole policy: error (default, fail on any hole), zero (fill with zero bytes), punch (fallocate PUNCH_HOLE on file output)")
 	gf := addGlobalFlags(fs)
 	fs.Parse(args)
 
@@ -341,76 +297,88 @@ func cmdLoad(args []string) {
 			out.Close()
 		}
 	}()
+	if out == os.Stdout {
+		if st, err := os.Stdout.Stat(); err == nil && st.Mode()&os.ModeCharDevice != 0 {
+			fatal("load: refusing to write a tarstream artifact to a terminal (use --output FILE or redirect stdout)")
+		}
+	}
 
-	holeFn, err := makeHolePolicy(*holePolicy, out)
-	if err != nil {
+	// The output is a tarstream artifact: holes ride the envelope's
+	// map losslessly (no materialization policy to choose), Zero
+	// chunks are synthesized by the writer without fetching, and Data
+	// chunks flow through the fetch path. A window (--offset/--length)
+	// loads that slice as its own artifact.
+	var src sparse.Source = stream
+	if readOffset != 0 || readLength != imageSize {
+		src = &windowSource{s: stream, base: readOffset, size: readLength}
+	}
+	var w io.Writer = out
+	if !*noProgress {
+		w = &progressWriter{w: out, label: "load"}
+	}
+	if err := tarstream.WriteTo(ctx, w, *name, src); err != nil {
 		fatal("%v", err)
-	}
-
-	// Write [readOffset, end): walk runs, applying the --hole policy to Hole
-	// runs and reading data/zero spans through the fetch path in windows (each
-	// ReadAt fetches its chunks concurrently; Zero chunks come back as zeros).
-	const window = 4 << 20
-	buf := make([]byte, window)
-	cur := readOffset
-	end := readOffset + readLength
-	progress := func() {
-		if *noProgress {
-			return
-		}
-		done := cur - readOffset
-		pct := float64(done) / float64(readLength) * 100
-		fmt.Fprintf(os.Stderr, "\rload: %s/%s (%.1f%%)", formatSize(done), formatSize(readLength), pct)
-	}
-	for cur < end {
-		kind, runEnd, rerr := stream.RunAt(cur, end-cur)
-		if rerr != nil { // io.EOF: cur reached image end
-			break
-		}
-		if kind == sparse.Hole {
-			if holeFn == nil {
-				fatal("manifest contains a hole; choose a policy with --hole=zero|punch (default --hole=error rejects)")
-			}
-			if herr := holeFn(out, cur, runEnd-cur); herr != nil {
-				fatal("hole: %v", herr)
-			}
-			cur = runEnd
-			progress()
-			continue
-		}
-		// Coalesce contiguous non-hole runs so each ReadAt window spans
-		// multiple chunks and fetches them concurrently.
-		spanEnd := runEnd
-		for spanEnd < end {
-			k2, e2, e2err := stream.RunAt(spanEnd, end-spanEnd)
-			if e2err != nil || k2 == sparse.Hole {
-				break
-			}
-			spanEnd = e2
-		}
-		for cur < spanEnd {
-			w := spanEnd - cur
-			if w > window {
-				w = window
-			}
-			n, rerr := stream.ReadAt(ctx, buf[:w], cur)
-			if rerr != nil && !errors.Is(rerr, io.EOF) {
-				fatal("read: %v", rerr)
-			}
-			if _, werr := out.Write(buf[:n]); werr != nil {
-				fatal("write: %v", werr)
-			}
-			cur += uint64(n)
-			progress()
-			if rerr != nil {
-				break // io.EOF: image ended within this span
-			}
-		}
 	}
 	if !*noProgress {
 		fmt.Fprintln(os.Stderr)
 	}
-	fmt.Fprintf(os.Stderr, "loaded %s from offset %d\n", formatSize(readLength), readOffset)
+	fmt.Fprintf(os.Stderr, "loaded %s from offset %d as %q\n", formatSize(readLength), readOffset, *name)
+}
+
+// windowSource exposes [base, base+size) of s as a source of its own.
+type windowSource struct {
+	s          sparse.Source
+	base, size uint64
+}
+
+func (w *windowSource) Size() uint64 { return w.size }
+
+func (w *windowSource) RunAt(off, limit uint64) (sparse.RunKind, uint64, error) {
+	if off >= w.size {
+		return 0, 0, io.EOF
+	}
+	if limit > w.size-off {
+		limit = w.size - off
+	}
+	kind, end, err := w.s.RunAt(w.base+off, limit)
+	if err != nil {
+		return kind, 0, err
+	}
+	return kind, end - w.base, nil
+}
+
+func (w *windowSource) ReadAt(ctx context.Context, buf []byte, off uint64) (int, error) {
+	if off >= w.size {
+		return 0, io.EOF
+	}
+	var eof error
+	if off+uint64(len(buf)) > w.size {
+		buf = buf[:w.size-off]
+		eof = io.EOF
+	}
+	n, err := w.s.ReadAt(ctx, buf, w.base+off)
+	if err != nil && err != io.EOF {
+		return 0, err
+	}
+	return n, eof
+}
+
+// progressWriter logs running byte counts to stderr (throttled).
+type progressWriter struct {
+	w     io.Writer
+	label string
+	n     uint64
+	last  time.Time
+}
+
+func (p *progressWriter) Write(b []byte) (int, error) {
+	n, err := p.w.Write(b)
+	p.n += uint64(n)
+	if time.Since(p.last) >= 2*time.Second {
+		fmt.Fprintf(os.Stderr, "\r%s: %s written", p.label, formatSize(p.n))
+		p.last = time.Now()
+	}
+	return n, err
 }
 
 // ---------------------------------------------------------------------------
@@ -788,22 +756,6 @@ func cmdDiff(args []string) {
 // ---------------------------------------------------------------------------
 // hole policy — used by `load`
 // ---------------------------------------------------------------------------
-
-func makeHolePolicy(name string, w io.Writer) (func(io.Writer, uint64, uint64) error, error) {
-	switch name {
-	case "error":
-		return nil, nil
-	case "zero":
-		return holeFillZero, nil
-	case "punch":
-		if f, ok := w.(*os.File); ok {
-			return holeFillPunch(f), nil
-		}
-		return nil, fmt.Errorf("--hole=punch requires output to be a regular file (not stdout/pipe)")
-	default:
-		return nil, fmt.Errorf("unknown --hole policy %q", name)
-	}
-}
 
 func holeFillZero(w io.Writer, _, size uint64) error {
 	_, err := io.CopyN(w, zeroReader{}, int64(size))

@@ -12,10 +12,10 @@
 | 包 | 作用 |
 |---|---|
 | `pkg/sparse` | 平台统一稀疏模型:三态 `RunKind`(Hole/Zero/Data)+ `Source` 契约(元数据查询 RunAt 与数据读取 ReadAt 分离,一次性源是一等公民),`ProbeHoles`(SEEK_HOLE)/`NewSource`/`Dense` 构造器;洞只来自权威元数据,禁止内容探洞 |
-| `pkg/manifest` (+ `codec`/`crypto`/`chunker`/`fetch`/`ingest`) | 分块 + 收敛加密 + 内容寻址的读写 SDK;`fetch.Stream` = `sparse.Source` + Close(并发随机访问强化),`ingest.Ingest` 单趟消费任意 `sparse.Source` |
+| `pkg/manifest` (+ `codec`/`crypto`/`chunker`/`fetch`/`ingest`) | 分块 + 收敛加密 + 内容寻址的读写 SDK;`fetch.Stream` = `sparse.Source` + Close(并发随机访问强化),`fetch.OpenTarStream` 把本地 tarstream 工件直接开成 Stream(零解包),`ingest.Ingest` 单趟消费任意 `sparse.Source` |
 | `pkg/store` + `pkg/store/client` | 远端存储代理的接口与客户端 |
 | `pkg/cache` + `pkg/cache/client` | 分层缓存的接口与客户端 |
-| `pkg/tarstream` | 单文件稀疏流的 tar 信封:`WriteTo`(任意 `sparse.Source` → GNU PAX sparse 1.0,仅数据字节上线,Zero 段合成零字节作数据)/ `ReadFrom`(顺序)/ `ReadSeekFrom`(在 tar 内零拷贝随机访问)/ `SourceFrom`(把 tar 流直接开成 `sparse.Source` 供管线消费),洞图精确取回;互操作 GNU tar 与 archive/tar |
+| `pkg/tarstream` | 单文件稀疏流的 tar 信封:`WriteTo`(任意 `sparse.Source` → GNU PAX sparse 1.0,仅数据字节上线,Zero 段合成零字节作数据)/ `ReadFrom`(顺序)/ `ReadSeekFrom`(在 tar 内零拷贝随机访问)/ `SourceFrom`/`SourceAt`(tar 流/ReaderAt 直接开成 `sparse.Source`,后者并发随机)/`ReadSeekFromIndex`(按 stdlib 条目序数定位,补回洞图),洞图精确取回;互操作 GNU tar 与 archive/tar |
 
 重后端(`*/server`、`pkg/cache/rocks`、`pkg/cache/ec`、`pkg/store/obs`、`pkg/store/fs`)
 只在守护进程与 `cmd/` 内编译,不进入下游闭包。

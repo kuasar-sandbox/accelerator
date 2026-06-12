@@ -77,9 +77,12 @@ manifest-ctl store [flags] <path|->        # <path|-> 省略或 - = stdin
 
 Flags:
   --extra-salt string         额外 salt 字节,叠加到 generation salt
-  --detect-holes              对常规文件 lseek(SEEK_HOLE/SEEK_DATA) 检测稀疏空洞
   --no-progress               禁用进度输出
 ```
+
+输入是 **tarstream 工件**(平台镜像/快照的统一容器):size 与洞图都在信封里,
+stdin 因此可单遍直通(零缓冲),文件则按需定位读;洞永远来自信封元数据,
+不做文件系统探测、更不做内容扫描。
 
 stdout 输出一行 64 字符 hex —— 这是上传后的 manifest content key。stderr
 是人类可读的摘要(默认开,`--no-progress` 关):
@@ -119,22 +122,23 @@ Args:
   <hex|manifest://hex>        要加载的 manifest content key(必填;可带可选
                               manifest:// 前缀)
 Flags:
-  --output string             输出路径 (default "-", stdout)
-  --offset uint               起始偏移
-  --length uint               读取长度 (0 = 整个镜像)
-  --hole string               空洞策略: error (默认) | zero | punch
+  --output string             输出路径 (default "-", stdout;终端拒写)
+  --name string               产物 tar 条目名 (default "image")
+  --offset uint               窗口起始偏移
+  --length uint               窗口长度 (0 = 余下全部)
   --no-progress               禁用进度输出
 ```
 
+输出是 **tarstream 工件**:manifest 空洞无损进信封洞图(没有"落洞还是填零"
+的策略问题,原 `--hole` 旗标随之取消),IsZero chunk 由写出端本地合成零字节、
+不取数。要 raw 字节用 `flatten-ctl tar extract` 解包。
+
 ```bash
-# 全量还原(flags 在位置参数前)
-manifest-ctl load --output disk-restored.img a1b2c3d4...
+# 全量还原为工件(flags 在位置参数前)
+manifest-ctl load --output disk.img a1b2c3d4...
 
-# 部分读
-manifest-ctl load --length 4096 a1b2c3d4... | hexdump -C
-
-# 稀疏镜像:把 manifest 空洞落成文件空洞
-manifest-ctl load --output disk.img --hole punch a1b2c3d4...
+# 窗口切片(切片本身也是合法工件)
+manifest-ctl load --offset 4096 --length 65536 --output slice.img a1b2c3d4...
 
 # 也可带 manifest:// 前缀
 manifest-ctl load --output disk.img manifest://a1b2c3d4...
