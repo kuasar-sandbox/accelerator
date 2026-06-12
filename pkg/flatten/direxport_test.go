@@ -49,6 +49,18 @@ func TestParseMountinfo(t *testing.T) {
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Errorf("mounts = %v, want %v", got, want)
 	}
+
+	// root == "/" — the in-guest full-rootfs export. Every mount except "/"
+	// itself must be returned (a naive root+"/" prefix matches nothing here,
+	// which once let mkfs walk /proc).
+	got, err = parseMountinfo(strings.NewReader(fixture), "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = []string{"proc", "rootfs", "rootfs/dev", "rootfs/mnt/data disk", "rootfs/proc", "rootfsfoo"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("mounts under / = %v, want %v", got, want)
+	}
 }
 
 func TestUnescapeMountPath(t *testing.T) {

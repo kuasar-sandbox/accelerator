@@ -141,12 +141,18 @@ func normalizeSkip(s string) (string, error) {
 }
 
 // strictlyUnder reports whether target lies strictly under root,
-// returning its relative path.
+// returning its relative path. root == "/" must work: the in-guest
+// rootfs export walks literal "/", and a naive root+"/" prefix ("//")
+// would silently match nothing — dropping every mount exclusion.
 func strictlyUnder(root, target string) (string, bool) {
-	if target == root || !strings.HasPrefix(target, root+string(os.PathSeparator)) {
+	prefix := root
+	if prefix != string(os.PathSeparator) {
+		prefix += string(os.PathSeparator)
+	}
+	if target == root || !strings.HasPrefix(target, prefix) {
 		return "", false
 	}
-	return target[len(root)+1:], true
+	return target[len(prefix):], true
 }
 
 func dedupeSorted(in []string) []string {

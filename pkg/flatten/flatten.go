@@ -666,6 +666,12 @@ func buildEROFS(mkfsPath, rootfsDir, outputPath string, extra ...string) error {
 	args = append(args, extra...)
 	args = append(args, outputPath, rootfsDir)
 	cmd := exec.Command(mkfsPath, args...)
+	// Chunk-mode mkfs.erofs stages dedup data through tmpfile()/$TMPDIR
+	// (default /tmp). Pin it to the output's directory — the flatten scratch
+	// — so the build works on rootfs without a /tmp (the in-guest import
+	// sandbox boots an EMPTY ext4) and the staging lands on the disk sized
+	// for it.
+	cmd.Env = append(os.Environ(), "TMPDIR="+filepath.Dir(outputPath))
 	cmd.Stdout = io.Discard
 	// Capture stderr so a failure carries mkfs.erofs's own diagnostic rather
 	// than a bare "exit status 1". (On success mkfs may still print benign
