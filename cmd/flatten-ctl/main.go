@@ -5,13 +5,12 @@
 //
 //	flatten-ctl export   [--output <path|->] [--config <path>]
 //	                     [--manifest-config <path>] [--upload] [--with-referer]  <path|->
-//	flatten-ctl verify   [--tmpdir D] [--no-progress]  <path|->
 //	flatten-ctl info     [--json] [--manifest-config <path>]  <path|manifest://hex>
 //	flatten-ctl cache    gc | info
 //	flatten-ctl config   [--config <path>] [--template] [-o <file>]
 //
 // The image is a positional arg (flags must precede it — stdlib flag).
-// For export/verify it defaults to `-` (docker-archive on stdin) when
+// For export it defaults to `-` (docker-archive on stdin) when
 // omitted; `-` may also be given explicitly.
 //
 // `export --upload` ingests the produced EROFS into the content store
@@ -39,6 +38,8 @@ import (
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/ingest"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandbox-builder/internal/util"
 	"github.com/kuasar-sandbox/sandbox-builder/pkg/flatten"
 	"github.com/kuasar-sandbox/sandbox-builder/pkg/image"
@@ -58,8 +59,6 @@ func main() {
 	switch os.Args[1] {
 	case "export":
 		cmdExport(os.Args[2:])
-	case "verify":
-		cmdVerify(os.Args[2:])
 	case "info":
 		cmdInfo(os.Args[2:])
 	case "cache":
@@ -68,6 +67,8 @@ func main() {
 		cmdConfig(os.Args[2:])
 	case "tar":
 		cmdTar(os.Args[2:])
+	case "mountpoint":
+		cmdMountpoint(os.Args[2:])
 	case "-h", "--help", "help":
 		printUsage()
 	default:
@@ -82,11 +83,11 @@ func printUsage() {
 
 Commands:
   export   Flatten OCI/docker-archive or a registry image → EROFS (optionally upload).
-  verify   Flatten twice, fail if outputs differ.
   info     Print EROFS metadata + OCI runtime config.
   cache    Inspect or garbage-collect the registry blob cache.
   config   Emit/validate a flatten config (FLATTEN_CONFIG): tmpdir/platform/cache/referer.
   tar      Extract files from a tar stream / package one sparse file as a tarstream (pure Go).
+  mountpoint  Make a directory a self-bind mount point (excluded by export --skip-mounts).
 
 See `+"`flatten-ctl <command> -h`"+` for per-command flags.
 `)
@@ -112,6 +113,8 @@ func cmdExport(args []string) {
 	fs.Var(&skips, "skip", "rootfs-dir source: exclude this path (relative to the rootfs, node and subtree); repeatable")
 	skipMounts := fs.Bool("skip-mounts", false, "rootfs-dir source: exclude every mount point under the rootfs")
 	runtimeConfig := fs.String("runtime-config", "", "rootfs-dir source: runtime config JSON to append (OCI image config or a projected config.json)")
+	tmpDir := fs.String("tmpdir", "", "scratch directory (overrides the config tmpdir; created if missing)")
+	insecure := fs.Bool("insecure", false, "registry source: allow plain-HTTP / skip-TLS registries (overrides the config)")
 	fs.Parse(args)
 	input := fs.Arg(0)
 	if input == "" {
@@ -128,6 +131,17 @@ func cmdExport(args []string) {
 	}
 	if err := cfg.SetPlatform(*platform); err != nil {
 		fatal("%v", err)
+	}
+	if *tmpDir != "" {
+		cfg.TmpDir = *tmpDir
+	}
+	if *insecure {
+		cfg.Insecure = true
+	}
+	if cfg.TmpDir != "" {
+		if err := os.MkdirAll(cfg.TmpDir, 0o755); err != nil {
+			fatal("tmpdir: %v", err)
+		}
 	}
 	// referer.enabled in a shared config is a registry-source concern;
 	// a rootfs-directory source ignores it (only the explicit flag errors).
@@ -192,55 +206,94 @@ func cmdExport(args []string) {
 		}
 	}
 
-	// Resolve output path: when --output is "-" or empty (+upload), use
-	// a temp file we can re-open after FlattenFile finishes.
-	tmpOut := false
-	outPath := *output
-	if *upload || outPath == "-" {
-		tf, err := os.CreateTemp(cfg.TmpDir, "flatten-out-*.img")
-		if err != nil {
-			fatal("create temp output: %v", err)
-		}
-		tf.Close()
-		outPath = tf.Name()
-		tmpOut = true
-		defer os.Remove(outPath)
+	// The raw erofs always lands in a scratch file first (mkfs.erofs
+	// needs a seekable output), then gets packed into the tarstream
+	// artifact (entry "image") — the platform container for images —
+	// whether the destination is a file or stdout.
+	rawTmp, err := os.CreateTemp(cfg.TmpDir, "flatten-erofs-*.img")
+	if err != nil {
+		fatal("create temp output: %v", err)
 	}
+	rawTmp.Close()
+	rawPath := rawTmp.Name()
+	defer os.Remove(rawPath)
 
 	switch {
 	case dirSrc:
-		if err := runDirFlatten(input, outPath, cfg.TmpDir, skips, *skipMounts, *runtimeConfig, *noProgress); err != nil {
+		if err := runDirFlatten(input, rawPath, cfg.TmpDir, skips, *skipMounts, *runtimeConfig, *noProgress); err != nil {
 			fatal("%v", err)
 		}
 	case remoteSrc:
-		if err := runRemoteFlatten(input, outPath, cfg, *printDigest, *noProgress); err != nil {
+		if err := runRemoteFlatten(input, rawPath, cfg, *printDigest, *noProgress); err != nil {
 			fatal("%v", err)
 		}
 	default:
-		if err := runFlatten(input, outPath, cfg.TmpDir, *noProgress); err != nil {
+		if err := runFlatten(input, rawPath, cfg.TmpDir, *noProgress); err != nil {
 			fatal("%v", err)
 		}
 	}
 
-	info, err := os.Stat(outPath)
-	if err != nil {
-		fatal("stat output: %v", err)
-	}
 	if !*noProgress {
-		fmt.Fprintf(os.Stderr, "EROFS image: %s\n", formatSize(info.Size()))
+		if info, err := os.Stat(rawPath); err == nil {
+			fmt.Fprintf(os.Stderr, "EROFS image: %s\n", formatSize(info.Size()))
+		}
 	}
 
-	// Pipe to stdout if requested.
-	if *output == "-" {
-		f, err := os.Open(outPath)
+	// Pack the artifact. --output - streams it; --upload without
+	// --output packs to a scratch artifact for ingest.
+	artifactPath := *output
+	switch *output {
+	case "-":
+		if st, err := os.Stdout.Stat(); err == nil && st.Mode()&os.ModeCharDevice != 0 {
+			fatal("export: refusing to write an image artifact to a terminal (use --output FILE or redirect stdout)")
+		}
+		artifactPath = ""
+		if *upload { // need a file for ingest too: pack once, copy to stdout
+			af, err := os.CreateTemp(cfg.TmpDir, "flatten-image-*.img")
+			if err != nil {
+				fatal("create temp artifact: %v", err)
+			}
+			af.Close()
+			artifactPath = af.Name()
+			defer os.Remove(artifactPath)
+		}
+		if artifactPath == "" {
+			if err := packImageArtifact(rawPath, os.Stdout); err != nil {
+				fatal("%v", err)
+			}
+		}
+	case "":
+		af, err := os.CreateTemp(cfg.TmpDir, "flatten-image-*.img")
 		if err != nil {
-			fatal("re-open temp output: %v", err)
+			fatal("create temp artifact: %v", err)
 		}
-		if _, err := io.Copy(os.Stdout, f); err != nil {
+		af.Close()
+		artifactPath = af.Name()
+		defer os.Remove(artifactPath)
+	}
+	if artifactPath != "" {
+		af, err := os.Create(artifactPath)
+		if err != nil {
+			fatal("create artifact: %v", err)
+		}
+		if err := packImageArtifact(rawPath, af); err != nil {
+			af.Close()
+			fatal("%v", err)
+		}
+		if err := af.Close(); err != nil {
+			fatal("close artifact: %v", err)
+		}
+		if *output == "-" {
+			f, err := os.Open(artifactPath)
+			if err != nil {
+				fatal("re-open artifact: %v", err)
+			}
+			if _, err := io.Copy(os.Stdout, f); err != nil {
+				f.Close()
+				fatal("write to stdout: %v", err)
+			}
 			f.Close()
-			fatal("write to stdout: %v", err)
 		}
-		f.Close()
 	}
 
 	if !*upload {
@@ -248,15 +301,40 @@ func cmdExport(args []string) {
 	}
 
 	mcfg := loadManifestCfg(*manifestCfg)
-	key, err := ingestEROFS(outPath, mcfg, *noProgress)
+	key, err := ingestEROFS(artifactPath, mcfg, *noProgress)
 	if err != nil {
 		fatal("%v", err)
 	}
 	fmt.Println(key)
+}
 
-	// Belt and braces: tmpOut already covered by defer, but make the
-	// intent explicit when --upload finishes without --output.
-	_ = tmpOut
+// packImageArtifact wraps the raw erofs(+config ZIP) at rawPath as a
+// tarstream artifact (single entry "image") on w: the platform
+// container for images. Holes come from the filesystem (the raw file
+// is the live scratch source); the artifact itself is dense and
+// self-describing.
+func packImageArtifact(rawPath string, w io.Writer) error {
+	f, err := os.Open(rawPath)
+	if err != nil {
+		return fmt.Errorf("open erofs: %w", err)
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	holes, err := sparse.ProbeHoles(f)
+	if err != nil {
+		return fmt.Errorf("probe holes: %w", err)
+	}
+	src, err := sparse.NewSource(f, uint64(st.Size()), holes)
+	if err != nil {
+		return err
+	}
+	if err := tarstream.WriteTo(context.Background(), w, "image", src); err != nil {
+		return fmt.Errorf("pack image artifact: %w", err)
+	}
+	return nil
 }
 
 // stringList is a repeatable string flag.
@@ -298,7 +376,7 @@ func runFlatten(image, outputPath, tmpDir string, noProgress bool) error {
 	return flatten.FlattenFileWith(image, outputPath, opts)
 }
 
-// isRemoteSource decides whether the export/verify positional arg names a
+// isRemoteSource decides whether the export positional arg names a
 // remote registry reference (vs a local docker-archive). Precedence: --archive
 // and stdin / `docker-archive:` force local; --registry forces remote; an
 // existing on-disk file is local; otherwise anything that parses as a registry
@@ -364,9 +442,9 @@ func ingestEROFS(path string, mcfg *manifest.Config, noProgress bool) (string, e
 	}
 	defer ing.Close()
 
-	src, err := fetch.OpenFileStream(path)
+	src, err := fetch.OpenTarStream(path)
 	if err != nil {
-		return "", fmt.Errorf("re-open output for upload: %w", err)
+		return "", fmt.Errorf("re-open artifact for upload: %w", err)
 	}
 	defer src.Close()
 
@@ -471,152 +549,6 @@ func runReferrerExport(ref string, rcfg *remote.Config, manifestCfgPath string, 
 }
 
 // ---------------------------------------------------------------------------
-// verify
-// ---------------------------------------------------------------------------
-
-func cmdVerify(args []string) {
-	fs := flag.NewFlagSet("verify", flag.ExitOnError)
-	tmpDir := fs.String("tmpdir", "", "parent of the per-run scratch directory")
-	noProgress := fs.Bool("no-progress", false, "suppress progress output")
-	configPath := fs.String("config", "", "flatten config YAML (overrides FLATTEN_CONFIG env); used when the source is a registry reference")
-	fs.Parse(args)
-	input := fs.Arg(0)
-	if input == "" {
-		input = "-" // default: docker-archive stream on stdin
-	}
-
-	// Registry source: pull once into the cache, then flatten twice from the
-	// same cached blobs and compare. (A moving tag is only as reproducible as
-	// the tag; pin @sha256 for a stable check.)
-	if isRemoteSource(input, false, false) {
-		verifyRemote(input, *tmpDir, *configPath, *noProgress)
-		return
-	}
-
-	// Buffer stdin to a temp file so we can seek across two flatten passes.
-	inputPath := input
-	if input == "-" {
-		tmp, err := os.CreateTemp(*tmpDir, "verify-input-*.tar")
-		if err != nil {
-			fatal("create temp: %v", err)
-		}
-		defer os.Remove(tmp.Name())
-		if _, err := io.Copy(tmp, os.Stdin); err != nil {
-			tmp.Close()
-			fatal("read stdin: %v", err)
-		}
-		tmp.Close()
-		inputPath = tmp.Name()
-	} else {
-		inputPath = strings.TrimPrefix(input, "docker-archive:")
-	}
-
-	tmp1, err := os.CreateTemp(*tmpDir, "verify-pass1-*.img")
-	if err != nil {
-		fatal("create temp: %v", err)
-	}
-	tmp1.Close()
-	defer os.Remove(tmp1.Name())
-
-	tmp2, err := os.CreateTemp(*tmpDir, "verify-pass2-*.img")
-	if err != nil {
-		fatal("create temp: %v", err)
-	}
-	tmp2.Close()
-	defer os.Remove(tmp2.Name())
-
-	opts := flatten.Options{TmpDir: *tmpDir}
-	if err := flatten.FlattenFileWith(inputPath, tmp1.Name(), opts); err != nil {
-		fatal("flatten pass 1: %v", err)
-	}
-	if err := flatten.FlattenFileWith(inputPath, tmp2.Name(), opts); err != nil {
-		fatal("flatten pass 2: %v", err)
-	}
-
-	h1, sz1, err := hashAndSize(tmp1.Name())
-	if err != nil {
-		fatal("hash pass 1: %v", err)
-	}
-	h2, sz2, err := hashAndSize(tmp2.Name())
-	if err != nil {
-		fatal("hash pass 2: %v", err)
-	}
-	if !*noProgress {
-		fmt.Fprintf(os.Stderr, "Pass 1: sha256:%s (%s)\n", h1, formatSize(sz1))
-		fmt.Fprintf(os.Stderr, "Pass 2: sha256:%s (%s)\n", h2, formatSize(sz2))
-	}
-	if h1 == h2 {
-		fmt.Fprintln(os.Stderr, "DETERMINISTIC")
-		return
-	}
-	fmt.Fprintln(os.Stderr, "NOT DETERMINISTIC")
-	os.Exit(1)
-}
-
-// verifyRemote pulls a registry image once into the shared cache, flattens it
-// twice from the same cached blobs, and compares the EROFS hashes.
-func verifyRemote(ref, tmpDir, configPath string, noProgress bool) {
-	cfg, err := remote.LoadConfig(configPath, flattenConfigEnv)
-	if err != nil {
-		fatal("%v", err)
-	}
-	ctx := context.Background()
-	res, err := cfg.Resolve(ctx, ref)
-	if err != nil {
-		fatal("%v", err)
-	}
-	cache, cleanup, err := cfg.OpenCache()
-	if err != nil {
-		fatal("%v", err)
-	}
-	defer cleanup()
-	src, err := cfg.Pull(ctx, res, cache)
-	if err != nil {
-		fatal("%v", err)
-	}
-
-	tmp1, err := os.CreateTemp(tmpDir, "verify-pass1-*.img")
-	if err != nil {
-		fatal("create temp: %v", err)
-	}
-	tmp1.Close()
-	defer os.Remove(tmp1.Name())
-	tmp2, err := os.CreateTemp(tmpDir, "verify-pass2-*.img")
-	if err != nil {
-		fatal("create temp: %v", err)
-	}
-	tmp2.Close()
-	defer os.Remove(tmp2.Name())
-
-	opts := flatten.Options{TmpDir: tmpDir}
-	if err := flatten.Build(src, tmp1.Name(), opts); err != nil {
-		fatal("flatten pass 1: %v", err)
-	}
-	if err := flatten.Build(src, tmp2.Name(), opts); err != nil {
-		fatal("flatten pass 2: %v", err)
-	}
-
-	h1, sz1, err := hashAndSize(tmp1.Name())
-	if err != nil {
-		fatal("hash pass 1: %v", err)
-	}
-	h2, sz2, err := hashAndSize(tmp2.Name())
-	if err != nil {
-		fatal("hash pass 2: %v", err)
-	}
-	if !noProgress {
-		fmt.Fprintf(os.Stderr, "resolved: %s\n", res.Digest)
-		fmt.Fprintf(os.Stderr, "Pass 1: sha256:%s (%s)\n", h1, formatSize(sz1))
-		fmt.Fprintf(os.Stderr, "Pass 2: sha256:%s (%s)\n", h2, formatSize(sz2))
-	}
-	if h1 != h2 {
-		fmt.Fprintln(os.Stderr, "NOT DETERMINISTIC")
-		os.Exit(1)
-	}
-	fmt.Fprintln(os.Stderr, "DETERMINISTIC")
-}
-
-// ---------------------------------------------------------------------------
 // info
 // ---------------------------------------------------------------------------
 
@@ -655,16 +587,14 @@ func cmdInfo(args []string) {
 		return
 	}
 
-	f, err := os.Open(input)
+	st, err := fetch.OpenTarStream(input)
 	if err != nil {
-		fatal("open %s: %v", input, err)
+		fatal("%v", err)
 	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		fatal("stat %s: %v", input, err)
-	}
-	printInfo(f, st.Size(), *asJSON)
+	defer st.Close()
+	ctx := context.Background()
+	size := int64(st.Size())
+	printInfo(fetch.NewReaderAt(ctx, st, size), size, *asJSON)
 }
 
 // printInfo reports the EROFS image size and embedded RuntimeConfig from

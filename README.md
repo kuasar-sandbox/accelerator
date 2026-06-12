@@ -11,8 +11,8 @@ rootfs,并在镜像尾部追加运行时配置(STORED-mode ZIP)。是
 | `pkg/image` | **轻量读取面**:`RuntimeConfig` 类型、`ReadConfig`/`AppendConfigZip`/`ReadEROFSSize`、`ExtractRuntimeConfigFromJSON`。供工具与 `sandbox-runtime` 读取/inspect 展平镜像 | 仅 stdlib |
 | `pkg/flatten` | 展平引擎:`Source` 接口 + 确定性 `Build` sink(OCI→EROFS,调用 `mkfs.erofs`)+ `Verify` | `pkg/image`、`internal/util` |
 | `pkg/remote` | **远程拉取面**:registry 拉取 + 平台选择 + env 凭据 + TLS CA 配置 + OCI-layout blob 缓存(并发下载 / 原子写 / LRU 淘汰)+ OCI Referrers 回写与幂等跳过。产出 `flatten.Source` | go-containerregistry、`pkg/flatten` |
-| `pkg/tar` | **tar 提取面**:从任意 tar 流取文件(`Rule`+`Extract`),纯 Go 单遍流式,常规文件致密落盘(零值是数据、不造洞);`ExtractFile` 对单成员按声明洞精确还原;重命名与 stdio 规则 | stdlib + `sandbox-accelerator/pkg/{sparse,tarstream}` |
-| `cmd/flatten-ctl` | CLI:`export`(registry/docker-archive/rootfs 目录三源)/`verify`/`info`/`cache`/`config`/`tar`;`--upload` 经 `sandbox-accelerator/pkg/manifest` ingest 进 store | accelerator SDK、`pkg/remote`、`pkg/tar` |
+| `pkg/tar` | **tar 提取面**:从任意 tar 流取文件(`Rule`+`Extract`),纯 Go 单遍流式,零值是数据不造洞;稀疏成员经 `Options.Reopen` 按序数二次定位**全路径声明洞精确**(stdlib 洞图未导出,issue 22735),`Options.Dense` 显式回 stdlib 致密;`ExtractFile` 单成员精确还原 | stdlib + `sandbox-accelerator/pkg/{sparse,tarstream}` |
+| `cmd/flatten-ctl` | CLI:`export`(registry/docker-archive/rootfs 目录三源,产物=tarstream 镜像工件 .img)/`info`/`cache`/`config`/`tar`/`mountpoint`;`--upload` 经 `sandbox-accelerator/pkg/manifest` ingest 进 store | accelerator SDK、`pkg/remote`、`pkg/tar` |
 
 依赖洁净:`sandbox-runtime` 只 import `pkg/image`(stdlib-only,读取镜像内嵌的
 RuntimeConfig);go-containerregistry **只落在 `pkg/remote`**,不进 `pkg/image` /

@@ -255,32 +255,97 @@ func sparseSupported(t *testing.T, dir string) bool {
 	return st.Blocks*512 < 1<<20
 }
 
-// TestExtractSparseFromTarstream: the generic engine materializes a
-// sparse member's logical bytes DENSE — declared holes downgrade to
-// allocated zeros (the stdlib reader hides the hole map; hole-exact
-// restoration is ExtractFile's job).
-func TestExtractSparseFromTarstream(t *testing.T) {
+// TestExtractSparseHoleExact: the engine extracts sparse members
+// hole-exact when the archive is re-openable (Plan C: the member is
+// re-located by ordinal on a second handle, recovering the map the
+// stdlib reader hides). Without Reopen it must FAIL — never silently
+// densify — and --dense explicitly opts into logical-bytes
+// materialization.
+func TestExtractSparseHoleExact(t *testing.T) {
 	dir := t.TempDir()
+	if !sparseSupported(t, dir) {
+		t.Skip("filesystem does not keep holes")
+	}
 	logical, holes := mkSparseLogical()
-	archive := mkTarstream(t, "disk/img.raw", logical, holes)
 
-	out := filepath.Join(dir, "out.raw")
-	if err := Extract(bytes.NewReader(archive), []Rule{{Tar: "disk/img.raw", FS: out}}, Options{}); err != nil {
+	// Multi-entry archive: [0] dense file, [1] dir, [2] SPARSE member.
+	var buf bytes.Buffer
+	tw := stdtar.NewWriter(&buf)
+	tw.WriteHeader(&stdtar.Header{Name: "plain.txt", Mode: 0o644, Size: 5})
+	tw.Write([]byte("hello"))
+	tw.WriteHeader(&stdtar.Header{Name: "d/", Typeflag: stdtar.TypeDir, Mode: 0o755})
+	tw.Flush() // no Close: the sparse member's WriteTo carries the trailer
+	buf.Write(mkTarstream(t, "disk/img.raw", logical, holes))
+	archivePath := filepath.Join(dir, "a.tar")
+	if err := os.WriteFile(archivePath, buf.Bytes(), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got, err := os.ReadFile(out)
+
+	// (1) Re-openable: hole-exact extraction of the whole archive.
+	outDir := filepath.Join(dir, "x")
+	os.Mkdir(outDir, 0o755)
+	af, err := os.Open(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer af.Close()
+	opts := Options{Reopen: func() (io.ReadSeekCloser, error) { return os.Open(archivePath) }}
+	if err := Extract(af, []Rule{{Tar: "", FS: outDir, Prefix: true}}, opts); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(outDir, "disk/img.raw"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(got, logical) {
-		t.Error("content mismatch")
+		t.Error("sparse member content mismatch")
+	}
+	f, err := os.Open(filepath.Join(outDir, "disk/img.raw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	probed, err := sparse.ProbeHoles(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(probed) != len(holes) {
+		t.Fatalf("restored holes = %v, want %v", probed, holes)
+	}
+	for i := range holes {
+		if probed[i] != holes[i] {
+			t.Fatalf("restored holes = %v, want %v", probed, holes)
+		}
+	}
+	if plain, _ := os.ReadFile(filepath.Join(outDir, "plain.txt")); string(plain) != "hello" {
+		t.Errorf("dense sibling = %q", plain)
+	}
+
+	// (2) Single-pass input without Reopen: hard error, never densify.
+	err = Extract(bytes.NewReader(buf.Bytes()), []Rule{{Tar: "", FS: filepath.Join(dir, "y"), Prefix: true}}, Options{})
+	if err == nil || !strings.Contains(err.Error(), "sparse member") {
+		t.Fatalf("want sparse-member error, got %v", err)
+	}
+
+	// (3) --dense: explicit logical-bytes materialization succeeds.
+	zDir := filepath.Join(dir, "z")
+	os.Mkdir(zDir, 0o755)
+	if err := Extract(bytes.NewReader(buf.Bytes()), []Rule{{Tar: "", FS: zDir, Prefix: true}}, Options{Dense: true}); err != nil {
+		t.Fatal(err)
+	}
+	dgot, err := os.ReadFile(filepath.Join(zDir, "disk/img.raw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(dgot, logical) {
+		t.Error("dense content mismatch")
 	}
 	var st syscall.Stat_t
-	if err := syscall.Stat(out, &st); err != nil {
+	if err := syscall.Stat(filepath.Join(zDir, "disk/img.raw"), &st); err != nil {
 		t.Fatal(err)
 	}
 	if st.Blocks*512 < int64(len(logical)) {
-		t.Errorf("engine extraction must be dense (no inferred holes): %d blocks", st.Blocks)
+		t.Errorf("--dense extraction must be dense: %d blocks", st.Blocks)
 	}
 }
 

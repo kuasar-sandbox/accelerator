@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
@@ -47,6 +49,7 @@ func cmdTarExtract(args []string) {
 	fs.StringVar(&file, "f", "-", "shorthand for --file")
 	chown := fs.String("chown", "", "numeric uid:gid applied to every entry")
 	chmod := fs.String("chmod", "", "octal permission bits applied to every entry")
+	dense := fs.Bool("dense", false, "disable sparse handling: extract logical bytes via the stdlib reader (declared holes become allocated zeros)")
 	fs.Usage = tarUsage
 	fs.Parse(args)
 
@@ -55,6 +58,7 @@ func cmdTarExtract(args []string) {
 		fatal("tar: %v", err)
 	}
 	opts := btar.Options{
+		Dense: *dense,
 		Warnf: func(format string, a ...any) {
 			fmt.Fprintf(os.Stderr, format+"\n", a...)
 		},
@@ -73,6 +77,11 @@ func cmdTarExtract(args []string) {
 		}
 		opts.Chmod = &m
 	}
+	if file != "-" {
+		// A re-openable archive lets the engine extract sparse members
+		// hole-exact (re-located by ordinal on a second handle).
+		opts.Reopen = func() (io.ReadSeekCloser, error) { return os.Open(file) }
+	}
 
 	openArchive := func() io.Reader {
 		if file == "-" {
@@ -84,14 +93,35 @@ func cmdTarExtract(args []string) {
 		}
 		return f // process exit closes it
 	}
+
+	// No rules + a single-entry archive file (the platform artifact
+	// shape): unwrap the one entry hole-exact — `tar extract -f x.img`
+	// just works. Multi-entry archives fall through to the generic
+	// engine (which is also hole-exact via Reopen).
+	if len(fs.Args()) == 0 && !*dense && file != "-" && singleEntryArtifact(file) {
+		f, err := os.Open(file)
+		if err != nil {
+			fatal("tar extract: %v", err)
+		}
+		defer f.Close()
+		v, err := tarstream.ReadFrom(f, "")
+		if err == nil {
+			if err := btar.ExtractFile(v, filepath.FromSlash(v.Name()), opts); err != nil {
+				fatal("%v", err)
+			}
+			return
+		}
+		// e.g. the single entry is not a regular file: generic engine.
+	}
+
 	in := openArchive()
 
 	// Single explicit file rule: route through the tarstream view so a
-	// sparse member's DECLARED holes are restored exactly (the generic
-	// engine writes dense — the stdlib reader hides the hole map). A
-	// rule that turns out to name a directory falls back to the
-	// generic engine — possible only when the archive can be reopened.
-	if member, dst, ok := singleFileRule(fs.Args()); ok {
+	// sparse member's DECLARED holes are restored exactly even from
+	// stdin (single-pass). A rule that turns out to name a directory
+	// falls back to the generic engine — possible only when the
+	// archive can be reopened.
+	if member, dst, ok := singleFileRule(fs.Args()); ok && !*dense {
 		v, err := tarstream.ReadFrom(in, member)
 		if err == nil {
 			if err := btar.ExtractFile(v, dst, opts); err != nil {
@@ -100,13 +130,25 @@ func cmdTarExtract(args []string) {
 			return
 		}
 		if file == "-" {
-			fatal("tar extract: %q: %v (stdin is single-pass: use -f FILE for directory members or legacy sparse encodings)", member, err)
+			fatal("tar extract: %q: %v (stdin is single-pass: use -f FILE for directory members or legacy sparse encodings, or --dense)", member, err)
 		}
 		in = openArchive() // rewind by reopening; the generic engine re-reads and reports authoritatively
 	}
 	if err := btar.Extract(in, rules, opts); err != nil {
 		fatal("%v", err)
 	}
+}
+
+// singleEntryArtifact reports whether the archive at path holds exactly
+// one real entry (the platform artifact shape).
+func singleEntryArtifact(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	_, err = tarstream.ReadSeekFromIndex(f, 1)
+	return errors.Is(err, tarstream.ErrNotFound)
 }
 
 // singleFileRule reports whether the raw extract arguments are exactly

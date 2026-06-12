@@ -20,14 +20,15 @@ import (
 // stdout). No rules selects everything into the current directory.
 //
 // Extraction is pure Go and single-pass: the stdlib reader decodes the
-// stream (sparse members of every encoding arrive as their logical
-// bytes) while entries are matched and written on the fly — pipes work
+// stream while entries are matched and written on the fly — pipes work
 // with nothing spooled, and no tar binary is involved. Regular files
 // are written dense: zero-valued bytes are data and stay allocated,
-// never inferred into holes; a sparse-encoded member therefore
-// materializes its logical bytes with declared holes downgraded to
-// allocated zeros (the stdlib reader hides the hole map — use
-// ExtractFile for hole-exact single-file restoration).
+// never inferred into holes. SPARSE members are extracted hole-exact
+// when Options.Reopen is available (the member is re-located by
+// ordinal on a second handle, recovering the map the stdlib reader
+// hides); without Reopen they are a hard error — never a silent
+// multi-GiB densification — unless Options.Dense explicitly selects
+// stdlib logical-bytes materialization.
 // Existing files are replaced. The most specific rule wins per entry
 // (exact file rule, then longest directory prefix). Entries escaping
 // the archive root (..) are skipped with a warning; an entry that
@@ -44,6 +45,7 @@ func Extract(r io.Reader, rules []Rule, o Options) error {
 		rules:    rules,
 		matched:  make([]bool, len(rules)),
 		evalBase: map[string]string{},
+		ordinal:  -1,
 	}
 	for {
 		hdr, err := x.tr.Next()
@@ -53,6 +55,7 @@ func Extract(r io.Reader, rules []Rule, o Options) error {
 		if err != nil {
 			return err
 		}
+		x.ordinal++ // stdlib entry sequence == tarstream ordinal addressing
 		if err := x.entry(hdr); err != nil {
 			return err
 		}
@@ -88,6 +91,7 @@ type extractor struct {
 	dirTimes    []dirTime
 	chownWarned bool
 	evalBase    map[string]string // rule FS base → EvalSymlinks(abs base)
+	ordinal     int               // current entry's ordinal (stdlib sequence)
 }
 
 // matchRule resolves an entry name to the most specific rule and marks
@@ -155,6 +159,9 @@ func (x *extractor) entry(hdr *stdtar.Header) error {
 		return nil
 
 	case stdtar.TypeReg:
+		if !x.o.Dense && sparseEntry(hdr) {
+			return x.sparseRegular(hdr, dest, name)
+		}
 		if err := x.prepare(dest); err != nil {
 			return err
 		}

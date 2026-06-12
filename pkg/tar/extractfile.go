@@ -1,6 +1,7 @@
 package tar
 
 import (
+	stdtar "archive/tar"
 	"fmt"
 	"io"
 	"io/fs"
@@ -94,4 +95,61 @@ func copyDeclared(f *os.File, v tarstream.Reader) error {
 	}
 	// Sets the final size; the trailing hole (if any) stays a hole.
 	return f.Truncate(size)
+}
+
+// sparseEntry reports whether hdr is a sparse-encoded member: the old
+// GNU 'S' typeflag, or PAX GNU.sparse.* records (retained verbatim in
+// Header.PAXRecords by the stdlib reader — the map itself is consumed
+// and unexposed, which is why hole-exact extraction re-locates the
+// member via tarstream).
+func sparseEntry(hdr *stdtar.Header) bool {
+	if hdr.Typeflag == stdtar.TypeGNUSparse {
+		return true
+	}
+	for _, k := range []string{"GNU.sparse.major", "GNU.sparse.map", "GNU.sparse.numblocks", "GNU.sparse.size"} {
+		if _, ok := hdr.PAXRecords[k]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// sparseRegular extracts the current (sparse) regular member
+// hole-exact: a second handle on the archive (Options.Reopen)
+// re-locates the member by ordinal via tarstream, recovering the hole
+// map, and copyDeclared punches exactly the declared holes. The
+// stdlib-side body is left unread — the next tr.Next() skips it
+// (seeking past it on seekable input). Metadata comes from hdr, like
+// any other member.
+func (x *extractor) sparseRegular(hdr *stdtar.Header, dest, name string) error {
+	if x.o.Reopen == nil {
+		return fmt.Errorf("tar: %s is a sparse member; hole-exact extraction needs a re-openable archive (-f FILE) — or pass --dense to materialize the logical bytes", name)
+	}
+	rs, err := x.o.Reopen()
+	if err != nil {
+		return fmt.Errorf("tar: reopen archive for sparse member %s: %w", name, err)
+	}
+	defer rs.Close()
+	v, err := tarstream.ReadSeekFromIndex(rs, x.ordinal)
+	if err != nil {
+		return fmt.Errorf("tar: locate sparse member %s (entry #%d): %w (pass --dense to materialize the logical bytes)", name, x.ordinal, err)
+	}
+	if err := x.prepare(dest); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := copyDeclared(f, v); err != nil {
+		f.Close()
+		return fmt.Errorf("extract sparse %s: %w", name, err)
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := x.applyMeta(dest, hdr, false); err != nil {
+		return err
+	}
+	return os.Chtimes(dest, hdr.ModTime, hdr.ModTime)
 }

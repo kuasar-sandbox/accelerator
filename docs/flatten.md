@@ -59,19 +59,21 @@ mkfs 层归一,不触碰源树)。**
 
 ## 2. 命令行接口
 
-五个子命令:`export`(展平,可选直接入库)、`verify`(确定性自检)、
-`info`(检视已生成镜像 / `manifest://` 引用)、`cache`(检视/回收本地拉取缓存)、
-`config`(输出/校验 flatten 配置)。
+六个子命令:`export`(展平为镜像工件,可选直接入库)、`info`(检视镜像工件 /
+`manifest://` 引用)、`cache`(检视/回收本地拉取缓存)、`config`(输出/校验
+flatten 配置)、`tar`(通用 tar 提取/封装)、`mountpoint`(自 bind 造挂载点,
+guest 内导出配套)。
 
 | 子命令 | 用途 |
 |--------|------|
-| `export` | registry 镜像或 docker-archive → 确定性 EROFS;`--upload` 时顺带 ingest 进 store 并打印 manifest key;`--with-referer` 经 Referrers 幂等跳过/回写(§2.4) |
-| `verify` | 对同一输入展平两次,比对字节级 sha256,确认确定性(registry 源:拉一次→展两遍) |
-| `info` | 读 EROFS superblock + 末尾 ZIP 里的 OCI runtime config 并打印 |
+| `export` | registry 镜像 / docker-archive / rootfs 目录 → 确定性 EROFS 的 **tarstream 镜像工件**(条目 `image`,约定后缀 `.img`);`--upload` 时顺带 ingest 进 store 并打印 manifest key;`--with-referer` 经 Referrers 幂等跳过/回写(§2.4) |
+| `info` | 读镜像工件(经信封)的 EROFS superblock + 末尾 ZIP 里的 OCI runtime config 并打印 |
 | `cache` | `cache info` 看缓存占用、`cache gc` 按 LRU 回收到上限(§2.5) |
 | `config` | 输出规范化的 flatten 配置(`--config`/`FLATTEN_CONFIG`,加载即校验),或 `--template` 骨架;`-o <file>` 写文件(默认 stdout) |
+| `tar` | 通用 tar 提取(全路径声明洞精确)与单文件封装(§2.6) |
+| `mountpoint` | `mountpoint <dir>`:MkdirAll + 自 bind,使 `<dir>` 成为挂载点 → `export --skip-mounts` 自动排除之;guest 内导出自身 rootfs 时作 tmpdir/输出落点(防自吞,Linux only) |
 
-`export` / `verify` 的输入是**位置参数**(匿名),按下列优先级自动判别 registry / 本地:
+`export` 的输入是**位置参数**(匿名),按下列优先级自动判别 registry / 本地:
 
 ```
 1. "-"                       → stdin docker-archive
@@ -81,16 +83,16 @@ mkfs 层归一,不触碰源树)。**
 ```
 
 歧义(本地文件名恰好形如 `repo:tag`)用 `--registry` / `--archive` 强制。`info` 的位置
-参数必填,接受 EROFS 文件路径或 `manifest://<hex>`。位置参数须置于 flags 之后(Go stdlib
+参数必填,接受镜像工件路径或 `manifest://<hex>`。位置参数须置于 flags 之后(Go stdlib
 flag 在首个非 flag 实参处停止解析)。
 
-展平保留镜像内文件的属主与权限位(§4.3),因此 `export`/`verify` 需要 root 或
-`CAP_CHOWN`;`export` 启动时即预检,避免昂贵的拉取+解包后才在首层 chown 上失败
+展平保留镜像内文件的属主与权限位(§4.3),因此 `export` 需要 root 或
+`CAP_CHOWN`;启动时即预检,避免昂贵的拉取+解包后才在首层 chown 上失败
 (`--with-referer` 命中即复用 manifest id、不展平,无需特权)。`info`/`cache`/`config`
 不需要特权。
 
-进度与诊断一律走 stderr,stdout 只承载交付物(EROFS 流 / manifest key /
-`--print-digest` 的 digest);`export`/`verify`/`cache gc` 经 `--no-progress` 关闭。
+进度与诊断一律走 stderr,stdout 只承载交付物(镜像工件流 / manifest key /
+`--print-digest` 的 digest);`export`/`cache gc` 经 `--no-progress` 关闭。
 拉取按层打 `pull: <done>/<total> layers`(只计缓存未命中的层),展平按阶段打
 `flatten: ...`,`--upload` 上传打 `upload: ...`(百分比+速率);字节型进度 2s 节流。
 
@@ -100,13 +102,18 @@ flag 在首个非 flag 实参处停止解析)。
 flatten-ctl export [flags] <ref|path|->
 
   <ref|path|->            registry 镜像引用,或 docker-archive(省略/`-` = stdin)
-  --output <path|->       EROFS 输出路径;`-` = stdout。--upload 关闭时必填,
+  --output <path|->       镜像工件输出路径(tarstream,条目 image,约定 .img);
+                          `-` = stdout(终端拒写)。--upload 关闭时必填,
                           --upload 开启时可省(产物默认丢弃,只要 manifest key)
   --upload                展平后把 EROFS ingest 进 store,stdout 打印 manifest key
   --manifest-config <p>   manifest 配置 YAML(覆盖 MANIFEST_CONFIG env);--upload 必需
   --config <p>            flatten 配置 YAML(覆盖 FLATTEN_CONFIG env):tmpdir/platform/
                           tls/cache/referer(详见 §2.4)
   --platform <os/arch>    覆盖配置里的拉取 platform(os/arch[/variant])
+  --tmpdir <dir>          覆盖配置 tmpdir(自动创建)。guest 内导出自身 rootfs 时
+                          必须指向 mountpoint 子命令造出的挂载点(连同 mkfs 临时
+                          文件一起被 --skip-mounts 排除,防自吞)
+  --insecure              registry 源:允许 plain-HTTP / 跳过 TLS 校验(覆盖配置)
   --no-progress           禁用 stderr 进度输出
 
   # 远程 registry 源(详见 §2.4)
@@ -125,8 +132,8 @@ flatten-ctl export [flags] <ref|path|->
 典型用法:
 
 ```bash
-# 远程 registry 镜像 → 单文件
-flatten-ctl export --output nginx.erofs nginx:1.27
+# 远程 registry 镜像 → 单文件镜像工件
+flatten-ctl export --output nginx.img nginx:1.27
 
 # 远程镜像直接入库(stdout 即 manifest key);凭据走环境变量
 export FLATTEN_REGISTRY_USERNAME=robot FLATTEN_REGISTRY_PASSWORD=…
@@ -134,17 +141,17 @@ flatten-ctl export --upload --manifest-config manifest.yaml --config flatten.yam
     registry.example.com/team/app@sha256:… > app.key
 
 # docker save 管道 → 单文件输出(省略位置参数 = stdin)
-docker save myapp:v1 | flatten-ctl export --output my-app.erofs
+docker save myapp:v1 | flatten-ctl export --output my-app.img
 
 # 本地 docker-archive 文件(位置参数在 flags 之后)
-flatten-ctl export --output my-app.erofs ./my-app.tar
+flatten-ctl export --output my-app.img ./my-app.tar
 
 # 幂等:已展平过即复用 manifest id,跳过拉取+展平+上传(或在 flatten.yaml 设 referer.enabled: true 省去 --with-referer)
 flatten-ctl export --upload --with-referer --manifest-config manifest.yaml \
     --config flatten.yaml registry.example.com/team/app:v1 > app.key
 
 # /tmp 不够大时在 flatten.yaml 设 tmpdir: /var/tmp,再 --config flatten.yaml
-flatten-ctl export --output big.erofs --config flatten.yaml ./big.tar
+flatten-ctl export --output big.img --config flatten.yaml ./big.tar
 ```
 
 **rootfs 目录源**。位置参数 stat 为目录时走第三条源:mkfs.erofs **就地读取**
@@ -157,32 +164,20 @@ flatten-ctl export --output big.erofs --config flatten.yaml ./big.tar
 
 ```bash
 # 把一台机器/一个 guest 的根做成沙箱镜像(挂载点全部剔除)
-flatten-ctl export --skip-mounts --runtime-config config.json -output host.erofs /
+flatten-ctl export --skip-mounts --runtime-config config.json -output host.img /
 
 # 从准备好的 rootfs 目录出图,剔除缓存目录;config 直接复用旧镜像里的投影
-unzip -p old.erofs config.json > rc.json
-flatten-ctl export --skip var/cache --runtime-config rc.json -output new.erofs /srv/rootfs
+flatten-ctl info --json old.img | jq .config > rc.json
+flatten-ctl export --skip var/cache --runtime-config rc.json -output new.img /srv/rootfs
 
 # --upload 同样可用:目录 → EROFS → store,stdout 打 manifest key
 flatten-ctl export --skip-mounts --upload --manifest-config m.yaml /srv/rootfs
 ```
 
-### 2.2 `flatten-ctl verify`
+### 2.2 (已移除)
 
-```
-flatten-ctl verify [--tmpdir D] [--config <p>] [--no-progress] <ref|path|->   # 省略/`-` = stdin
-```
-
-对同一输入展平两次,比对 sha256,确认字节级确定性。registry 引用时 `--config` 提供
-拉取配置(platform/TLS/缓存,§2.4),先拉一次进缓存、再从同批 blob 展两遍。stderr 输出:
-
-```
-Pass 1: sha256:a1b2c3... (1.2 GiB)
-Pass 2: sha256:a1b2c3... (1.2 GiB)
-DETERMINISTIC
-```
-
-两遍不一致时打印 `NOT DETERMINISTIC` 并以退出码 1 结束。
+`flatten-ctl verify` 已移除:确定性由单元测试与 manifest key 的可复现性背书,
+双跑比对不再提供增量价值。(§ 编号保留占位,避免跨仓引用重排。)
 
 ### 2.3 `flatten-ctl info` — 检视镜像
 
@@ -201,7 +196,7 @@ superblock 与尾部 ZIP,不取回整个镜像。
 人类可读输出示例:
 
 ```
-$ flatten-ctl info my-app.erofs
+$ flatten-ctl info my-app.img
 EROFS image size:  1.2 GiB (1287651328 bytes)
 Architecture:      amd64
 Os:                linux
@@ -244,10 +239,10 @@ JSON 输出示例:
 
 ```bash
 # 用 unzip 直接拎 config.json(ZIP 是标准格式,任何 ZIP 工具可读)
-unzip -p my-app.erofs config.json | jq
+flatten-ctl info --json my-app.img | jq .config
 
 # 或者经 flatten-ctl info --json 进 jq
-flatten-ctl info --json my-app.erofs | jq '.config.Entrypoint'
+flatten-ctl info --json my-app.img | jq '.config.Entrypoint'
 ```
 
 ### 2.4 远程拉取、本地缓存与 Referrers 回写
@@ -357,7 +352,7 @@ flatten-ctl cache gc   [--config <p>] [--cache-dir <D>] [--cache-max-size <S>] [
 tar 工具面,两个方向都是**纯 Go、零 tar 二进制依赖**:
 
 ```
-flatten-ctl tar extract [-f tarfile] [--chown u:g] [--chmod 755] [规则...]
+flatten-ctl tar extract [-f tarfile] [--chown u:g] [--chmod 755] [--dense] [规则...]
 flatten-ctl tar stream  [-f tarfile] [--size N] [tar内名[:源]]
 ```
 
@@ -365,13 +360,24 @@ flatten-ctl tar stream  [-f tarfile] [--size N] [tar内名[:源]]
 永不互转**——洞只来自权威元数据(文件系统 SEEK_HOLE、tar sparse map),
 绝不从内容零扫描推导。
 
-**extract** 从任意 tar 流取文件:对输入单遍流式(stdlib 解码,管道零落盘)。
-常规文件**致密落盘**(数据段里的零保持已分配,不打洞);**单条显式文件规则**
-(`成员[:目标文件]`)走 tarstream 视图做**声明洞精确还原**——只 punch sparse
-map 声明的洞,洞图逐字节往返(成员实为目录等情形:`-f` 文件输入自动回退通用
-引擎重读,stdin 单遍不可回退、报错引导)。目录树解包中的稀疏成员按逻辑字节
-致密落盘(stdlib 不暴露洞图)。`..` 成员跳过告警,穿 symlink 写出是硬错误;
-条目命中多条规则时最具体者胜。规则 = `tar内路径[:外部路径]`:
+**extract** 从任意 tar 流取文件,**全路径声明洞精确**:对输入单遍流式
+(stdlib 解码,管道零落盘),常规文件致密落盘(数据段里的零保持已分配,不打洞);
+**稀疏成员**(PAX sparse 1.0 经 `PAXRecords` 检测,老 GNU 'S' 经 typeflag)的还原
+分三档:
+
+- `-f` 文件输入:引擎按**条目序数**在第二个句柄上经 tarstream 重定位该成员,
+  取回 stdlib reader 隐藏的洞图(Go 1.26 仍未导出,golang.org/issue/22735),
+  只 punch 声明的洞;stdlib 侧 `Next()` Seek 跳过包体,数据不读两遍;
+- stdin(单遍,图已被 stdlib 消费,且禁落盘):**硬错误**并引导——绝不静默把
+  32 GiB 逻辑稀疏档致密化;
+- `--dense`:显式整体关闭稀疏处理,回 stdlib 逻辑字节致密落盘(声明洞落为
+  已分配零)。
+
+便捷形态:**无规则 + `-f` 单条目归档**(平台工件形态)自动洞精确解出该条目
+(`tar extract -f image.img` 即可);**单条显式文件规则**(`成员[:目标文件]`)
+走 tarstream 视图,stdin 也能洞精确(成员实为目录等情形:`-f` 输入回退通用引擎,
+stdin 报错引导)。`..` 成员跳过告警,穿 symlink 写出是硬错误;条目命中多条规则时
+最具体者胜。规则 = `tar内路径[:外部路径]`:
 
 | 形式 | 含义 |
 |---|---|

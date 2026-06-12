@@ -72,6 +72,21 @@ type Options struct {
 	// Warnf, when non-nil, receives non-fatal diagnostics (skipped
 	// sockets, unprivileged chown downgrades). nil silences them.
 	Warnf func(format string, args ...any)
+
+	// Reopen, when non-nil, returns an independent ReadSeeker over the
+	// SAME archive. It enables hole-exact extraction of sparse members
+	// in multi-entry archives: the engine re-locates the member by
+	// ordinal on the second handle and recovers the hole map the
+	// stdlib reader hides (golang.org/issue/22735). nil + a sparse
+	// member is a hard error (single-pass input cannot recover the
+	// map) unless Dense is set.
+	Reopen func() (io.ReadSeekCloser, error)
+
+	// Dense disables sparse handling wholesale: members extract as
+	// their logical bytes (stdlib semantics), declared holes
+	// materializing as allocated zeros. The default is hole-exact
+	// extraction — never a silent multi-GiB densification.
+	Dense bool
 }
 
 func (o *Options) warnf(format string, args ...any) {
