@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"sync"
+
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
 )
 
 // layeredStream overlays several Streams (top → bottom) into one Stream: the
@@ -53,7 +55,7 @@ func (ls *layeredStream) Close() error {
 // bounding the run. No serving layer ⇒ a merged hole. For a serving ChunkStream
 // layer it returns the chunk index (hasChunk=true) so the read can skip a
 // re-lookup.
-func (ls *layeredStream) resolve(offset, limit uint64) (li int, kind RunKind, end, chunkIdx uint64, hasChunk bool) {
+func (ls *layeredStream) resolve(offset, limit uint64) (li int, kind sparse.RunKind, end, chunkIdx uint64, hasChunk bool) {
 	end = offset + limit
 	if end < offset || end > ls.size {
 		end = ls.size
@@ -62,7 +64,7 @@ func (ls *layeredStream) resolve(offset, limit uint64) (li int, kind RunKind, en
 		if offset >= layer.Size() {
 			continue // out-of-bounds = hole for this layer
 		}
-		var k RunKind
+		var k sparse.RunKind
 		var e, idx uint64
 		var hc bool
 		var err error
@@ -75,7 +77,7 @@ func (ls *layeredStream) resolve(offset, limit uint64) (li int, kind RunKind, en
 		if err != nil { // io.EOF (out-of-bounds) — defensive, offset < Size already
 			continue
 		}
-		if k == Hole {
+		if k == sparse.Hole {
 			if e < end {
 				end = e // this layer resumes serving at its hole end
 			}
@@ -86,10 +88,10 @@ func (ls *layeredStream) resolve(offset, limit uint64) (li int, kind RunKind, en
 		}
 		return i, k, end, idx, hc
 	}
-	return -1, Hole, end, 0, false
+	return -1, sparse.Hole, end, 0, false
 }
 
-func (ls *layeredStream) RunAt(offset, limit uint64) (RunKind, uint64, error) {
+func (ls *layeredStream) RunAt(offset, limit uint64) (sparse.RunKind, uint64, error) {
 	if offset >= ls.size {
 		return 0, 0, io.EOF
 	}
@@ -123,7 +125,7 @@ func (ls *layeredStream) ReadAt(ctx context.Context, buf []byte, offset uint64) 
 	for cur := offset; cur < end; {
 		li, kind, runEnd, idx, hasChunk := ls.resolve(cur, end-cur)
 		dst := buf[cur-offset : runEnd-offset]
-		if kind == Data {
+		if kind == sparse.Data {
 			layer := ls.layers[li]
 			wg.Add(1)
 			go func(layer Stream, idx, lo, hi uint64, hasChunk bool, dst []byte) {

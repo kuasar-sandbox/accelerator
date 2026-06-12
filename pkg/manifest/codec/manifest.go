@@ -5,7 +5,7 @@
 //
 //	[Header 64B]
 //	[ChunkEntry × N, 56B each]
-//	[HoleExtent × M, 16B each]    -- entries describe data, holes describe absence
+//	[hole extent × M, 16B each]   -- entries describe data, holes describe absence
 //	[SealedKeyTable variable]
 //
 // Entries cover the data ranges of the original image; holes cover the
@@ -18,6 +18,8 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
 )
 
 // Binary format constants.
@@ -54,8 +56,15 @@ type Manifest struct {
 	MinChunkSize uint32
 	MaxChunkSize uint32
 	Entries      []ChunkEntry
-	Holes        []HoleExtent // sparse holes in the original image; sorted by Offset, disjoint from Entries
-	Keys         [][32]byte   // per-chunk convergent keys (plaintext, before sealing)
+	// Holes are the "no data here" regions of the original image,
+	// sorted by Offset and disjoint from Entries. Holes are externally
+	// declared (filesystem hole detection, qcow2 unallocated, TRIM
+	// ranges, ...); they are NEVER derived from chunk content — a
+	// chunk of all zeros uses IsZero instead. Read semantics are
+	// caller-defined: the fetch layer zero-fills holes, or falls
+	// through to a lower layer when overlaid.
+	Holes []sparse.Extent
+	Keys  [][32]byte // per-chunk convergent keys (plaintext, before sealing)
 }
 
 // ChunkEntry describes one chunk in the original image.
@@ -64,17 +73,6 @@ type ChunkEntry struct {
 	Size           uint32
 	IsZero         bool
 	CiphertextHash [32]byte
-}
-
-// HoleExtent describes a contiguous "no data here" region of the
-// original image. Holes are externally declared (filesystem hole
-// detection, qcow2 unallocated, TRIM ranges, ...); they are NOT
-// derived from chunk content (a chunk of all zeros uses IsZero
-// instead). Read semantics are caller-defined — the fetch layer
-// zero-fills holes, or falls through to a lower layer when overlaid.
-type HoleExtent struct {
-	Offset uint64
-	Size   uint64 // uint64 so a single extent can span GB-scale gaps
 }
 
 // ChunkCount returns the number of chunk entries.
@@ -213,9 +211,9 @@ func Unmarshal(data []byte) (*Manifest, []byte, error) {
 	}
 
 	// --- Hole Extents ---
-	var holes []HoleExtent
+	var holes []sparse.Extent
 	if holeCount > 0 {
-		holes = make([]HoleExtent, holeCount)
+		holes = make([]sparse.Extent, holeCount)
 		for i := range holes {
 			base := holesOffset + uint64(i)*uint64(HoleSize)
 			holes[i].Offset = le.Uint64(data[base : base+8])

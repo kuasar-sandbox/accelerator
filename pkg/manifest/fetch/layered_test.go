@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/codec"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
@@ -43,7 +44,7 @@ func TestLayered_HoleFallsThrough(t *testing.T) {
 	top := newTestStream(&codec.Manifest{
 		Version: codec.Version1, ImageSize: 8192,
 		Entries: []codec.ChunkEntry{{Offset: 0, Size: 4096, CiphertextHash: store.ContentKey{0x1}}},
-		Holes:   []codec.HoleExtent{{Offset: 4096, Size: 4096}},
+		Holes:   []sparse.Extent{{Offset: 4096, Size: 4096}},
 	}, 'A')
 	bottom := newTestStream(&codec.Manifest{
 		Version: codec.Version1, ImageSize: 8192,
@@ -52,10 +53,10 @@ func TestLayered_HoleFallsThrough(t *testing.T) {
 	ls := NewLayered(top, bottom)
 	defer ls.Close()
 
-	if k, _, err := ls.RunAt(0, ls.Size()); err != nil || k != Data {
+	if k, _, err := ls.RunAt(0, ls.Size()); err != nil || k != sparse.Data {
 		t.Errorf("RunAt(0) = (%v, %v), want Data", k, err)
 	}
-	if k, _, err := ls.RunAt(4096, ls.Size()); err != nil || k != Data {
+	if k, _, err := ls.RunAt(4096, ls.Size()); err != nil || k != sparse.Data {
 		t.Errorf("RunAt(4096) = (%v, %v), want Data (fall-through to bottom)", k, err)
 	}
 	out := readAll(t, ls)
@@ -80,7 +81,7 @@ func TestLayered_ZeroChunkDoesNotFallThrough(t *testing.T) {
 	ls := NewLayered(top, bottom)
 	defer ls.Close()
 
-	if k, _, err := ls.RunAt(0, ls.Size()); err != nil || k != Zero {
+	if k, _, err := ls.RunAt(0, ls.Size()); err != nil || k != sparse.Zero {
 		t.Errorf("RunAt(0) = (%v, %v), want Zero (no fall-through)", k, err)
 	}
 	out := readAll(t, ls)
@@ -94,13 +95,13 @@ func TestLayered_MergedHole(t *testing.T) {
 		return newTestStream(&codec.Manifest{
 			Version: codec.Version1, ImageSize: 8192,
 			Entries: []codec.ChunkEntry{{Offset: 4096, Size: 4096, CiphertextHash: h}},
-			Holes:   []codec.HoleExtent{{Offset: 0, Size: 4096}},
+			Holes:   []sparse.Extent{{Offset: 0, Size: 4096}},
 		}, fill)
 	}
 	ls := NewLayered(mk('A', store.ContentKey{0x1}), mk('B', store.ContentKey{0x2}))
 	defer ls.Close()
 
-	if k, end, err := ls.RunAt(0, ls.Size()); err != nil || k != Hole || end != 4096 {
+	if k, end, err := ls.RunAt(0, ls.Size()); err != nil || k != sparse.Hole || end != 4096 {
 		t.Errorf("RunAt(0) = (%v, %d, %v), want (Hole, 4096, nil)", k, end, err)
 	}
 	out := readAll(t, ls)
@@ -171,14 +172,14 @@ func TestLayered_MixedFileAndManifest(t *testing.T) {
 	overlay := newTestStream(&codec.Manifest{
 		Version: codec.Version1, ImageSize: size,
 		Entries: []codec.ChunkEntry{{Offset: 0, Size: 4096, CiphertextHash: store.ContentKey{0x1}}},
-		Holes:   []codec.HoleExtent{{Offset: 4096, Size: 8192}},
+		Holes:   []sparse.Extent{{Offset: 4096, Size: 8192}},
 	}, 'A')
 
 	ls := NewLayered(overlay, base)
 	defer ls.Close()
 
 	out := readAll(t, ls)
-	assertRegion(t, out[:4096], 'A', "overlay data")          // overlay wins
+	assertRegion(t, out[:4096], 'A', "overlay data")                  // overlay wins
 	assertRegion(t, out[4096:8192], 'B', "fall-through to file base") // overlay hole → file data
 	assertRegion(t, out[8192:], 0x00, "merged hole (file sparse + overlay hole)")
 }

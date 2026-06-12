@@ -1,8 +1,18 @@
 // Package ingest implements the unified write pipeline for the
 // container accelerator.
 //
-// Pipeline: Reader → Chunk → Encrypt → Store.Put (dedup) → Marshal
-// Manifest → Store.Put (manifest partition).
+// Pipeline: sparse.Source → Chunk → Encrypt → Store.Put (dedup) →
+// Marshal Manifest → Store.Put (manifest partition).
+//
+// The input is a sparse.Source: its Hole runs become the manifest's
+// hole extents (never chunked, never read), its Zero runs are fed to
+// the chunker as synthesized zero bytes without calling ReadAt (the
+// fetch is free, but the bytes are data — chunk boundaries and IsZero
+// classification are identical to reading literal zeros, so the
+// manifest key is a pure function of content + holes, independent of
+// the source kind). Data is consumed in one strictly-forward pass, so
+// one-pass sources (sparse.Dense over a pipe, tarstream.SourceFrom)
+// ingest without temp files.
 //
 // Construct an Ingester via NewIngester; call Ingest per image. The
 // returned Result reports the manifest content key already written to
@@ -19,6 +29,7 @@ import (
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/chunker"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/codec"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
@@ -52,26 +63,14 @@ type StoreWriter interface {
 }
 
 // IngestOption holds the per-call knobs for Ingest. Zero value is
-// valid (no holes, no progress callback).
+// valid.
 type IngestOption struct {
-	// Holes describes byte ranges of the original image that hold no
-	// data — filesystem holes from a sparse file, qcow2 unallocated
-	// clusters, TRIM ranges, etc. The chunker never sees these
-	// regions; they appear in the manifest as HoleExtent records and
-	// are reconstructed by the read path according to caller policy
-	// (zero-fill, sparse output, or fall-through across layers).
-	//
-	// When non-empty, r must be an io.ReadSeeker — Ingest seeks past
-	// holes to the next data segment instead of reading & discarding.
-	// Stdin/pipe input must be wrapped in a temp file by the caller.
-	//
-	// Holes need not be sorted; Ingest sorts and validates the layout
-	// against the image size before consuming.
-	Holes []codec.HoleExtent
-
-	// OnProgress, if non-nil, is invoked after each chunk write with
-	// the running (processed, total) byte count over the data segments
-	// (hole regions do not participate).
+	// OnProgress, if non-nil, is invoked after each chunk with the
+	// running (processed, total) byte count. Zero runs count when
+	// their synthesized chunks complete; hole regions do not
+	// participate (total is the full image size, so a sparse image
+	// finishes below 100% of total — callers wanting an effective
+	// denominator subtract the hole bytes).
 	OnProgress func(processed, total uint64)
 }
 
@@ -99,7 +98,7 @@ type Result struct {
 // customer-key-func, salt-func, store-writer, chunker, encryptor)
 // combination; many Ingest calls per Ingester (each independent).
 type Ingester interface {
-	Ingest(ctx context.Context, r io.Reader, size uint64, opt IngestOption) (*Result, error)
+	Ingest(ctx context.Context, src sparse.Source, opt IngestOption) (*Result, error)
 }
 
 // NewIngester wires the four collaborators into an Ingester. None is
@@ -127,14 +126,13 @@ type ingester struct {
 	enc         crypto.Encryptor
 }
 
-// Ingest reads the [0, size) image from r, chunks the data segments
-// (= [0, size) minus opt.Holes), encrypts each chunk, writes them to
-// the store with content-addressed dedup, seals the key table with
-// the customer key, marshals the manifest, writes the manifest blob,
-// and returns Result.ManifestKey.
-//
-// When opt.Holes is non-empty, r must be an io.ReadSeeker.
-func (i *ingester) Ingest(ctx context.Context, r io.Reader, size uint64, opt IngestOption) (*Result, error) {
+// Ingest consumes src in one forward pass: Hole runs are recorded as
+// manifest hole extents and skipped; Zero and Data runs form the
+// hole-bounded data segments that are chunked, encrypted and written
+// to the store with content-addressed dedup. The key table is sealed
+// with the customer key, the manifest marshaled and written, and
+// Result.ManifestKey returned.
+func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOption) (*Result, error) {
 	customerKey, err := i.keyFn()
 	if err != nil {
 		return nil, fmt.Errorf("ingest: customer key: %w", err)
@@ -160,24 +158,13 @@ func (i *ingester) Ingest(ctx context.Context, r io.Reader, size uint64, opt Ing
 		chunkMode = codec.ChunkModeFastCDC
 	}
 
+	size := src.Size()
 	m := &codec.Manifest{
 		Version:      codec.Version1,
 		ChunkMode:    chunkMode,
 		ImageSize:    size,
 		MinChunkSize: info.MinSize,
 		MaxChunkSize: info.MaxSize,
-	}
-
-	holes, err := normaliseHoles(opt.Holes, size)
-	if err != nil {
-		return nil, err
-	}
-	m.Holes = holes
-	dataSegs := dataSegmentsFromHoles(size, holes)
-	if len(holes) > 0 {
-		if _, ok := r.(io.ReadSeeker); !ok {
-			return nil, fmt.Errorf("ingest: opt.Holes is non-empty but reader is not io.ReadSeeker")
-		}
 	}
 
 	// chunkOutcome is one chunk's record. The (sequential) chunker
@@ -263,21 +250,48 @@ func (i *ingester) Ingest(ctx context.Context, r io.Reader, size uint64, opt Ing
 		}()
 	}
 
+	// One forward pass over src's runs: holes are recorded and
+	// skipped; contiguous Zero|Data runs form one segment, chunked as
+	// a unit so chunk boundaries match a literal byte stream bounded
+	// only by holes.
 	var chunkErr error
-	for _, seg := range dataSegs {
-		if rs, ok := r.(io.ReadSeeker); ok && (len(holes) > 0 || seg.Offset != 0) {
-			if _, err := rs.Seek(int64(seg.Offset), io.SeekStart); err != nil {
-				chunkErr = fmt.Errorf("ingest: seek to %d: %w", seg.Offset, err)
-				break
+	cursor := uint64(0)
+	for cursor < size && chunkErr == nil {
+		kind, end, err := src.RunAt(cursor, size-cursor)
+		if err != nil {
+			chunkErr = fmt.Errorf("ingest: classify @ %d: %w", cursor, err)
+			break
+		}
+		if kind == sparse.Hole {
+			if n := len(m.Holes); n > 0 && m.Holes[n-1].Offset+m.Holes[n-1].Size == cursor {
+				m.Holes[n-1].Size += end - cursor
+			} else {
+				m.Holes = append(m.Holes, sparse.Extent{Offset: cursor, Size: end - cursor})
 			}
+			cursor = end
+			continue
 		}
 
-		// Bound the chunker to this segment; otherwise CDC's read
-		// buffer would spill into the next segment's bytes.
-		segReader := io.LimitReader(r, int64(seg.Size))
-		segOffset := seg.Offset
+		// Extend the segment through every contiguous non-hole run
+		// (pure metadata queries — no data is consumed).
+		segStart := cursor
+		for cursor < size {
+			k2, e2, err := src.RunAt(cursor, size-cursor)
+			if err != nil {
+				chunkErr = fmt.Errorf("ingest: classify @ %d: %w", cursor, err)
+				break
+			}
+			if k2 == sparse.Hole {
+				break
+			}
+			cursor = e2
+		}
+		if chunkErr != nil {
+			break
+		}
 
-		err := i.chunker.Chunk(segReader, func(cr chunker.ChunkResult) error {
+		segOffset := segStart
+		err = i.chunker.Chunk(&segReader{ctx: wctx, src: src, cur: segStart, end: cursor}, func(cr chunker.ChunkResult) error {
 			if wctx.Err() != nil {
 				return wctx.Err() // a worker failed; stop chunking
 			}
@@ -299,8 +313,7 @@ func (i *ingester) Ingest(ctx context.Context, r io.Reader, size uint64, opt Ing
 			}
 		})
 		if err != nil {
-			chunkErr = fmt.Errorf("ingest: chunking segment [%d, %d): %w", seg.Offset, seg.Offset+seg.Size, err)
-			break
+			chunkErr = fmt.Errorf("ingest: chunking segment [%d, %d): %w", segStart, cursor, err)
 		}
 	}
 	close(jobs)
@@ -373,6 +386,53 @@ func (i *ingester) Ingest(ctx context.Context, r io.Reader, size uint64, opt Ing
 	return &res, nil
 }
 
+// segReader feeds one hole-bounded segment [cur, end) of a
+// sparse.Source to the chunker as a plain io.Reader: Data runs are
+// read from the source (strictly forward — one-pass sources work),
+// Zero runs are synthesized without touching it. The chunker sees the
+// exact byte stream it would see reading literal zeros, so chunk
+// boundaries and IsZero classification are source-independent.
+type segReader struct {
+	ctx      context.Context
+	src      sparse.Source
+	cur, end uint64
+	runKind  sparse.RunKind
+	runEnd   uint64
+}
+
+func (r *segReader) Read(p []byte) (int, error) {
+	if r.cur >= r.end {
+		return 0, io.EOF
+	}
+	if r.cur >= r.runEnd {
+		kind, end, err := r.src.RunAt(r.cur, r.end-r.cur)
+		if err != nil {
+			return 0, err
+		}
+		if kind == sparse.Hole {
+			return 0, fmt.Errorf("ingest: hole @ %d inside a data segment (inconsistent RunAt)", r.cur)
+		}
+		r.runKind, r.runEnd = kind, end
+	}
+	n := len(p)
+	if rest := r.runEnd - r.cur; rest < uint64(n) {
+		n = int(rest)
+	}
+	if r.runKind == sparse.Zero {
+		clear(p[:n])
+	} else {
+		m, err := r.src.ReadAt(r.ctx, p[:n], r.cur)
+		if err != nil && err != io.EOF {
+			return 0, err
+		}
+		if m < n {
+			return 0, fmt.Errorf("ingest: source ended early (%d of %d bytes @ %d)", m, n, r.cur)
+		}
+	}
+	r.cur += uint64(n)
+	return n, nil
+}
+
 // mixSalt folds optional extra-salt bytes into the base salt. The
 // derivation is salt = SHA256("accelerator-extra-salt-v1" || base ||
 // extra); empty extra returns base unchanged so the no-mix path is
@@ -395,70 +455,4 @@ func (i *ingester) mixSalt(base [32]byte) ([32]byte, error) {
 	var mixed [32]byte
 	copy(mixed[:], h.Sum(nil))
 	return mixed, nil
-}
-
-// normaliseHoles returns a sorted, validated copy of the caller's
-// holes. Errors out on overlapping holes, holes past ImageSize, or
-// zero-size holes. The caller's slice is not mutated.
-func normaliseHoles(holes []codec.HoleExtent, size uint64) ([]codec.HoleExtent, error) {
-	if len(holes) == 0 {
-		return nil, nil
-	}
-	out := make([]codec.HoleExtent, len(holes))
-	copy(out, holes)
-	sortHoles(out)
-	prevEnd := uint64(0)
-	for i, h := range out {
-		if h.Size == 0 {
-			return nil, fmt.Errorf("ingest: hole at offset %d has zero size", h.Offset)
-		}
-		if h.Offset < prevEnd {
-			return nil, fmt.Errorf("ingest: holes[%d] overlaps with previous (offset %d < %d)", i, h.Offset, prevEnd)
-		}
-		end := h.Offset + h.Size
-		if end > size {
-			return nil, fmt.Errorf("ingest: hole [%d, %d) extends past ImageSize %d", h.Offset, end, size)
-		}
-		prevEnd = end
-	}
-	return out, nil
-}
-
-// sortHoles — local insertion sort to avoid the sort.Slice / reflect
-// cost. N is small in practice (a few extents per sparse image).
-func sortHoles(s []codec.HoleExtent) {
-	for i := 1; i < len(s); i++ {
-		x := s[i]
-		j := i - 1
-		for j >= 0 && s[j].Offset > x.Offset {
-			s[j+1] = s[j]
-			j--
-		}
-		s[j+1] = x
-	}
-}
-
-// dataSegmentsFromHoles produces the inverse of holes within
-// [0, size): the contiguous runs that hold actual chunked data. With
-// no holes returns a single {0, size} segment, preserving the
-// pre-hole code path verbatim.
-func dataSegmentsFromHoles(size uint64, holes []codec.HoleExtent) []codec.HoleExtent {
-	if len(holes) == 0 {
-		if size == 0 {
-			return nil
-		}
-		return []codec.HoleExtent{{Offset: 0, Size: size}}
-	}
-	var segs []codec.HoleExtent
-	cursor := uint64(0)
-	for _, h := range holes {
-		if h.Offset > cursor {
-			segs = append(segs, codec.HoleExtent{Offset: cursor, Size: h.Offset - cursor})
-		}
-		cursor = h.Offset + h.Size
-	}
-	if cursor < size {
-		segs = append(segs, codec.HoleExtent{Offset: cursor, Size: size - cursor})
-	}
-	return segs
 }

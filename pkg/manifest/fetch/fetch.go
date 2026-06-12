@@ -2,9 +2,17 @@
 //
 // A Stream is the read-base abstraction: it reconstructs a virtual image from
 // either a chunked + encrypted manifest, a local file, or an overlay of several
-// such streams. Three implementations satisfy it — manifestStream (also
-// implements ChunkStream), fileStream, and layeredStream — and a sandbox disk,
-// snapshot bundle, or manifest-ctl read all sit on the same abstraction.
+// such streams. Stream is sparse.Source plus lifetime — it strengthens the
+// Source baseline contract (monotone single-goroutine reads) to full concurrent
+// random access, which the runtime consumers (vhost, uffd) rely on. Three
+// implementations satisfy it — manifestStream (also implements ChunkStream),
+// the file stream returned by OpenFileStream, and layeredStream — and a sandbox
+// disk, snapshot bundle, or manifest-ctl read all sit on the same abstraction.
+//
+// Run classification uses sparse.RunKind. Only manifest-backed streams ever
+// return sparse.Zero (an IsZero chunk in the serving layer — explicit zero
+// data that needs no fetch but does NOT fall through an overlay); file streams
+// classify allocated zeros as Data and filesystem holes as Hole.
 //
 // ChunkStream is an optional enhancement a Stream may implement so a caller can
 // thread a chunk index between classification (RunChunkAt) and read
@@ -25,51 +33,16 @@ import (
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/codec"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
-// RunKind classifies the effective (overlay-resolved) content at an image
-// offset.
-type RunKind uint8
-
-const (
-	// Hole: a declared hole / out-of-bounds in every layer — no data anywhere.
-	// Consumers zero-fill or punch a sparse extent; no fetch.
-	Hole RunKind = iota
-	// Zero: an IsZero chunk in the serving layer — explicit zero data. Needs no
-	// fetch, but it is content the layer owns, so it does NOT fall through.
-	Zero
-	// Data: a non-zero chunk in the serving layer — must be fetched.
-	Data
-)
-
-// Stream serves byte-range reads from a chunked+encrypted manifest, a local
-// file, or an overlay of several. limit in RunAt is a length: the returned run
-// satisfies offset < end <= min(offset+limit, Size()).
+// Stream is a sparse.Source with a lifetime, and a stronger contract: RunAt
+// and ReadAt are safe for concurrent use at arbitrary offsets, and ReadAt MAY
+// fetch the data chunks in a range concurrently (internal goroutines); see
+// ChunkStream.ReadChunkAt for the synchronous counterpart.
 type Stream interface {
-	// Size is the total virtual image size, holes included. For a multi-layer
-	// stream it is the maximum Size over all layers.
-	Size() uint64
-
-	// RunAt classifies the effective content at offset and returns the kind plus
-	// the end of a same-kind run. err == io.EOF iff offset >= Size(); otherwise
-	// err == nil and offset < end <= min(offset+limit, Size()). Hole/Zero runs
-	// may extend through contiguous same-kind regions; a Data run is at most one
-	// chunk. Callers iterate RunAt until io.EOF.
-	RunAt(offset, limit uint64) (kind RunKind, end uint64, err error)
-
-	// ReadAt reads len(buf) bytes from offset with POSIX io.ReaderAt semantics:
-	// holes and IsZero chunks are zero-filled, a single call spans hole/data
-	// boundaries until buf is full or end-of-image.
-	//
-	//	(len(buf), nil)  full read
-	//	(n, io.EOF)      n < len(buf): clipped at Size(); buf[:n] valid
-	//	(0, io.EOF)      offset >= Size()
-	//	(0, transport)   cache / decrypt / context error (n == 0 on error)
-	//
-	// ReadAt MAY fetch the data chunks in the range concurrently (internal
-	// goroutines); see ChunkStream.ReadChunkAt for the synchronous counterpart.
-	ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error)
+	sparse.Source
 
 	// Close releases resources owned by this stream (e.g. a file descriptor).
 	// manifest streams own none (no-op); a layered stream closes its layers.
@@ -86,7 +59,7 @@ type ChunkStream interface {
 	// RunChunkAt is RunAt that additionally returns the serving chunk index
 	// (valid for Data and Zero; meaningless for Hole). It returns a single
 	// region (no Hole/Zero extension).
-	RunChunkAt(offset, limit uint64) (kind RunKind, end, chunkIdx uint64, err error)
+	RunChunkAt(offset, limit uint64) (kind sparse.RunKind, end, chunkIdx uint64, err error)
 	// ReadChunkAt synchronously fetches+decrypts chunk chunkIdx and copies its
 	// [offset, end) sub-range into buf. Used for Data (and Zero, which yields
 	// zeros); never for Hole.
@@ -115,7 +88,7 @@ func (s *manifestStream) Close() error { return nil }
 // RunChunkAt classifies one region starting at offset. By the tiling invariant
 // (entries + holes cover [0, ImageSize) with no overlap or gap) a data/zero
 // chunk ends exactly where the next hole begins.
-func (s *manifestStream) RunChunkAt(offset, limit uint64) (RunKind, uint64, uint64, error) {
+func (s *manifestStream) RunChunkAt(offset, limit uint64) (sparse.RunKind, uint64, uint64, error) {
 	if offset >= s.m.ImageSize {
 		return 0, 0, 0, io.EOF
 	}
@@ -128,11 +101,11 @@ func (s *manifestStream) RunChunkAt(offset, limit uint64) (RunKind, uint64, uint
 		if end > limEnd {
 			end = limEnd
 		}
-		return Hole, end, 0, nil
+		return sparse.Hole, end, 0, nil
 	}
 	i := codec.ChunkIndexForOffset(s.m.Entries, offset)
 	if i < 0 {
-		return Hole, limEnd, 0, nil // unreachable in bounds (tiling); degrade safely
+		return sparse.Hole, limEnd, 0, nil // unreachable in bounds (tiling); degrade safely
 	}
 	e := s.m.Entries[i]
 	end := e.Offset + uint64(e.Size)
@@ -140,16 +113,16 @@ func (s *manifestStream) RunChunkAt(offset, limit uint64) (RunKind, uint64, uint
 		end = limEnd
 	}
 	if e.IsZero {
-		return Zero, end, uint64(i), nil
+		return sparse.Zero, end, uint64(i), nil
 	}
-	return Data, end, uint64(i), nil
+	return sparse.Data, end, uint64(i), nil
 }
 
 // RunAt extends Hole/Zero runs through contiguous same-kind regions; a Data run
 // stays a single chunk.
-func (s *manifestStream) RunAt(offset, limit uint64) (RunKind, uint64, error) {
+func (s *manifestStream) RunAt(offset, limit uint64) (sparse.RunKind, uint64, error) {
 	kind, end, _, err := s.RunChunkAt(offset, limit)
-	if err != nil || kind == Data {
+	if err != nil || kind == sparse.Data {
 		return kind, end, err
 	}
 	limEnd := offset + limit
@@ -226,7 +199,7 @@ func (s *manifestStream) ReadAt(ctx context.Context, buf []byte, offset uint64) 
 	for cur := offset; cur < end; {
 		kind, runEnd, idx, _ := s.RunChunkAt(cur, end-cur)
 		dst := buf[cur-offset : runEnd-offset]
-		if kind == Data {
+		if kind == sparse.Data {
 			wg.Add(1)
 			go func(idx, lo, hi uint64, dst []byte) {
 				defer wg.Done()
@@ -250,8 +223,10 @@ func (s *manifestStream) ReadAt(ctx context.Context, buf []byte, offset uint64) 
 }
 
 // findHoleAt returns the hole extent containing offset, or ok=false. The hole
-// slice is sorted by Offset and disjoint. O(log M).
-func findHoleAt(holes []codec.HoleExtent, offset uint64) (codec.HoleExtent, bool) {
+// slice is sorted by Offset and disjoint. O(log M). (manifestStream owns its
+// lookup — the manifest's holes live next to chunk entries, not behind a
+// sparse source.)
+func findHoleAt(holes []sparse.Extent, offset uint64) (sparse.Extent, bool) {
 	lo, hi := 0, len(holes)-1
 	idx := -1
 	for lo <= hi {
@@ -264,31 +239,13 @@ func findHoleAt(holes []codec.HoleExtent, offset uint64) (codec.HoleExtent, bool
 		}
 	}
 	if idx < 0 {
-		return codec.HoleExtent{}, false
+		return sparse.Extent{}, false
 	}
 	h := holes[idx]
 	if offset < h.Offset+h.Size {
 		return h, true
 	}
-	return codec.HoleExtent{}, false
-}
-
-// nextHoleStart returns the start of the first hole at or after offset (caller
-// must be in data at offset), clamped to limEnd — used to bound a data run.
-func nextHoleStart(holes []codec.HoleExtent, offset, limEnd uint64) uint64 {
-	lo, hi := 0, len(holes)
-	for lo < hi {
-		mid := (lo + hi) / 2
-		if holes[mid].Offset < offset {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	if lo < len(holes) && holes[lo].Offset < limEnd {
-		return holes[lo].Offset
-	}
-	return limEnd
+	return sparse.Extent{}, false
 }
 
 // clearSlice zeros every byte in b (the compiler lowers this to memclr).

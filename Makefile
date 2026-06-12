@@ -94,7 +94,7 @@ test: deps-rocksdb
 
 # vet the CGO-free client surface (no librocksdb needed).
 vet:
-	CGO_ENABLED=0 $(GO) vet ./pkg/manifest/... ./pkg/store/client/... ./pkg/cache/client/... ./cmd/manifest-ctl ./cmd/store-ctl
+	CGO_ENABLED=0 $(GO) vet ./pkg/sparse/... ./pkg/tarstream/... ./pkg/manifest/... ./pkg/store/client/... ./pkg/cache/client/... ./cmd/manifest-ctl ./cmd/store-ctl
 
 clean:
 	rm -rf bin build

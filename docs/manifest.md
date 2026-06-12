@@ -11,10 +11,10 @@
 ### 1.1 模块定位
 
 ```
-   ┌─ input stream ──┐      ┌─ manifest-ctl store ──────────────┐      ┌─ output ──────────┐
-   │  io.Reader      │ ───► │  chunker                          │ ───► │  Manifest         │
+   ┌─ input source ──┐      ┌─ manifest-ctl store ──────────────┐      ┌─ output ──────────┐
+   │  sparse.Source  │ ───► │  chunker (data segments)          │ ───► │  Manifest         │
    │  (file/stdin/   │      │      ↓                            │      │  (binary file or  │
-   │   pipe)         │      │  convergent encrypt               │      │   stdout)         │
+   │   tar stream)   │      │  convergent encrypt               │      │   stdout)         │
    └─────────────────┘      │      ↓                            │      └───────────────────┘
                             │  store-ctl Put(chunk_hash) ───────┼───►  chunk bytes land in
                             └───────────────────────────────────┘      store-ctl backend
@@ -25,7 +25,8 @@
 
 ### 1.2 设计原则
 
-- **写入路径**:`io.Reader → chunker → encrypt → store.Put → Manifest`
+- **写入路径**:`sparse.Source → chunker → encrypt → store.Put → Manifest`
+  (Hole 段记为 manifest 空洞、不读取;Zero 段合成零字节过 chunker、免取数)
 - **读取路径**:`Manifest → fetch → decrypt → io.Writer`
 - **去重单位**:chunk(可变长 FastCDC 或固定长度)
 - **跨用户隔离**:salt 区分 dedup 域,加密 + content-addressing 让 store 只
@@ -439,7 +440,7 @@ Manifest 是一段紧凑的小型二进制(整数 little-endian):
 ### 4.7 写路径(细节)
 
 ```
-io.Reader
+sparse.Source                ← holes recorded & skipped; zero runs synthesized
    │
    ▼
 chunker (cdc | fixed)        ← split per configured mode

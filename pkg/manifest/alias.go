@@ -15,7 +15,6 @@ import (
 type (
 	Manifest   = codec.Manifest
 	ChunkEntry = codec.ChunkEntry
-	HoleExtent = codec.HoleExtent
 	ChunkMode  = codec.ChunkMode
 	Stream     = fetch.Stream
 

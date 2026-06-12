@@ -3,11 +3,14 @@ package ingest
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/codec"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
@@ -49,21 +52,22 @@ func TestIngest_HolesSkipChunker(t *testing.T) {
 		chunkSize = 4 * 1024
 		imageSize = 12 * 1024
 	)
-	src := make([]byte, imageSize)
-	for i := range src {
-		src[i] = byte(i%127) + 1
+	image := make([]byte, imageSize)
+	for i := range image {
+		image[i] = byte(i%127) + 1
 	}
-	holes := []codec.HoleExtent{
+	clear(image[chunkSize : 2*chunkSize]) // the hole region reads as zeros
+	src, err := sparse.NewSource(bytes.NewReader(image), imageSize, []sparse.Extent{
 		{Offset: chunkSize, Size: chunkSize}, // hole [4K, 8K)
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	rec := &observingStore{}
 	ing := NewIngester(testKeyFn, nil, rec, fixedChunker(t, chunkSize), fakeEncryptor())
 
-	_, err := ing.Ingest(context.Background(), bytes.NewReader(src), imageSize, IngestOption{
-		Holes: holes,
-	})
-	if err != nil {
+	if _, err := ing.Ingest(context.Background(), src, IngestOption{}); err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
 
@@ -99,33 +103,84 @@ func TestIngest_HolesSkipChunker(t *testing.T) {
 	}
 }
 
-// TestIngest_RejectsHolesWithoutSeeker — Holes set but reader
-// is just an io.Reader (no ReadSeeker) → error.
-func TestIngest_RejectsHolesWithoutSeeker(t *testing.T) {
-	rec := &observingStore{}
-	ing := NewIngester(testKeyFn, nil, rec, fixedChunker(t, 4096), fakeEncryptor())
+// zeroRunIngestSource fakes a manifest-backed source: [0,4K) Data,
+// [4K,12K) Zero. ReadAt inside the Zero run is a test failure — the
+// ingester must synthesize those bytes, not fetch them.
+type zeroRunIngestSource struct {
+	data []byte // the [0,4K) bytes
+}
 
-	src := bytes.NewReader(make([]byte, 8192))
-	wrapper := readerWrapper{R: src}
+func (s *zeroRunIngestSource) Size() uint64 { return 12 * 1024 }
 
-	_, err := ing.Ingest(context.Background(), wrapper, 8192, IngestOption{
-		Holes: []codec.HoleExtent{{Offset: 0, Size: 8192}},
-	})
-	if err == nil {
-		t.Fatal("expected error when Holes is non-empty but reader is not io.ReadSeeker")
+func (s *zeroRunIngestSource) RunAt(off, limit uint64) (sparse.RunKind, uint64, error) {
+	size := s.Size()
+	if off >= size {
+		return 0, 0, io.EOF
+	}
+	limEnd := min(off+limit, size)
+	if off < 4096 {
+		return sparse.Data, min(4096, limEnd), nil
+	}
+	return sparse.Zero, limEnd, nil
+}
+
+func (s *zeroRunIngestSource) ReadAt(_ context.Context, buf []byte, off uint64) (int, error) {
+	if off+uint64(len(buf)) > 4096 {
+		return 0, fmt.Errorf("unexpected ReadAt [%d,+%d): zero runs must not be read", off, len(buf))
+	}
+	copy(buf, s.data[off:])
+	return len(buf), nil
+}
+
+// TestIngest_ZeroRunsFeedChunkerWithoutRead — a source's Zero runs go
+// through the chunker as synthesized zero bytes (IsZero entries, no
+// store Puts, no source reads), and the manifest key is identical to
+// ingesting the literal byte stream: the key is a pure function of
+// content + holes, independent of the source kind.
+func TestIngest_ZeroRunsFeedChunkerWithoutRead(t *testing.T) {
+	const chunkSize = 4 * 1024
+	data := make([]byte, chunkSize)
+	for i := range data {
+		data[i] = byte(i%127) + 1
+	}
+
+	recA := &observingStore{}
+	ingA := NewIngester(testKeyFn, nil, recA, fixedChunker(t, chunkSize), fakeEncryptor())
+	resA, err := ingA.Ingest(context.Background(), &zeroRunIngestSource{data: data}, IngestOption{})
+	if err != nil {
+		t.Fatalf("Ingest(zero-run source): %v", err)
+	}
+
+	if got := recA.chunkPuts.Load(); got != 1 {
+		t.Errorf("chunk Puts: got %d, want 1 (zeros never stored)", got)
+	}
+	if resA.ZeroChunks != 2 {
+		t.Errorf("ZeroChunks = %d, want 2", resA.ZeroChunks)
+	}
+	m, _, err := codec.Unmarshal(recA.manifest)
+	if err != nil {
+		t.Fatalf("codec.Unmarshal: %v", err)
+	}
+	if len(m.Holes) != 0 {
+		t.Errorf("holes = %v, want none (Zero is data, not absence)", m.Holes)
+	}
+
+	// Same logical bytes as a literal dense stream → same manifest key.
+	literal := make([]byte, 12*1024)
+	copy(literal, data)
+	recB := &observingStore{}
+	ingB := NewIngester(testKeyFn, nil, recB, fixedChunker(t, chunkSize), fakeEncryptor())
+	resB, err := ingB.Ingest(context.Background(), sparse.Dense(bytes.NewReader(literal), uint64(len(literal))), IngestOption{})
+	if err != nil {
+		t.Fatalf("Ingest(dense literal): %v", err)
+	}
+	if resA.ManifestKey != resB.ManifestKey {
+		t.Error("manifest keys differ between zero-run source and literal bytes")
 	}
 }
 
-type readerWrapper struct {
-	R interface {
-		Read(p []byte) (int, error)
-	}
-}
-
-func (rw readerWrapper) Read(p []byte) (int, error) { return rw.R.Read(p) }
-
-// TestIngest_NoHoles_BackwardCompat — running Ingest with no Holes
-// is byte-equivalent to the pre-hole behavior.
+// TestIngest_NoHoles_BackwardCompat — a dense one-pass source behaves
+// like the pre-Source io.Reader path: every byte chunked, no holes.
 func TestIngest_NoHoles_BackwardCompat(t *testing.T) {
 	const chunkSize = 64 * 1024
 	const imageSize = 4 * chunkSize
@@ -137,7 +192,7 @@ func TestIngest_NoHoles_BackwardCompat(t *testing.T) {
 	rec := &observingStore{}
 	ing := NewIngester(testKeyFn, nil, rec, fixedChunker(t, chunkSize), fakeEncryptor())
 
-	_, err := ing.Ingest(context.Background(), bytes.NewReader(src), imageSize, IngestOption{})
+	_, err := ing.Ingest(context.Background(), sparse.Dense(bytes.NewReader(src), imageSize), IngestOption{})
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -163,10 +218,11 @@ func TestIngest_AllHoleManifest(t *testing.T) {
 	rec := &observingStore{}
 	ing := NewIngester(testKeyFn, nil, rec, fixedChunker(t, 4096), fakeEncryptor())
 
-	_, err := ing.Ingest(context.Background(), bytes.NewReader(nil), 1024, IngestOption{
-		Holes: []codec.HoleExtent{{Offset: 0, Size: 1024}},
-	})
+	src, err := sparse.NewSource(bytes.NewReader(make([]byte, 1024)), 1024, []sparse.Extent{{Offset: 0, Size: 1024}})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ing.Ingest(context.Background(), src, IngestOption{}); err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
 	m, _, err := codec.Unmarshal(rec.manifest)

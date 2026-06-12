@@ -9,6 +9,7 @@ import (
 
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/codec"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
@@ -22,7 +23,7 @@ func buildHoleManifest(dataSize, holeSize uint64) *codec.Manifest {
 			{Offset: 0, Size: uint32(dataSize), CiphertextHash: store.ContentKey{0xA1}},
 			{Offset: dataSize + holeSize, Size: uint32(dataSize), CiphertextHash: store.ContentKey{0xA2}},
 		},
-		Holes: []codec.HoleExtent{
+		Holes: []sparse.Extent{
 			{Offset: dataSize, Size: holeSize},
 		},
 	}
@@ -54,17 +55,17 @@ func TestRunAt_DataHoleData(t *testing.T) {
 	defer f.Close()
 	full := m.ImageSize
 
-	if k, end, err := f.RunAt(0, full); err != nil || k != Data || end != dataSize {
+	if k, end, err := f.RunAt(0, full); err != nil || k != sparse.Data || end != dataSize {
 		t.Errorf("RunAt(0) = (%v, %d, %v), want (Data, %d, nil)", k, end, err, dataSize)
 	}
-	if k, end, err := f.RunAt(dataSize, full); err != nil || k != Hole || end != dataSize+holeSize {
+	if k, end, err := f.RunAt(dataSize, full); err != nil || k != sparse.Hole || end != dataSize+holeSize {
 		t.Errorf("RunAt(hole) = (%v, %d, %v), want (Hole, %d, nil)", k, end, err, dataSize+holeSize)
 	}
-	if k, end, err := f.RunAt(dataSize+holeSize, full); err != nil || k != Data || end != full {
+	if k, end, err := f.RunAt(dataSize+holeSize, full); err != nil || k != sparse.Data || end != full {
 		t.Errorf("RunAt(data2) = (%v, %d, %v), want (Data, %d, nil)", k, end, err, full)
 	}
 	// limit is a length: end <= offset+limit.
-	if k, end, err := f.RunAt(0, 1024); err != nil || k != Data || end != 1024 {
+	if k, end, err := f.RunAt(0, 1024); err != nil || k != sparse.Data || end != 1024 {
 		t.Errorf("RunAt(0, 1024) = (%v, %d, %v), want (Data, 1024, nil)", k, end, err)
 	}
 	// offset >= Size → io.EOF.
@@ -200,7 +201,7 @@ func TestRunChunkAt_ChainLoop(t *testing.T) {
 		if err != nil {
 			t.Fatalf("RunChunkAt @ %d: %v", off, err)
 		}
-		if kind == Data {
+		if kind == sparse.Data {
 			if _, rerr := cs.ReadChunkAt(context.Background(), out[off:end], idx, off, end); rerr != nil {
 				t.Fatalf("ReadChunkAt @ %d: %v", off, rerr)
 			}

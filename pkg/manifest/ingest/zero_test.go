@@ -9,6 +9,7 @@ import (
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/chunker"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/codec"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
@@ -111,7 +112,7 @@ func TestIngest_AllZeroNoStorePut(t *testing.T) {
 	const numChunks = 4
 	input := make([]byte, chunkSize*numChunks)
 
-	res, err := ing.Ingest(context.Background(), bytes.NewReader(input), uint64(len(input)), IngestOption{})
+	res, err := ing.Ingest(context.Background(), sparse.Dense(bytes.NewReader(input), uint64(len(input))), IngestOption{})
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -155,7 +156,7 @@ func TestIngest_KeyTableCompressed(t *testing.T) {
 		input[i] = byte(i%255) + 1
 	}
 
-	res, err := ing.Ingest(context.Background(), bytes.NewReader(input), uint64(len(input)), IngestOption{})
+	res, err := ing.Ingest(context.Background(), sparse.Dense(bytes.NewReader(input), uint64(len(input))), IngestOption{})
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -205,7 +206,7 @@ func TestIngest_AllZeroSealedTableTinyAndDeterministic(t *testing.T) {
 	const chunkSize = 64 * 1024
 	input := make([]byte, 4*chunkSize)
 
-	_, err := ing.Ingest(context.Background(), bytes.NewReader(input), uint64(len(input)), IngestOption{})
+	_, err := ing.Ingest(context.Background(), sparse.Dense(bytes.NewReader(input), uint64(len(input))), IngestOption{})
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}

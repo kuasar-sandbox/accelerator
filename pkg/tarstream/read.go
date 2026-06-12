@@ -2,11 +2,14 @@ package tarstream
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"maps"
 	"strconv"
 	"strings"
+
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
 )
 
 // ReadFrom locates the entry called name in the tar stream r (an empty
@@ -18,12 +21,53 @@ import (
 // one sequential pass with nothing buffered beyond a block.
 func ReadFrom(r io.Reader, name string) (Reader, error) {
 	if rs, ok := r.(io.ReadSeeker); ok {
-		ts, err := ReadSeekFrom(rs, name)
+		v, err := newSeekView(rs, name)
 		if err != nil {
 			return nil, err
 		}
-		return ts, nil
+		return v, nil
 	}
+	v, err := newSeqView(r, name)
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+// ReadSeekFrom is ReadFrom over a seekable stream: the returned view
+// supports random access by mapping logical offsets straight onto the
+// packed data region inside rs — no extraction, no copies. The view
+// owns rs's seek position; do not use rs elsewhere while reading.
+func ReadSeekFrom(rs io.ReadSeeker, name string) (ReadSeeker, error) {
+	v, err := newSeekView(rs, name)
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+// SourceFrom locates the entry called name (empty: first regular file
+// entry) and opens it as a sparse.Source — the pipeline-facing twin
+// of ReadFrom: RunAt serves the envelope's hole map (Hole/Data only,
+// never Zero), ReadAt the logical bytes. Over a plain reader the
+// source is one-pass (monotone ReadAt); a seekable r upgrades to
+// random access. The entry's name is returned alongside.
+func SourceFrom(r io.Reader, name string) (sparse.Source, string, error) {
+	if rs, ok := r.(io.ReadSeeker); ok {
+		v, err := newSeekView(rs, name)
+		if err != nil {
+			return nil, "", err
+		}
+		return &sourceView{m: &v.meta, sk: v}, v.meta.name, nil
+	}
+	v, err := newSeqView(r, name)
+	if err != nil {
+		return nil, "", err
+	}
+	return &sourceView{m: &v.meta, seq: v}, v.meta.name, nil
+}
+
+func newSeqView(r io.Reader, name string) (*seqView, error) {
 	m, err := locate(r, name, func(n int64) error {
 		_, err := io.CopyN(io.Discard, r, n)
 		return err
@@ -37,11 +81,7 @@ func ReadFrom(r io.Reader, name string) (Reader, error) {
 	}, nil
 }
 
-// ReadSeekFrom is ReadFrom over a seekable stream: the returned view
-// supports random access by mapping logical offsets straight onto the
-// packed data region inside rs — no extraction, no copies. The view
-// owns rs's seek position; do not use rs elsewhere while reading.
-func ReadSeekFrom(rs io.ReadSeeker, name string) (ReadSeeker, error) {
+func newSeekView(rs io.ReadSeeker, name string) (*seekView, error) {
 	m, err := locate(rs, name, func(n int64) error {
 		_, err := rs.Seek(n, io.SeekCurrent)
 		return err
@@ -64,11 +104,11 @@ func ReadSeekFrom(rs io.ReadSeeker, name string) (ReadSeeker, error) {
 // meta describes the located entry.
 type meta struct {
 	name    string
-	logical int64    // logical file size
-	stored  int64    // stored entry size (map + packed data)
-	mapLen  int64    // sparse map bytes consumed from the stored region
-	extents []extent // data extents in logical offsets (dense: one run)
-	holes   []Hole   // canonical hole map (nil = dense)
+	logical int64           // logical file size
+	stored  int64           // stored entry size (map + packed data)
+	mapLen  int64           // sparse map bytes consumed from the stored region
+	extents []extent        // data extents in logical offsets (dense: one run)
+	holes   []sparse.Extent // canonical hole map (nil = dense)
 }
 
 // locate scans entries until it finds the wanted one, leaving r
@@ -359,9 +399,9 @@ type seqView struct {
 	extIdx int
 }
 
-func (v *seqView) Name() string  { return v.meta.name }
-func (v *seqView) Size() int64   { return v.logical }
-func (v *seqView) Holes() []Hole { return append([]Hole(nil), v.holes...) }
+func (v *seqView) Name() string           { return v.meta.name }
+func (v *seqView) Size() int64            { return v.logical }
+func (v *seqView) Holes() []sparse.Extent { return append([]sparse.Extent(nil), v.holes...) }
 
 func (v *seqView) Read(p []byte) (int, error) {
 	if v.pos >= v.logical {
@@ -409,9 +449,9 @@ type seekView struct {
 	pos          int64
 }
 
-func (v *seekView) Name() string  { return v.meta.name }
-func (v *seekView) Size() int64   { return v.logical }
-func (v *seekView) Holes() []Hole { return append([]Hole(nil), v.holes...) }
+func (v *seekView) Name() string           { return v.meta.name }
+func (v *seekView) Size() int64            { return v.logical }
+func (v *seekView) Holes() []sparse.Extent { return append([]sparse.Extent(nil), v.holes...) }
 
 func (v *seekView) Seek(offset int64, whence int) (int64, error) {
 	var base int64
@@ -434,20 +474,29 @@ func (v *seekView) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (v *seekView) Read(p []byte) (int, error) {
-	if v.pos >= v.logical {
+	n, err := v.readAtPos(p, v.pos)
+	v.pos += int64(n)
+	return n, err
+}
+
+// readAtPos serves one partial read of the logical view at pos
+// without touching v.pos: data extents map onto the packed region,
+// everything else reads as zeros.
+func (v *seekView) readAtPos(p []byte, pos int64) (int, error) {
+	if pos >= v.logical {
 		return 0, io.EOF
 	}
 	// Find the extent at or after pos.
 	idx := 0
-	for idx < len(v.extents) && v.pos >= v.extents[idx].Offset+v.extents[idx].Size {
+	for idx < len(v.extents) && pos >= v.extents[idx].Offset+v.extents[idx].Size {
 		idx++
 	}
-	if idx < len(v.extents) && v.pos >= v.extents[idx].Offset {
+	if idx < len(v.extents) && pos >= v.extents[idx].Offset {
 		// Data: map the logical position into the packed region.
 		e := v.extents[idx]
-		packed := v.packedPrefix[idx] + (v.pos - e.Offset)
+		packed := v.packedPrefix[idx] + (pos - e.Offset)
 		n := int64(len(p))
-		if rest := e.Offset + e.Size - v.pos; rest < n {
+		if rest := e.Offset + e.Size - pos; rest < n {
 			n = rest
 		}
 		if _, err := v.rs.Seek(v.dataStart+packed, io.SeekStart); err != nil {
@@ -455,7 +504,6 @@ func (v *seekView) Read(p []byte) (int, error) {
 		}
 		read, err := v.rs.Read(p[:n])
 		if read > 0 {
-			v.pos += int64(read)
 			return read, nil
 		}
 		if err == io.EOF {
@@ -469,10 +517,113 @@ func (v *seekView) Read(p []byte) (int, error) {
 		zeroEnd = v.extents[idx].Offset
 	}
 	n := int64(len(p))
-	if rest := zeroEnd - v.pos; rest < n {
+	if rest := zeroEnd - pos; rest < n {
 		n = rest
 	}
 	clear(p[:n])
-	v.pos += n
 	return int(n), nil
+}
+
+// readFullAt fills p from logical offset off, independent of the
+// view's Read/Seek position.
+func (v *seekView) readFullAt(p []byte, off int64) error {
+	for len(p) > 0 {
+		n, err := v.readAtPos(p, off)
+		if err != nil {
+			return err
+		}
+		p = p[n:]
+		off += int64(n)
+	}
+	return nil
+}
+
+// sourceView adapts a located entry to sparse.Source. A separate type
+// because Reader.Size returns int64 while sparse.Source.Size returns
+// uint64 — one type cannot carry both methods.
+type sourceView struct {
+	m   *meta
+	seq *seqView // exactly one of seq/sk is set
+	sk  *seekView
+}
+
+func (s *sourceView) Size() uint64 { return uint64(s.m.logical) }
+
+// RunAt classifies offsets from the envelope's map: Data inside a
+// stored extent, Hole everywhere else. Zero is never produced — the
+// envelope has no such state.
+func (s *sourceView) RunAt(offset, limit uint64) (sparse.RunKind, uint64, error) {
+	size := uint64(s.m.logical)
+	if offset >= size {
+		return 0, 0, io.EOF
+	}
+	limEnd := offset + limit
+	if limEnd < offset || limEnd > size {
+		limEnd = size
+	}
+	// First extent that ends past offset.
+	ext := s.m.extents
+	lo, hi := 0, len(ext)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if uint64(ext[mid].Offset+ext[mid].Size) <= offset {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo == len(ext) {
+		return sparse.Hole, limEnd, nil // trailing hole
+	}
+	e := ext[lo]
+	if offset < uint64(e.Offset) { // gap before the extent
+		end := uint64(e.Offset)
+		if end > limEnd {
+			end = limEnd
+		}
+		return sparse.Hole, end, nil
+	}
+	end := uint64(e.Offset + e.Size)
+	if end > limEnd {
+		end = limEnd
+	}
+	return sparse.Data, end, nil
+}
+
+func (s *sourceView) ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	size := uint64(s.m.logical)
+	if offset >= size {
+		return 0, io.EOF
+	}
+	n := len(buf)
+	var eof error
+	if offset+uint64(n) > size {
+		n = int(size - offset)
+		eof = io.EOF
+	}
+	if s.sk != nil {
+		if err := s.sk.readFullAt(buf[:n], int64(offset)); err != nil {
+			return 0, err
+		}
+		return n, eof
+	}
+	// One-pass: discard forward, then fill. The view synthesizes
+	// zeros across holes, so skipping a hole region never touches the
+	// underlying source.
+	pos := uint64(s.seq.pos)
+	if offset < pos {
+		return 0, fmt.Errorf("tarstream: backward ReadAt @ %d (position %d) on one-pass source", offset, pos)
+	}
+	if offset > pos {
+		if _, err := io.CopyN(io.Discard, s.seq, int64(offset-pos)); err != nil {
+			return 0, err
+		}
+	}
+	if _, err := io.ReadFull(s.seq, buf[:n]); err != nil {
+		return 0, err
+	}
+	return n, eof
 }

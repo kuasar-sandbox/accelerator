@@ -2,39 +2,56 @@ package tarstream
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"path"
 	"sort"
 	"strconv"
+
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
 )
 
-// WriteTo packages data as a complete single-file tar stream on w. The
-// logical size is measured from data (Seek to its end and back); holes
-// may be unsorted and merge when adjacent. Only the data extents are
-// read — via Seek, so holes cost nothing — and a file with no holes is
-// written as a plain entry. The envelope metadata is fixed and
-// deterministic (mode 0644, uid/gid 0, epoch mtime): the entry is a
-// transport vessel, not a filesystem snapshot.
-func WriteTo(w io.Writer, name string, data io.ReadSeeker, holes []Hole) error {
+// WriteTo packages src as a complete single-file tar stream on w. The
+// sparse map comes from src.RunAt — Hole runs become the entry's
+// holes (costing nothing on the wire); Zero and Data runs are the
+// data extents, with Zero runs written as synthesized zero bytes
+// without calling ReadAt (zeros are data; only holes are absent). A
+// source with no holes is written as a plain entry. The metadata
+// sweep precedes any data read (sparse law 1), so one-pass sources
+// work. The envelope metadata is fixed and deterministic (mode 0644,
+// uid/gid 0, epoch mtime): the entry is a transport vessel, not a
+// filesystem snapshot.
+func WriteTo(ctx context.Context, w io.Writer, name string, src sparse.Source) error {
 	name = normalizeName(name)
 	if name == "" {
 		return fmt.Errorf("tarstream: empty entry name")
 	}
-	size, err := data.Seek(0, io.SeekEnd)
-	if err != nil {
-		return fmt.Errorf("tarstream: measure %s: %w", name, err)
+	if src.Size() > 1<<62 {
+		return fmt.Errorf("tarstream: %s: size %d overflows", name, src.Size())
 	}
-	extents, sparse, err := holesToExtents(size, holes)
-	if err != nil {
-		return fmt.Errorf("tarstream: %s: %w", name, err)
-	}
-	if !sparse {
-		extents = nil
-		if size > 0 {
-			extents = []extent{{Offset: 0, Size: size}}
+	size := int64(src.Size())
+
+	// Metadata sweep: data extents = Zero|Data runs, merged across
+	// kind changes; holes are everything else.
+	var extents []extent
+	hasHole := false
+	for off := uint64(0); off < uint64(size); {
+		kind, end, err := src.RunAt(off, uint64(size)-off)
+		if err != nil {
+			return fmt.Errorf("tarstream: %s: classify @ %d: %w", name, off, err)
 		}
-		return emit(w, name, size, size, nil, extents, data)
+		if kind == sparse.Hole {
+			hasHole = true
+		} else if n := len(extents); n > 0 && uint64(extents[n-1].Offset+extents[n-1].Size) == off {
+			extents[n-1].Size += int64(end - off)
+		} else {
+			extents = append(extents, extent{Offset: int64(off), Size: int64(end - off)})
+		}
+		off = end
+	}
+	if !hasHole {
+		return emit(ctx, w, name, size, size, nil, extents, src)
 	}
 
 	// Sparse map: decimal extent count, then offset/size per line —
@@ -57,13 +74,13 @@ func WriteTo(w io.Writer, name string, data io.ReadSeeker, holes []Hole) error {
 		mapBuf.Write(zeroBlock[:pad])
 	}
 	stored := int64(mapBuf.Len()) + dataSize
-	return emit(w, name, size, stored, mapBuf.Bytes(), extents, data)
+	return emit(ctx, w, name, size, stored, mapBuf.Bytes(), extents, src)
 }
 
 // emit writes the PAX extended header, the data header, the optional
 // sparse map, the data extents and the end-of-archive trailer.
 // sparseMap == nil emits a plain entry of logical == stored size.
-func emit(w io.Writer, name string, logical, stored int64, sparseMap []byte, extents []extent, data io.ReadSeeker) error {
+func emit(ctx context.Context, w io.Writer, name string, logical, stored int64, sparseMap []byte, extents []extent, src sparse.Source) error {
 	ustarName := name
 	recs := map[string]string{
 		"path": name,
@@ -114,12 +131,12 @@ func emit(w io.Writer, name string, logical, stored int64, sparseMap []byte, ext
 			return err
 		}
 	}
-	for _, e := range extents {
-		if _, err := data.Seek(e.Offset, io.SeekStart); err != nil {
-			return err
-		}
-		if err := copyExactly(w, data, e.Size, name); err != nil {
-			return err
+	if len(extents) > 0 {
+		buf := make([]byte, copyBufSize)
+		for _, e := range extents {
+			if err := copyExtent(ctx, w, src, e, name, buf); err != nil {
+				return err
+			}
 		}
 	}
 	if pad := int((512 - stored%512) % 512); pad > 0 {
@@ -132,21 +149,46 @@ func emit(w io.Writer, name string, logical, stored int64, sparseMap []byte, ext
 	return err
 }
 
+const copyBufSize = 256 << 10
+
 var (
 	zeroBlock  [512]byte
 	zeroBlock2 [1024]byte
 )
 
-// copyExactly copies exactly n bytes and turns a short source into a
-// hard error — the header size is already committed, so a source that
-// came up short must fail loudly rather than corrupt the stream.
-func copyExactly(dst io.Writer, src io.Reader, n int64, name string) error {
-	written, err := io.CopyN(dst, src, n)
-	if err != nil {
-		if err == io.EOF {
-			return fmt.Errorf("%s: source ended early (%d of %d bytes)", name, written, n)
+// copyExtent writes the logical bytes of one data extent: Data runs
+// are read from src, Zero runs are synthesized without a read. A
+// short or failing source is a hard error — the header size is
+// already committed, so the stream must fail loudly rather than be
+// silently corrupt.
+func copyExtent(ctx context.Context, w io.Writer, src sparse.Source, e extent, name string, buf []byte) error {
+	off, end := uint64(e.Offset), uint64(e.Offset+e.Size)
+	for off < end {
+		kind, runEnd, err := src.RunAt(off, end-off)
+		if err != nil {
+			return fmt.Errorf("%s: classify @ %d: %w", name, off, err)
 		}
-		return err
+		if kind == sparse.Hole {
+			return fmt.Errorf("%s: hole @ %d inside a data extent (inconsistent RunAt)", name, off)
+		}
+		for off < runEnd {
+			n := len(buf)
+			if rest := runEnd - off; rest < uint64(n) {
+				n = int(rest)
+			}
+			chunk := buf[:n]
+			if kind == sparse.Zero {
+				clear(chunk)
+			} else if m, err := src.ReadAt(ctx, chunk, off); err != nil && err != io.EOF {
+				return fmt.Errorf("%s: read @ %d: %w", name, off, err)
+			} else if m < n {
+				return fmt.Errorf("%s: source ended early (%d of %d bytes @ %d)", name, m, n, off)
+			}
+			if _, err := w.Write(chunk); err != nil {
+				return err
+			}
+			off += uint64(n)
+		}
 	}
 	return nil
 }

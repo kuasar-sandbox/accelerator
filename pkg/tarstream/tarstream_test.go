@@ -3,7 +3,9 @@ package tarstream
 import (
 	stdtar "archive/tar"
 	"bytes"
+	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -11,62 +13,12 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
 )
 
-func TestHolesToExtents(t *testing.T) {
-	ext := func(pairs ...int64) []extent {
-		var out []extent
-		for i := 0; i < len(pairs); i += 2 {
-			out = append(out, extent{pairs[i], pairs[i+1]})
-		}
-		return out
-	}
-	cases := []struct {
-		size   int64
-		holes  []Hole
-		want   []extent
-		sparse bool
-		err    bool
-	}{
-		{size: 100, holes: nil, sparse: false},
-		{size: 100, holes: []Hole{{10, 0}}, sparse: false},
-		{size: 100, holes: []Hole{{0, 100}}, want: nil, sparse: true},
-		{size: 100, holes: []Hole{{0, 40}}, want: ext(40, 60), sparse: true},
-		{size: 100, holes: []Hole{{60, 40}}, want: ext(0, 60), sparse: true},
-		{size: 100, holes: []Hole{{40, 20}}, want: ext(0, 40, 60, 40), sparse: true},
-		{size: 100, holes: []Hole{{60, 20}, {20, 20}}, want: ext(0, 20, 40, 20, 80, 20), sparse: true},
-		{size: 100, holes: []Hole{{20, 20}, {40, 20}}, want: ext(0, 20, 60, 40), sparse: true},
-		{size: 100, holes: []Hole{{20, 30}, {40, 20}}, err: true},
-		{size: 100, holes: []Hole{{90, 20}}, err: true},
-		{size: 100, holes: []Hole{{-1, 5}}, err: true},
-	}
-	for i, c := range cases {
-		got, sparse, err := holesToExtents(c.size, c.holes)
-		if c.err {
-			if err == nil {
-				t.Errorf("case %d: want error", i)
-			}
-			continue
-		}
-		if err != nil {
-			t.Errorf("case %d: %v", i, err)
-			continue
-		}
-		if sparse != c.sparse || len(got) != len(c.want) {
-			t.Errorf("case %d: got %v/%v, want %v/%v", i, got, sparse, c.want, c.sparse)
-			continue
-		}
-		for j := range got {
-			if got[j] != c.want[j] {
-				t.Errorf("case %d: extents %v, want %v", i, got, c.want)
-				break
-			}
-		}
-	}
-}
-
 // fixture: logical 3 MiB — "A"*8K at 0, hole, "B"*4K at 1M, trailing hole.
-func fixture() ([]byte, []Hole) {
+func fixture() ([]byte, []sparse.Extent) {
 	const size = 3 << 20
 	buf := make([]byte, size)
 	for i := range 8192 {
@@ -75,16 +27,20 @@ func fixture() ([]byte, []Hole) {
 	for i := 1 << 20; i < (1<<20)+4096; i++ {
 		buf[i] = 'B'
 	}
-	return buf, []Hole{
-		{8192, (1 << 20) - 8192},
-		{(1 << 20) + 4096, (3 << 20) - ((1 << 20) + 4096)},
+	return buf, []sparse.Extent{
+		{Offset: 8192, Size: (1 << 20) - 8192},
+		{Offset: (1 << 20) + 4096, Size: (3 << 20) - ((1 << 20) + 4096)},
 	}
 }
 
-func mustWrite(t *testing.T, name string, logical []byte, holes []Hole) []byte {
+func mustWrite(t *testing.T, name string, logical []byte, holes []sparse.Extent) []byte {
 	t.Helper()
+	src, err := sparse.NewSource(bytes.NewReader(logical), uint64(len(logical)), holes)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var buf bytes.Buffer
-	if err := WriteTo(&buf, name, bytes.NewReader(logical), holes); err != nil {
+	if err := WriteTo(context.Background(), &buf, name, src); err != nil {
 		t.Fatal(err)
 	}
 	return buf.Bytes()
@@ -414,11 +370,11 @@ func TestDenseEmptyAllHole(t *testing.T) {
 	}
 	// All-hole.
 	all := make([]byte, 1<<20)
-	ts, err = ReadSeekFrom(bytes.NewReader(mustWrite(t, "h", all, []Hole{{0, 1 << 20}})), "h")
+	ts, err = ReadSeekFrom(bytes.NewReader(mustWrite(t, "h", all, []sparse.Extent{{Offset: 0, Size: 1 << 20}})), "h")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ts.Holes()) != 1 || ts.Holes()[0] != (Hole{0, 1 << 20}) {
+	if len(ts.Holes()) != 1 || ts.Holes()[0] != (sparse.Extent{Offset: 0, Size: 1 << 20}) {
 		t.Errorf("all-hole map = %v", ts.Holes())
 	}
 	got, err := io.ReadAll(ts)
@@ -451,12 +407,164 @@ func TestLookupAndNotFound(t *testing.T) {
 
 func TestWriteToValidation(t *testing.T) {
 	var buf bytes.Buffer
-	if err := WriteTo(&buf, "x", bytes.NewReader(make([]byte, 100)), []Hole{{50, 100}}); err == nil {
-		t.Error("out-of-bounds hole must fail")
-	}
-	if err := WriteTo(&buf, "", bytes.NewReader(nil), nil); err == nil {
+	if err := WriteTo(context.Background(), &buf, "", sparse.Dense(bytes.NewReader(nil), 0)); err == nil {
 		t.Error("empty name must fail")
 	}
+}
+
+// zeroRunSource fakes a manifest-backed source: [0,4K) Data 'A',
+// [4K,1M) Zero, [1M,2M) Hole. ReadAt outside the data run is an error
+// — Zero runs must be synthesized by the writer, never read.
+type zeroRunSource struct{}
+
+func (zeroRunSource) Size() uint64 { return 2 << 20 }
+
+func (zeroRunSource) RunAt(off, limit uint64) (sparse.RunKind, uint64, error) {
+	const size = 2 << 20
+	if off >= size {
+		return 0, 0, io.EOF
+	}
+	limEnd := min(off+limit, uint64(size))
+	switch {
+	case off < 4096:
+		return sparse.Data, min(4096, limEnd), nil
+	case off < 1<<20:
+		return sparse.Zero, min(1<<20, limEnd), nil
+	default:
+		return sparse.Hole, limEnd, nil
+	}
+}
+
+func (zeroRunSource) ReadAt(_ context.Context, buf []byte, off uint64) (int, error) {
+	if off+uint64(len(buf)) > 4096 {
+		return 0, fmt.Errorf("unexpected ReadAt [%d,+%d): zero/hole runs must not be read", off, len(buf))
+	}
+	for i := range buf {
+		buf[i] = 'A'
+	}
+	return len(buf), nil
+}
+
+// TestWriteToZeroRuns: Zero runs cross the boundary as data (literal
+// zero bytes on the wire), never as holes; only Hole runs land in the
+// sparse map.
+func TestWriteToZeroRuns(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteTo(context.Background(), &buf, "z", zeroRunSource{}); err != nil {
+		t.Fatal(err)
+	}
+
+	ts, err := ReadSeekFrom(bytes.NewReader(buf.Bytes()), "z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	holes := ts.Holes()
+	if len(holes) != 1 || holes[0] != (sparse.Extent{Offset: 1 << 20, Size: 1 << 20}) {
+		t.Fatalf("holes = %v, want exactly the [1M,2M) hole", holes)
+	}
+	got, err := io.ReadAll(ts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := make([]byte, 2<<20)
+	for i := range 4096 {
+		want[i] = 'A'
+	}
+	if !bytes.Equal(got, want) {
+		t.Error("logical content mismatch (zeros must read back as data)")
+	}
+	// The zero run is stored on the wire: the packed entry must be at
+	// least 1 MiB (4K data + ~1M zeros), proving zeros were not
+	// encoded as holes.
+	if len(buf.Bytes()) < 1<<20 {
+		t.Errorf("archive only %d bytes: zero run was dropped from the wire", buf.Len())
+	}
+}
+
+func TestSourceFrom(t *testing.T) {
+	logical, holes := fixture()
+	archive := mustWrite(t, "img", logical, holes)
+	ctx := context.Background()
+
+	check := func(t *testing.T, src sparse.Source, name string, random bool) {
+		t.Helper()
+		if name != "img" {
+			t.Fatalf("name = %q", name)
+		}
+		if src.Size() != uint64(len(logical)) {
+			t.Fatalf("size = %d", src.Size())
+		}
+		// Run sweep mirrors the hole map; Zero never appears.
+		type run struct {
+			kind sparse.RunKind
+			end  uint64
+		}
+		var runs []run
+		for off := uint64(0); ; {
+			kind, end, err := src.RunAt(off, src.Size())
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("RunAt(%d): %v", off, err)
+			}
+			if kind == sparse.Zero {
+				t.Fatalf("tar source returned Zero at %d", off)
+			}
+			runs = append(runs, run{kind, end})
+			off = end
+		}
+		want := []run{
+			{sparse.Data, 8192},
+			{sparse.Hole, 1 << 20},
+			{sparse.Data, (1 << 20) + 4096},
+			{sparse.Hole, 3 << 20},
+		}
+		if len(runs) != len(want) {
+			t.Fatalf("runs = %v, want %v", runs, want)
+		}
+		for i := range want {
+			if runs[i] != want[i] {
+				t.Fatalf("run[%d] = %v, want %v", i, runs[i], want[i])
+			}
+		}
+
+		// Monotone reads across the data runs.
+		head := make([]byte, 8192)
+		if _, err := src.ReadAt(ctx, head, 0); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(head, logical[:8192]) {
+			t.Fatal("head mismatch")
+		}
+		mid := make([]byte, 4096)
+		if _, err := src.ReadAt(ctx, mid, 1<<20); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(mid, logical[1<<20:(1<<20)+4096]) {
+			t.Fatal("mid mismatch")
+		}
+		// Backward read: random sources serve it, one-pass ones refuse.
+		_, err := src.ReadAt(ctx, head, 0)
+		if random && err != nil {
+			t.Fatalf("random source backward read: %v", err)
+		}
+		if !random && err == nil {
+			t.Fatal("one-pass source accepted a backward read")
+		}
+	}
+
+	src, name, err := SourceFrom(readerOnly{bytes.NewReader(archive)}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Run("one-pass", func(t *testing.T) { check(t, src, name, false) })
+
+	src, name, err = SourceFrom(bytes.NewReader(archive), "img")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Run("random", func(t *testing.T) { check(t, src, name, true) })
 }
 
 // TestReadFromUpgrade: ReadFrom over a seekable source returns a view
@@ -499,7 +607,9 @@ func TestWriteToDeterministic(t *testing.T) {
 	}
 }
 
-func TestProbeHoles(t *testing.T) {
+// TestFileRoundTrip: ProbeHoles + NewSource + WriteTo over a real
+// sparse file round-trips both content and hole map.
+func TestFileRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	if !sparseSupported(t, dir) {
 		t.Skip("filesystem does not keep holes")
@@ -515,21 +625,24 @@ func TestProbeHoles(t *testing.T) {
 	f.WriteAt(logical[1<<20:(1<<20)+4096], 1<<20)
 	f.Truncate(int64(len(logical)))
 
-	got, err := ProbeHoles(f)
+	probed, err := sparse.ProbeHoles(f)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != len(holes) {
-		t.Fatalf("holes = %v, want %v", got, holes)
+	if len(probed) != len(holes) {
+		t.Fatalf("probed holes = %v, want %v", probed, holes)
 	}
 	for i := range holes {
-		if got[i] != holes[i] {
-			t.Fatalf("holes = %v, want %v", got, holes)
+		if probed[i] != holes[i] {
+			t.Fatalf("probed holes = %v, want %v", probed, holes)
 		}
 	}
-	// Offset restored; probe → WriteTo round-trip works directly.
+	src, err := sparse.NewSource(f, uint64(len(logical)), probed)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var buf bytes.Buffer
-	if err := WriteTo(&buf, "img.raw", f, got); err != nil {
+	if err := WriteTo(context.Background(), &buf, "img.raw", src); err != nil {
 		t.Fatal(err)
 	}
 	ts, err := ReadSeekFrom(bytes.NewReader(buf.Bytes()), "")
@@ -540,13 +653,10 @@ func TestProbeHoles(t *testing.T) {
 	if err != nil || !bytes.Equal(all, logical) {
 		t.Errorf("probe→write→read mismatch: %v", err)
 	}
-
-	// Dense file probes to nil.
-	d := filepath.Join(dir, "dense")
-	df, _ := os.Create(d)
-	df.Write(bytes.Repeat([]byte("x"), 8192))
-	defer df.Close()
-	if h, err := ProbeHoles(df); err != nil || h != nil {
-		t.Errorf("dense probe = %v, %v", h, err)
+	gotHoles := ts.Holes()
+	for i := range holes {
+		if gotHoles[i] != holes[i] {
+			t.Fatalf("round-trip holes = %v, want %v", gotHoles, holes)
+		}
 	}
 }

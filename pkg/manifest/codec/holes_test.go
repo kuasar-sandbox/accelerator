@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"testing"
+
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
 )
 
 // TestMarshalUnmarshal_NoHoles_PreservesAADBytes verifies that adding
@@ -54,7 +56,7 @@ func TestMarshalUnmarshal_WithHoles_RoundTrip(t *testing.T) {
 			{Offset: 0, Size: 4096, CiphertextHash: [32]byte{0x11}},
 			{Offset: 4096, Size: 4096, IsZero: true},
 		},
-		Holes: []HoleExtent{
+		Holes: []sparse.Extent{
 			{Offset: 8192, Size: 1<<20 - 8192}, // tail hole
 		},
 	}
@@ -96,7 +98,7 @@ func TestValidateGeometry_RejectsOverlap(t *testing.T) {
 	m := &Manifest{
 		ImageSize: 8192,
 		Entries:   []ChunkEntry{{Offset: 0, Size: 4096}},
-		Holes:     []HoleExtent{{Offset: 2048, Size: 4096}}, // overlaps entry [0, 4096)
+		Holes:     []sparse.Extent{{Offset: 2048, Size: 4096}}, // overlaps entry [0, 4096)
 	}
 	if err := m.ValidateGeometry(); !errors.Is(err, ErrBadGeometry) {
 		t.Fatalf("expected ErrBadGeometry on overlap, got %v", err)
@@ -127,7 +129,7 @@ func TestValidateGeometry_RejectsZeroSize(t *testing.T) {
 	}
 	m2 := &Manifest{
 		ImageSize: 0,
-		Holes:     []HoleExtent{{Offset: 0, Size: 0}},
+		Holes:     []sparse.Extent{{Offset: 0, Size: 0}},
 	}
 	if err := m2.ValidateGeometry(); !errors.Is(err, ErrBadGeometry) {
 		t.Fatalf("zero-size hole: expected ErrBadGeometry, got %v", err)
@@ -138,7 +140,7 @@ func TestValidateGeometry_RejectsZeroSize(t *testing.T) {
 func TestValidateGeometry_AllHoles(t *testing.T) {
 	m := &Manifest{
 		ImageSize: 1 << 30,
-		Holes:     []HoleExtent{{Offset: 0, Size: 1 << 30}},
+		Holes:     []sparse.Extent{{Offset: 0, Size: 1 << 30}},
 	}
 	if err := m.ValidateGeometry(); err != nil {
 		t.Fatalf("all-hole manifest should validate: %v", err)

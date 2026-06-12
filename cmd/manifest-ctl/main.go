@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -15,8 +16,8 @@ import (
 
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/codec"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/ingest"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
@@ -169,7 +170,7 @@ func cmdStore(args []string) {
 	fs := flag.NewFlagSet("store", flag.ExitOnError)
 	extraSalt := fs.String("extra-salt", "", "optional extra-salt bytes mixed with the store-supplied generation salt")
 	noProgress := fs.Bool("no-progress", false, "suppress progress output")
-	detectHoles := fs.Bool("detect-holes", false, "detect filesystem holes in the input via lseek(SEEK_HOLE/SEEK_DATA) and record them as HoleExtents (file input only — ignored for stdin)")
+	detectHoles := fs.Bool("detect-holes", false, "detect filesystem holes in the input via lseek(SEEK_HOLE/SEEK_DATA) and record them as manifest hole extents (file input only — ignored for stdin)")
 	gf := addGlobalFlags(fs)
 	fs.Parse(args)
 	input := fs.Arg(0)
@@ -179,9 +180,10 @@ func cmdStore(args []string) {
 
 	cfg := loadCfg(*gf.configPath)
 
-	// Resolve input + size. Stdin gets buffered to a temp file so the
-	// chunker can stream over io.Reader and so detect-holes can call
-	// lseek on a real fd (no-op for stdin, but consistent).
+	// Resolve the input as a sparse.Source. Stdin is consumed in
+	// memory (one-pass dense source — its byte count is the size);
+	// files are positioned-read in place, with the hole map probed
+	// from filesystem metadata when --detect-holes is set.
 	in, err := openInput(input)
 	if err != nil {
 		fatal("open input: %v", err)
@@ -191,45 +193,42 @@ func cmdStore(args []string) {
 			in.Close()
 		}
 	}()
-	size, err := inputSize(in)
-	if err != nil {
-		fatal("stat input: %v", err)
-	}
+	var (
+		src  sparse.Source
+		size uint64
+	)
 	if in == os.Stdin {
 		data, err := io.ReadAll(in)
 		if err != nil {
 			fatal("read stdin: %v", err)
 		}
 		size = uint64(len(data))
-		tmp, err := os.CreateTemp("", "manifest-ctl-store-*")
-		if err != nil {
-			fatal("create temp: %v", err)
-		}
-		defer os.Remove(tmp.Name())
-		if _, err := tmp.Write(data); err != nil {
-			tmp.Close()
-			fatal("write temp: %v", err)
-		}
-		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-			tmp.Close()
-			fatal("seek temp: %v", err)
-		}
-		in = tmp
-	}
-
-	// Hole detection (regular files only).
-	var detectedHoles []codec.HoleExtent
-	if *detectHoles {
-		if fi, _ := in.Stat(); fi != nil && fi.Mode().IsRegular() {
-			detectedHoles, err = codec.DetectHoles(in, size)
-			if err != nil {
-				fatal("detect holes: %v", err)
-			}
-			if !*noProgress {
-				fmt.Fprintf(os.Stderr, "detected %d hole extent(s) in input\n", len(detectedHoles))
-			}
-		} else {
+		src = sparse.Dense(bytes.NewReader(data), size)
+		if *detectHoles {
 			fmt.Fprintln(os.Stderr, "warn: --detect-holes ignored for non-regular input")
+		}
+	} else {
+		size, err = inputSize(in)
+		if err != nil {
+			fatal("stat input: %v", err)
+		}
+		var holes []sparse.Extent
+		if *detectHoles {
+			if fi, _ := in.Stat(); fi != nil && fi.Mode().IsRegular() {
+				holes, err = sparse.ProbeHoles(in)
+				if err != nil {
+					fatal("detect holes: %v", err)
+				}
+				if !*noProgress {
+					fmt.Fprintf(os.Stderr, "detected %d hole extent(s) in input\n", len(holes))
+				}
+			} else {
+				fmt.Fprintln(os.Stderr, "warn: --detect-holes ignored for non-regular input")
+			}
+		}
+		src, err = sparse.NewSource(in, size, holes)
+		if err != nil {
+			fatal("input source: %v", err)
 		}
 	}
 
@@ -259,8 +258,7 @@ func cmdStore(args []string) {
 	}
 
 	ctx := context.Background()
-	result, err := ing.Ingest(ctx, in, size, ingest.IngestOption{
-		Holes:      detectedHoles,
+	result, err := ing.Ingest(ctx, src, ingest.IngestOption{
 		OnProgress: onProgress,
 	})
 	if err != nil {
@@ -369,7 +367,7 @@ func cmdLoad(args []string) {
 		if rerr != nil { // io.EOF: cur reached image end
 			break
 		}
-		if kind == fetch.Hole {
+		if kind == sparse.Hole {
 			if holeFn == nil {
 				fatal("manifest contains a hole; choose a policy with --hole=zero|punch (default --hole=error rejects)")
 			}
@@ -385,7 +383,7 @@ func cmdLoad(args []string) {
 		spanEnd := runEnd
 		for spanEnd < end {
 			k2, e2, e2err := stream.RunAt(spanEnd, end-spanEnd)
-			if e2err != nil || k2 == fetch.Hole {
+			if e2err != nil || k2 == sparse.Hole {
 				break
 			}
 			spanEnd = e2

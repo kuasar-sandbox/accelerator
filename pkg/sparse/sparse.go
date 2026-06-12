@@ -1,0 +1,306 @@
+// Package sparse defines the platform-wide model for sparse byte
+// sources: a three-state classification (Hole / Zero / Data) over a
+// fixed-size logical image, queried as metadata (RunAt) and read as
+// data (ReadAt).
+//
+// The Source contract separates the two concerns by law:
+//
+//  1. RunAt is a pure metadata query — answerable for any offset at
+//     any time, never consuming data. A source's sparse map is known
+//     up front (filesystem allocation, manifest metadata, tar sparse
+//     map); it is never derived by scanning content.
+//  2. ReadAt's baseline guarantee is monotone consumption: calls at
+//     non-decreasing, non-overlapping offsets. One-pass sources
+//     (pipes, tar streams) are first-class Sources.
+//  3. Consumers call ReadAt only inside Data runs; Hole and Zero runs
+//     are synthesized as zeros by the consumer (ReadAt over them must
+//     still work and yield zeros).
+//  4. Random or concurrent access is not part of this contract.
+//     Consumers that need it require a stronger interface
+//     (manifest/fetch.Stream strengthens ReadAt and RunAt to
+//     concurrent random access).
+//
+// Semantics of the three states:
+//
+//   - Hole: no data anywhere — authoritative absence metadata. In an
+//     overlay it falls through to lower layers; it is restored as a
+//     real hole and never conflated with zero-valued data.
+//   - Zero: data whose bytes are known to be all zero — a read-side
+//     optimization hint, not an on-wire state. Only manifest-backed
+//     sources produce it (IsZero chunks). Consumers may synthesize
+//     zeros instead of calling ReadAt, but every boundary crossing
+//     (tar envelope, chunker) treats it exactly like Data.
+//   - Data: bytes that must be read.
+//
+// Holes only ever come from authoritative metadata. Deriving holes
+// from content (zero scanning) is forbidden platform-wide: written
+// zeros and holes carry different business meanings.
+package sparse
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+)
+
+// Extent is a byte range [Offset, Offset+Size) of the logical image.
+type Extent struct {
+	Offset, Size uint64
+}
+
+// RunKind classifies the content of one run of the logical image.
+type RunKind uint8
+
+const (
+	// Hole: no data — authoritative absence. Falls through in overlays.
+	Hole RunKind = iota
+	// Zero: data known to be all zero — fetch-free read hint; treated
+	// as Data at every boundary.
+	Zero
+	// Data: bytes that must be read.
+	Data
+)
+
+// Source is the platform's sparse byte source. limit in RunAt is a
+// length: the returned run satisfies offset < end <= min(offset+limit,
+// Size()). See the package comment for the contract laws.
+type Source interface {
+	// Size is the total logical image size, holes included.
+	Size() uint64
+
+	// RunAt classifies the content at offset and returns the kind plus
+	// the end of a same-kind run. err == io.EOF iff offset >= Size();
+	// otherwise err == nil and offset < end <= min(offset+limit,
+	// Size()). Run granularity is implementation-defined (a Data run
+	// may end before any state change); callers iterate until io.EOF.
+	RunAt(offset, limit uint64) (kind RunKind, end uint64, err error)
+
+	// ReadAt reads len(buf) bytes from offset:
+	//
+	//	(len(buf), nil)  full read
+	//	(n, io.EOF)      n < len(buf): clipped at Size(); buf[:n] valid
+	//	(0, io.EOF)      offset >= Size()
+	//	(0, err)         transport / source error
+	//
+	// Hole and Zero runs read as zeros. Baseline contract is monotone
+	// single-goroutine use (law 2); implementations may strengthen it.
+	ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error)
+}
+
+// NewSource builds a Source over a random-access image: ra serves the
+// bytes of [0, size) (hole regions, if ever read, must yield zeros —
+// an *os.File over a sparse file does), holes is the authoritative
+// hole map. Holes may be unsorted; zero-size extents are dropped and
+// adjacent extents merge. Overlapping or out-of-bounds holes are an
+// error. The source never returns Zero runs, and is as concurrent-safe
+// as ra.
+func NewSource(ra io.ReaderAt, size uint64, holes []Extent) (Source, error) {
+	normalized, err := normalizeHoles(size, holes)
+	if err != nil {
+		return nil, fmt.Errorf("sparse: %w", err)
+	}
+	return &staticSource{ra: ra, size: size, holes: normalized}, nil
+}
+
+type staticSource struct {
+	ra    io.ReaderAt
+	size  uint64
+	holes []Extent // sorted, merged, disjoint, in bounds
+}
+
+func (s *staticSource) Size() uint64 { return s.size }
+
+func (s *staticSource) RunAt(offset, limit uint64) (RunKind, uint64, error) {
+	if offset >= s.size {
+		return 0, 0, io.EOF
+	}
+	limEnd := offset + limit
+	if limEnd < offset || limEnd > s.size { // overflow or past EOF
+		limEnd = s.size
+	}
+	if h, in := holeAt(s.holes, offset); in {
+		end := h.Offset + h.Size
+		if end > limEnd {
+			end = limEnd
+		}
+		return Hole, end, nil
+	}
+	return Data, nextHoleStart(s.holes, offset, limEnd), nil
+}
+
+func (s *staticSource) ReadAt(_ context.Context, buf []byte, offset uint64) (int, error) {
+	if offset >= s.size {
+		return 0, io.EOF
+	}
+	n := len(buf)
+	var eof error
+	if offset+uint64(n) > s.size {
+		n = int(s.size - offset)
+		eof = io.EOF
+	}
+	m, err := s.ra.ReadAt(buf[:n], int64(offset))
+	if err != nil && err != io.EOF {
+		return m, fmt.Errorf("sparse: read @ %d: %w", offset, err)
+	}
+	if m < n {
+		return m, fmt.Errorf("sparse: short read @ %d: %d of %d bytes", offset, m, n)
+	}
+	return n, eof
+}
+
+// Dense wraps a sequential reader of exactly size bytes as a one-pass
+// Source: a single Data run, ReadAt at monotone offsets (forward gaps
+// are skipped by discarding). A source that ends before size yields
+// io.ErrUnexpectedEOF. Not safe for concurrent use.
+func Dense(r io.Reader, size uint64) Source {
+	return &denseSource{r: r, size: size}
+}
+
+type denseSource struct {
+	r    io.Reader
+	size uint64
+	pos  uint64 // bytes consumed from r
+}
+
+func (s *denseSource) Size() uint64 { return s.size }
+
+func (s *denseSource) RunAt(offset, limit uint64) (RunKind, uint64, error) {
+	if offset >= s.size {
+		return 0, 0, io.EOF
+	}
+	limEnd := offset + limit
+	if limEnd < offset || limEnd > s.size {
+		limEnd = s.size
+	}
+	return Data, limEnd, nil
+}
+
+func (s *denseSource) ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if offset >= s.size {
+		return 0, io.EOF
+	}
+	if offset < s.pos {
+		return 0, fmt.Errorf("sparse: dense source: backward read @ %d (consumed through %d)", offset, s.pos)
+	}
+	if offset > s.pos {
+		if _, err := io.CopyN(io.Discard, s.r, int64(offset-s.pos)); err != nil {
+			return 0, s.short(err)
+		}
+		s.pos = offset
+	}
+	n := len(buf)
+	var eof error
+	if offset+uint64(n) > s.size {
+		n = int(s.size - offset)
+		eof = io.EOF
+	}
+	if _, err := io.ReadFull(s.r, buf[:n]); err != nil {
+		return 0, s.short(err)
+	}
+	s.pos = offset + uint64(n)
+	return n, eof
+}
+
+// short maps an early end of the underlying reader to a hard error:
+// the caller declared size bytes, so a shorter stream is corruption,
+// not EOF.
+func (s *denseSource) short(err error) error {
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return fmt.Errorf("sparse: dense source ended early (declared %d bytes): %w", s.size, io.ErrUnexpectedEOF)
+	}
+	return err
+}
+
+// normalizeHoles validates and canonicalizes a hole map: copy, sort,
+// drop zero-size extents, merge adjacent ones; overlap and
+// out-of-bounds are errors.
+func normalizeHoles(size uint64, holes []Extent) ([]Extent, error) {
+	hs := make([]Extent, 0, len(holes))
+	for _, h := range holes {
+		if h.Size == 0 {
+			continue
+		}
+		end := h.Offset + h.Size
+		if end < h.Offset || end > size {
+			return nil, fmt.Errorf("hole [%d, %d) out of bounds (size %d)", h.Offset, end, size)
+		}
+		hs = append(hs, h)
+	}
+	if len(hs) == 0 {
+		return nil, nil
+	}
+	sortExtents(hs)
+	merged := hs[:1]
+	for _, h := range hs[1:] {
+		last := &merged[len(merged)-1]
+		switch {
+		case h.Offset < last.Offset+last.Size:
+			return nil, errors.New("overlapping holes")
+		case h.Offset == last.Offset+last.Size: // adjacent: merge
+			last.Size += h.Size
+		default:
+			merged = append(merged, h)
+		}
+	}
+	return merged, nil
+}
+
+// sortExtents — insertion sort: extent maps are small and usually
+// already sorted.
+func sortExtents(s []Extent) {
+	for i := 1; i < len(s); i++ {
+		x := s[i]
+		j := i - 1
+		for j >= 0 && s[j].Offset > x.Offset {
+			s[j+1] = s[j]
+			j--
+		}
+		s[j+1] = x
+	}
+}
+
+// holeAt returns the hole extent containing offset, or ok=false. holes
+// is sorted and disjoint. O(log n).
+func holeAt(holes []Extent, offset uint64) (Extent, bool) {
+	lo, hi := 0, len(holes)-1
+	idx := -1
+	for lo <= hi {
+		mid := lo + (hi-lo)/2
+		if holes[mid].Offset <= offset {
+			idx = mid
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	if idx < 0 {
+		return Extent{}, false
+	}
+	if h := holes[idx]; offset < h.Offset+h.Size {
+		return h, true
+	}
+	return Extent{}, false
+}
+
+// nextHoleStart returns the start of the first hole at or after offset
+// (the caller must be in data at offset), clamped to limEnd — used to
+// bound a data run.
+func nextHoleStart(holes []Extent, offset, limEnd uint64) uint64 {
+	lo, hi := 0, len(holes)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if holes[mid].Offset < offset {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo < len(holes) && holes[lo].Offset < limEnd {
+		return holes[lo].Offset
+	}
+	return limEnd
+}
