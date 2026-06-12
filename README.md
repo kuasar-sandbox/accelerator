@@ -11,7 +11,8 @@ rootfs,并在镜像尾部追加运行时配置(STORED-mode ZIP)。是
 | `pkg/image` | **轻量读取面**:`RuntimeConfig` 类型、`ReadConfig`/`AppendConfigZip`/`ReadEROFSSize`、`ExtractRuntimeConfigFromJSON`。供工具与 `sandbox-runtime` 读取/inspect 展平镜像 | 仅 stdlib |
 | `pkg/flatten` | 展平引擎:`Source` 接口 + 确定性 `Build` sink(OCI→EROFS,调用 `mkfs.erofs`)+ `Verify` | `pkg/image`、`internal/util` |
 | `pkg/remote` | **远程拉取面**:registry 拉取 + 平台选择 + env 凭据 + TLS CA 配置 + OCI-layout blob 缓存(并发下载 / 原子写 / LRU 淘汰)+ OCI Referrers 回写与幂等跳过。产出 `flatten.Source` | go-containerregistry、`pkg/flatten` |
-| `cmd/flatten-ctl` | CLI:`export`/`verify`/`info`/`cache`/`config`;`--upload` 经 `sandbox-accelerator/pkg/manifest` ingest 进 store | accelerator SDK、`pkg/remote` |
+| `pkg/tar` | **tar 工具面**:规则化组装/提取 tar 流(`Rule`+`Create`/`Extract`),稀疏保持、重命名、stdio——create=exec GNU tar(≥1.28,`LocateTar` 三级定位),extract=纯 Go 单遍流式;`StreamWriter.WriteSparse` 把已知洞图的内存稀疏流直接发射为 PAX sparse 1.0 条目(纯 Go 真流式) | 仅 stdlib(仅 create 运行期依赖 GNU tar) |
+| `cmd/flatten-ctl` | CLI:`export`(registry/docker-archive/rootfs 目录三源)/`verify`/`info`/`cache`/`config`/`tar`;`--upload` 经 `sandbox-accelerator/pkg/manifest` ingest 进 store | accelerator SDK、`pkg/remote`、`pkg/tar` |
 
 依赖洁净:`sandbox-runtime` 只 import `pkg/image`(stdlib-only,读取镜像内嵌的
 RuntimeConfig);go-containerregistry **只落在 `pkg/remote`**,不进 `pkg/image` /
