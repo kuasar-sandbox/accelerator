@@ -22,8 +22,12 @@ import (
 // Extraction is pure Go and single-pass: the stdlib reader decodes the
 // stream (sparse members of every encoding arrive as their logical
 // bytes) while entries are matched and written on the fly — pipes work
-// with nothing spooled, and no tar binary is involved. Zero runs land
-// as holes whether the archive encoded them or not (CopySparse).
+// with nothing spooled, and no tar binary is involved. Regular files
+// are written dense: zero-valued bytes are data and stay allocated,
+// never inferred into holes; a sparse-encoded member therefore
+// materializes its logical bytes with declared holes downgraded to
+// allocated zeros (the stdlib reader hides the hole map — use
+// ExtractFile for hole-exact single-file restoration).
 // Existing files are replaced. The most specific rule wins per entry
 // (exact file rule, then longest directory prefix). Entries escaping
 // the archive root (..) are skipped with a warning; an entry that
@@ -158,7 +162,7 @@ func (x *extractor) entry(hdr *stdtar.Header) error {
 		if err != nil {
 			return err
 		}
-		if err := CopySparse(f, x.tr, hdr.Size); err != nil {
+		if _, err := io.Copy(f, x.tr); err != nil {
 			f.Close()
 			return fmt.Errorf("extract %s: %w", name, err)
 		}

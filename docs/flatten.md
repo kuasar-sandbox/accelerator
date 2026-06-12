@@ -358,11 +358,19 @@ tar 工具面,两个方向都是**纯 Go、零 tar 二进制依赖**:
 
 ```
 flatten-ctl tar extract [-f tarfile] [--chown u:g] [--chmod 755] [规则...]
-flatten-ctl tar stream  [-f tarfile] [tar内名[:源]]
+flatten-ctl tar stream  [-f tarfile] [--size N] [tar内名[:源]]
 ```
 
-**extract** 从任意 tar 流取文件:对输入单遍流式(stdlib 解码,管道零落盘),
-稀疏成员与稠密零段一律落成空洞;`..` 成员跳过告警,穿 symlink 写出是硬错误;
+稀疏语义铁律(全平台一致):**零值字节是数据、空洞是缺失,二者业务含义不同,
+永不互转**——洞只来自权威元数据(文件系统 SEEK_HOLE、tar sparse map),
+绝不从内容零扫描推导。
+
+**extract** 从任意 tar 流取文件:对输入单遍流式(stdlib 解码,管道零落盘)。
+常规文件**致密落盘**(数据段里的零保持已分配,不打洞);**单条显式文件规则**
+(`成员[:目标文件]`)走 tarstream 视图做**声明洞精确还原**——只 punch sparse
+map 声明的洞,洞图逐字节往返(成员实为目录等情形:`-f` 文件输入自动回退通用
+引擎重读,stdin 单遍不可回退、报错引导)。目录树解包中的稀疏成员按逻辑字节
+致密落盘(stdlib 不暴露洞图)。`..` 成员跳过告警,穿 symlink 写出是硬错误;
 条目命中多条规则时最具体者胜。规则 = `tar内路径[:外部路径]`:
 
 | 形式 | 含义 |
@@ -378,9 +386,11 @@ flatten-ctl tar stream  [-f tarfile] [tar内名[:源]]
 不给规则取全部到当前目录;`--chown/--chmod` 改写每个落盘条目的属主/权限。
 
 **stream** 把**一个文件**封装为 tarstream(单文件稀疏 tar,
-`sandbox-accelerator/pkg/tarstream`),稀疏自动检测——文件源经 SEEK_HOLE 探洞,
-stdin 源先落临时文件并按零段打洞(tar 头先含 size,一次性流长度未知,这是格式
-下界;tmpdir 经 `--config` 可配)。参数 = `tar内名[:源]`:
+`sandbox-accelerator/pkg/tarstream`)。文件源的洞图来自文件系统元数据
+(SEEK_HOLE),稀疏保真;stdin 源**必须给 `--size N`**(tar 头先含 size,这是
+格式下界),全程直通、**零落盘**,按致密封装(一次性流没有权威洞元数据,
+也不做内容探洞)。`--size` 仅限 stdin 源(文件长度以文件系统为准)。
+参数 = `tar内名[:源]`:
 
 | 形式 | 含义 |
 |---|---|
@@ -394,19 +404,20 @@ stdin 源先落临时文件并按零段打洞(tar 头先含 size,一次性流长
 map 字节,不占流量。
 
 ```bash
-# 稀疏快照盘 → tarstream → 异地还原(空洞全程保持;16G 逻辑/100M 数据只传 ~100M)
+# 稀疏快照盘 → tarstream → 异地还原(声明洞全程精确保持;16G 逻辑/100M 数据只传 ~100M)
 flatten-ctl tar stream -f snap.tar /var/lib/sandbox/disks/overlay.img
 flatten-ctl tar extract -f snap.tar "overlay.img:/restore/overlay.img"
 
-# 管道对管道:生成器 → tarstream → 提取(stdin 源经零段检测自动稀疏化)
-gen-disk | flatten-ctl tar stream disk.img:- | flatten-ctl tar extract disk.img:-
+# 管道对管道:生成器 → tarstream → 提取(stdin 源给定长度,全程零落盘)
+gen-disk | flatten-ctl tar stream --size $((16<<20)) disk.img:- | flatten-ctl tar extract disk.img:-
 
 # 程序化读写(含洞图精确取回、tar 内随机访问)见 sandbox-accelerator/pkg/tarstream
 ```
 
-编程接口:size 与洞图已知的调用方不需要 stdin 落盘下界——
-`sandbox-accelerator/pkg/tarstream` 的 `WriteTo`/`ReadFrom`/`ReadSeekFrom`/
-`ProbeHoles`(洞图精确往返、tar 内零拷贝随机访问),本仓与各下游仓均可 import。
+编程接口:`sandbox-accelerator/pkg/tarstream` 的 `WriteTo`(吃任意
+`sparse.Source`)/`ReadFrom`/`ReadSeekFrom`(洞图精确往返、tar 内零拷贝随机
+访问)/`SourceFrom`(tar 流直接开成 `sparse.Source`,可直通 manifest ingest
+等管线消费者),本仓与各下游仓均可 import。
 
 ## 3. 镜像格式
 

@@ -3,6 +3,7 @@ package tar
 import (
 	stdtar "archive/tar"
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/tarstream"
 )
 
@@ -210,15 +212,30 @@ func TestExtractChownToSelf(t *testing.T) {
 	}
 }
 
-func mkSparseLogical() ([]byte, []tarstream.Hole) {
+func mkSparseLogical() ([]byte, []sparse.Extent) {
 	const size = 3 << 20
 	buf := make([]byte, size)
 	copy(buf, "head")
 	copy(buf[1<<20:], "middle")
-	return buf, []tarstream.Hole{
-		{Offset: 4096, Length: (1 << 20) - 4096},
-		{Offset: (1 << 20) + 4096, Length: (3 << 20) - ((1 << 20) + 4096)},
+	return buf, []sparse.Extent{
+		{Offset: 4096, Size: (1 << 20) - 4096},
+		{Offset: (1 << 20) + 4096, Size: (3 << 20) - ((1 << 20) + 4096)},
 	}
+}
+
+// mkTarstream packages the logical bytes + hole map as a tarstream
+// archive (the writer reads only the data extents).
+func mkTarstream(t *testing.T, name string, logical []byte, holes []sparse.Extent) []byte {
+	t.Helper()
+	src, err := sparse.NewSource(bytes.NewReader(logical), uint64(len(logical)), holes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := tarstream.WriteTo(context.Background(), &buf, name, src); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
 }
 
 func sparseSupported(t *testing.T, dir string) bool {
@@ -238,21 +255,17 @@ func sparseSupported(t *testing.T, dir string) bool {
 	return st.Blocks*512 < 1<<20
 }
 
-// TestExtractSparseFromTarstream: a tarstream-encoded sparse member
-// extracts with its holes back on disk.
+// TestExtractSparseFromTarstream: the generic engine materializes a
+// sparse member's logical bytes DENSE — declared holes downgrade to
+// allocated zeros (the stdlib reader hides the hole map; hole-exact
+// restoration is ExtractFile's job).
 func TestExtractSparseFromTarstream(t *testing.T) {
 	dir := t.TempDir()
-	if !sparseSupported(t, dir) {
-		t.Skip("filesystem does not keep holes")
-	}
 	logical, holes := mkSparseLogical()
-	var buf bytes.Buffer
-	if err := tarstream.WriteTo(&buf, "disk/img.raw", bytes.NewReader(logical), holes); err != nil {
-		t.Fatal(err)
-	}
+	archive := mkTarstream(t, "disk/img.raw", logical, holes)
 
 	out := filepath.Join(dir, "out.raw")
-	if err := Extract(bytes.NewReader(buf.Bytes()), []Rule{{Tar: "disk/img.raw", FS: out}}, Options{}); err != nil {
+	if err := Extract(bytes.NewReader(archive), []Rule{{Tar: "disk/img.raw", FS: out}}, Options{}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(out)
@@ -266,16 +279,71 @@ func TestExtractSparseFromTarstream(t *testing.T) {
 	if err := syscall.Stat(out, &st); err != nil {
 		t.Fatal(err)
 	}
-	if st.Blocks*512 >= int64(len(logical)) {
-		t.Errorf("extracted dense: %d blocks", st.Blocks)
+	if st.Blocks*512 < int64(len(logical)) {
+		t.Errorf("engine extraction must be dense (no inferred holes): %d blocks", st.Blocks)
 	}
 }
 
-func TestDenseZerosBecomeHoles(t *testing.T) {
+// TestExtractFileExactHoles: ExtractFile restores exactly the DECLARED
+// holes — sparse on disk, hole map round-tripped — for both the
+// seekable and the one-pass view.
+func TestExtractFileExactHoles(t *testing.T) {
 	dir := t.TempDir()
 	if !sparseSupported(t, dir) {
 		t.Skip("filesystem does not keep holes")
 	}
+	logical, holes := mkSparseLogical()
+	archive := mkTarstream(t, "disk/img.raw", logical, holes)
+
+	for _, tc := range []struct {
+		name string
+		in   io.Reader
+	}{
+		{"seek", bytes.NewReader(archive)},
+		{"sequential", struct{ io.Reader }{bytes.NewReader(archive)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v, err := tarstream.ReadFrom(tc.in, "disk/img.raw")
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := filepath.Join(dir, tc.name+".raw")
+			if err := ExtractFile(v, out, Options{}); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, logical) {
+				t.Error("content mismatch")
+			}
+			f, err := os.Open(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			probed, err := sparse.ProbeHoles(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(probed) != len(holes) {
+				t.Fatalf("restored holes = %v, want %v", probed, holes)
+			}
+			for i := range holes {
+				if probed[i] != holes[i] {
+					t.Fatalf("restored holes = %v, want %v", probed, holes)
+				}
+			}
+		})
+	}
+}
+
+// TestDenseZerosStayAllocated: zero-valued bytes in a tar are DATA —
+// extraction must keep them allocated, never punching them into holes
+// (written zeros and holes carry different meanings).
+func TestDenseZerosStayAllocated(t *testing.T) {
+	dir := t.TempDir()
 	var buf bytes.Buffer
 	tw := stdtar.NewWriter(&buf)
 	payload := make([]byte, 256<<10)
@@ -292,12 +360,19 @@ func TestDenseZerosBecomeHoles(t *testing.T) {
 	if err := Extract(bytes.NewReader(buf.Bytes()), []Rule{{Tar: "z.bin", FS: out}}, Options{}); err != nil {
 		t.Fatal(err)
 	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Error("content mismatch")
+	}
 	var st syscall.Stat_t
 	if err := syscall.Stat(out, &st); err != nil {
 		t.Fatal(err)
 	}
-	if st.Blocks*512 >= int64(len(payload)) {
-		t.Errorf("zero run not punched: %d blocks", st.Blocks)
+	if st.Blocks*512 < int64(len(payload)) {
+		t.Errorf("dense zeros were punched into holes: %d blocks", st.Blocks)
 	}
 }
 

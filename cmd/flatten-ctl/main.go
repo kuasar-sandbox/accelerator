@@ -248,7 +248,7 @@ func cmdExport(args []string) {
 	}
 
 	mcfg := loadManifestCfg(*manifestCfg)
-	key, err := ingestEROFS(outPath, info.Size(), mcfg, *noProgress)
+	key, err := ingestEROFS(outPath, mcfg, *noProgress)
 	if err != nil {
 		fatal("%v", err)
 	}
@@ -357,20 +357,20 @@ func runRemoteFlatten(ref, outputPath string, cfg *remote.Config, printDigest, n
 // ingestEROFS uploads the EROFS at path into the content store via the
 // manifest ingester and returns the hex manifest key. Shared by the plain
 // --upload tail and the --with-referer flow.
-func ingestEROFS(path string, size int64, mcfg *manifest.Config, noProgress bool) (string, error) {
+func ingestEROFS(path string, mcfg *manifest.Config, noProgress bool) (string, error) {
 	ing, err := mcfg.NewIngester(mcfg.IngestKeyFunc(), nil)
 	if err != nil {
 		return "", fmt.Errorf("ingester: %w", err)
 	}
 	defer ing.Close()
 
-	in, err := os.Open(path)
+	src, err := fetch.OpenFileStream(path)
 	if err != nil {
 		return "", fmt.Errorf("re-open output for upload: %w", err)
 	}
-	defer in.Close()
+	defer src.Close()
 
-	res, err := ing.Ingest(context.Background(), in, uint64(size), ingest.IngestOption{
+	res, err := ing.Ingest(context.Background(), src, ingest.IngestOption{
 		OnProgress: byteProgress(!noProgress, "erofs"),
 	})
 	if err != nil {
@@ -457,7 +457,7 @@ func runReferrerExport(ref string, rcfg *remote.Config, manifestCfgPath string, 
 		fmt.Fprintf(os.Stderr, "EROFS image: %s\n", formatSize(info.Size()))
 	}
 
-	key, err := ingestEROFS(tmpOut.Name(), info.Size(), mcfg, noProgress)
+	key, err := ingestEROFS(tmpOut.Name(), mcfg, noProgress)
 	if err != nil {
 		fatal("%v", err)
 	}

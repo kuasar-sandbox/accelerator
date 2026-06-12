@@ -1,10 +1,12 @@
 // Package tar extracts files from tar streams: pure Go, single pass
 // over any io.Reader (the stdlib reader decodes every sparse encoding
 // into logical bytes), entries matched and materialized on the fly —
-// pipes need no spooling and no tar binary is involved. Zero runs land
-// as holes whether the archive encoded them or not. Selection and
-// renaming use Rules: left side = in-tar path, right side = filesystem
-// path, or "-" for the process stdout.
+// pipes need no spooling and no tar binary is involved. Regular files
+// are written dense: zero-valued bytes are data and stay allocated,
+// never inferred into holes. Selection and renaming use Rules: left
+// side = in-tar path, right side = filesystem path, or "-" for the
+// process stdout. ExtractFile restores one located member with exact
+// sparse fidelity (only the archive's DECLARED holes are punched).
 //
 // Producing tar streams is out of scope here: single sparse files
 // travel via sandbox-accelerator/pkg/tarstream (WriteTo/ReadFrom).
