@@ -8,12 +8,16 @@ import (
 
 var ErrNotFound = errors.New("store: not found")
 
-// Partition distinguishes chunk vs manifest storage.
+// Partition distinguishes chunk, manifest, and blob storage.
 type Partition string
 
 const (
 	PartitionChunk    Partition = "chunk"
 	PartitionManifest Partition = "manifest"
+	// PartitionBlob holds arbitrary content-addressed data. It is handled
+	// identically to chunk/manifest (SHA256 key, generation scope, dedup);
+	// the separate partition exists purely for logical isolation.
+	PartitionBlob Partition = "blob"
 )
 
 // ContentKey is the content-addressed key for stored objects.

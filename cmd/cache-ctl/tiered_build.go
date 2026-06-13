@@ -10,7 +10,6 @@ import (
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/ec"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/rocks"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/runtime"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/server"
 )
 
 // parseDurationOrDefault parses a Go duration string and falls back to
@@ -39,7 +38,7 @@ type tieredComponents struct {
 	// refs (rocks.Store / ec.Tier / upstream endpoint) for the Info
 	// gRPC service to produce per-tier detail. Populated in lockstep
 	// with Tiers inside the build loop.
-	TierSpecs []server.TierSpec
+	TierSpecs []TierSpec
 
 	// EmbeddedStore is the embedded RocksDB store if the chain contains
 	// a `type: embedded` tier, otherwise nil. The Info gRPC service
@@ -104,7 +103,7 @@ func buildTieredChain(cfg *runtime.Config, blobPool cache.BlobPool) (*tieredComp
 			comps.EmbeddedStore = store
 			// rocks.Interface implements cache.Tier directly — no wrapper.
 			comps.Tiers = append(comps.Tiers, store)
-			comps.TierSpecs = append(comps.TierSpecs, server.TierSpec{
+			comps.TierSpecs = append(comps.TierSpecs, TierSpec{
 				Type:          "embedded",
 				EmbeddedStore: store,
 			})
@@ -132,7 +131,7 @@ func buildTieredChain(cfg *runtime.Config, blobPool cache.BlobPool) (*tieredComp
 			}
 			closers = append(closers, ecTier.Close)
 			comps.Tiers = append(comps.Tiers, ecTier)
-			comps.TierSpecs = append(comps.TierSpecs, server.TierSpec{
+			comps.TierSpecs = append(comps.TierSpecs, TierSpec{
 				Type: "ec",
 				EC:   ecTier,
 			})
@@ -157,7 +156,7 @@ func buildTieredChain(cfg *runtime.Config, blobPool cache.BlobPool) (*tieredComp
 			}
 			closers = append(closers, c.Close)
 			comps.Tiers = append(comps.Tiers, c)
-			comps.TierSpecs = append(comps.TierSpecs, server.TierSpec{
+			comps.TierSpecs = append(comps.TierSpecs, TierSpec{
 				Type:       "upstream",
 				UpstreamEP: t.Endpoint,
 				Upstream:   c,

@@ -10,8 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/freq"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/runtime"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 	grocksdb "github.com/linxGnu/grocksdb"
 )
 
@@ -25,6 +27,40 @@ func tempRocksConfigT(t *testing.T) runtime.RocksConfig {
 		DiskBytes: "64MiB",
 		MemRatio:  0.1,
 		BloomBits: 10,
+	}
+}
+
+// TestBlobCF proves the blob partition gets its own column family
+// (cfBlob), round-trips through the public Get/Fill, and is isolated
+// from the chunk CF — i.e. partitionToCF(PartitionBlob) == cfBlob.
+func TestBlobCF(t *testing.T) {
+	s, err := openImpl(tempRocksConfigT(t), runtime.FreqConfig{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	ctx := context.Background()
+	k := store.ContentKey(sha256.Sum256([]byte("blob-cf-test")))
+	data := []byte("blob value in its own CF")
+
+	if err := s.Fill(ctx, store.PartitionBlob, k, data); err != nil {
+		t.Fatalf("Fill(blob): %v", err)
+	}
+	res, blob, err := s.Get(ctx, store.PartitionBlob, k)
+	if err != nil || res != cache.CacheHit {
+		t.Fatalf("Get(blob): res=%v err=%v", res, err)
+	}
+	if string(blob.Bytes()) != string(data) {
+		t.Fatalf("Get(blob): got %q want %q", blob.Bytes(), data)
+	}
+	blob.Release()
+
+	// Isolation: the same key under chunk is a miss (separate CF).
+	if res2, _, _ := s.Get(ctx, store.PartitionChunk, k); res2 == cache.CacheHit {
+		t.Fatal("blob Fill must not be visible under the chunk CF")
+	}
+	// The blob CF must actually have been opened.
+	if _, ok := s.cfh[cfBlob]; !ok {
+		t.Fatal("cfBlob column family was not opened")
 	}
 }
 

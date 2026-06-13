@@ -102,6 +102,9 @@ socket 路径(`/run/sandbox/store.sock` 或 `unix:///run/sandbox/store.sock`)—
 即可(裸路径或 `unix:///` 形式皆可,见 manifest.md §3)。active generation 在
 daemon 生命周期内**不变**,换代见 §2.5。
 
+yaml 若设了 `cache_listen`(§3.4),serve 还会在该地址额外起一个**只读** cache
+wire server(§4.7),让用 cache 客户端的组件经 wire 协议直读 store 内容。
+
 ### 2.5 `store-ctl rollout`
 
 ```
@@ -138,7 +141,7 @@ store-ctl info --config FILE
 - root / bucket+prefix
 - active generation
 - generations 列表
-- 每代的 chunk / manifest 对象数
+- 每代的 chunk / manifest / blob 对象数
 
 ### 2.8 `store-ctl config`
 
@@ -157,6 +160,7 @@ store-ctl config generate
 listen: 127.0.0.1:7100
 backend: fs
 stats_interval: 30s              # 周期自适应统计行(§5.7);缺省 30s,"0"/"off" 关闭
+cache_listen: ""                 # 可选:非空则额外起只读 cache wire server(§3.4 / §4.7)
 fs:
   root: /var/store               # 文件系统根目录(必填,init 时创建结构)
   verify_content_key: true       # 默认 true
@@ -202,6 +206,27 @@ obs:
 - `false`:服务端信任客户端的 key,跳过 hash 重算;仅适合受信批量加载,
   不推荐生产常开。
 
+### 3.4 cache_listen
+
+可选(缺省空 = 关闭)。非空时,`serve` 在该地址(`host:port` 或 Unix socket,
+解析规则同 `listen`)额外起一个**只读 cache wire server**:直接以
+[`cache.md`](cache.md) §4.2 的二进制 wire 协议对外服务 chunk / manifest / blob
+三个 partition 的对象读,数据直取后端——让用 cache 客户端的组件无需单独部署
+cache-ctl 就能读到 store 内容。
+
+```yaml
+listen: 127.0.0.1:7100
+backend: fs
+cache_listen: 127.0.0.1:7101     # cache wire 协议(只读);与 listen 同解析规则
+fs:
+  root: /var/store
+```
+
+只读:`ObjectPut` 与所有 shard 操作一律拒绝(`writes not supported`);写仍走
+store gRPC。它是**纯透传**——无 L1 缓存,每次 Get 直达后端;要收敛延迟仍按
+§5.3 部署 cache-ctl tiered 以本 store 为 origin。设计细节见 §4.7。不引入额外
+配置:idle / rpc 超时取固定默认(120s idle、无 per-rpc deadline)。
+
 ## 4. 设计
 
 ### 4.1 总体架构
@@ -222,10 +247,11 @@ obs:
 
 数据面与运维面分离:
 
-- **数据面**:`serve` 在单个 `listen:` 端口上只注册 Store 这一个 gRPC 服务,
-  含 `Put`(客户端流)/ `Get`(服务端流)/ `GetSalt`,manifest-ctl / cache-ctl
-  作为 gRPC 客户端连接;**没有**独立的 health listener(store-ctl 无
-  `health_listen` 字段);
+- **数据面**:`serve` 在 `listen:` 端口注册 Store 这一个 gRPC 服务,含
+  `Put`(客户端流)/ `Get`(服务端流)/ `GetSalt`,manifest-ctl / cache-ctl
+  作为 gRPC 客户端连接;设了 `cache_listen` 时再在该端口起一个**只读** cache
+  wire server(§4.7)——两者都是数据面。**没有**独立的 health listener
+  (store-ctl 无 `health_listen` 字段);
 - **运维面**:admin 子命令直接打开后端,**不**经过 gRPC,与运行中的 serve
   共存(读同一份 meta)。
 
@@ -258,10 +284,18 @@ admin 操作(`Rollout` / `Drop` / `Wipe` / `GenerationStats`)是 Store 类型上
 │   │   ├── a1/b2/a1b2c3...    ← 文件名 = lowercase-hex(SHA256(client bytes))
 │   │   └── ...
 │   └── G2/
-└── manifest/
+├── manifest/
+│   ├── G1/
+│   └── G2/
+└── blob/
     ├── G1/
     └── G2/
 ```
+
+`chunk` / `manifest` / `blob` 是三个**内容寻址 partition**,机制完全一致
+(同一 ContentKey 寻址、generation 分代、dedup、verify),仅作逻辑隔离:
+`chunk` / `manifest` 由 manifest-ctl 写入,`blob` 复用同一 store API 存任意
+内容寻址数据(经 store gRPC 写;读经 store gRPC 或 §4.7 的 cache wire)。
 
 **ContentKey** = `SHA256(bytes-as-submitted-by-client)`,**没有 salt 参与
 寻址**。dedup 仍天然成立——客户端的 convergent encryption 用 store-ctl
@@ -283,6 +317,7 @@ admin 操作(`Rollout` / `Drop` / `Wipe` / `GenerationStats`)是 Store 类型上
 <bucket>/<prefix>/__meta/generations
 <bucket>/<prefix>/chunk/<gen>/<aa>/<bb>/<hash>
 <bucket>/<prefix>/manifest/<gen>/<aa>/<bb>/<hash>
+<bucket>/<prefix>/blob/<gen>/<aa>/<bb>/<hash>
 ```
 
 **写入路径**:obs 没有"流式 Put + atomic rename"原语,改用"内存缓冲 + 单
@@ -326,7 +361,7 @@ obs 后端的 endpoint / access_key / secret_key 三档退化:
 ### 4.6 Generation 模型
 
 generation 是 store 内部的代次划分:**同代去重、跨代不共享**。每个
-chunk / manifest 对象按 `<partition>/<gen>/...` 路径存,active generation
+chunk / manifest / blob 对象按 `<partition>/<gen>/...` 路径存,active generation
 是新写入的目标,旧 generation 仍可被反向 Get 找到。
 
 `__meta/generations` 是 source of truth,文本文件(fs)或对象(obs):
@@ -360,6 +395,27 @@ return not found
 `Exists`(用于写路径上的 dedup short-circuit)**不**做反向扫描——只看
 active 路径。在旧代存在不算 dedup(因为旧代会被 purge,留下来的引用就
 dangling)。
+
+### 4.7 内嵌只读 cache wire server(`cache_listen`)
+
+store-ctl 默认只讲 store gRPC。设了 `cache_listen`(§3.4)后,它在该端口**额外**
+起一个 cache wire server——直接讲 [`cache.md`](cache.md) §4.2 的二进制 wire 协议,
+与 cache-ctl 的数据面同一套。于是任何用 cache 客户端的组件都能从 store-ctl 直读
+内容,前面无需再架一台 cache-ctl。
+
+- **复用而非另写**:wire server 取 `pkg/cache/server` 的 `WireServer` +
+  `CacheHandler`(该包已与 rocks 解耦、纯 Go,store-ctl 仍 `CGO_ENABLED=0`);
+  后端经 `cache.NewStoreOrigin(backend)` 包成 `cache.Getter`,进程内直连,无回环
+  gRPC。
+- **只读**:外面再裹一层拒写 Tier——`ObjectGet` 透传到后端,`ObjectPut` 与所有
+  shard 操作回 `writes not supported`。写入仍只经 store gRPC,单写者语义不变。
+- **三 partition**:wire Namespace `0x01/0x02/0x03` 映射 chunk / manifest / blob,
+  与 store gRPC 服务的对象集一致。
+- **纯透传**:无 L1 缓存,每次 `ObjectGet` 直达后端(fs stat+read / obs GET)。
+  要收敛延迟仍按 §5.3 部署 cache-ctl tiered 以本 store 为 origin——`cache_listen`
+  解决的是"少一个进程也能讲 cache 协议",不是缓存。
+- **零额外配置**:idle / rpc 超时用固定默认(120s idle、无 per-rpc deadline),
+  不新增 YAML 旋钮。
 
 ## 5. 部署与运维
 
@@ -421,7 +477,9 @@ make test-e2e        # = test-e2e-cache + test-e2e-cluster(fs 后端全链路)
 ```
 
 `test/e2e/e2e_cache.sh` 以 fs 后端 store-ctl 为 sidecar,覆盖 manifest-ctl ↔
-cache-ctl(local / shard / tiered)↔ store-ctl 全链路;`e2e_cluster_rolling.sh`
+cache-ctl(local / shard / tiered)↔ store-ctl 全链路;`e2e_store_cache_listen.sh`
+单独验证 store-ctl 的 `cache_listen` 只读 wire 服务(manifest 经 cache 协议字节级
+比对 store gRPC、blob namespace 路由、拒写);`e2e_cluster_rolling.sh`
 验证 EC 集群 SIGHUP 滚动换 peer 后读全部成功、且不穿透 store-ctl origin。
 obs 后端无独立 e2e:凭据发现 / 签名 / meta CAS 由 `pkg/store/obs` 单元测试
 (内置 fake S3)覆盖。

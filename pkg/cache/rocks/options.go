@@ -1,17 +1,18 @@
 package rocks
 
 import (
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/runtime"
 	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/runtime"
 	grocksdb "github.com/linxGnu/grocksdb"
 )
 
 // OpenOptions holds resolved RocksDB options ready for Open.
 type OpenOptions struct {
-	DBOpts    *grocksdb.Options
-	ChunkCF   *grocksdb.Options
+	DBOpts     *grocksdb.Options
+	ChunkCF    *grocksdb.Options
 	ManifestCF *grocksdb.Options
-	BBTOpts   *grocksdb.BlockBasedTableOptions
+	BlobCF     *grocksdb.Options
+	BBTOpts    *grocksdb.BlockBasedTableOptions
 }
 
 // BuildOptions creates RocksDB options from a runtime.RocksConfig.
@@ -81,7 +82,7 @@ func BuildOptions(cfg runtime.RocksConfig) *OpenOptions {
 	dbOpts.SetMaxBackgroundCompactions(maxJobs)
 	dbOpts.SetMaxBackgroundFlushes(2)
 
-	// BlobDB on both chunk and manifest CFs.
+	// BlobDB on chunk, manifest, and blob CFs.
 	//
 	// chunk values are ~256 KiB typical (one FastCDC block), manifest
 	// values range from a few KiB (metadata + sealed key table) to
@@ -97,7 +98,7 @@ func BuildOptions(cfg runtime.RocksConfig) *OpenOptions {
 	// unaffected and still costs exactly one IO to fetch.
 	applyBlobDB := func(o *grocksdb.Options) {
 		o.EnableBlobFiles(true)
-		o.SetMinBlobSize(4 << 10)   // 4 KiB inline threshold
+		o.SetMinBlobSize(4 << 10)    // 4 KiB inline threshold
 		o.SetBlobFileSize(256 << 20) // 256 MiB per blob file
 		o.EnableBlobGC(true)         // background reclamation of stale blobs
 	}
@@ -112,10 +113,16 @@ func BuildOptions(cfg runtime.RocksConfig) *OpenOptions {
 	manifestOpts.SetCompression(grocksdb.NoCompression)
 	applyBlobDB(manifestOpts)
 
+	blobOpts := grocksdb.NewDefaultOptions()
+	blobOpts.SetBlockBasedTableFactory(bbto)
+	blobOpts.SetCompression(grocksdb.NoCompression)
+	applyBlobDB(blobOpts)
+
 	return &OpenOptions{
 		DBOpts:     dbOpts,
 		ChunkCF:    chunkOpts,
 		ManifestCF: manifestOpts,
+		BlobCF:     blobOpts,
 		BBTOpts:    bbto,
 	}
 }

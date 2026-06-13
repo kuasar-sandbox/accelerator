@@ -255,6 +255,8 @@ func wireNSToPartition(ns byte) store.Partition {
 	switch ns {
 	case wire.NSManifest:
 		return store.PartitionManifest
+	case wire.NSBlob:
+		return store.PartitionBlob
 	default:
 		return store.PartitionChunk
 	}

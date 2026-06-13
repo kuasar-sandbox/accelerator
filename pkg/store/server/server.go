@@ -237,6 +237,8 @@ func protoPartitionToStore(p pb.Partition) (store.Partition, error) {
 		return store.PartitionChunk, nil
 	case pb.Partition_PARTITION_MANIFEST:
 		return store.PartitionManifest, nil
+	case pb.Partition_PARTITION_BLOB:
+		return store.PartitionBlob, nil
 	default:
 		return "", errors.New("unknown partition")
 	}

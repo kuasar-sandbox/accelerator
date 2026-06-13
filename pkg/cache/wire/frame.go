@@ -45,6 +45,7 @@ const (
 const (
 	NSChunk    byte = 0x01
 	NSManifest byte = 0x02
+	NSBlob     byte = 0x03
 )
 
 // Frame size constants.

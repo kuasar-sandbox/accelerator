@@ -188,7 +188,7 @@ func cmdServe(args []string) {
 	// tiered state captured during mode == "tiered" construction, consumed
 	// below when wiring the Info gRPC service.
 	var tieredCache *cache.TieredCache
-	var originSpec *server.OriginSpec
+	var originSpec *OriginSpec
 
 	switch cfg.Mode {
 	case "local", "shard":
@@ -254,7 +254,7 @@ func cmdServe(args []string) {
 			}
 			defer originStore.Close()
 			origin = cache.NewOriginAdapter(cache.NewStoreOrigin(originStore), maxInflight)
-			originSpec = &server.OriginSpec{Type: "store", Endpoint: sc.Endpoint}
+			originSpec = &OriginSpec{Type: "store", Endpoint: sc.Endpoint}
 		case "upstream":
 			uc := cfg.Origin.Upstream
 			pool := uc.Pool
@@ -277,7 +277,7 @@ func cmdServe(args []string) {
 			}
 			defer originClient.Close()
 			origin = cache.NewOriginAdapter(originClient, maxInflight)
-			originSpec = &server.OriginSpec{Type: "upstream", Endpoint: uc.Endpoint}
+			originSpec = &OriginSpec{Type: "upstream", Endpoint: uc.Endpoint}
 		default:
 			fatal("unknown origin.type: %q", cfg.Origin.Type)
 		}
@@ -319,7 +319,7 @@ func cmdServe(args []string) {
 		hsrv := server.RegisterHealth(grpcServer)
 		healthSrv = hsrv
 
-		infoSrv := server.NewInfoServer(cfg.Mode, handler)
+		infoSrv := NewInfoServer(cfg.Mode, handler)
 		if tieredCache != nil {
 			infoSrv.SetTiered(tieredCache, tieredComps.TierSpecs, originSpec)
 		}

@@ -53,7 +53,7 @@ func cmdInfo(args []string) {
 			fmt.Printf("  %s: error: %v\n", gen, err)
 			continue
 		}
-		fmt.Printf("  %s: chunk=%d manifest=%d\n",
-			gen, stats[store.PartitionChunk], stats[store.PartitionManifest])
+		fmt.Printf("  %s: chunk=%d manifest=%d blob=%d\n",
+			gen, stats[store.PartitionChunk], stats[store.PartitionManifest], stats[store.PartitionBlob])
 	}
 }

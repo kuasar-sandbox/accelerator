@@ -65,6 +65,17 @@ func cmdServe(args []string) {
 	errCh := make(chan error, 1)
 	go func() { errCh <- gs.Serve(lis) }()
 
+	// Optional embedded read-only cache wire server (cache_listen): serves
+	// cache-protocol reads straight from the backend so cache clients can
+	// reach store content without a separate cache-ctl. Disabled when empty.
+	var stopCache func()
+	if cfg.CacheListen != "" {
+		stopCache, err = startCacheWireServer(cfg, backend)
+		if err != nil {
+			fatal("%v", err)
+		}
+	}
+
 	// Periodic adaptive stats line (stderr). Silent in windows with no traffic;
 	// stopped on shutdown via statsCancel. stats_interval=0/off disables it.
 	statsCtx, statsCancel := context.WithCancel(context.Background())
@@ -78,6 +89,9 @@ func cmdServe(args []string) {
 	case sig := <-sigCh:
 		fmt.Fprintf(os.Stderr, "store-ctl: received %s, shutting down...\n", sig)
 		gs.GracefulStop()
+		if stopCache != nil {
+			stopCache()
+		}
 	case err := <-errCh:
 		if err != nil {
 			fatal("gRPC serve: %v", err)

@@ -8,11 +8,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/freq"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/runtime"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
-	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util"
 	grocksdb "github.com/linxGnu/grocksdb"
 )
 
@@ -79,9 +79,10 @@ func openImpl(cfg runtime.RocksConfig, freqCfg runtime.FreqConfig) (*impl, error
 	filter := newSketchCompactionFilter()
 	opts.ChunkCF.SetCompactionFilter(filter)
 	opts.ManifestCF.SetCompactionFilter(filter)
+	opts.BlobCF.SetCompactionFilter(filter)
 
-	cfNames := []string{cfDefault, cfChunk, cfManifest}
-	cfOpts := []*grocksdb.Options{opts.DBOpts, opts.ChunkCF, opts.ManifestCF}
+	cfNames := []string{cfDefault, cfChunk, cfManifest, cfBlob}
+	cfOpts := []*grocksdb.Options{opts.DBOpts, opts.ChunkCF, opts.ManifestCF, opts.BlobCF}
 
 	db, cfHandles, err := grocksdb.OpenDbColumnFamilies(opts.DBOpts, cfg.Path, cfNames, cfOpts)
 	if err != nil {
@@ -161,8 +162,8 @@ func OpenReadOnly(cfg runtime.RocksConfig) (Interface, error) {
 func openReadOnlyImpl(cfg runtime.RocksConfig) (*impl, error) {
 	opts := BuildOptions(cfg)
 
-	cfNames := []string{cfDefault, cfChunk, cfManifest}
-	cfOpts := []*grocksdb.Options{opts.DBOpts, opts.ChunkCF, opts.ManifestCF}
+	cfNames := []string{cfDefault, cfChunk, cfManifest, cfBlob}
+	cfOpts := []*grocksdb.Options{opts.DBOpts, opts.ChunkCF, opts.ManifestCF, opts.BlobCF}
 
 	// errorIfWalFileExists=false tolerates a crashed-but-not-recovered WAL.
 	db, cfHandles, err := grocksdb.OpenDbForReadOnlyColumnFamilies(

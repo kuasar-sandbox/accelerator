@@ -1,6 +1,6 @@
 // Package rocks provides a RocksDB-backed key-value store for the cache layer.
 //
-// The store uses separate column families for chunk and manifest data,
+// The store uses separate column families for chunk, manifest, and blob data,
 // and integrates with freq.Sketch via CompactionFilter for cold-key eviction.
 package rocks
 
@@ -10,6 +10,7 @@ import "github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 const (
 	cfChunk    = "chunk"
 	cfManifest = "manifest"
+	cfBlob     = "blob"
 	cfDefault  = "default" // RocksDB requires a "default" CF
 )
 
@@ -21,6 +22,8 @@ func partitionToCF(p store.Partition) string {
 		return cfChunk
 	case store.PartitionManifest:
 		return cfManifest
+	case store.PartitionBlob:
+		return cfBlob
 	default:
 		return cfChunk
 	}

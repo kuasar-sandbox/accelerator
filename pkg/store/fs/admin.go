@@ -93,7 +93,7 @@ func (s *Store) Drop(_ context.Context, gen string) error {
 	s.gens = remaining
 
 	// Delete data trees.
-	for _, p := range []store.Partition{store.PartitionChunk, store.PartitionManifest} {
+	for _, p := range []store.Partition{store.PartitionChunk, store.PartitionManifest, store.PartitionBlob} {
 		dir := filepath.Join(s.root, string(p), gen)
 		if err := os.RemoveAll(dir); err != nil {
 			return fmt.Errorf("fs: remove %s: %w", dir, err)
@@ -121,7 +121,7 @@ func (s *Store) Wipe(_ context.Context) error {
 // dev-scale stores, linear-but-bounded for production.
 func (s *Store) GenerationStats(_ context.Context, gen string) (map[store.Partition]int, error) {
 	out := make(map[store.Partition]int)
-	for _, p := range []store.Partition{store.PartitionChunk, store.PartitionManifest} {
+	for _, p := range []store.Partition{store.PartitionChunk, store.PartitionManifest, store.PartitionBlob} {
 		dir := filepath.Join(s.root, string(p), gen)
 		count := 0
 		_ = filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {

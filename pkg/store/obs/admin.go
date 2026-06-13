@@ -126,7 +126,7 @@ func (s *Store) Drop(ctx context.Context, gen string) error {
 		// "live" list and a second Drop call would short-circuit on
 		// ErrGenerationNotFound — but the data sweep is idempotent
 		// so a manual purge can clean up).
-		for _, p := range []store.Partition{store.PartitionChunk, store.PartitionManifest} {
+		for _, p := range []store.Partition{store.PartitionChunk, store.PartitionManifest, store.PartitionBlob} {
 			pref := path.Join(s.prefix, string(p), gen) + "/"
 			if err := s.deleteUnder(ctx, pref); err != nil {
 				return fmt.Errorf("obs: delete under %s: %w", pref, err)
@@ -161,7 +161,7 @@ func (s *Store) Wipe(ctx context.Context) error {
 // the given generation. Walks the in-bucket tree once via List.
 func (s *Store) GenerationStats(ctx context.Context, gen string) (map[store.Partition]int, error) {
 	out := make(map[store.Partition]int)
-	for _, p := range []store.Partition{store.PartitionChunk, store.PartitionManifest} {
+	for _, p := range []store.Partition{store.PartitionChunk, store.PartitionManifest, store.PartitionBlob} {
 		pref := path.Join(s.prefix, string(p), gen) + "/"
 		count := 0
 		if err := s.listBounded(ctx, pref, func(_ string) bool {

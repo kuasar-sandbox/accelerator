@@ -61,6 +61,51 @@ func TestRoundtrip(t *testing.T) {
 	}
 }
 
+// TestBlobPartition exercises the blob partition: content-addressed
+// Put/Get/Exists and generation scope identical to chunk/manifest,
+// isolated only by partition.
+func TestBlobPartition(t *testing.T) {
+	s := newTestStore(t, "G1")
+	ctx := context.Background()
+
+	data := []byte("arbitrary blob payload")
+	key := sum(data)
+
+	if isNew, err := s.Put(ctx, store.PartitionBlob, key, data); err != nil || !isNew {
+		t.Fatalf("Put blob: isNew=%v err=%v", isNew, err)
+	}
+	if !s.Exists(store.PartitionBlob, key) {
+		t.Fatal("Exists(blob) should be true after Put")
+	}
+	found, got, err := s.Get(ctx, store.PartitionBlob, key)
+	if err != nil || !found || string(got) != string(data) {
+		t.Fatalf("Get blob: found=%v err=%v got=%q", found, err, got)
+	}
+
+	// Partition isolation: the same key under chunk must be absent.
+	if s.Exists(store.PartitionChunk, key) {
+		t.Fatal("blob Put must not leak into the chunk partition")
+	}
+	if f, _, _ := s.Get(ctx, store.PartitionChunk, key); f {
+		t.Fatal("Get(chunk) must miss a blob-only key")
+	}
+
+	// Generation-scoped: still reverse-found after rollout, gone after
+	// dropping its generation (same as chunk/manifest).
+	if err := s.Rollout(ctx, "G2"); err != nil {
+		t.Fatalf("Rollout: %v", err)
+	}
+	if f, _, _ := s.Get(ctx, store.PartitionBlob, key); !f {
+		t.Fatal("blob should still be reverse-found after rollout")
+	}
+	if err := s.Drop(ctx, "G1"); err != nil {
+		t.Fatalf("Drop G1: %v", err)
+	}
+	if f, _, _ := s.Get(ctx, store.PartitionBlob, key); f {
+		t.Fatal("blob should be gone after dropping its generation")
+	}
+}
+
 // TestDedupShortCircuit verifies that a second Put with the same
 // key returns isNew=false and does NOT rewrite the temp/final file.
 func TestDedupShortCircuit(t *testing.T) {

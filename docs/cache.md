@@ -362,7 +362,7 @@ Request  (固定 39 B 头 + 可选 Value):
   4   Opcode       u8    0x01 ObjectGet / 0x02 ObjectPut
                           0x03 ShardGet  / 0x04 ShardPut / 0x05 Ping
                           0x06 CancelRequest(取消在途请求)
-  5   Namespace    u8    0x01 chunk / 0x02 manifest(Ping 忽略)
+  5   Namespace    u8    0x01 chunk / 0x02 manifest / 0x03 blob(Ping 忽略)
   6   Flags        u8    保留
   7   Hash         32 B  SHA256(ciphertext);Ping 时全 0
   39  Value        可变  仅 Put 携带;Shard* 时 Value 首 2 B 为
@@ -453,17 +453,20 @@ Wire 帧头只携带 32 字节 `Hash`——Object 与 Shard 都不需要告诉�
 
 #### Column Family 隔离
 
-chunk 与 manifest 使用独立 CF:
+chunk / manifest / blob 各用独立 CF:
 
 - **chunk CF**:高频写入(fill-aside),大 value(256 KiB 级);
-- **manifest CF**:低频写入,value 几 KiB 到若干 MiB。
+- **manifest CF**:低频写入,value 几 KiB 到若干 MiB;
+- **blob CF**:任意内容寻址数据(store 的第三 partition,见 [`store.md`](store.md)
+  §4.6),机制同 chunk——同样的 BlobDB / Bloom / compaction filter,跟着
+  generation 一起淘汰。
 
-独立 CF 让两类数据有独立 write buffer / Bloom / compaction 节奏,避免稀
+独立 CF 让各类数据有独立 write buffer / Bloom / compaction 节奏,避免稀
 有的 manifest 写入干扰高频 chunk compaction。
 
 #### BlobDB 与写放大
 
-两个 CF 都启用 RocksDB BlobDB,固定参数(不暴露 YAML):
+三个 CF 都启用 RocksDB BlobDB,固定参数(不暴露 YAML):
 
 - `min_blob_size = 4 KiB`:小于阈值的 value 内联到 SST,大于的旁路到独立
   `.blob` 文件。
@@ -804,7 +807,8 @@ cache stat tiered | get 5.1k/s 620MiB/s p50 40µs/p99 700µs/max 9ms · hit 94% 
 
 - [`store.md`](store.md) — tiered 模式 origin = `store`(store gRPC 客户端)或
   `upstream`(另一台 cache-ctl);store 形态下 cache-ctl 自身**没有**任何文件系统
-  读写权限,所有持久化集中在 store-ctl
+  读写权限,所有持久化集中在 store-ctl;store-ctl 亦可经 `cache_listen` 以**只读**
+  方式直接讲本 wire 协议(chunk/manifest/blob,纯透传无 L1),省掉独立 cache-ctl
 - [`manifest.md`](manifest.md) — manifest-ctl 通过 wire ObjectGet 调 cache-ctl
   tiered;Manifest 内 chunk hash = 这里的 wire Hash 字段
 - `kuasar-sandbox/docs/perf.md` §1 — cache 子系统实测延迟/吞吐基线与优化记录

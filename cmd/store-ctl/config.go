@@ -56,6 +56,14 @@ type Config struct {
 	// window). Empty/absent → 30s (on by default); "0"/"off" disables it.
 	StatsInterval string `yaml:"stats_interval"`
 
+	// CacheListen, when non-empty, starts an embedded read-only cache wire
+	// server on this address (host:port or unix:/path) alongside the store
+	// gRPC. It serves cache-protocol object reads (chunk/manifest/blob)
+	// straight from the backend, so cache clients can read store content
+	// without a separate cache-ctl. Writes are rejected (use the store
+	// gRPC). Empty = disabled.
+	CacheListen string `yaml:"cache_listen"`
+
 	// FS / OBS hold backend-specific config. Exactly one is read,
 	// keyed by Backend.
 	FS  FSConfig  `yaml:"fs"`

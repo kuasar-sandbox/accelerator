@@ -63,6 +63,10 @@ enum Partition {
     PARTITION_UNSPECIFIED = 0;
     PARTITION_CHUNK       = 1;
     PARTITION_MANIFEST    = 2;
+    // Arbitrary content-addressed data, isolated from chunk/manifest only
+    // by partition. The mechanism is identical: client-computed SHA256 key,
+    // generation scope, dedup short-circuit, optional re-hash verify.
+    PARTITION_BLOB        = 3;
 }
 
 message GetRequest {

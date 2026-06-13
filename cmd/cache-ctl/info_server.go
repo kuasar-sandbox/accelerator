@@ -1,4 +1,4 @@
-package server
+package main
 
 import (
 	"context"
@@ -9,6 +9,7 @@ import (
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/ec"
 	cachepb "github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/pb"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/rocks"
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/server"
 )
 
 // TierSpec carries a tier's type plus the one concrete reference that
@@ -18,7 +19,7 @@ import (
 // Exactly one of EmbeddedStore / EC / UpstreamEP is set, per Type.
 type TierSpec struct {
 	Type          string
-	EmbeddedStore rocks.Interface      // "embedded"
+	EmbeddedStore rocks.Interface   // "embedded"
 	EC            ec.Interface      // "ec"
 	UpstreamEP    string            // "upstream"
 	Upstream      client.TierCloser // "upstream"; retained for future
@@ -42,17 +43,17 @@ type InfoServer struct {
 	start time.Time
 	mode  string
 
-	handler       *CacheHandler      // non-nil: always (wire counters source)
-	tiered        *cache.TieredCache // non-nil when mode == "tiered"
-	tierSpecs     []TierSpec         // parallel to tiered.tiers
-	origin        *OriginSpec        // non-nil when mode == "tiered"
-	topLevelRocks rocks.Interface       // non-nil when mode != "tiered"
+	handler       *server.CacheHandler // non-nil: always (wire counters source)
+	tiered        *cache.TieredCache   // non-nil when mode == "tiered"
+	tierSpecs     []TierSpec           // parallel to tiered.tiers
+	origin        *OriginSpec          // non-nil when mode == "tiered"
+	topLevelRocks rocks.Interface      // non-nil when mode != "tiered"
 }
 
 // NewInfoServer creates a fresh InfoServer with the wire handler
 // attached. Subsequent SetTiered / SetTopLevelRocks calls fill in
 // mode-specific sources.
-func NewInfoServer(mode string, handler *CacheHandler) *InfoServer {
+func NewInfoServer(mode string, handler *server.CacheHandler) *InfoServer {
 	return &InfoServer{
 		start:   time.Now(),
 		mode:    mode,

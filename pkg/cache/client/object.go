@@ -190,6 +190,8 @@ func partitionToWireNS(p store.Partition) byte {
 		return wire.NSChunk
 	case store.PartitionManifest:
 		return wire.NSManifest
+	case store.PartitionBlob:
+		return wire.NSBlob
 	default:
 		return wire.NSChunk
 	}
