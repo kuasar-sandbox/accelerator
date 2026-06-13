@@ -62,8 +62,18 @@ free_port() {
     python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
 }
 
-# Prepare a small test file (deterministic, ~512 KiB).
-dd if=/dev/urandom of="$TMPDIR/test.bin" bs=1024 count=512 2>/dev/null
+# Hash the payload inside a tarstream artifact. store/load round-trip the
+# payload losslessly but re-canonicalize the tar envelope (entry name → image,
+# mtime → epoch), so roundtrip checks compare extracted payloads, not the
+# envelope bytes.
+payload_hash() {
+    tar xOf "$1" | sha256sum | awk '{print $1}'
+}
+
+# Prepare a ~512 KiB payload wrapped in a tarstream artifact — manifest-ctl
+# ingests tarstream-contained payloads, not raw bytes.
+dd if=/dev/urandom of="$TMPDIR/payload.bin" bs=1024 count=512 2>/dev/null
+tar cf "$TMPDIR/test.bin" -C "$TMPDIR" payload.bin
 
 # ============================================================
 # Spin up store-ctl sidecar. All subsequent manifest-ctl / cache-ctl
@@ -141,7 +151,7 @@ EOF
 echo ""
 echo "=== Ingest test data (via store-ctl) ==="
 MKEY=$("$BIN/manifest-ctl" store $COMMON --no-progress "$TMPDIR/test.bin")
-ORIG_HASH=$(sha256sum "$TMPDIR/test.bin" | awk '{print $1}')
+ORIG_HASH=$(payload_hash "$TMPDIR/test.bin")
 echo "  Stored. SHA256=$ORIG_HASH  manifest-key=$MKEY"
 
 # ============================================================
@@ -151,12 +161,13 @@ echo "=== Test 0: store-ctl standalone roundtrip ==="
 # to prove the standalone path is healthy before any cache-ctl
 # tests run. Uses a fresh 64 KiB payload so it doesn't collide with
 # the main 512 KiB blob's chunks.
-dd if=/dev/urandom of="$TMPDIR/store0.bin" bs=1024 count=64 2>/dev/null
+dd if=/dev/urandom of="$TMPDIR/store0-payload.bin" bs=1024 count=64 2>/dev/null
+tar cf "$TMPDIR/store0.bin" -C "$TMPDIR" store0-payload.bin
 MKEY0=$("$BIN/manifest-ctl" store $COMMON --no-progress "$TMPDIR/store0.bin")
 "$BIN/manifest-ctl" get-manifest $COMMON --output "$TMPDIR/store0.manifest.rt" "$MKEY0" 2>&1
 "$BIN/manifest-ctl" load $COMMON --output "$TMPDIR/store0.rt" --no-progress "$MKEY0" 2>&1
-H_ORIG=$(sha256sum "$TMPDIR/store0.bin" | awk '{print $1}')
-H_RT=$(sha256sum "$TMPDIR/store0.rt" | awk '{print $1}')
+H_ORIG=$(payload_hash "$TMPDIR/store0.bin")
+H_RT=$(payload_hash "$TMPDIR/store0.rt")
 assert_eq "$H_ORIG" "$H_RT" "store-ctl standalone store + get-manifest + load roundtrip (one-step store)"
 
 # ============================================================
@@ -272,7 +283,7 @@ wait_ready "127.0.0.1:$TIERED_HEALTH_PORT"
 # Load via cache (first read — cold, fills embedded from origin).
 "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
     --output "$TMPDIR/test-cached.bin" --no-progress "$MKEY" 2>&1
-CACHED_HASH=$(sha256sum "$TMPDIR/test-cached.bin" | awk '{print $1}')
+CACHED_HASH=$(payload_hash "$TMPDIR/test-cached.bin")
 assert_eq "$ORIG_HASH" "$CACHED_HASH" "tiered load roundtrip (cold)"
 
 # ============================================================
@@ -280,7 +291,7 @@ echo ""
 echo "=== Test 6: tiered mode — warm read (second load hits embedded cache) ==="
 "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
     --output "$TMPDIR/test-warm.bin" --no-progress "$MKEY" 2>&1
-WARM_HASH=$(sha256sum "$TMPDIR/test-warm.bin" | awk '{print $1}')
+WARM_HASH=$(payload_hash "$TMPDIR/test-warm.bin")
 assert_eq "$ORIG_HASH" "$WARM_HASH" "tiered load roundtrip (warm)"
 
 # ============================================================
@@ -375,7 +386,7 @@ wait_ready "127.0.0.1:$EC_TIERED_HEALTH_PORT"
 # Load through EC tiered cache.
 "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$EC_TIERED_PORT")" \
     --output "$TMPDIR/test-ec.bin" --no-progress "$MKEY" 2>&1
-EC_HASH=$(sha256sum "$TMPDIR/test-ec.bin" | awk '{print $1}')
+EC_HASH=$(payload_hash "$TMPDIR/test-ec.bin")
 assert_eq "$ORIG_HASH" "$EC_HASH" "tiered+EC load roundtrip"
 
 # ============================================================
@@ -388,7 +399,7 @@ kill "${PIDS[$SHARD1_PID_IDX]}" 2>/dev/null; wait "${PIDS[$SHARD1_PID_IDX]}" 2>/
 # Second load (warm from embedded + EC with 1 node down — should still work).
 "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$EC_TIERED_PORT")" \
     --output "$TMPDIR/test-ec-1down.bin" --no-progress "$MKEY" 2>&1
-DOWN1_HASH=$(sha256sum "$TMPDIR/test-ec-1down.bin" | awk '{print $1}')
+DOWN1_HASH=$(payload_hash "$TMPDIR/test-ec-1down.bin")
 assert_eq "$ORIG_HASH" "$DOWN1_HASH" "tiered+EC load with 1 shard down"
 
 # ============================================================
@@ -459,7 +470,7 @@ wait_ready "127.0.0.1:$FRONT_HEALTH_PORT"
 # writes back through upstream into remote.
 "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$FRONT_PORT")" \
     --output "$TMPDIR/test-upstream.bin" --no-progress "$MKEY" 2>&1
-UP_HASH=$(sha256sum "$TMPDIR/test-upstream.bin" | awk '{print $1}')
+UP_HASH=$(payload_hash "$TMPDIR/test-upstream.bin")
 assert_eq "$ORIG_HASH" "$UP_HASH" "upstream tier read-through (cold)"
 
 # Kill front; remote must now serve the same manifest on its own.
@@ -468,7 +479,7 @@ assert_eq "$ORIG_HASH" "$UP_HASH" "upstream tier read-through (cold)"
 kill $FRONT_PID 2>/dev/null; wait $FRONT_PID 2>/dev/null || true
 "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$REMOTE_PORT")" \
     --output "$TMPDIR/test-from-remote.bin" --no-progress "$MKEY" 2>&1
-REM_HASH=$(sha256sum "$TMPDIR/test-from-remote.bin" | awk '{print $1}')
+REM_HASH=$(payload_hash "$TMPDIR/test-from-remote.bin")
 assert_eq "$ORIG_HASH" "$REM_HASH" "upstream tier writeback populated remote"
 
 # ============================================================
