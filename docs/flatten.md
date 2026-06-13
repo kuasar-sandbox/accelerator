@@ -389,7 +389,11 @@ stdin 报错引导)。`..` 成员跳过告警,穿 symlink 写出是硬错误;条
 | `dir/:` | 解到当前目录 |
 | `:dir/` | 整个归档根映射到 dir/ |
 
-不给规则取全部到当前目录;`--chown/--chmod` 改写每个落盘条目的属主/权限。
+不给规则取全部到当前目录;`--chown/--chmod` 改写每个落盘条目的属主/权限。`--chown`
+取 `uid:gid`:数字直用,**名字**则按解包目标根的 `/etc/passwd`/`/etc/group` 解析
+(Docker `COPY --chown=name` 同款;CGO 关,os/user 直读文件不经 NSS);`user`(无组)
+取该用户主组,纯数字 `1000` 镜像为 `1000:1000`。orchestrator 的 COPY step 即以
+`extract --dense --chown` 把上下文 tar 摊进 guest rootfs(见 orchestrator.md §11)。
 
 **stream** 把**一个文件**封装为 tarstream(单文件稀疏 tar,
 `sandbox-accelerator/pkg/tarstream`)。文件源的洞图来自文件系统元数据

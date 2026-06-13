@@ -5,6 +5,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/user"
 	"strconv"
 	"strings"
 )
@@ -14,23 +15,83 @@ type Owner struct {
 	UID, GID int
 }
 
-// ParseOwner parses the --chown value "uid:gid" (numeric only — name
-// resolution against the host's /etc/passwd would be wrong for guest
-// content, which is this package's main audience).
+// ParseOwner parses a --chown value into a numeric Owner. Each side is a
+// number used verbatim, or a NAME resolved against /etc/passwd / /etc/group
+// (Docker COPY --chown semantics). When flatten-ctl extracts into a guest
+// rootfs (the COPY path), that passwd/group IS the image's — CGO is off, so
+// os/user reads the files directly, never libc/NSS. Forms:
+//
+//	uid:gid · user:group · user (→ the user's primary group) · 1000 (→ 1000:1000)
 func ParseOwner(s string) (Owner, error) {
-	u, g, ok := strings.Cut(s, ":")
-	if !ok {
-		return Owner{}, fmt.Errorf("chown %q: want uid:gid (numeric)", s)
+	if s == "" {
+		return Owner{}, fmt.Errorf("chown: empty")
 	}
-	uid, err := strconv.Atoi(u)
-	if err != nil || uid < 0 {
-		return Owner{}, fmt.Errorf("chown %q: bad uid", s)
+	uPart, gPart, hasGroup := strings.Cut(s, ":")
+	if uPart == "" {
+		return Owner{}, fmt.Errorf("chown %q: empty user", s)
 	}
-	gid, err := strconv.Atoi(g)
-	if err != nil || gid < 0 {
-		return Owner{}, fmt.Errorf("chown %q: bad gid", s)
+	uid, uName, err := resolveID(uPart, false)
+	if err != nil {
+		return Owner{}, err
+	}
+	// No group given: a numeric user mirrors to the same gid (1000 → 1000:1000);
+	// a named user takes its primary group from /etc/passwd.
+	if !hasGroup {
+		if uName == "" {
+			return Owner{UID: uid, GID: uid}, nil
+		}
+		u, err := user.Lookup(uName)
+		if err != nil {
+			return Owner{}, fmt.Errorf("chown %q: lookup user: %w", s, err)
+		}
+		gid, err := strconv.Atoi(u.Gid)
+		if err != nil {
+			return Owner{}, fmt.Errorf("chown %q: user %q primary gid %q not numeric", s, uName, u.Gid)
+		}
+		return Owner{UID: uid, GID: gid}, nil
+	}
+	if gPart == "" {
+		return Owner{}, fmt.Errorf("chown %q: empty group", s)
+	}
+	gid, _, err := resolveID(gPart, true)
+	if err != nil {
+		// A common shape is "name:name" where only the USER exists (no
+		// like-named group); fall back to that user's primary group.
+		if uName != "" && gPart == uName {
+			if u, uerr := user.Lookup(uName); uerr == nil {
+				if pg, perr := strconv.Atoi(u.Gid); perr == nil {
+					return Owner{UID: uid, GID: pg}, nil
+				}
+			}
+		}
+		return Owner{}, err
 	}
 	return Owner{UID: uid, GID: gid}, nil
+}
+
+// resolveID parses a uid/gid component: a non-negative number is used as-is
+// (name=""), otherwise it is looked up by name. group selects the namespace.
+func resolveID(s string, group bool) (id int, name string, err error) {
+	if n, aerr := strconv.Atoi(s); aerr == nil {
+		if n < 0 {
+			return 0, "", fmt.Errorf("chown %q: negative id", s)
+		}
+		return n, "", nil
+	}
+	if group {
+		g, gerr := user.LookupGroup(s)
+		if gerr != nil {
+			return 0, "", fmt.Errorf("chown: lookup group %q: %w", s, gerr)
+		}
+		n, _ := strconv.Atoi(g.Gid)
+		return n, s, nil
+	}
+	u, uerr := user.Lookup(s)
+	if uerr != nil {
+		return 0, "", fmt.Errorf("chown: lookup user %q: %w", s, uerr)
+	}
+	n, _ := strconv.Atoi(u.Uid)
+	return n, s, nil
 }
 
 // ParseMode parses the --chmod value as octal permission bits

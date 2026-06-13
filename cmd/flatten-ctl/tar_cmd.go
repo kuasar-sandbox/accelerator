@@ -47,7 +47,7 @@ func cmdTarExtract(args []string) {
 	var file string
 	fs.StringVar(&file, "file", "-", "archive file (- = stdin)")
 	fs.StringVar(&file, "f", "-", "shorthand for --file")
-	chown := fs.String("chown", "", "numeric uid:gid applied to every entry")
+	chown := fs.String("chown", "", "uid:gid applied to every entry (numeric, or names resolved against the target's /etc/passwd|group)")
 	chmod := fs.String("chmod", "", "octal permission bits applied to every entry")
 	dense := fs.Bool("dense", false, "disable sparse handling: extract logical bytes via the stdlib reader (declared holes become allocated zeros)")
 	fs.Usage = tarUsage
