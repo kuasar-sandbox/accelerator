@@ -70,6 +70,14 @@ free_port() {
     python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
 }
 
+# Hash the payload inside a tarstream artifact. manifest-ctl ingests
+# tarstream-contained payloads (ff88f5f), and load re-canonicalizes the
+# envelope (entry name → image, mtime → epoch), so roundtrip checks must
+# compare extracted payloads, not the envelope bytes.
+payload_hash() {
+    tar xOf "$1" | sha256sum | awk '{print $1}'
+}
+
 # ============================================================
 # store-ctl sidecar
 # ============================================================
@@ -215,9 +223,10 @@ declare -a MKEYS=()
 declare -a ORIG_HASHES=()
 echo "=== Populating $N keys into EC cluster {s1..s5} ==="
 for i in $(seq 1 $N); do
-    dd if=/dev/urandom of="$TMPDIR/val-$i.bin" bs=1024 count=32 2>/dev/null
+    dd if=/dev/urandom of="$TMPDIR/val-$i.payload" bs=1024 count=32 2>/dev/null
+    tar cf "$TMPDIR/val-$i.bin" -C "$TMPDIR" "val-$i.payload"
     MKEYS+=("$("$BIN/manifest-ctl" store $COMMON --no-progress "$TMPDIR/val-$i.bin" 2>/dev/null)")
-    ORIG_HASHES+=("$(sha256sum $TMPDIR/val-$i.bin | awk '{print $1}')")
+    ORIG_HASHES+=("$(payload_hash "$TMPDIR/val-$i.bin")")
 done
 echo "  $N manifest keys stored."
 
@@ -252,7 +261,7 @@ for i in $(seq 1 $N); do
     "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
         --output "$TMPDIR/val-$i.postswap" \
         --no-progress "${MKEYS[$((i-1))]}" 2>/dev/null
-    h=$(sha256sum "$TMPDIR/val-$i.postswap" | awk '{print $1}')
+    h=$(payload_hash "$TMPDIR/val-$i.postswap")
     if [ "$h" != "${ORIG_HASHES[$((i-1))]}" ]; then
         fail "key $i hash mismatch after membership swap"
         all_match=0
@@ -276,7 +285,7 @@ sleep 0.5
 "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
     --output "$TMPDIR/val-1.idem" \
     --no-progress "${MKEYS[0]}" 2>/dev/null
-h=$(sha256sum "$TMPDIR/val-1.idem" | awk '{print $1}')
+h=$(payload_hash "$TMPDIR/val-1.idem")
 assert_eq "${ORIG_HASHES[0]}" "$h" "second SIGHUP leaves reads working"
 
 echo ""
