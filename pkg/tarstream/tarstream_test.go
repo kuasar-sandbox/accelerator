@@ -126,6 +126,44 @@ func TestRoundTripPipe(t *testing.T) {
 	}
 }
 
+// pipeFile mimics an *os.File backed by a pipe: it implements io.ReadSeeker (so a
+// naive r.(io.ReadSeeker) assertion takes the seek path) but Seek fails at runtime
+// like ESPIPE — exactly a piped stdin (`cat foo | manifest-ctl store`).
+type pipeFile struct{ r io.Reader }
+
+func (p pipeFile) Read(b []byte) (int, error) { return p.r.Read(b) }
+func (pipeFile) Seek(int64, int) (int64, error) {
+	return 0, errors.New("seek /dev/stdin: illegal seek")
+}
+
+// TestNonSeekableSeekerFallsBackToStream: SourceFrom + ReadFrom over a reader that
+// implements io.ReadSeeker but cannot actually seek must use the one-pass path
+// instead of erroring (regression for piped-stdin store).
+func TestNonSeekableSeekerFallsBackToStream(t *testing.T) {
+	logical, holes := fixture()
+	archive := mustWrite(t, "x", logical, holes)
+
+	src, name, err := SourceFrom(pipeFile{bytes.NewReader(archive)}, "")
+	if err != nil {
+		t.Fatalf("SourceFrom over a non-seekable seeker: %v", err)
+	}
+	if name != "x" || src.Size() != uint64(len(logical)) {
+		t.Fatalf("SourceFrom name=%q size=%d (want x / %d)", name, src.Size(), len(logical))
+	}
+
+	ts, err := ReadFrom(pipeFile{bytes.NewReader(archive)}, "x")
+	if err != nil {
+		t.Fatalf("ReadFrom over a non-seekable seeker: %v", err)
+	}
+	got, err := io.ReadAll(ts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, logical) {
+		t.Error("content mismatch over a non-seekable seeker")
+	}
+}
+
 func TestStdlibOracle(t *testing.T) {
 	logical, holes := fixture()
 	archive := mustWrite(t, "disk/img.raw", logical, holes)

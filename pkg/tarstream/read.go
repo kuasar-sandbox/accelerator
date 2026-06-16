@@ -12,15 +12,32 @@ import (
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
 )
 
+// asReadSeeker returns r as an io.ReadSeeker only if it BOTH implements the
+// interface AND can actually seek. An *os.File satisfies io.ReadSeeker even when
+// its fd is a pipe/socket, where Seek fails at runtime with ESPIPE ("illegal
+// seek") — e.g. a piped stdin (`cat foo | manifest-ctl store`). A no-op
+// current-offset probe distinguishes a real seekable (regular file) from a stream,
+// so the latter takes the one-pass path instead of erroring.
+func asReadSeeker(r io.Reader) (io.ReadSeeker, bool) {
+	rs, ok := r.(io.ReadSeeker)
+	if !ok {
+		return nil, false
+	}
+	if _, err := rs.Seek(0, io.SeekCurrent); err != nil {
+		return nil, false
+	}
+	return rs, true
+}
+
 // ReadFrom locates the entry called name in the tar stream r (an empty
 // name takes the first regular file entry) and returns its logical
 // view: Read yields size bytes with holes reading as zeros, pulling
-// only the packed data from r. When r also implements io.ReadSeeker
-// the call upgrades to ReadSeekFrom — the returned Reader then also
-// implements ReadSeeker (type-assert to use it). Otherwise the view is
-// one sequential pass with nothing buffered beyond a block.
+// only the packed data from r. When r is actually seekable the call
+// upgrades to ReadSeekFrom — the returned Reader then also implements
+// ReadSeeker (type-assert to use it). Otherwise the view is one
+// sequential pass with nothing buffered beyond a block.
 func ReadFrom(r io.Reader, name string) (Reader, error) {
-	if rs, ok := r.(io.ReadSeeker); ok {
+	if rs, ok := asReadSeeker(r); ok {
 		v, err := newSeekView(rs, name)
 		if err != nil {
 			return nil, err
@@ -50,10 +67,10 @@ func ReadSeekFrom(rs io.ReadSeeker, name string) (ReadSeeker, error) {
 // entry) and opens it as a sparse.Source — the pipeline-facing twin
 // of ReadFrom: RunAt serves the envelope's hole map (Hole/Data only,
 // never Zero), ReadAt the logical bytes. Over a plain reader the
-// source is one-pass (monotone ReadAt); a seekable r upgrades to
-// random access. The entry's name is returned alongside.
+// source is one-pass (monotone ReadAt); an actually-seekable r upgrades
+// to random access. The entry's name is returned alongside.
 func SourceFrom(r io.Reader, name string) (sparse.Source, string, error) {
-	if rs, ok := r.(io.ReadSeeker); ok {
+	if rs, ok := asReadSeeker(r); ok {
 		v, err := newSeekView(rs, name)
 		if err != nil {
 			return nil, "", err
