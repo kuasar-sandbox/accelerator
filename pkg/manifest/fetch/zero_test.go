@@ -183,8 +183,8 @@ type passthroughEncryptor struct {
 	plain []byte
 }
 
-func (e *passthroughEncryptor) Encrypt(_ [32]byte, plaintext []byte) ([]byte, [32]byte) {
-	return plaintext, [32]byte{}
+func (e *passthroughEncryptor) Encrypt(_ [32]byte, plaintext []byte) ([]byte, [32]byte, [32]byte) {
+	return plaintext, [32]byte{}, [32]byte{}
 }
 func (e *passthroughEncryptor) Decrypt(_ [32]byte, _ []byte) ([]byte, error) {
 	return e.plain, nil

@@ -262,8 +262,8 @@ chunker:
   fixed:
     size: 512KiB
 crypto:
-  chunk: aes                      # aes | fake
-  manifest: aes                   # aes | fake
+  chunk: aes                      # aes(唯一支持)
+  manifest: aes                   # aes(唯一支持)
 ```
 
 字段说明:
@@ -282,8 +282,8 @@ crypto:
   通过 wire 协议穿 cache-ctl。同样接受 `host:port` 或 Unix socket 路径
   (`unix://path` 或裸 `/path`),与 cache-ctl 的 `listen` 同址。
 - `chunker.mode` — `cdc`(FastCDC,变长)或 `fixed`(固定大小)。详见 §4.1。
-- `crypto.chunk` / `crypto.manifest` — chunk 与 Manifest 各自的加密模式
-  (§4.3 / §4.4)。fake 是性能基线模式,不要在生产打开。
+- `crypto.chunk` / `crypto.manifest` — chunk 与 Manifest 的加密算法,均仅支持
+  `aes`(§4.3 / §4.4);其它值在构造时即被拒绝。
 
 ### 3.2 加载顺序
 
@@ -360,16 +360,15 @@ Chunk 上传时,`SHA256(ciphertext)` 是 store 的寻址键;Manifest 上传时�
 
 ### 4.3 加密模式 — chunk
 
-YAML `crypto.chunk`:
+YAML `crypto.chunk` 仅支持 `aes`;任何其它值在构造时即被拒绝(无明文回退):
 
 | 模式 | 行为 | 用途 |
 |---|---|---|
-| `aes`  | `[flag=0x01] + AES-256-CTR(key, plaintext)`(IV 全零,§4.2) | 生产默认 |
-| `fake` | `[flag=0x00] + HMAC-SHA256(key, plaintext) + plaintext` | 性能基线;不要在生产打开 |
+| `aes` | `[flag=0x01] + AES-256-CTR(key, plaintext)`(IV 全零,§4.2) | 唯一模式 |
 
-`fake` 模式专为对比测量收敛寻址 / 去重 / 上传开销时,排除 AES 加密的
-CPU 影响 —— 由于密文 = 明文,生产部署不应允许使用。flag byte 在解密时
-做模式校验,跨模式读取会失败。
+chunk key 是收敛密钥 `SHA256(salt‖plaintext)`,由加密层内部派生(调用方只
+传 salt、不传 key),故 (key, IV=0) 对不同明文不复用、CTR keystream 不重用。
+flag byte 在解密时做格式校验。
 
 ### 4.4 加密模式 — Manifest
 
@@ -378,8 +377,7 @@ Manifest 中**密钥表 (key table)** 是一段编码了所有 chunk 加密 key 
 
 | 模式 | 行为 |
 |---|---|
-| `aes`  | AES-GCM(`manifest.key`, key_table) — customer key 解密 |
-| `fake` | HMAC + 明文(同 chunk 路径) |
+| `aes` | AES-GCM(`manifest.key`, key_table) — customer key 解密 |
 
 只要 `manifest.key` 不泄露,**chunk 在 store 上永远不可读**(密文),即
 使 store 后端被入侵,store 自己也无法解密。
@@ -513,8 +511,7 @@ manifest:// 加载端到端时长)。
 主要决定项:
 
 - chunk 模式(cdc 命中率高于 fixed,但分块本身略慢);
-- 加密模式(aes 是 CPU 大头,~50–100% CPU 在大 chunk 上;fake 是基线
-  对比用);
+- 加密模式(aes 是 CPU 大头,~50–100% CPU 在大 chunk 上);
 - store 端点延迟(本地 fs vs 远端 OBS,详见 [`store.md`](store.md))。
 
 ## 6. See Also

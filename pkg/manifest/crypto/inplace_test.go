@@ -10,14 +10,14 @@ import (
 // returns the original plaintext, with the working buffer reusing
 // the ciphertext storage (no fresh allocation).
 func TestAES_DecryptInPlace_RoundTrip(t *testing.T) {
-	var key [32]byte
-	if _, err := rand.Read(key[:]); err != nil {
+	var salt [32]byte
+	if _, err := rand.Read(salt[:]); err != nil {
 		t.Fatal(err)
 	}
 	plain := bytes.Repeat([]byte{0xAB, 0xCD, 0xEF, 0x12}, 4096)
 
 	enc := &AESChunkEncryptor{}
-	ct, _ := enc.Encrypt(key, plain)
+	ct, _, key := enc.Encrypt(salt, plain)
 
 	// In-place decrypt: the buffer ct itself is mutated.
 	got, err := enc.DecryptInPlace(key, ct)
@@ -30,30 +30,6 @@ func TestAES_DecryptInPlace_RoundTrip(t *testing.T) {
 	// got must alias ct[1:] — same underlying array.
 	if &got[0] != &ct[1] {
 		t.Fatalf("DecryptInPlace returned a fresh slice; expected aliasing into ct[1:]")
-	}
-}
-
-// TestFake_DecryptInPlace_RoundTrip — fake mode: decrypt-in-place
-// returns plaintext aliased into the input buffer, with no XOR step.
-func TestFake_DecryptInPlace_RoundTrip(t *testing.T) {
-	var key [32]byte
-	if _, err := rand.Read(key[:]); err != nil {
-		t.Fatal(err)
-	}
-	plain := bytes.Repeat([]byte{0xEE}, 1024)
-
-	enc := &FakeChunkEncryptor{}
-	ct, _ := enc.Encrypt(key, plain)
-
-	got, err := enc.DecryptInPlace(key, ct)
-	if err != nil {
-		t.Fatalf("DecryptInPlace: %v", err)
-	}
-	if !bytes.Equal(got, plain) {
-		t.Fatalf("plaintext mismatch")
-	}
-	if &got[0] != &ct[1+hmacTagSize] {
-		t.Fatalf("DecryptInPlace did not alias; got addr differs")
 	}
 }
 
@@ -170,14 +146,14 @@ func TestAESKeyTable_InputChangeChangesOutput(t *testing.T) {
 // TestAES_DecryptInPlace_LegacyDecryptUnchanged — Decrypt still
 // returns a fresh allocation independent of the input buffer.
 func TestAES_DecryptInPlace_LegacyDecryptUnchanged(t *testing.T) {
-	var key [32]byte
-	if _, err := rand.Read(key[:]); err != nil {
+	var salt [32]byte
+	if _, err := rand.Read(salt[:]); err != nil {
 		t.Fatal(err)
 	}
 	plain := []byte("hello world")
 
 	enc := &AESChunkEncryptor{}
-	ct, _ := enc.Encrypt(key, plain)
+	ct, _, key := enc.Encrypt(salt, plain)
 
 	out, err := enc.Decrypt(key, ct)
 	if err != nil {

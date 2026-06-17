@@ -7,7 +7,10 @@ import "fmt"
 // two views over the same underlying codec keep ingest and fetch paths
 // from accidentally touching each other's primitives.
 type Encryptor interface {
-	EncryptChunk(key [32]byte, plaintext []byte) (ciphertext []byte, hash [32]byte)
+	// EncryptChunk derives the convergent key from (salt, plaintext), encrypts
+	// under it, and returns the ciphertext, its hash, and the derived key (to
+	// record in the key table). See crypto.DeriveKey and the AES zero-IV invariant.
+	EncryptChunk(salt [32]byte, plaintext []byte) (ciphertext []byte, hash [32]byte, key [32]byte)
 	SealKeyTable(customerKey [32]byte, keys, aad []byte) ([]byte, error)
 }
 
@@ -23,10 +26,8 @@ type Decryptor interface {
 // views are backed by the same underlying impl so the algorithm choice
 // is per-process atomic; New is idempotent within a process.
 //
-// Modes:
-//
-//	"aes"  AES-256-CTR convergent (chunks) + AES-256-GCM (key table)
-//	"fake" HMAC + plaintext (NOT secure; for perf baselining only)
+// The only supported mode is "aes" (AES-256-CTR convergent chunks +
+// AES-256-GCM key table); any other value is rejected (no insecure fallback).
 func New(cfg Config) (Encryptor, Decryptor, error) {
 	chunk, err := NewChunkEncryptor(cfg.Chunk)
 	if err != nil {
@@ -48,8 +49,8 @@ type codec struct {
 	kt    KeyTableEncryptor
 }
 
-func (c *codec) EncryptChunk(key [32]byte, plaintext []byte) ([]byte, [32]byte) {
-	return c.chunk.Encrypt(key, plaintext)
+func (c *codec) EncryptChunk(salt [32]byte, plaintext []byte) ([]byte, [32]byte, [32]byte) {
+	return c.chunk.Encrypt(salt, plaintext)
 }
 
 func (c *codec) DecryptChunk(key [32]byte, ciphertext []byte) ([]byte, error) {

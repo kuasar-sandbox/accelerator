@@ -233,8 +233,7 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 				if wctx.Err() != nil {
 					continue // drain fast; error already recorded
 				}
-				key := crypto.DeriveKey(salt, j.data)
-				ciphertext, _ := i.enc.EncryptChunk(key, j.data)
+				ciphertext, _, key := i.enc.EncryptChunk(salt, j.data)
 				ck := store.ContentKey(sha256.Sum256(ciphertext))
 				isNew, err := i.store.Put(wctx, store.PartitionChunk, ck, ciphertext)
 				if err != nil {

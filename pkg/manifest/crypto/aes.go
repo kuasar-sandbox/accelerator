@@ -12,16 +12,27 @@ import (
 // AESChunkEncryptor implements ChunkEncryptor using AES-256-CTR.
 type AESChunkEncryptor struct{}
 
-// Encrypt encrypts plaintext with AES-256-CTR.
+// Encrypt derives the convergent chunk key key = SHA256(salt || plaintext)
+// (DeriveKey) and encrypts plaintext with AES-256-CTR under it. It returns the
+// ciphertext, the ciphertext hash (SHA256 over the full output, flag byte
+// included), and the derived key for the caller to record in the manifest key
+// table.
+//
 // Format: [0x01] + AES-256-CTR(key, iv=0, plaintext)
-// Hash is SHA256 of the full ciphertext including flag byte.
-func (e *AESChunkEncryptor) Encrypt(key [32]byte, plaintext []byte) ([]byte, [32]byte) {
+//
+// The IV is fixed at zero. This is safe ONLY because the key is convergent:
+// within one salt domain the key is a pure function of the plaintext, so a
+// given (key, iv=0) pair never encrypts two distinct plaintexts and the CTR
+// keystream is never reused. Derivation is owned here — the caller supplies the
+// salt, never a key — so the invariant cannot be violated from outside.
+func (e *AESChunkEncryptor) Encrypt(salt [32]byte, plaintext []byte) ([]byte, [32]byte, [32]byte) {
+	key := DeriveKey(salt, plaintext)
 	block, err := aes.NewCipher(key[:])
 	if err != nil {
 		panic(fmt.Sprintf("crypto: aes.NewCipher: %v", err))
 	}
 
-	iv := make([]byte, aes.BlockSize) // zero IV
+	iv := make([]byte, aes.BlockSize) // zero IV — safe under the convergent-key invariant above
 	stream := cipher.NewCTR(block, iv)
 
 	ciphertext := make([]byte, 1+len(plaintext))
@@ -29,7 +40,7 @@ func (e *AESChunkEncryptor) Encrypt(key [32]byte, plaintext []byte) ([]byte, [32
 	stream.XORKeyStream(ciphertext[1:], plaintext)
 
 	hash := sha256.Sum256(ciphertext)
-	return ciphertext, hash
+	return ciphertext, hash, key
 }
 
 // Decrypt decrypts AES-256-CTR ciphertext into a fresh allocation.
@@ -110,9 +121,8 @@ const gcmNonceSize = 12
 // already sees the chunk-level dedup, so manifest-level dedup adds no
 // new information channel.
 //
-// Domain-separation prefix prevents this HMAC use of the customer key
-// from colliding with FakeKeyTableEncryptor's HMAC tag use of the
-// same key.
+// The domain-separation prefix scopes this HMAC use of the customer key
+// so it cannot collide with any other HMAC use of the same key.
 func (e *AESKeyTableEncryptor) Seal(customerKey [32]byte, keys []byte, aad []byte) ([]byte, error) {
 	block, err := aes.NewCipher(customerKey[:])
 	if err != nil {

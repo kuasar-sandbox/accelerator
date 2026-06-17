@@ -78,8 +78,8 @@ func uintToString(n uint64) string {
 	return string(b[i:])
 }
 
-func fakeEncryptor() crypto.Encryptor {
-	enc, _, err := crypto.New(crypto.Config{Chunk: "fake", Manifest: "fake"})
+func testEncryptor() crypto.Encryptor {
+	enc, _, err := crypto.New(crypto.Config{Chunk: "aes", Manifest: "aes"})
 	if err != nil {
 		panic(err)
 	}
@@ -106,7 +106,7 @@ func loadManifest(t *testing.T, rec *recordingStore) *codec.Manifest {
 // still written.
 func TestIngest_AllZeroNoStorePut(t *testing.T) {
 	rec := &recordingStore{}
-	ing := NewIngester(testKeyFn, nil, rec, fixedChunker(t, 64*1024), fakeEncryptor())
+	ing := NewIngester(testKeyFn, nil, rec, fixedChunker(t, 64*1024), testEncryptor())
 
 	const chunkSize = 64 * 1024
 	const numChunks = 4
@@ -142,11 +142,11 @@ func TestIngest_AllZeroNoStorePut(t *testing.T) {
 
 // TestIngest_KeyTableCompressed — for a half-zero input the sealed
 // key table must hold exactly M=non-zero-chunk-count keys (32 B each)
-// after the AEAD/HMAC tag overhead. We use the fake key-table encoder
-// since its overhead is deterministic (1 flag byte + 32 byte tag).
+// after the AEAD overhead. AES-GCM's overhead is deterministic too
+// (1 flag + 12 synthesized-nonce + 16 tag), so the size is exact.
 func TestIngest_KeyTableCompressed(t *testing.T) {
 	rec := &recordingStore{}
-	ing := NewIngester(testKeyFn, nil, rec, fixedChunker(t, 64*1024), fakeEncryptor())
+	ing := NewIngester(testKeyFn, nil, rec, fixedChunker(t, 64*1024), testEncryptor())
 
 	const chunkSize = 64 * 1024
 	const numChunks = 4
@@ -177,10 +177,10 @@ func TestIngest_KeyTableCompressed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("codec.Unmarshal: %v", err)
 	}
-	// Fake key-table seal format: [1 byte flag][32 byte HMAC][N*32 byte keys]
-	// → expected length = 33 + (non-zero chunk count) * 32
-	const fakeOverhead = 33
-	wantKeyTableLen := fakeOverhead + 2*32
+	// AES-GCM key-table seal format: [1 byte flag][12 byte nonce][N*32 byte
+	// keys][16 byte tag] → expected length = 29 + (non-zero chunk count) * 32
+	const gcmOverhead = 1 + 12 + 16 // flag + synthesized nonce + GCM tag
+	wantKeyTableLen := gcmOverhead + 2*32
 	if got := len(sealed); got != wantKeyTableLen {
 		t.Errorf("sealed key table size %d, want %d (compressed: only 2 non-zero keys)", got, wantKeyTableLen)
 	}
@@ -201,7 +201,7 @@ func TestIngest_KeyTableCompressed(t *testing.T) {
 // no key bytes at all.
 func TestIngest_AllZeroSealedTableTinyAndDeterministic(t *testing.T) {
 	rec := &recordingStore{}
-	ing := NewIngester(testKeyFn, nil, rec, fixedChunker(t, 64*1024), fakeEncryptor())
+	ing := NewIngester(testKeyFn, nil, rec, fixedChunker(t, 64*1024), testEncryptor())
 
 	const chunkSize = 64 * 1024
 	input := make([]byte, 4*chunkSize)
@@ -215,8 +215,8 @@ func TestIngest_AllZeroSealedTableTinyAndDeterministic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("codec.Unmarshal: %v", err)
 	}
-	const fakeOverhead = 33 // 1 flag + 32 HMAC
-	if len(sealed) != fakeOverhead {
-		t.Errorf("sealed key table size %d, want %d (no keys, just AEAD overhead)", len(sealed), fakeOverhead)
+	const gcmOverhead = 1 + 12 + 16 // flag + synthesized nonce + GCM tag
+	if len(sealed) != gcmOverhead {
+		t.Errorf("sealed key table size %d, want %d (no keys, just AEAD overhead)", len(sealed), gcmOverhead)
 	}
 }

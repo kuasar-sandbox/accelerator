@@ -108,7 +108,7 @@ func (f *fetcher) fetchOne(ctx context.Context, manifestKey store.ContentKey) (S
 // mis-use (the stream never encrypts).
 type decryptorAsChunkEncryptor struct{ dec crypto.Decryptor }
 
-func (a decryptorAsChunkEncryptor) Encrypt(key [32]byte, plain []byte) ([]byte, [32]byte) {
+func (a decryptorAsChunkEncryptor) Encrypt(salt [32]byte, plain []byte) ([]byte, [32]byte, [32]byte) {
 	panic("fetch: Encrypt called on read-only stream adapter")
 }
 

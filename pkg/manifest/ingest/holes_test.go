@@ -65,7 +65,7 @@ func TestIngest_HolesSkipChunker(t *testing.T) {
 	}
 
 	rec := &observingStore{}
-	ing := NewIngester(testKeyFn, nil, rec, fixedChunker(t, chunkSize), fakeEncryptor())
+	ing := NewIngester(testKeyFn, nil, rec, fixedChunker(t, chunkSize), testEncryptor())
 
 	if _, err := ing.Ingest(context.Background(), src, IngestOption{}); err != nil {
 		t.Fatalf("Ingest: %v", err)
@@ -145,7 +145,7 @@ func TestIngest_ZeroRunsFeedChunkerWithoutRead(t *testing.T) {
 	}
 
 	recA := &observingStore{}
-	ingA := NewIngester(testKeyFn, nil, recA, fixedChunker(t, chunkSize), fakeEncryptor())
+	ingA := NewIngester(testKeyFn, nil, recA, fixedChunker(t, chunkSize), testEncryptor())
 	resA, err := ingA.Ingest(context.Background(), &zeroRunIngestSource{data: data}, IngestOption{})
 	if err != nil {
 		t.Fatalf("Ingest(zero-run source): %v", err)
@@ -169,7 +169,7 @@ func TestIngest_ZeroRunsFeedChunkerWithoutRead(t *testing.T) {
 	literal := make([]byte, 12*1024)
 	copy(literal, data)
 	recB := &observingStore{}
-	ingB := NewIngester(testKeyFn, nil, recB, fixedChunker(t, chunkSize), fakeEncryptor())
+	ingB := NewIngester(testKeyFn, nil, recB, fixedChunker(t, chunkSize), testEncryptor())
 	resB, err := ingB.Ingest(context.Background(), sparse.Dense(bytes.NewReader(literal), uint64(len(literal))), IngestOption{})
 	if err != nil {
 		t.Fatalf("Ingest(dense literal): %v", err)
@@ -190,7 +190,7 @@ func TestIngest_NoHoles_BackwardCompat(t *testing.T) {
 	}
 
 	rec := &observingStore{}
-	ing := NewIngester(testKeyFn, nil, rec, fixedChunker(t, chunkSize), fakeEncryptor())
+	ing := NewIngester(testKeyFn, nil, rec, fixedChunker(t, chunkSize), testEncryptor())
 
 	_, err := ing.Ingest(context.Background(), sparse.Dense(bytes.NewReader(src), imageSize), IngestOption{})
 	if err != nil {
@@ -216,7 +216,7 @@ func TestIngest_NoHoles_BackwardCompat(t *testing.T) {
 // 1 hole, sealed key table contains 0 keys (just AEAD overhead).
 func TestIngest_AllHoleManifest(t *testing.T) {
 	rec := &observingStore{}
-	ing := NewIngester(testKeyFn, nil, rec, fixedChunker(t, 4096), fakeEncryptor())
+	ing := NewIngester(testKeyFn, nil, rec, fixedChunker(t, 4096), testEncryptor())
 
 	src, err := sparse.NewSource(bytes.NewReader(make([]byte, 1024)), 1024, []sparse.Extent{{Offset: 0, Size: 1024}})
 	if err != nil {
