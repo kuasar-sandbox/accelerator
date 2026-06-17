@@ -26,6 +26,7 @@ package fetch
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"sync"
@@ -154,6 +155,15 @@ func (s *manifestStream) readChunkInto(ctx context.Context, dst []byte, chunkIdx
 	}
 	if result != cache.CacheHit {
 		return fmt.Errorf("chunk %d: not found", chunkIdx)
+	}
+	// The content key is SHA256(ciphertext) and is authenticated by the key
+	// table's AAD, so verifying the returned bytes against it rejects a corrupt
+	// or tampered chunk before the unauthenticated AES-CTR decrypt would turn
+	// attacker-chosen ciphertext into attacker-chosen plaintext. Hash the bytes
+	// as received — DecryptInPlace mutates the buffer in place.
+	if sha256.Sum256(blob.Bytes()) != e.CiphertextHash {
+		blob.Release()
+		return fmt.Errorf("chunk %d: ciphertext hash mismatch (corrupt or tampered store/cache)", chunkIdx)
 	}
 	plain, err := s.encryptor.DecryptInPlace(s.keys[chunkIdx], blob.Bytes())
 	if err != nil {

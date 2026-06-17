@@ -22,6 +22,7 @@ func newTestStream(m *codec.Manifest, fill byte) Stream {
 		}
 	}
 	plain := bytes.Repeat([]byte{fill}, int(maxSz))
+	stampHashes(m, plain)
 	return NewStream(m, make([][32]byte, len(m.Entries)), &staticGetter{plain: plain}, &passthroughEncryptor{plain: plain})
 }
 

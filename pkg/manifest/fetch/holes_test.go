@@ -80,6 +80,7 @@ func TestReadAt_ZeroFillsHole(t *testing.T) {
 	const dataSize, holeSize = uint64(4096), uint64(4096)
 	m := buildHoleManifest(dataSize, holeSize)
 	plain := bytes.Repeat([]byte{0xEE}, int(dataSize))
+	stampHashes(m, plain)
 	f := NewStream(m, make([][32]byte, 2), &staticGetter{plain}, &passthroughEncryptor{plain: plain})
 	defer f.Close()
 
@@ -124,6 +125,7 @@ func TestReadAt_PartialEOF(t *testing.T) {
 		Entries:   []codec.ChunkEntry{{Offset: 0, Size: uint32(dataSize), CiphertextHash: store.ContentKey{0xCC}}},
 	}
 	plain := bytes.Repeat([]byte{0xCC}, int(dataSize))
+	stampHashes(m, plain)
 	f := NewStream(m, make([][32]byte, 1), &staticGetter{plain}, &passthroughEncryptor{plain: plain})
 	defer f.Close()
 
@@ -150,6 +152,7 @@ func TestReadAt_FillsCompleteBuf(t *testing.T) {
 		Entries:   []codec.ChunkEntry{{Offset: 0, Size: uint32(dataSize), CiphertextHash: store.ContentKey{0xDD}}},
 	}
 	plain := bytes.Repeat([]byte{0xDD}, int(dataSize))
+	stampHashes(m, plain)
 	f := NewStream(m, make([][32]byte, 1), &staticGetter{plain}, &passthroughEncryptor{plain: plain})
 	defer f.Close()
 
@@ -185,6 +188,7 @@ func TestRunChunkAt_ChainLoop(t *testing.T) {
 	const dataSize, holeSize = uint64(4096), uint64(4096)
 	m := buildHoleManifest(dataSize, holeSize)
 	plain := bytes.Repeat([]byte{0xEE}, int(dataSize))
+	stampHashes(m, plain)
 	s := NewStream(m, make([][32]byte, 2), &staticGetter{plain}, &passthroughEncryptor{plain: plain})
 	defer s.Close()
 	cs, ok := s.(ChunkStream)

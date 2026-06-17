@@ -3,6 +3,7 @@ package fetch
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"sync/atomic"
 	"testing"
@@ -11,6 +12,18 @@ import (
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/codec"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
+
+// stampHashes sets every non-zero entry's CiphertextHash to SHA256(blob), so a
+// test getter returning blob satisfies readChunkInto's integrity check (these
+// tests use passthrough crypto, so the stored "ciphertext" is blob itself).
+func stampHashes(m *codec.Manifest, blob []byte) {
+	h := sha256.Sum256(blob)
+	for i := range m.Entries {
+		if !m.Entries[i].IsZero {
+			m.Entries[i].CiphertextHash = h
+		}
+	}
+}
 
 // recordingGetter counts Get calls; it lets a test assert the IsZero
 // short-circuit never reaches the cache.
@@ -72,13 +85,10 @@ func TestReadAt_AcrossZeroBoundary(t *testing.T) {
 	for i := range plain {
 		plain[i] = byte(i % 251)
 	}
-	var hashEntry store.ContentKey
-	for i := range hashEntry {
-		hashEntry[i] = 0xAA
-	}
+	hashEntry := sha256.Sum256(plain)
 	entries[0].CiphertextHash = hashEntry
 
-	getter := &fixedHitGetter{hash: hashEntry, value: plain}
+	getter := &fixedHitGetter{hash: store.ContentKey(hashEntry), value: plain}
 	f := NewStream(m, make([][32]byte, 2), getter, &passthroughEncryptor{plain: plain})
 	defer f.Close()
 
@@ -122,12 +132,12 @@ func TestReadAt_FetchError(t *testing.T) {
 func TestReadAt_ReleasesBlobs(t *testing.T) {
 	const chunkSize = 4096
 	const numChunks = 3
+	plain := bytes.Repeat([]byte{0x5A}, chunkSize)
 	entries := make([]codec.ChunkEntry, numChunks)
 	for i := range entries {
-		entries[i] = codec.ChunkEntry{Offset: uint64(i) * chunkSize, Size: chunkSize, CiphertextHash: store.ContentKey{byte(i + 1)}}
+		entries[i] = codec.ChunkEntry{Offset: uint64(i) * chunkSize, Size: chunkSize, CiphertextHash: sha256.Sum256(plain)}
 	}
 	m := &codec.Manifest{Version: codec.Version1, ImageSize: numChunks * chunkSize, Entries: entries}
-	plain := bytes.Repeat([]byte{0x5A}, chunkSize)
 
 	var released atomic.Int64
 	getter := blobReleaseGetter{value: plain, released: &released}
@@ -139,6 +149,31 @@ func TestReadAt_ReleasesBlobs(t *testing.T) {
 	}
 	if got := released.Load(); got != numChunks {
 		t.Errorf("blobs released = %d, want %d", got, numChunks)
+	}
+}
+
+// TestReadAt_HashMismatchRejected — the integrity check rejects a chunk whose
+// bytes do not match the manifest's authenticated CiphertextHash (a corrupt or
+// tampered store/cache), instead of feeding attacker-chosen ciphertext to the
+// unauthenticated AES-CTR decrypt.
+func TestReadAt_HashMismatchRejected(t *testing.T) {
+	const chunkSize = 4096
+	tampered := bytes.Repeat([]byte{0x42}, chunkSize)
+	m := &codec.Manifest{
+		Version:   codec.Version1,
+		ImageSize: chunkSize,
+		Entries:   []codec.ChunkEntry{{Offset: 0, Size: chunkSize, CiphertextHash: sha256.Sum256([]byte("authentic ciphertext"))}},
+	}
+	// staticGetter returns `tampered`, which does not hash to the entry's hash.
+	f := NewStream(m, make([][32]byte, 1), &staticGetter{plain: tampered}, &passthroughEncryptor{plain: tampered})
+	defer f.Close()
+
+	n, err := f.ReadAt(context.Background(), make([]byte, chunkSize), 0)
+	if err == nil {
+		t.Fatal("expected hash-mismatch error, got nil (tampered chunk accepted)")
+	}
+	if n != 0 {
+		t.Errorf("n = %d, want 0 on integrity failure", n)
 	}
 }
 
