@@ -70,7 +70,7 @@ func RegionFromEndpoint(endpoint string) string {
 	return regionFromEndpoint(endpoint)
 }
 
-// regionFromEndpoint extracts the region name from a OBS
+// regionFromEndpoint extracts the region name from an OBS-style
 // endpoint of the canonical form
 //
 //	http(s)://obs.<region>.<flavour>.<rest>
