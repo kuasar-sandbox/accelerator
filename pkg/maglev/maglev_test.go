@@ -1,4 +1,4 @@
-package ec
+package maglev
 
 import (
 	"fmt"
@@ -14,7 +14,7 @@ func testNodes(n int) []string {
 	return nodes
 }
 
-// TestBuildMaglev_TableBalance verifies that each node owns exactly
+// TestBuildMaglev_TableBalance verifies that each member owns exactly
 // TableSize/M ± 1 positions in the lookup table.
 func TestBuildMaglev_TableBalance(t *testing.T) {
 	for _, m := range []int{3, 5, 7, 10, 20} {
@@ -28,14 +28,14 @@ func TestBuildMaglev_TableBalance(t *testing.T) {
 			for i, c := range counts {
 				diff := c - expected
 				if diff < -1 || diff > 1 {
-					t.Errorf("node %d: %d positions (expected %d ± 1)", i, c, expected)
+					t.Errorf("member %d: %d positions (expected %d ± 1)", i, c, expected)
 				}
 			}
 		})
 	}
 }
 
-// TestLocateN_Distinctness verifies that LocateN returns N distinct nodes.
+// TestLocateN_Distinctness verifies that LocateN returns N distinct members.
 func TestLocateN_Distinctness(t *testing.T) {
 	tbl := buildMaglev(testNodes(5), defaultTableSize)
 	for n := 1; n <= 5; n++ {
@@ -44,12 +44,12 @@ func TestLocateN_Distinctness(t *testing.T) {
 			t.Fatal(err)
 		}
 		if len(ids) != n {
-			t.Fatalf("LocateN(%d): got %d nodes", n, len(ids))
+			t.Fatalf("LocateN(%d): got %d members", n, len(ids))
 		}
 		seen := make(map[string]bool)
 		for _, id := range ids {
 			if seen[id] {
-				t.Fatalf("LocateN(%d): duplicate node %s", n, id)
+				t.Fatalf("LocateN(%d): duplicate member %s", n, id)
 			}
 			seen[id] = true
 		}
@@ -57,7 +57,7 @@ func TestLocateN_Distinctness(t *testing.T) {
 }
 
 // TestLocateN_Deterministic verifies the same key always produces the
-// same result with the same node set.
+// same result with the same member set.
 func TestLocateN_Deterministic(t *testing.T) {
 	tbl := buildMaglev(testNodes(5), defaultTableSize)
 	ids1, _ := tbl.LocateN([]byte("stable-key"), 5)
@@ -70,7 +70,7 @@ func TestLocateN_Deterministic(t *testing.T) {
 }
 
 // TestLocateN_NEqualsM verifies that when N == M, LocateN returns all
-// M nodes (as a key-dependent permutation, not a fixed order).
+// M members (as a key-dependent permutation, not a fixed order).
 func TestLocateN_NEqualsM(t *testing.T) {
 	tbl := buildMaglev(testNodes(5), defaultTableSize)
 	ids, _ := tbl.LocateN([]byte("any-key"), 5)
@@ -82,12 +82,12 @@ func TestLocateN_NEqualsM(t *testing.T) {
 		seen[id] = true
 	}
 	if len(seen) != 5 {
-		t.Fatal("not all 5 nodes present in result")
+		t.Fatal("not all 5 members present in result")
 	}
 }
 
 // TestLocateN_NGreaterThanM verifies that LocateN returns an error
-// when N exceeds the number of nodes.
+// when N exceeds the number of members.
 func TestLocateN_NGreaterThanM(t *testing.T) {
 	tbl := buildMaglev(testNodes(5), defaultTableSize)
 	_, err := tbl.LocateN([]byte("key"), 6)
@@ -96,10 +96,10 @@ func TestLocateN_NGreaterThanM(t *testing.T) {
 	}
 }
 
-// TestLocateN_Shard0Balance verifies that shard 0 (the first node in
-// the LocateN result) is approximately uniformly distributed across
-// all nodes. This validates that different keys get different primary
-// nodes, preventing hotspots.
+// TestLocateN_Shard0Balance verifies that the first member in the
+// LocateN result is approximately uniformly distributed across all
+// members. This validates that different keys get different primary
+// members, preventing hotspots.
 func TestLocateN_Shard0Balance(t *testing.T) {
 	tbl := buildMaglev(testNodes(5), defaultTableSize)
 	const numKeys = 100_000
@@ -117,7 +117,7 @@ func TestLocateN_Shard0Balance(t *testing.T) {
 	stddev := math.Sqrt(sumSqDiff / 5.0)
 	relStddev := stddev / expected
 	if relStddev > 0.01 {
-		t.Errorf("shard-0 relative stddev %.4f > 1%%: %v", relStddev, counts)
+		t.Errorf("primary relative stddev %.4f > 1%%: %v", relStddev, counts)
 	}
 }
 
@@ -135,9 +135,9 @@ func TestBuildMaglev_InputOrderIndependent(t *testing.T) {
 	}
 }
 
-// TestBuildMaglev_MinimalDisruption verifies that adding one node to a
-// cluster remaps approximately 1/(M+1) of keys (close to the
-// theoretical minimum).
+// TestBuildMaglev_MinimalDisruption verifies that adding one member to a
+// set remaps approximately 1/(M+1) of keys (close to the theoretical
+// minimum).
 func TestBuildMaglev_MinimalDisruption(t *testing.T) {
 	const numKeys = 100_000
 	nodes5 := testNodes(5)
@@ -158,6 +158,45 @@ func TestBuildMaglev_MinimalDisruption(t *testing.T) {
 	expected := 1.0 / 6.0
 	if math.Abs(ratio-expected) > 0.05 {
 		t.Errorf("remap ratio %.4f too far from expected %.4f", ratio, expected)
+	}
+}
+
+// TestNew verifies the exported New constructor produces the same table
+// as buildMaglev at the default size.
+func TestNew(t *testing.T) {
+	members := testNodes(5)
+	got := New(members)
+	want := buildMaglev(members, defaultTableSize)
+	if got.size != want.size || len(got.table) != len(want.table) {
+		t.Fatalf("New shape mismatch: size %d/%d", got.size, want.size)
+	}
+	for i := range want.table {
+		if got.table[i] != want.table[i] {
+			t.Fatalf("New table differs at %d", i)
+		}
+	}
+}
+
+// TestPackageLocateN verifies the package-level LocateN convenience
+// matches building a Table and calling its method.
+func TestPackageLocateN(t *testing.T) {
+	members := testNodes(8)
+	key := []byte("group/cell/proj/app/g1")
+	got, err := LocateN(key, members, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := New(members).LocateN(key, 3)
+	if len(got) != 3 {
+		t.Fatalf("got %d members, want 3", len(got))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("convenience LocateN differs at %d: %s vs %s", i, got[i], want[i])
+		}
+	}
+	if _, err := LocateN(key, members, 9); err == nil {
+		t.Fatal("expected error for n > len(members)")
 	}
 }
 

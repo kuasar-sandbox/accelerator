@@ -5,6 +5,7 @@ import (
 	"sort"
 	"sync/atomic"
 
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/maglev"
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
 )
 
@@ -29,7 +30,7 @@ type routerState struct {
 	epoch   int64
 	peers   []Peer             // sorted by ID
 	peerMap map[string]string  // id → endpoint for O(1) Endpoint()
-	table   *maglevTable
+	table   *maglev.Table
 }
 
 // Peer identifies a cache-ctl shard node. Exported because it's the
@@ -71,7 +72,7 @@ func buildRouterState(epoch int64, peers []Peer) (*routerState, error) {
 		epoch:   epoch,
 		peers:   sorted,
 		peerMap: peerMap,
-		table:   buildMaglev(ids, defaultTableSize),
+		table:   maglev.New(ids),
 	}, nil
 }
 
