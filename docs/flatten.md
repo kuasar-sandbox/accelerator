@@ -294,8 +294,7 @@ grace 期保护近期写入的 blob 不被并发拉取误删。`cache.dir` 指�
 
 **确定性提醒**:tag 可变,`:latest` 不可复现;可复现构建请钉 `@sha256:`。`export` 把
 解析到的 `repo@sha256:..` 打到 stderr(`--no-progress` 关闭),`--print-digest` 另打到
-stdout。`verify` 对 registry 源先拉一次进缓存,再从同批缓存 blob 展两遍比对——对 tag 只
-与其当前指向一样稳,对 digest 永远稳定。
+stdout。复现性以 digest 为准:对 tag 只与其当前指向一样稳,对 digest 永远稳定。
 
 #### Referrers 回写与幂等跳过(`--with-referer`)
 
@@ -392,8 +391,8 @@ stdin 报错引导)。`..` 成员跳过告警,穿 symlink 写出是硬错误;条
 不给规则取全部到当前目录;`--chown/--chmod` 改写每个落盘条目的属主/权限。`--chown`
 取 `uid:gid`:数字直用,**名字**则按解包目标根的 `/etc/passwd`/`/etc/group` 解析
 (Docker `COPY --chown=name` 同款;CGO 关,os/user 直读文件不经 NSS);`user`(无组)
-取该用户主组,纯数字 `1000` 镜像为 `1000:1000`。orchestrator 的 COPY step 即以
-`extract --dense --chown` 把上下文 tar 摊进 guest rootfs(见 orchestrator.md §11)。
+取该用户主组,纯数字 `1000` 镜像为 `1000:1000`。node-ctl 的 COPY step 即以
+`extract --dense --chown` 把上下文 tar 摊进 guest rootfs(见 node.md §12)。
 
 **stream** 把**一个文件**封装为 tarstream(单文件稀疏 tar,
 `sandbox-accelerator/pkg/tarstream`)。文件源的洞图来自文件系统元数据
@@ -633,7 +632,7 @@ OCI image config 字段繁多,大量与启动无关:`created` / `author` / `hist
 构建时间:与镜像大小近似线性,主要成本在 layer tar 解压 + mkfs.erofs。
 1 GiB 镜像 ~3-5 秒(SSD)。ZIP append 步骤 < 10 ms(单 entry,无压缩)。
 
-确定性自检(`verify` 子命令):同镜像两次展平,比对输出 sha256 一致。
+确定性自检:同镜像两次展平产出 sha256 一致,由单元测试 + manifest key 可复现性背书(`verify` 子命令已移除,见 §2.2)。
 
 `flatten-ctl info` 不解压 EROFS,仅读 superblock(128 字节)+ ZIP EOCD 扫描
 + 单 entry 解压,亚毫秒级。
