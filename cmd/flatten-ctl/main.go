@@ -535,7 +535,24 @@ func runReferrerExport(ref string, rcfg *remote.Config, manifestCfgPath string, 
 		fmt.Fprintf(os.Stderr, "EROFS image: %s\n", formatSize(info.Size()))
 	}
 
-	key, err := ingestEROFS(tmpOut.Name(), mcfg, noProgress)
+	// Pack the raw erofs into a tarstream image artifact (the platform
+	// container) before ingest — ingestEROFS opens it via OpenTarStream, exactly
+	// as the --output/--upload path does (see packImageArtifact). Without this the
+	// referrer flow would ingest a bare erofs and fail "not a tarstream artifact".
+	artTmp, err := os.CreateTemp(rcfg.TmpDir, "flatten-image-*.img")
+	if err != nil {
+		fatal("create temp artifact: %v", err)
+	}
+	defer os.Remove(artTmp.Name())
+	if err := packImageArtifact(tmpOut.Name(), artTmp); err != nil {
+		artTmp.Close()
+		fatal("%v", err)
+	}
+	if err := artTmp.Close(); err != nil {
+		fatal("close artifact: %v", err)
+	}
+
+	key, err := ingestEROFS(artTmp.Name(), mcfg, noProgress)
 	if err != nil {
 		fatal("%v", err)
 	}
