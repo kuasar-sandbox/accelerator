@@ -11,7 +11,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all build manifest-ctl store-ctl cache-ctl flatten-ctl deps-rocksdb test vet bench test-e2e test-e2e-cache test-e2e-store-cache test-e2e-cluster zot e2e perf-cache perf-cache-remote dedup-report clean help
+.PHONY: all build manifest-ctl store-ctl cache-ctl flatten-ctl deps-rocksdb test vet bench test-e2e test-e2e-cache test-e2e-store-cache test-e2e-cluster test-e2e-flatten zot perf-cache perf-cache-remote dedup-report clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -121,7 +121,7 @@ bench: deps-rocksdb
 	CGO_LDFLAGS="-L$(ROCKS_PREFIX)/lib -lrocksdb -lstdc++ -lm -lpthread -ldl" \
 		$(GO) test -bench=. -benchmem -run=^$$ ./...
 
-test-e2e: test-e2e-cache test-e2e-store-cache test-e2e-cluster
+test-e2e: test-e2e-cache test-e2e-store-cache test-e2e-cluster test-e2e-flatten
 
 test-e2e-cache:
 	BIN=$(SBIN) bash test/e2e/e2e_cache.sh
@@ -132,10 +132,10 @@ test-e2e-store-cache:
 test-e2e-cluster:
 	BIN=$(SBIN) bash test/e2e/e2e_cluster_rolling.sh
 
-# Opt-in registry e2e (folded in from sandbox-builder): flatten-ctl pulls a real
-# image from a local zot (OCI 1.1) registry, flattens it, and writes the manifest
-# referrer back. Needs docker (seeds the image), mkfs.erofs, curl, network. Not
-# part of `make test`. store-ctl is built in-repo (no cross-repo dependency).
+# Registry e2e (flatten-ctl pulls a real image from a local zot OCI 1.1 registry,
+# flattens it, writes the manifest referrer back). Part of test-e2e; the script
+# SKIPs cleanly (exit 0) when docker / zot / mkfs.erofs are absent, so it is safe
+# in the aggregate. Not part of `make test` (unit tests). store-ctl is in-repo.
 ZOT_VERSION ?= v2.1.17
 ZOT_BIN     := $(BINDIR)/zot
 
@@ -147,11 +147,14 @@ $(ZOT_BIN):
 
 zot: $(ZOT_BIN)
 
-e2e: flatten-ctl store-ctl zot
+# Prefer a zot already on PATH (how the umbrella e2e locate it); fetch one only as
+# a best-effort fallback so a no-network host SKIPs rather than fails the suite.
+test-e2e-flatten: flatten-ctl store-ctl
+	@command -v zot >/dev/null 2>&1 || $(MAKE) --no-print-directory $(ZOT_BIN) >/dev/null 2>&1 || true
 	FLATTEN_CTL="$(abspath $(BINDIR)/flatten-ctl)" \
 	STORE_CTL="$(abspath $(BINDIR)/store-ctl)" \
-	ZOT_BIN="$(abspath $(ZOT_BIN))" \
-	  bash test/e2e/run.sh
+	ZOT_BIN="$$(command -v zot || echo $(abspath $(ZOT_BIN)))" \
+	  bash test/e2e/e2e_flatten.sh
 
 perf-cache:
 	BIN=$(SBIN) bash test/scripts/bench_cache.sh
@@ -172,6 +175,6 @@ help:
 	@echo "  deps-rocksdb  build local librocksdb.a"
 	@echo "  test          unit tests (needs librocksdb for cache/rocks)"
 	@echo "  vet           vet the CGO-free client surface"
-	@echo "  zot / e2e     registry pull + flatten + referrer e2e (needs docker, mkfs.erofs)"
+	@echo "  test-e2e-flatten  registry pull + flatten + referrer e2e (docker+zot; SKIPs if absent)"
 	@echo "  clean         remove bin/ + build/"
 	@echo "  TARGET_ARCH   x86_64 (default) | aarch64"

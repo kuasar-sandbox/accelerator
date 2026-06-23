@@ -9,10 +9,11 @@ in-memory ggcr registry that only does the tag-schema referrers fallback.)
 
 ## Run
 
-    make e2e
+    make test-e2e-flatten      # also runs as part of `make test-e2e` + the umbrella gate
 
-This builds `flatten-ctl` + the sibling `store-ctl`, downloads a `zot` binary
-into `bin/`, and runs `test/e2e/run.sh`.
+This builds `flatten-ctl` + the sibling `store-ctl`, prefers a `zot` already on
+`PATH` (fetching one into `bin/` only as a fallback), and runs
+`test/e2e/e2e_flatten.sh`. Any missing requirement yields a clean `[SKIP]`.
 
 ## What it checks
 
