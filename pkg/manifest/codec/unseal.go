@@ -3,7 +3,7 @@ package codec
 import (
 	"fmt"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 )
 
 // UnsealKeys decrypts the manifest's sealed key table and expands it

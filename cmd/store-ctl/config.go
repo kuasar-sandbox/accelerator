@@ -9,7 +9,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/obs"
+	"github.com/kuasar-sandbox/accelerator/pkg/store/obs"
 )
 
 // defaultStatsInterval is the base period for the adaptive stats line when

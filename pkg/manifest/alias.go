@@ -1,9 +1,9 @@
 package manifest
 
 import (
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/codec"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/fetch"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/ingest"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 )
 
 // Re-exports of the most commonly used types and functions from the
@@ -34,9 +34,9 @@ const (
 // surface; codec stays the implementation home but callers shouldn't
 // have to know about it.
 var (
-	Marshal              = codec.Marshal
-	Unmarshal            = codec.Unmarshal
-	BuildAAD             = codec.BuildAAD
-	UnsealKeys           = codec.UnsealKeys
-	ChunkIndexForOffset  = codec.ChunkIndexForOffset
+	Marshal             = codec.Marshal
+	Unmarshal           = codec.Unmarshal
+	BuildAAD            = codec.BuildAAD
+	UnsealKeys          = codec.UnsealKeys
+	ChunkIndexForOffset = codec.ChunkIndexForOffset
 )

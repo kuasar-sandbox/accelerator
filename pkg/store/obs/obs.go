@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
-	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util/optrace"
+	"github.com/kuasar-sandbox/accelerator/internal/util/optrace"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
 // metaGenerationsKey is the in-bucket path of the generations meta
@@ -329,4 +329,3 @@ func (s *Store) boundedPut(parent context.Context, key string, body []byte, opts
 func normalisePrefix(p string) string {
 	return strings.Trim(p, "/")
 }
-

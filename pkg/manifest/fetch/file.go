@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
 
 // fileStream is a local file as a Stream: a sparse.Source built from

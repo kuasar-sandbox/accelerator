@@ -21,8 +21,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/pb"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/store/pb"
 )
 
 // frameSize is the per-message payload cap on the wire for
@@ -244,4 +244,3 @@ func storePartitionToProto(p store.Partition) (pb.Partition, error) {
 		return pb.Partition_PARTITION_UNSPECIFIED, fmt.Errorf("store: unknown partition %q", p)
 	}
 }
-

@@ -8,9 +8,9 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/codec"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
 // stampHashes sets every non-zero entry's CiphertextHash to SHA256(blob), so a
@@ -228,6 +228,6 @@ type countingBlob struct {
 	released *atomic.Int64
 }
 
-func (b countingBlob) Bytes() []byte    { return b.data }
+func (b countingBlob) Bytes() []byte     { return b.data }
 func (b countingBlob) Clone() cache.Blob { return b }
 func (b countingBlob) Release()          { b.released.Add(1) }

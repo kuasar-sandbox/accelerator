@@ -11,9 +11,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/tarstream"
-	btar "github.com/kuasar-sandbox/sandbox-accelerator/pkg/tar"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	btar "github.com/kuasar-sandbox/accelerator/pkg/tar"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 )
 
 // cmdTar implements the tar tooling, all pure Go:
@@ -22,7 +22,7 @@ import (
 //	  (single-pass streaming; a single-file rule restores declared
 //	  holes exactly)
 //	flatten-ctl tar stream  — package one file or sized stdin as a
-//	  tarstream (sandbox-accelerator pkg/tarstream)
+//	  tarstream (accelerator pkg/tarstream)
 func cmdTar(args []string) {
 	if len(args) < 1 || args[0] == "-h" || args[0] == "--help" {
 		tarUsage()
@@ -299,7 +299,7 @@ No rules takes everything. --chown/--chmod override ownership and
 permissions on every extracted entry.
 
 stream packages exactly one file as a tarstream (a single-file sparse
-tar; see sandbox-accelerator/pkg/tarstream). A file source's holes
+tar; see accelerator/pkg/tarstream). A file source's holes
 come from the filesystem (SEEK_HOLE) — never from scanning content. A
 stdin source requires --size N (the tar header carries the size up
 front), streams straight through with nothing spooled, and is packaged

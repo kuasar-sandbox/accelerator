@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 )
 
 func TestParseRule(t *testing.T) {

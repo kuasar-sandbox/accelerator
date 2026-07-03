@@ -8,9 +8,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/client"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/rocks"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/runtime"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/client"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/rocks"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/runtime"
 )
 
 // embeddedTier constructs an embedded TierConfig rooted at a fresh tmpdir.

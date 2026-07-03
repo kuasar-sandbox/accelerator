@@ -4,7 +4,7 @@ import (
 	"flag"
 	"os"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/remote"
+	"github.com/kuasar-sandbox/accelerator/pkg/remote"
 	"gopkg.in/yaml.v3"
 )
 

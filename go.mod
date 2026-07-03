@@ -1,4 +1,4 @@
-module github.com/kuasar-sandbox/sandbox-accelerator
+module github.com/kuasar-sandbox/accelerator
 
 go 1.24.0
 

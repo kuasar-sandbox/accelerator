@@ -5,9 +5,9 @@ import (
 	"context"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/client"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/client"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
 // mockShard implements client.ShardCloser synchronously from a single

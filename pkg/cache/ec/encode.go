@@ -5,8 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
 	"github.com/klauspost/reedsolomon"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 )
 
 // encoder wraps a Reed-Solomon encoder with data/parity shard counts.

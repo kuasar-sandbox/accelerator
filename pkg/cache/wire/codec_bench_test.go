@@ -5,7 +5,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 )
 
 // BenchmarkWireCodec_RoundTrip_512KB measures the wire protocol

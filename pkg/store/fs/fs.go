@@ -28,7 +28,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
 // ErrKeyMismatch is returned by Put / PutHandle.Commit when the
@@ -417,5 +417,3 @@ func cleanOrphanTemps(root string) {
 		}
 	}
 }
-
-

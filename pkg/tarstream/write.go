@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
 
 // WriteTo packages src as a complete single-file tar stream on w. The

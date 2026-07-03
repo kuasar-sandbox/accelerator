@@ -17,7 +17,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util"
+	"github.com/kuasar-sandbox/accelerator/internal/util"
 )
 
 // PageSize is the alignment boundary for chunk boundaries (4 KiB).
@@ -41,7 +41,7 @@ type Callback func(ChunkResult) error
 // inherit defaults: Mode="cdc", CDC=(128K min / 512K avg / 1M max),
 // Fixed=(512K).
 type Config struct {
-	Mode  string      `yaml:"mode"`  // "cdc" (default) | "fixed"
+	Mode  string      `yaml:"mode"` // "cdc" (default) | "fixed"
 	CDC   CDCConfig   `yaml:"cdc"`
 	Fixed FixedConfig `yaml:"fixed"`
 }

@@ -8,7 +8,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/pb"
+	"github.com/kuasar-sandbox/accelerator/pkg/store/pb"
 )
 
 // TestStatsCounters drives a representative request mix through the gRPC server

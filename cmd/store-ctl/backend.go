@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/fs"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/obs"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/obs/s3client"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/store/fs"
+	"github.com/kuasar-sandbox/accelerator/pkg/store/obs"
+	"github.com/kuasar-sandbox/accelerator/pkg/store/obs/s3client"
 )
 
 // adminStore is the common surface that init/rollout/purge/info

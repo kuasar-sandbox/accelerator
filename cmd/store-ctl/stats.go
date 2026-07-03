@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util/obstat"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/server"
+	"github.com/kuasar-sandbox/accelerator/internal/util/obstat"
+	"github.com/kuasar-sandbox/accelerator/pkg/store/server"
 )
 
 // storeSampler returns an obstat.RunAdaptive sample func over a store Server: it

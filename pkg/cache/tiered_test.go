@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
 // countingBlob is a cache.Blob mock that tracks Clone and Release

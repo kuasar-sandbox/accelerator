@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
 
 // TestMarshalUnmarshal_NoHoles_PreservesAADBytes verifies that adding

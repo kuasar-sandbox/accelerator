@@ -57,8 +57,8 @@ func dialOpts() []grpc.DialOption {
 	return []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(4 << 20),
-			grpc.MaxCallSendMsgSize(4 << 20),
+			grpc.MaxCallRecvMsgSize(4<<20),
+			grpc.MaxCallSendMsgSize(4<<20),
 		),
 		grpc.WithInitialWindowSize(64 << 20),
 		grpc.WithInitialConnWindowSize(128 << 20),

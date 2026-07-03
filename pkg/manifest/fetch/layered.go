@@ -6,7 +6,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
 
 // layeredStream overlays several Streams (top → bottom) into one Stream: the

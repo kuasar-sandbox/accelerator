@@ -22,7 +22,7 @@ import (
 	ggcrremote "github.com/google/go-containerregistry/pkg/v1/remote"
 	"gopkg.in/yaml.v3"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util"
+	"github.com/kuasar-sandbox/accelerator/internal/util"
 )
 
 const (

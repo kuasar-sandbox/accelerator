@@ -8,10 +8,10 @@ import (
 	"os"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
-	cachepb "github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/pb"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/rocks"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/runtime"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache"
+	cachepb "github.com/kuasar-sandbox/accelerator/pkg/cache/pb"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/rocks"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/runtime"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"

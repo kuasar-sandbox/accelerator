@@ -4,10 +4,10 @@ package cache
 // service. Pure Go — no proto dependency. The server package owns the
 // Go ↔ proto conversion.
 type DaemonStats struct {
-	Mode      string       `json:"mode"`
-	UptimeSec int64        `json:"uptime_sec"`
-	Server    ServerStats  `json:"server"`
-	Tiered    *TieredStats `json:"tiered,omitempty"`
+	Mode      string         `json:"mode"`
+	UptimeSec int64          `json:"uptime_sec"`
+	Server    ServerStats    `json:"server"`
+	Tiered    *TieredStats   `json:"tiered,omitempty"`
 	Rocks     []RocksCFStats `json:"rocks,omitempty"`
 }
 

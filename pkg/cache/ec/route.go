@@ -5,8 +5,8 @@ import (
 	"sort"
 	"sync/atomic"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/maglev"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/maglev"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
 // router maps shard keys to peers using Maglev consistent hashing.
@@ -28,8 +28,8 @@ type router struct {
 // moment Load was called.
 type routerState struct {
 	epoch   int64
-	peers   []Peer             // sorted by ID
-	peerMap map[string]string  // id → endpoint for O(1) Endpoint()
+	peers   []Peer            // sorted by ID
+	peerMap map[string]string // id → endpoint for O(1) Endpoint()
 	table   *maglev.Table
 }
 

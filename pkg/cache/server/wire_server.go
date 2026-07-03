@@ -7,8 +7,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util/optrace"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/wire"
+	"github.com/kuasar-sandbox/accelerator/internal/util/optrace"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/wire"
 )
 
 // WireServer accepts TCP/UDS connections and serves cache RPCs using the

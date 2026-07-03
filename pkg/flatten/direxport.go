@@ -10,7 +10,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/image"
+	"github.com/kuasar-sandbox/accelerator/pkg/image"
 )
 
 // DirOptions configures BuildFromDir.

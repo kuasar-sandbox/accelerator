@@ -395,7 +395,7 @@ stdin 报错引导)。`..` 成员跳过告警,穿 symlink 写出是硬错误;条
 `extract --dense --chown` 把上下文 tar 摊进 guest rootfs(见 node.md §12)。
 
 **stream** 把**一个文件**封装为 tarstream(单文件稀疏 tar,
-`sandbox-accelerator/pkg/tarstream`)。文件源的洞图来自文件系统元数据
+`accelerator/pkg/tarstream`)。文件源的洞图来自文件系统元数据
 (SEEK_HOLE),稀疏保真;stdin 源**必须给 `--size N`**(tar 头先含 size,这是
 格式下界),全程直通、**零落盘**,按致密封装(一次性流没有权威洞元数据,
 也不做内容探洞)。`--size` 仅限 stdin 源(文件长度以文件系统为准)。
@@ -420,10 +420,10 @@ flatten-ctl tar extract -f snap.tar "overlay.img:/restore/overlay.img"
 # 管道对管道:生成器 → tarstream → 提取(stdin 源给定长度,全程零落盘)
 gen-disk | flatten-ctl tar stream --size $((16<<20)) disk.img:- | flatten-ctl tar extract disk.img:-
 
-# 程序化读写(含洞图精确取回、tar 内随机访问)见 sandbox-accelerator/pkg/tarstream
+# 程序化读写(含洞图精确取回、tar 内随机访问)见 accelerator/pkg/tarstream
 ```
 
-编程接口:`sandbox-accelerator/pkg/tarstream` 的 `WriteTo`(吃任意
+编程接口:`accelerator/pkg/tarstream` 的 `WriteTo`(吃任意
 `sparse.Source`)/`ReadFrom`/`ReadSeekFrom`(洞图精确往返、tar 内零拷贝随机
 访问)/`SourceFrom`(tar 流直接开成 `sparse.Source`,可直通 manifest ingest
 等管线消费者),本仓与各下游仓均可 import。
@@ -565,7 +565,7 @@ mkfs.erofs -Ededupe --chunksize=4096 -T0 -b4096 -x-1 \
 完成后追加 ZIP:以 append 方式打开输出文件,在 EROFS 段之后写一条 STORED
 (无压缩)模式的 `config.json` entry(§3.3 的确定性约束)。
 
-`mkfs.erofs` 由 `sandbox-deps` 仓构建产出(`make -C ../sandbox-deps erofs`);本仓
+`mkfs.erofs` 由 `guest-runtime/native-deps` 仓构建产出(`make -C ../guest-runtime/native-deps erofs`);本仓
 `make build` 只构建 flatten-ctl。运行期定位优先级:`MKFS_EROFS_PATH` 环境变量 >
 flatten-ctl 同目录 > `PATH`。
 
@@ -645,6 +645,6 @@ OCI image config 字段繁多,大量与启动无关:`created` / `author` / `hist
   沙箱 启动时如何使用 ZIP trailer 中的 OCI runtime config
 - [`sandbox.md`](sandbox.md) §boot.root.base —— 用展平镜像作为 sandbox
   的只读根
-- [`build.md`](build.md) —— `sandbox-deps` 构建 mkfs.erofs(`make -C ../sandbox-deps
+- [`build.md`](build.md) —— `guest-runtime/native-deps` 构建 mkfs.erofs(`make -C ../guest-runtime/native-deps
   erofs`);本仓 `make build` 只构建 flatten-ctl,运行期经同目录 / `PATH` 定位 mkfs.erofs
 - `kuasar-sandbox/docs/kuasar-sandbox.md` §2.2 / §3.1 —— 展平在系统中的位置与目标

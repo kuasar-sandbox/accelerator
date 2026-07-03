@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
 // CacheResult distinguishes the three lookup outcomes from a cache layer.
@@ -14,8 +14,8 @@ type CacheResult int
 
 const (
 	CacheHit     CacheResult = iota // hit, blob valid
-	CacheMiss                        // miss, caller should try the next layer
-	CacheHitMiss                     // negative cache hit ("known absent"), terminate cascade
+	CacheMiss                       // miss, caller should try the next layer
+	CacheHitMiss                    // negative cache hit ("known absent"), terminate cascade
 )
 
 // Getter is the read-side contract implemented by every cache layer.

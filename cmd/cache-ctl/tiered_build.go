@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/client"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/ec"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/rocks"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/runtime"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/client"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/ec"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/rocks"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/runtime"
 )
 
 // parseDurationOrDefault parses a Go duration string and falls back to

@@ -5,10 +5,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util/obstat"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/rocks"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/server"
+	"github.com/kuasar-sandbox/accelerator/internal/util/obstat"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/rocks"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/server"
 )
 
 // cacheSampler returns an obstat.RunAdaptive sample func over the wire server:

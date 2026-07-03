@@ -1,4 +1,4 @@
-# sandbox-accelerator — storage acceleration + image build (manifest / cache /
+# accelerator — storage acceleration + image build (manifest / cache /
 # store / flatten).
 #
 # Builds four CLIs:
@@ -166,7 +166,7 @@ dedup-report:
 	BIN=$(SBIN) bash test/scripts/dedup_report.sh
 
 help:
-	@echo "sandbox-accelerator. Targets:"
+	@echo "accelerator. Targets:"
 	@echo "  build         build manifest-ctl + store-ctl + cache-ctl + flatten-ctl"
 	@echo "  manifest-ctl  pure Go"
 	@echo "  store-ctl     pure Go"

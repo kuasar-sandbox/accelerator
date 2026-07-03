@@ -15,9 +15,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/client"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/client"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
 // selectKey chooses the next read key per the access pattern, optionally

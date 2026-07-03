@@ -11,10 +11,10 @@ import (
 
 	"google.golang.org/grpc"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util"
-	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util/obstat"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/pb"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/server"
+	"github.com/kuasar-sandbox/accelerator/internal/util"
+	"github.com/kuasar-sandbox/accelerator/internal/util/obstat"
+	"github.com/kuasar-sandbox/accelerator/pkg/store/pb"
+	"github.com/kuasar-sandbox/accelerator/pkg/store/server"
 )
 
 // cmdServe starts the gRPC store daemon and blocks until the

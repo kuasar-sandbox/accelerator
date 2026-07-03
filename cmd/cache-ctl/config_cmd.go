@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/runtime"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/runtime"
 	"gopkg.in/yaml.v3"
 )
 

@@ -29,7 +29,7 @@ import (
 	"errors"
 	"io"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
 
 // Reader is the sequential logical view of the file inside a tar

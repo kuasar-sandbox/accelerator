@@ -3,7 +3,7 @@ package ec
 import (
 	"io"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 )
 
 // Interface is the single exported surface of the ec package. An EC

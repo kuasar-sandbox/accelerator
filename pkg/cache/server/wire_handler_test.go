@@ -6,9 +6,9 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/wire"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/wire"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
 // roTier presents an in-memory Getter as a read-only cache.Tier,

@@ -22,15 +22,15 @@ import (
 	"io"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
-	cacheclient "github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/client"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/chunker"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/codec"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/crypto"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/fetch"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/manifest/ingest"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
-	storeclient "github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/client"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache"
+	cacheclient "github.com/kuasar-sandbox/accelerator/pkg/cache/client"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/chunker"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
+	storeclient "github.com/kuasar-sandbox/accelerator/pkg/store/client"
 )
 
 // Default store/cache timeouts when StoreConfig.Timeout /

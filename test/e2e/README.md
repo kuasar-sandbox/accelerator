@@ -35,7 +35,7 @@ Any missing requirement yields a clean `[SKIP]` (exit 0), not a failure.
 - `docker`, with the seed image cached (default `python:3.12-alpine`),
 - `mkfs.erofs` on `PATH` or via `MKFS_EROFS_PATH`,
 - `curl`, and network access to download zot (honours the ambient proxy env),
-- the sibling `../sandbox-accelerator` checkout (builds `store-ctl`),
+- the sibling `../accelerator` checkout (builds `store-ctl`),
 - `htpasswd` for the basic-auth sub-test (that sub-test is skipped if absent).
 
 ## Knobs

@@ -9,10 +9,10 @@
 //     hides whichever SDK we end up using and the small data types
 //     it needs (ObjectMeta, PutOptions, sentinel errors).
 //   - obs.go:    Store implementation — generations meta load/init,
-//                Get/Put/Exists/OpenPut, generation-walk on Get,
-//                defensive wrapper (timeout + semaphore + size limit).
+//     Get/Put/Exists/OpenPut, generation-walk on Get,
+//     defensive wrapper (timeout + semaphore + size limit).
 //   - puthandle.go: streaming-Put session that buffers in memory
-//                and uploads on Commit via s3Client.Put.
+//     and uploads on Commit via s3Client.Put.
 //
 // Production code wires *s3client.Client (a thin aws-sdk-go-v2/s3
 // adapter living in a sub-package so it doesn't pollute this

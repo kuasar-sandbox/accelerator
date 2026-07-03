@@ -521,6 +521,6 @@ manifest:// 加载端到端时长)。
   以 manifest 同款客户端从 store 取 chunk
 - [`flatten.md`](flatten.md) — 镜像展平后经
   `flatten-ctl export --upload` 入库
-- `sandbox-runtime/docs/sandbox.md` — 沙箱通过 `manifest://<key>` 引用磁盘
+- `sandboxer/docs/sandbox.md` — 沙箱通过 `manifest://<key>` 引用磁盘
   base 与快照
 - `kuasar-sandbox/docs/kuasar-sandbox.md` §4.1–4.4 — Manifest 抽象在系统中的位置

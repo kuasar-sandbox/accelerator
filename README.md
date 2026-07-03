@@ -1,4 +1,4 @@
-# sandbox-accelerator
+# accelerator
 
 存储加速 + 镜像构建层:内容寻址存储 + 分层缓存 + 收敛加密,为 microVM 沙箱提供
 镜像/快照的按需加载与跨租户去重;并含 OCI/目录 → EROFS 的确定性展平(`flatten-ctl`)。
@@ -7,14 +7,14 @@
 
 ## 导出面(下游 import 的薄客户端)
 
-下游项目(`sandbox-runtime` 等)只 import 以下 **纯 Go、无 CGO** 的包,不会引入
+下游项目(`sandboxer` 等)只 import 以下 **纯 Go、无 CGO** 的包,不会引入
 RocksDB / AWS SDK / Reed-Solomon / go-containerregistry 等重依赖:
 
 | 包 | 作用 |
 |---|---|
 | `pkg/sparse` | 平台统一稀疏模型:三态 `RunKind`(Hole/Zero/Data)+ `Source` 契约(元数据查询 RunAt 与数据读取 ReadAt 分离,一次性源是一等公民),`ProbeHoles`(SEEK_HOLE)/`NewSource`/`Dense`;洞只来自权威元数据,禁止内容探洞 |
 | `pkg/manifest` (+ `codec`/`crypto`/`chunker`/`fetch`/`ingest`) | 分块 + 收敛加密 + 内容寻址的读写 SDK;`fetch.Stream` = `sparse.Source` + Close,`fetch.OpenTarStream` 把本地 tarstream 工件零解包开成 Stream,`ingest.Ingest` 单趟消费任意 `sparse.Source` |
-| `pkg/image` | 读取展平镜像内嵌的 RuntimeConfig(EROFS superblock + 追加 ZIP);纯 stdlib,无 registry 依赖(`sandbox-runtime` import) |
+| `pkg/image` | 读取展平镜像内嵌的 RuntimeConfig(EROFS superblock + 追加 ZIP);纯 stdlib,无 registry 依赖(`sandboxer` import) |
 | `pkg/store` + `pkg/store/client` | 远端内容寻址存储代理的接口与客户端 |
 | `pkg/cache` + `pkg/cache/client` | 分层缓存的接口与客户端 |
 | `pkg/tarstream` | 单文件稀疏流的 tar 信封:`WriteTo`(任意 `sparse.Source` → GNU PAX sparse 1.0,仅数据字节上线)/ `ReadFrom` / `ReadSeekFrom`(tar 内零拷贝随机)/ `SourceFrom`·`SourceAt` / `ReadSeekFromIndex`,洞图精确往返;互操作 GNU tar 与 archive/tar |
@@ -47,7 +47,7 @@ make test                       # 单元测试(含 rocks,需 librocksdb);e2e 见
 
 `deps/build-rocksdb.sh` 在 `build/<arch>/rocksdb/` 下编出无压缩的 `librocksdb.a`
 (约数分钟,冷启)。`flatten-ctl` 运行期还需 `mkfs.erofs`(经 PATH / 同目录定位,
-由 `sandbox-deps` 产出)。
+由 `guest-runtime/native-deps` 产出)。
 
 ## 私网 / 离线构建
 

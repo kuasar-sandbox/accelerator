@@ -3,7 +3,7 @@ package server
 import (
 	"sync/atomic"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util/obstat"
+	"github.com/kuasar-sandbox/accelerator/internal/util/obstat"
 )
 
 // Stats accumulates store-server request counters that feed the daemon's

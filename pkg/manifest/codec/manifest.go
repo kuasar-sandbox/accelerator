@@ -19,16 +19,16 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
 
 // Binary format constants.
 const (
-	Magic       uint32 = 0x4D414E49 // "MANI"
-	Version1    uint8  = 1
-	HeaderSize         = 64
-	EntrySize          = 56
-	HoleSize           = 16 // 8 B Offset + 8 B Size; no flags, no reserved
+	Magic      uint32 = 0x4D414E49 // "MANI"
+	Version1   uint8  = 1
+	HeaderSize        = 64
+	EntrySize         = 56
+	HoleSize          = 16 // 8 B Offset + 8 B Size; no flags, no reserved
 )
 
 // ChunkEntry flag bits (the 4-byte flags field at offset 12 of each entry).

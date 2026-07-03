@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/client"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/client"
 )
 
 // Membership is the (epoch, peers) pair a cache-ctl client advertises

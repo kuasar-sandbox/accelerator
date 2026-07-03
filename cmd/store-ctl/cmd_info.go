@@ -5,7 +5,7 @@ import (
 	"flag"
 	"fmt"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
 // cmdInfo opens the store described by the config in read-only mode

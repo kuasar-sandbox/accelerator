@@ -4,7 +4,7 @@
 // and integrates with freq.Sketch via CompactionFilter for cold-key eviction.
 package rocks
 
-import "github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
+import "github.com/kuasar-sandbox/accelerator/pkg/store"
 
 // Column family names (internal — callers address data via store.Partition).
 const (

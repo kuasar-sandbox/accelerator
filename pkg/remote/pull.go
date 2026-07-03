@@ -15,7 +15,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/klauspost/compress/zstd"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/flatten"
+	"github.com/kuasar-sandbox/accelerator/pkg/flatten"
 )
 
 // Resolved is a registry reference pinned to a concrete, platform-selected

@@ -9,8 +9,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 )
 
 // TestOpenTarStream: a tarstream artifact serves as a Stream — hole

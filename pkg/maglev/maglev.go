@@ -78,7 +78,7 @@ func buildMaglev(nodes []string, tableSize int) *Table {
 	skip := make([]int, n)
 	for i, name := range sorted {
 		offset[i] = int(fnvHash(name) % uint64(tableSize))
-		skip[i] = int(fnvHashSalted(name) % uint64(tableSize-1)) + 1
+		skip[i] = int(fnvHashSalted(name)%uint64(tableSize-1)) + 1
 	}
 
 	table := make([]int, tableSize)

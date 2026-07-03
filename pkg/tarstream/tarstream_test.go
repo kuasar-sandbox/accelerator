@@ -15,7 +15,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
 
 // fixture: logical 3 MiB — "A"*8K at 0, hole, "B"*4K at 1M, trailing hole.

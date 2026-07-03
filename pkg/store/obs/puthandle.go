@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
 // putHandle buffers the streamed bytes in memory and uploads once

@@ -16,10 +16,10 @@ func TestDerivedNormalizationLevel_AsymmetricCases(t *testing.T) {
 	// derivedNormalizationLevel docstring. Expected values reflect
 	// that.
 	cases := []struct {
-		name             string
-		min, avg, max    uint32
-		wantN1, wantN2   int
-		desc             string
+		name           string
+		min, avg, max  uint32
+		wantN1, wantN2 int
+		desc           string
 	}{
 		{
 			name: "default 128K/512K/1M", min: 128 << 10, avg: 512 << 10, max: 1024 << 10,

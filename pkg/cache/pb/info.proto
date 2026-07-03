@@ -11,7 +11,7 @@ syntax = "proto3";
 
 package cac.cache.v1;
 
-option go_package = "github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/pb";
+option go_package = "github.com/kuasar-sandbox/accelerator/pkg/cache/pb";
 
 service Info {
     // Get returns a point-in-time snapshot of the daemon's counters.

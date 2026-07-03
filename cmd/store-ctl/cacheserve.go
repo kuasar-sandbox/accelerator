@@ -7,11 +7,11 @@ import (
 	"os"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
-	cacheserver "github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/server"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store/server"
+	"github.com/kuasar-sandbox/accelerator/internal/util"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache"
+	cacheserver "github.com/kuasar-sandbox/accelerator/pkg/cache/server"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/store/server"
 )
 
 // errCacheReadOnly is returned for cache-protocol writes: store-ctl's

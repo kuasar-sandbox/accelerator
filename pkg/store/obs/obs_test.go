@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
 // newStoreT creates a fresh fake bucket, runs Init with `gen`, then

@@ -18,7 +18,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/flatten"
+	"github.com/kuasar-sandbox/accelerator/pkg/flatten"
 )
 
 // syntheticImage builds a small single-layer image whose files have normal

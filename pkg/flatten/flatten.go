@@ -31,8 +31,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/internal/util"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/image"
+	"github.com/kuasar-sandbox/accelerator/internal/util"
+	"github.com/kuasar-sandbox/accelerator/pkg/image"
 )
 
 // dockerManifestEntry describes one image in a docker-archive tar.

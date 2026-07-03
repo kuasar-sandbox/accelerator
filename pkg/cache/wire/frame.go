@@ -20,17 +20,17 @@ package wire
 import (
 	"sync"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 )
 
 // Opcodes identify the operation in a request frame.
 const (
-	OpcodeObjectGet      byte = 0x01
-	OpcodeObjectPut      byte = 0x02
-	OpcodeShardGet       byte = 0x03
-	OpcodeShardPut       byte = 0x04
-	OpcodePing           byte = 0x05
-	OpcodeCancelRequest  byte = 0x06
+	OpcodeObjectGet     byte = 0x01
+	OpcodeObjectPut     byte = 0x02
+	OpcodeShardGet      byte = 0x03
+	OpcodeShardPut      byte = 0x04
+	OpcodePing          byte = 0x05
+	OpcodeCancelRequest byte = 0x06
 )
 
 // Status codes in a response frame.

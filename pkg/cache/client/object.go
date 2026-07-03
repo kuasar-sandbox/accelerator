@@ -6,16 +6,16 @@ import (
 	"io"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/cache/wire"
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/wire"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
 // Options configures a cache-ctl wire client.
 type Options struct {
-	Pool     int             // number of parallel connections (default 4)
-	Timeout  time.Duration   // per-op timeout (default 2s)
-	BlobPool cache.BlobPool  // payload allocator; nil → cache.DefaultPool
+	Pool     int            // number of parallel connections (default 4)
+	Timeout  time.Duration  // per-op timeout (default 2s)
+	BlobPool cache.BlobPool // payload allocator; nil → cache.DefaultPool
 }
 
 // GetCloser = cache.Getter + io.Closer. The client package's exported

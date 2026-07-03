@@ -9,7 +9,7 @@
 // sparse fidelity (only the archive's DECLARED holes are punched).
 //
 // Producing tar streams is out of scope here: single sparse files
-// travel via sandbox-accelerator/pkg/tarstream (WriteTo/ReadFrom).
+// travel via accelerator/pkg/tarstream (WriteTo/ReadFrom).
 package tar
 
 import (

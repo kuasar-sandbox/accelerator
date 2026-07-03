@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/image"
+	"github.com/kuasar-sandbox/accelerator/pkg/image"
 )
 
 func TestNormalizeSkip(t *testing.T) {
