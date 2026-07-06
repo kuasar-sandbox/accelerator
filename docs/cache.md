@@ -792,7 +792,7 @@ cache stat tiered | get 5.1k/s 620MiB/s p50 40µs/p99 700µs/max 9ms · hit 94% 
 
 ## 7. 性能特征
 
-延迟目标(实测基线与已采纳优化见 `kuasar-sandbox/docs/perf.md` §1):
+延迟目标(实测基线与已采纳优化见 `orchestrator/release-builder/docs/perf.md` §1):
 
 | 指标 | P50 | P99 |
 |---|---|---|
@@ -811,7 +811,7 @@ cache stat tiered | get 5.1k/s 620MiB/s p50 40µs/p99 700µs/max 9ms · hit 94% 
   方式直接讲本 wire 协议(chunk/manifest/blob,纯透传无 L1),省掉独立 cache-ctl
 - [`manifest.md`](manifest.md) — manifest-ctl 通过 wire ObjectGet 调 cache-ctl
   tiered;Manifest 内 chunk hash = 这里的 wire Hash 字段
-- `kuasar-sandbox/docs/perf.md` §1 — cache 子系统实测延迟/吞吐基线与优化记录
+- `orchestrator/release-builder/docs/perf.md` §1 — cache 子系统实测延迟/吞吐基线与优化记录
 - 仓根 `README.md` / `Makefile` — 构建:`make cache-ctl`(CGO,自动
   `deps-rocksdb` 后静态链 librocksdb;本仓唯一 CGO 二进制)
-- `kuasar-sandbox/docs/kuasar-sandbox.md` §4.5 — 缓存模型与命中率目标
+- `orchestrator/release-builder/docs/kuasar-sandbox.md` §4.5 — 缓存模型与命中率目标

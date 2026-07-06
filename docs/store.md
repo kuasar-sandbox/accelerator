@@ -467,7 +467,7 @@ OBS 延迟加到每次客户端 Get 上。详见 [`cache.md`](cache.md)。
 ### 5.4 容量监控(obs)
 
 OBS 不限对象数,监控 bucket 计费即可。chunk 路径下对象数 ≈ 唯一 chunk
-数(高去重场景 < 100K /节点 /月,见 `kuasar-sandbox/docs/kuasar-sandbox.md`
+数(高去重场景 < 100K /节点 /月,见 `orchestrator/release-builder/docs/kuasar-sandbox.md`
 §7.3 存储与带宽推算)。
 
 ### 5.5 e2e 验证
@@ -534,4 +534,4 @@ store stat | get 1.2k/s 92%hit 180MiB/s p50 80µs/p99 900µs/max 4.1ms · put 34
   指向 store-ctl
 - 仓根 `README.md` / `Makefile` — 构建:store-ctl 是纯 Go 二进制,
   `make store-ctl`(或 `make build`)产出
-- `kuasar-sandbox/docs/kuasar-sandbox.md` §7.3 — 存储模型与容量推算
+- `orchestrator/release-builder/docs/kuasar-sandbox.md` §7.3 — 存储模型与容量推算

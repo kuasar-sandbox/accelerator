@@ -3,8 +3,8 @@
 // disruption when the member set changes.
 //
 // It is used both by the L2 cache (locating the N erasure-coded shard
-// peers for a chunk, pkg/cache/ec) and by the cluster scaler
-// (shuffle-sharding a sandbox-group onto N slots). Build a Table once
+// peers for a chunk, pkg/cache/ec) and by cluster placement/shard ownership
+// (mapping a group or node key onto N slots). Build a Table once
 // from a fixed member set and call its LocateN method repeatedly, or use
 // the package-level LocateN convenience when the member set is supplied
 // per call.

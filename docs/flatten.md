@@ -274,7 +274,7 @@ artifact_type 固定为常量 `application/vnd.kuasar.flatten-manifest.v1`(不�
 **凭据(命名空间环境变量,匿名回落)**:`FLATTEN_REGISTRY_TOKEN`(Bearer,优先)或
 `FLATTEN_REGISTRY_USERNAME` + `FLATTEN_REGISTRY_PASSWORD`(Basic);都不设则匿名拉公有
 镜像。密钥只走 env(不上 argv、不入配置文件),契合 orchestrator 经 exec env 把租户拉取凭据
-下发进构建沙箱的模型(`kuasar-sandbox/docs/deployment.md` §5)。
+下发进构建沙箱的模型(`orchestrator/release-builder/docs/deployment.md` §5)。
 
 **TLS(`tls.*`)**:作用于全部 HTTPS 请求——既包括 registry API,也包括层 blob 的 CDN
 重定向(拦截式代理会用私有 CA 重签这些证书,系统信任库默认拒绝)。`ca_cert` 把额外的
@@ -565,7 +565,7 @@ mkfs.erofs -Ededupe --chunksize=4096 -T0 -b4096 -x-1 \
 完成后追加 ZIP:以 append 方式打开输出文件,在 EROFS 段之后写一条 STORED
 (无压缩)模式的 `config.json` entry(§3.3 的确定性约束)。
 
-`mkfs.erofs` 由 `guest-runtime/native-deps` 仓构建产出(`make -C ../guest-runtime/native-deps erofs`);本仓
+`mkfs.erofs` 由 `guest-runtime/native-deps` 构建产出(`make -C ../guest-runtime/native-deps erofs`);本仓
 `make build` 只构建 flatten-ctl。运行期定位优先级:`MKFS_EROFS_PATH` 环境变量 >
 flatten-ctl 同目录 > `PATH`。
 
@@ -647,4 +647,4 @@ OCI image config 字段繁多,大量与启动无关:`created` / `author` / `hist
   的只读根
 - [`build.md`](build.md) —— `guest-runtime/native-deps` 构建 mkfs.erofs(`make -C ../guest-runtime/native-deps
   erofs`);本仓 `make build` 只构建 flatten-ctl,运行期经同目录 / `PATH` 定位 mkfs.erofs
-- `kuasar-sandbox/docs/kuasar-sandbox.md` §2.2 / §3.1 —— 展平在系统中的位置与目标
+- `orchestrator/release-builder/docs/kuasar-sandbox.md` §2.2 / §3.1 —— 展平在系统中的位置与目标
