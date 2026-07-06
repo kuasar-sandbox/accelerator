@@ -2,7 +2,8 @@
 // into a flatten.Source, so flatten-ctl can flatten `repo:tag` without an
 // intermediate `docker save`. It is the single home of the
 // go-containerregistry dependency — pkg/flatten and pkg/image stay
-// stdlib-only (pkg/image is imported by sandbox-runtime).
+// stdlib-only so runtime code can read flattened-image metadata without pulling
+// registry dependencies.
 //
 // Responsibilities: reference resolution + platform selection (pull.go),
 // env-based credentials (auth.go), a shared OCI-layout blob cache with

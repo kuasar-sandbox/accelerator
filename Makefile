@@ -1,17 +1,16 @@
-# accelerator — storage acceleration + image build (manifest / cache /
-# store / flatten).
+# accelerator — content acceleration (manifest / cache / store).
 #
-# Builds four CLIs:
-#   manifest-ctl, store-ctl, flatten-ctl  — pure Go (CGO_ENABLED=0)
-#   cache-ctl                             — CGO, statically links librocksdb.a
+# Builds three CLIs:
+#   manifest-ctl, store-ctl  — pure Go (CGO_ENABLED=0)
+#   cache-ctl                — CGO, statically links librocksdb.a
 #
-# The thin client surface that downstream repos import (pkg/manifest, pkg/image,
-# pkg/{cache,store}/client) is CGO-free; only cache-ctl pulls RocksDB. flatten-ctl's
-# registry deps (go-containerregistry) stay confined to pkg/{remote,flatten}.
+# The public packages downstream repos import are CGO-free; only cache-ctl pulls
+# RocksDB. pkg/remote uses go-containerregistry, but it is pure Go and isolated
+# from the manifest/cache/store client paths.
 
 SHELL := /bin/bash
 
-.PHONY: all build manifest-ctl store-ctl cache-ctl flatten-ctl deps-rocksdb test vet bench test-e2e test-e2e-cache test-e2e-store-cache test-e2e-cluster test-e2e-flatten zot perf-cache perf-cache-remote dedup-report clean help
+.PHONY: all build manifest-ctl store-ctl cache-ctl deps-rocksdb test vet bench test-e2e test-e2e-cache test-e2e-store-cache test-e2e-cluster perf-cache perf-cache-remote dedup-report clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -59,7 +58,7 @@ endef
 # ---------------------------------------------------------------------------
 all: build
 
-build: manifest-ctl store-ctl cache-ctl flatten-ctl
+build: manifest-ctl store-ctl cache-ctl
 
 manifest-ctl:
 	@mkdir -p $(BINDIR)
@@ -70,13 +69,6 @@ store-ctl:
 	@mkdir -p $(BINDIR)
 	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o $(BINDIR)/store-ctl ./cmd/store-ctl
 	$(call link_bin,store-ctl)
-
-# flatten-ctl: OCI/dir → EROFS image builder (pure Go; invokes mkfs.erofs at
-# runtime, resolved via PATH / its own dir). Folded in from sandbox-builder.
-flatten-ctl:
-	@mkdir -p $(BINDIR)
-	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o $(BINDIR)/flatten-ctl ./cmd/flatten-ctl
-	$(call link_bin,flatten-ctl)
 
 # cache-ctl requires CGO for RocksDB.
 cache-ctl: deps-rocksdb
@@ -103,7 +95,7 @@ test: deps-rocksdb
 
 # vet the CGO-free client surface (no librocksdb needed).
 vet:
-	CGO_ENABLED=0 $(GO) vet ./pkg/sparse/... ./pkg/tarstream/... ./pkg/manifest/... ./pkg/store/client/... ./pkg/cache/client/... ./pkg/image/... ./pkg/flatten/... ./pkg/remote/... ./pkg/tar/... ./cmd/manifest-ctl ./cmd/store-ctl ./cmd/flatten-ctl
+	CGO_ENABLED=0 $(GO) vet ./pkg/sparse/... ./pkg/tarstream/... ./pkg/manifest/... ./pkg/store/client/... ./pkg/cache/client/... ./pkg/flatten/... ./pkg/image/... ./pkg/remote/... ./pkg/tar/... ./cmd/manifest-ctl ./cmd/store-ctl
 
 clean:
 	rm -rf bin build
@@ -121,7 +113,7 @@ bench: deps-rocksdb
 	CGO_LDFLAGS="-L$(ROCKS_PREFIX)/lib -lrocksdb -lstdc++ -lm -lpthread -ldl" \
 		$(GO) test -bench=. -benchmem -run=^$$ ./...
 
-test-e2e: test-e2e-cache test-e2e-store-cache test-e2e-cluster test-e2e-flatten
+test-e2e: test-e2e-cache test-e2e-store-cache test-e2e-cluster
 
 test-e2e-cache:
 	BIN=$(SBIN) bash test/e2e/e2e_cache.sh
@@ -131,30 +123,6 @@ test-e2e-store-cache:
 
 test-e2e-cluster:
 	BIN=$(SBIN) bash test/e2e/e2e_cluster_rolling.sh
-
-# Registry e2e (flatten-ctl pulls a real image from a local zot OCI 1.1 registry,
-# flattens it, writes the manifest referrer back). Part of test-e2e; the script
-# SKIPs cleanly (exit 0) when docker / zot / mkfs.erofs are absent, so it is safe
-# in the aggregate. Not part of `make test` (unit tests). store-ctl is in-repo.
-ZOT_VERSION ?= v2.1.17
-ZOT_BIN     := $(BINDIR)/zot
-
-$(ZOT_BIN):
-	@mkdir -p $(BINDIR)
-	curl -fSL --retry 3 -o $(ZOT_BIN) \
-	  "https://github.com/project-zot/zot/releases/download/$(ZOT_VERSION)/zot-linux-$(GO_ARCH)-minimal"
-	@chmod +x $(ZOT_BIN)
-
-zot: $(ZOT_BIN)
-
-# Prefer a zot already on PATH (how the umbrella e2e locate it); fetch one only as
-# a best-effort fallback so a no-network host SKIPs rather than fails the suite.
-test-e2e-flatten: flatten-ctl store-ctl
-	@command -v zot >/dev/null 2>&1 || $(MAKE) --no-print-directory $(ZOT_BIN) >/dev/null 2>&1 || true
-	FLATTEN_CTL="$(abspath $(BINDIR)/flatten-ctl)" \
-	STORE_CTL="$(abspath $(BINDIR)/store-ctl)" \
-	ZOT_BIN="$$(command -v zot || echo $(abspath $(ZOT_BIN)))" \
-	  bash test/e2e/e2e_flatten.sh
 
 perf-cache:
 	BIN=$(SBIN) bash test/scripts/bench_cache.sh
@@ -167,14 +135,12 @@ dedup-report:
 
 help:
 	@echo "accelerator. Targets:"
-	@echo "  build         build manifest-ctl + store-ctl + cache-ctl + flatten-ctl"
+	@echo "  build         build manifest-ctl + store-ctl + cache-ctl"
 	@echo "  manifest-ctl  pure Go"
 	@echo "  store-ctl     pure Go"
 	@echo "  cache-ctl     CGO + librocksdb (auto deps-rocksdb)"
-	@echo "  flatten-ctl   OCI/dir → EROFS image builder (pure Go)"
 	@echo "  deps-rocksdb  build local librocksdb.a"
 	@echo "  test          unit tests (needs librocksdb for cache/rocks)"
 	@echo "  vet           vet the CGO-free client surface"
-	@echo "  test-e2e-flatten  registry pull + flatten + referrer e2e (docker+zot; SKIPs if absent)"
 	@echo "  clean         remove bin/ + build/"
 	@echo "  TARGET_ARCH   x86_64 (default) | aarch64"

@@ -109,7 +109,8 @@ func ExtractRuntimeConfig(archiveDir, configPath string) (*RuntimeConfig, error)
 // Keeping the projection in one place is what guarantees a registry pull
 // and an equivalent docker-archive flatten produce byte-identical config
 // trailers. stdlib-only by design — no registry/ggcr types leak into
-// pkg/image (which sandbox-runtime imports).
+// pkg/image, so runtime code can read config trailers without pulling registry
+// dependencies.
 //
 // Architecture / Os are passed through transparently with no validation.
 // Unknown source fields are dropped by encoding/json.
