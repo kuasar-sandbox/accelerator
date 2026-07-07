@@ -321,14 +321,16 @@ func (x *extractor) applyMeta(dest string, hdr *stdtar.Header, linkOnly bool) er
 	if x.o.Chown != nil {
 		uid, gid = x.o.Chown.UID, x.o.Chown.GID
 	}
-	if err := os.Lchown(dest, uid, gid); err != nil {
-		if x.o.Chown == nil && errors.Is(err, syscall.EPERM) {
-			if !x.chownWarned {
-				x.o.warnf("tar: cannot preserve ownership (not root); continuing without")
-				x.chownWarned = true
+	if !x.o.NoChown {
+		if err := os.Lchown(dest, uid, gid); err != nil {
+			if x.o.Chown == nil && errors.Is(err, syscall.EPERM) {
+				if !x.chownWarned {
+					x.o.warnf("tar: cannot preserve ownership (not root); continuing without")
+					x.chownWarned = true
+				}
+			} else {
+				return fmt.Errorf("chown %s -> %d:%d: %w", dest, uid, gid, err)
 			}
-		} else {
-			return fmt.Errorf("chown %s -> %d:%d: %w", dest, uid, gid, err)
 		}
 	}
 	if linkOnly {

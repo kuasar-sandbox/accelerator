@@ -277,7 +277,8 @@ origin:
 EOF
 
 "$BIN/cache-ctl" serve --config "$TMPDIR/tiered.yaml" &
-PIDS+=($!)
+TIERED_PID=$!
+PIDS+=($TIERED_PID)
 wait_ready "127.0.0.1:$TIERED_HEALTH_PORT"
 
 # Load via cache (first read — cold, fills embedded from origin).
@@ -303,6 +304,8 @@ if echo "$PUT_OUT" | grep -qi "not supported\|error"; then
 else
     fail "object put on tiered mode should return error (got: $PUT_OUT)"
 fi
+kill "$TIERED_PID" 2>/dev/null || true
+wait "$TIERED_PID" 2>/dev/null || true
 
 # ============================================================
 echo ""
@@ -310,6 +313,7 @@ echo "=== Test 8: 5-node shard cluster + tiered EC mode ==="
 
 SHARD_PORTS=()
 SHARD_HEALTH_PORTS=()
+SHARD_PIDS=()
 for i in $(seq 1 5); do
     SP=$(free_port)
     SHP=$(free_port)
@@ -331,7 +335,9 @@ rocks:
   bloom_bits: 10
 EOF
     "$BIN/cache-ctl" serve --config "$TMPDIR/shard-$i.yaml" &
-    PIDS+=($!)
+    shard_pid=$!
+    PIDS+=($shard_pid)
+    SHARD_PIDS+=($shard_pid)
 done
 
 # Wait for all shard nodes.
@@ -392,9 +398,9 @@ assert_eq "$ORIG_HASH" "$EC_HASH" "tiered+EC load roundtrip"
 # ============================================================
 echo ""
 echo "=== Test 9: EC failure injection — kill 1 shard node ==="
-# Kill shard node 1 (index 3 in PIDS: 0=local, 1=shard, 2=tiered, 3..7=shard-1..5).
-SHARD1_PID_IDX=3
-kill "${PIDS[$SHARD1_PID_IDX]}" 2>/dev/null; wait "${PIDS[$SHARD1_PID_IDX]}" 2>/dev/null || true
+# Kill one EC shard node.
+kill "${SHARD_PIDS[0]}" 2>/dev/null || true
+wait "${SHARD_PIDS[0]}" 2>/dev/null || true
 
 # Second load (warm from embedded + EC with 1 node down — should still work).
 "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$EC_TIERED_PORT")" \

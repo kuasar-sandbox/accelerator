@@ -78,6 +78,28 @@ payload_hash() {
     tar xOf "$1" | sha256sum | awk '{print $1}'
 }
 
+load_hash_via_tiered() {
+    local key="$1" out="$2" label="$3" attempt hash
+    local cfg
+    cfg="$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")"
+    for attempt in $(seq 1 10); do
+        if "$BIN/manifest-ctl" load --manifest-config "$cfg" \
+            --output "$out" \
+            --no-progress "$key" >"$out.stdout" 2>"$out.stderr"; then
+            if hash="$(payload_hash "$out" 2>"$out.tar.stderr")"; then
+                printf '%s\n' "$hash"
+                return 0
+            fi
+        fi
+        sleep 0.3
+    done
+    echo "  FAIL: $label did not load/decode through tiered cache" >&2
+    [ -s "$out.stdout" ] && { echo "---- $out.stdout ----" >&2; cat "$out.stdout" >&2; }
+    [ -s "$out.stderr" ] && { echo "---- $out.stderr ----" >&2; cat "$out.stderr" >&2; }
+    [ -s "$out.tar.stderr" ] && { echo "---- $out.tar.stderr ----" >&2; cat "$out.tar.stderr" >&2; }
+    return 1
+}
+
 # ============================================================
 # store-ctl sidecar
 # ============================================================
@@ -234,9 +256,7 @@ echo "  $N manifest keys stored."
 # gets its 5 shards distributed and filled on {p1..p5}.
 echo "=== Pre-warm: load each manifest through tiered (populates EC cache) ==="
 for i in $(seq 1 $N); do
-    "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
-        --output "$TMPDIR/val-$i.prewarm" \
-        --no-progress "${MKEYS[$((i-1))]}" 2>/dev/null
+    load_hash_via_tiered "${MKEYS[$((i-1))]}" "$TMPDIR/val-$i.prewarm" "prewarm key $i" >/dev/null || exit 1
 done
 ok "$N keys prewarmed through EC tier"
 
@@ -258,10 +278,7 @@ sleep 1
 echo "=== Read $N keys after membership change ==="
 all_match=1
 for i in $(seq 1 $N); do
-    "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
-        --output "$TMPDIR/val-$i.postswap" \
-        --no-progress "${MKEYS[$((i-1))]}" 2>/dev/null
-    h=$(payload_hash "$TMPDIR/val-$i.postswap")
+    h="$(load_hash_via_tiered "${MKEYS[$((i-1))]}" "$TMPDIR/val-$i.postswap" "post-swap key $i")" || exit 1
     if [ "$h" != "${ORIG_HASHES[$((i-1))]}" ]; then
         fail "key $i hash mismatch after membership swap"
         all_match=0
@@ -282,10 +299,7 @@ echo "=== Second SIGHUP (idempotent-ish: membership {s2..s6} again) ==="
 kill -HUP "$TIERED_PID"
 sleep 0.5
 # Reads should still work.
-"$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
-    --output "$TMPDIR/val-1.idem" \
-    --no-progress "${MKEYS[0]}" 2>/dev/null
-h=$(payload_hash "$TMPDIR/val-1.idem")
+h="$(load_hash_via_tiered "${MKEYS[0]}" "$TMPDIR/val-1.idem" "second SIGHUP key 1")" || exit 1
 assert_eq "${ORIG_HASHES[0]}" "$h" "second SIGHUP leaves reads working"
 
 echo ""

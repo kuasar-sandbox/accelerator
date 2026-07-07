@@ -122,6 +122,10 @@ type Options struct {
 	// without it, ownership is preserved best-effort (EPERM as an
 	// unprivileged user downgrades to a one-time warning).
 	Chown *Owner
+	// NoChown skips ownership restoration entirely. It is useful for
+	// payload-only extraction checks where uid/gid metadata is not part
+	// of the assertion and the caller wants clean unprivileged output.
+	NoChown bool
 	// Chmod, when non-nil, overrides the permission bits (including
 	// setuid/setgid/sticky) of every selected entry, directories
 	// included.
