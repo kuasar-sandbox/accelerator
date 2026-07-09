@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	ggcrremote "github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 )
 
@@ -27,6 +30,8 @@ const (
 	AnnID      = "vnd.kuasar.flatten-manifest.id"
 	AnnValidAt = "vnd.kuasar.flatten-manifest.valid_at"
 )
+
+var ErrReferrersUnsupported = errors.New("remote: registry does not support OCI referrers")
 
 // Owner identifies a flatten-manifest referrer's owner.
 type Owner struct {
@@ -47,11 +52,16 @@ func (c *Config) refererOwner() Owner {
 // hmac = HMAC-SHA256(key=customerKey, msg=Owner.Key). The token is constant
 // per (customer key, referer key) pair — computable before export, scoped to
 // the tenant, and unforgeable without the secret customer key.
-func (o Owner) ownerValue(customerKey []byte) string {
+func (o Owner) OwnerValue(customerKey []byte) string {
+	if o.Key == "" {
+		o.Key = o.Desc
+	}
 	mac := hmac.New(sha256.New, customerKey)
 	mac.Write([]byte(o.Key))
 	return hex.EncodeToString(mac.Sum(nil)) + " " + o.Desc
 }
+
+func (o Owner) ownerValue(customerKey []byte) string { return o.OwnerValue(customerKey) }
 
 // FindReferrer looks for a flatten-manifest referrer on the subject image
 // whose owner matches this owner (HMAC over customerKey) and whose valid_at
@@ -64,7 +74,29 @@ func (c *Config) FindReferrer(ctx context.Context, subj *Resolved, customerKey [
 	if o.ArtifactType == "" {
 		return "", false, errors.New("remote: referrer artifact type is empty")
 	}
-	want := o.ownerValue(customerKey)
+	return c.findReferrerByOwner(ctx, subj, o.ownerValue(customerKey))
+}
+
+// FindReferrerByOwner is the atomic lookup used by build orchestrators that
+// compute the owner token outside the guest. supported=false means the registry
+// did not expose the OCI 1.1 Referrers API; callers decide whether to fail or
+// fall back to a full flatten without writeback.
+func (c *Config) FindReferrerByOwner(ctx context.Context, subj *Resolved, ownerValue string) (id string, supported bool, ok bool, err error) {
+	if RefererArtifactType == "" {
+		return "", false, false, errors.New("remote: referrer artifact type is empty")
+	}
+	supported, err = c.ReferrersSupported(ctx, subj)
+	if err != nil {
+		return "", false, false, err
+	}
+	if !supported {
+		return "", false, false, nil
+	}
+	id, ok, err = c.findReferrerByOwner(ctx, subj, ownerValue)
+	return id, true, ok, err
+}
+
+func (c *Config) findReferrerByOwner(ctx context.Context, subj *Resolved, ownerValue string) (id string, ok bool, err error) {
 	idx, err := ggcrremote.Referrers(subj.Digest, c.remoteOpts(ctx)...)
 	if err != nil {
 		return "", false, fmt.Errorf("remote: list referrers for %s: %w", subj.Digest, err)
@@ -83,7 +115,7 @@ func (c *Config) FindReferrer(ctx context.Context, subj *Resolved, customerKey [
 			// only for our artifact type so we don't pull unrelated referrers
 			// (SBOMs, signatures, ...). A compliant Referrers API includes the
 			// annotations on the descriptor, taking the fast path here.
-			if d.ArtifactType != "" && d.ArtifactType != o.ArtifactType {
+			if d.ArtifactType != "" && d.ArtifactType != RefererArtifactType {
 				continue
 			}
 			anns, err = c.manifestAnnotations(ctx, subj.Repo, d.Digest)
@@ -91,10 +123,10 @@ func (c *Config) FindReferrer(ctx context.Context, subj *Resolved, customerKey [
 				continue // unreadable / not an image manifest — skip
 			}
 		}
-		if anns[AnnOwner] != want || isExpired(anns[AnnValidAt], now) {
+		if anns[AnnOwner] != ownerValue || isExpired(anns[AnnValidAt], now) {
 			continue
 		}
-		if mid := anns[AnnID]; mid != "" {
+		if mid := anns[AnnID]; validManifestID(mid) {
 			return mid, true, nil
 		}
 	}
@@ -116,6 +148,48 @@ func (c *Config) manifestAnnotations(ctx context.Context, repo name.Repository, 
 	return m.Annotations, nil
 }
 
+// ReferrersSupported probes the real OCI 1.1 Referrers API endpoint. The ggcr
+// Referrers helper silently falls back to the tag schema, which is useful for
+// standalone clients but hides the unsupported case from build policy.
+func (c *Config) ReferrersSupported(ctx context.Context, subj *Resolved) (bool, error) {
+	base := ggcrremote.DefaultTransport
+	if c.transport != nil {
+		base = c.transport
+	}
+	tr, err := transport.NewWithContext(ctx, subj.Repo.Registry, authenticator(), base,
+		[]string{subj.Repo.Scope(transport.PullScope)})
+	if err != nil {
+		return false, fmt.Errorf("remote: referrers auth transport: %w", err)
+	}
+	u := url.URL{
+		Scheme: subj.Repo.Scheme(),
+		Host:   subj.Repo.RegistryStr(),
+		Path:   fmt.Sprintf("/v2/%s/referrers/%s", subj.Repo.RepositoryStr(), subj.Hash.String()),
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Accept", string(types.OCIImageIndex))
+	resp, err := (&http.Client{Transport: tr}).Do(req)
+	if err != nil {
+		return false, fmt.Errorf("remote: probe referrers for %s: %w", subj.Digest, err)
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+		ct := strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0])
+		return ct == string(types.OCIImageIndex), nil
+	case http.StatusNotFound, http.StatusBadRequest, http.StatusNotAcceptable:
+		return false, nil
+	default:
+		if err := transport.CheckError(resp, http.StatusOK); err != nil {
+			return false, fmt.Errorf("remote: probe referrers for %s: %w", subj.Digest, err)
+		}
+		return false, nil
+	}
+}
+
 // PutReferrer writes a flatten-manifest referrer on the subject image: an OCI
 // artifact whose config media type carries the artifactType (so the registry
 // reports that as the referrer's artifactType, per the OCI fallback rule), a
@@ -127,13 +201,21 @@ func (c *Config) PutReferrer(ctx context.Context, subj *Resolved, id string, cus
 	if o.ArtifactType == "" {
 		return errors.New("remote: referrer artifact type is empty")
 	}
+	return c.PutReferrerByOwner(ctx, subj, id, o.ownerValue(customerKey))
+}
 
+// PutReferrerByOwner writes a flatten-manifest referrer using a precomputed
+// owner annotation value. This keeps manifest customer keys out of build guests.
+func (c *Config) PutReferrerByOwner(ctx context.Context, subj *Resolved, id, ownerValue string) error {
+	if !validManifestID(id) {
+		return fmt.Errorf("remote: manifest id %q is not a 64-hex key", id)
+	}
 	validAt, err := c.validAtValue()
 	if err != nil {
 		return err
 	}
 	anns := map[string]string{
-		AnnOwner:   o.ownerValue(customerKey),
+		AnnOwner:   ownerValue,
 		AnnID:      id,
 		AnnValidAt: validAt,
 	}
@@ -148,7 +230,7 @@ func (c *Config) PutReferrer(ctx context.Context, subj *Resolved, id string, cus
 	// the config media type. Registries surface a referrer's config media
 	// type as its artifactType when the artifactType field is absent, so the
 	// WithFilter("artifactType", ...) lookup in FindReferrer still matches.
-	art := mutate.ConfigMediaType(empty.Image, types.MediaType(o.ArtifactType))
+	art := mutate.ConfigMediaType(empty.Image, types.MediaType(RefererArtifactType))
 	// Force an OCI image manifest. empty.Image serialises as a Docker schema2
 	// manifest by default, which has no `subject` field semantics — a compliant
 	// OCI 1.1 registry (e.g. zot) then ignores the subject and never indexes the
@@ -171,6 +253,14 @@ func (c *Config) PutReferrer(ctx context.Context, subj *Resolved, id string, cus
 		return fmt.Errorf("remote: write referrer (needs push access to %s): %w", subj.Repo, err)
 	}
 	return nil
+}
+
+func validManifestID(id string) bool {
+	if len(id) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(id)
+	return err == nil
 }
 
 // validAtValue builds the valid_at annotation: "<import RFC3339>" plus, when

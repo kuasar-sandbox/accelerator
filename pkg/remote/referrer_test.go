@@ -15,11 +15,11 @@ func TestOwnerValueDeterministicAndKeyed(t *testing.T) {
 	k1 := bytes.Repeat([]byte{1}, 32)
 	k2 := bytes.Repeat([]byte{2}, 32)
 
-	a := o.ownerValue(k1)
-	if a != o.ownerValue(k1) {
+	a := o.OwnerValue(k1)
+	if a != o.OwnerValue(k1) {
 		t.Fatal("ownerValue not deterministic for the same key")
 	}
-	if a == o.ownerValue(k2) {
+	if a == o.OwnerValue(k2) {
 		t.Fatal("ownerValue must differ for different customer keys")
 	}
 	if !strings.HasSuffix(a, " acme-prod") {
@@ -28,6 +28,32 @@ func TestOwnerValueDeterministicAndKeyed(t *testing.T) {
 	// The HMAC token is the first space-separated field, hex-encoded SHA-256.
 	if first := strings.Fields(a)[0]; len(first) != 64 {
 		t.Fatalf("hmac token %q is not 64 hex chars", first)
+	}
+}
+
+func TestFindReferrerByOwnerReportsUnsupported(t *testing.T) {
+	host := startRegistry(t)
+	img, err := random.Image(512, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := host + "/test/unsupported:v1"
+	pushImage(t, ref, img)
+
+	cfg := &Config{Insecure: true, Cache: CacheConfig{Dir: t.TempDir()}}
+	if err := cfg.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	res, err := cfg.Resolve(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, supported, ok, err := cfg.FindReferrerByOwner(context.Background(), res, "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if supported || ok {
+		t.Fatalf("expected unsupported miss, got supported=%v ok=%v", supported, ok)
 	}
 }
 

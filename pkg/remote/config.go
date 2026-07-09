@@ -93,11 +93,11 @@ type CacheConfig struct {
 	MaxSize string `yaml:"max_size"`
 }
 
-// RefererConfig configures the OCI Referrers write-back (--with-referer). The
-// artifact type is fixed (RefererArtifactType), not configurable.
+// RefererConfig configures OCI Referrers helpers. The artifact type is fixed
+// (RefererArtifactType), not configurable.
 type RefererConfig struct {
-	// Enabled turns on the idempotent OCI-Referrers flow by default (equivalent
-	// to passing --with-referer); the flag can still force it on per-run.
+	// Enabled is kept for callers that still use Config-level policy. The
+	// flatten-ctl CLI exposes referer lookup/put as explicit atomic commands.
 	Enabled bool `yaml:"enabled"`
 	// Desc is the public owner descriptor appended to the owner annotation.
 	Desc string `yaml:"desc"`
