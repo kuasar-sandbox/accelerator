@@ -89,6 +89,7 @@ fill-aside 经 `EncodePrefixed` 完成。
 ```
 cache-ctl ping --endpoint host:port            # gRPC 健康探测 (--endpoint 指向 health_listen)
 cache-ctl info --endpoint host:port [--json]   # 实时 stats(同 health_listen);--json 输出原始 JSON
+cache-ctl info --endpoint host:port --wait-fills [--timeout 30s]
 cache-ctl info --rocks-path PATH               # 离线只读打开 RocksDB,查看属性
 ```
 
@@ -96,6 +97,8 @@ cache-ctl info --rocks-path PATH               # 离线只读打开 RocksDB,查�
 **不是**数据端口,都不走 wire 协议。两者调不同 gRPC 服务:`ping` 调
 `grpc.health.v1.Health/Check`;`info --endpoint` 调 `cac.cache.v1.Info/Get`,把运行时
 计数快照拉回来(`--json` 输出原始 JSON,否则人类可读表格)。
+`info --wait-fills` 调 `cac.cache.v1.Info/WaitFills`,直到 tiered cache 的当前
+fill/repair 任务排空或 `--timeout` 到期;它不改变异步 fill-aside 的数据面语义。
 `info --rocks-path` 走 RocksDB secondary instance(只读并行打开),不打扰
 运行中的 cache-ctl。
 

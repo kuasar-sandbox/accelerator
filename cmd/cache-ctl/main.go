@@ -8,7 +8,7 @@
 //	shard get   Read an EC shard from cache
 //	shard put   Write an EC shard to cache
 //	ping        Health probe via gRPC health protocol
-//	info        Inspect RocksDB properties (offline, no daemon needed)
+//	info        Inspect a daemon/RocksDB or wait for tiered fills
 package main
 
 import (
@@ -103,7 +103,7 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  shard get   Read an EC shard")
 	fmt.Fprintln(os.Stderr, "  shard put   Write an EC shard")
 	fmt.Fprintln(os.Stderr, "  ping        Health probe")
-	fmt.Fprintln(os.Stderr, "  info        Inspect RocksDB (offline)")
+	fmt.Fprintln(os.Stderr, "  info        Inspect cache state or wait for tiered fills")
 	fmt.Fprintln(os.Stderr, "  bench       Run performance benchmark")
 	fmt.Fprintln(os.Stderr, "  config      Inspect or generate the cache-ctl config")
 	fmt.Fprintln(os.Stderr, "")

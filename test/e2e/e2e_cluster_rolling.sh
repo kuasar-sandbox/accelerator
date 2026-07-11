@@ -100,6 +100,16 @@ load_hash_via_tiered() {
     return 1
 }
 
+wait_tiered_fills() {
+    "$BIN/cache-ctl" info --endpoint "127.0.0.1:$TIERED_HEALTH_PORT" \
+        --wait-fills --timeout 30s
+}
+
+origin_hits() {
+    "$BIN/cache-ctl" info --endpoint "127.0.0.1:$TIERED_HEALTH_PORT" --json | \
+        python3 -c 'import json,sys; print(json.load(sys.stdin)["tiered"]["origin"]["hits"])'
+}
+
 # ============================================================
 # store-ctl sidecar
 # ============================================================
@@ -258,6 +268,7 @@ echo "=== Pre-warm: load each manifest through tiered (populates EC cache) ==="
 for i in $(seq 1 $N); do
     load_hash_via_tiered "${MKEYS[$((i-1))]}" "$TMPDIR/val-$i.prewarm" "prewarm key $i" >/dev/null || exit 1
 done
+wait_tiered_fills || { fail "prewarm fills did not drain"; exit 1; }
 ok "$N keys prewarmed through EC tier"
 
 # ============================================================
@@ -276,6 +287,7 @@ sleep 1
 # output hashes match the original.
 # ============================================================
 echo "=== Read $N keys after membership change ==="
+origin_hits_before=$(origin_hits)
 all_match=1
 for i in $(seq 1 $N); do
     h="$(load_hash_via_tiered "${MKEYS[$((i-1))]}" "$TMPDIR/val-$i.postswap" "post-swap key $i")" || exit 1
@@ -287,6 +299,9 @@ done
 if [ "$all_match" = "1" ]; then
     ok "all $N keys decoded correctly after 1-peer rolling swap"
 fi
+origin_hits_after=$(origin_hits)
+assert_eq "$origin_hits_before" "$origin_hits_after" "rolling-swap reads did not fall through to origin"
+wait_tiered_fills || { fail "post-swap repair fills did not drain"; exit 1; }
 
 # ============================================================
 # Monotone epoch guard: second SIGHUP with the same peer set should be

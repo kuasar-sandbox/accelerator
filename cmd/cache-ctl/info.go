@@ -30,11 +30,25 @@ func cmdInfo(args []string) {
 		"Offline: open rocksdb read-only at this path")
 	asJSON := fs.Bool("json", false,
 		"output raw JSON (default: human-readable table)")
+	wait := fs.Bool("wait-fills", false,
+		"wait for in-flight tiered fills to drain instead of reading stats")
+	timeout := fs.Duration("timeout", 30*time.Second,
+		"timeout for --wait-fills")
 	fs.Parse(args)
 
 	switch {
 	case *endpoint != "" && *rocksPath != "":
 		fatal("--endpoint and --rocks-path are mutually exclusive")
+	case *wait && *endpoint == "":
+		fatal("--wait-fills requires --endpoint")
+	case *wait && *asJSON:
+		fatal("--wait-fills and --json are mutually exclusive")
+	case *wait && *timeout <= 0:
+		fatal("--timeout must be positive")
+	case *wait:
+		if err := waitFills(*endpoint, *timeout); err != nil {
+			fatal("%v", err)
+		}
 	case *endpoint != "":
 		cmdInfoRemote(*endpoint, *asJSON)
 	case *rocksPath != "":
