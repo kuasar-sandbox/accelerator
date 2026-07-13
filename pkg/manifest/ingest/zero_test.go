@@ -23,8 +23,8 @@ type recordingStore struct {
 	manifest    []byte
 }
 
-func (s *recordingStore) GetSalt(_ context.Context) (string, [32]byte, error) {
-	return "test-gen", [32]byte{}, nil
+func (s *recordingStore) GetSalt(_ context.Context) ([32]byte, error) {
+	return [32]byte{}, nil
 }
 
 func (s *recordingStore) Put(_ context.Context, p store.Partition, key store.ContentKey, data []byte) (bool, error) {

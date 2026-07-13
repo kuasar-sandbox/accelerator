@@ -67,8 +67,7 @@ func newFSStore(t *testing.T, generation string) *fs.Store {
 	return s
 }
 
-// TestGetSalt — happy path: server returns the active generation
-// name plus a 32-byte salt derived from it.
+// TestGetSalt — happy path: server returns an opaque 32-byte salt.
 func TestGetSalt(t *testing.T) {
 	cli, _ := startBufconnServer(t, Options{Backend: newFSStore(t, "G1"), VerifyKey: true})
 
@@ -76,11 +75,29 @@ func TestGetSalt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSalt: %v", err)
 	}
-	if resp.GetGeneration() != "G1" {
-		t.Errorf("Generation: got %q, want G1", resp.GetGeneration())
-	}
 	if len(resp.GetSalt()) != 32 {
 		t.Errorf("Salt: got %d bytes, want 32", len(resp.GetSalt()))
+	}
+}
+
+func TestOpaqueSaltIsStableWithinAndIsolatedAcrossWriteDomains(t *testing.T) {
+	a, err := New(Options{Backend: newFSStore(t, "G1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := New(Options{Backend: newFSStore(t, "G1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(Options{Backend: newFSStore(t, "G2")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.salt != b.salt {
+		t.Fatal("the same store write domain produced different salts")
+	}
+	if a.salt == c.salt {
+		t.Fatal("different store write domains produced the same salt")
 	}
 }
 

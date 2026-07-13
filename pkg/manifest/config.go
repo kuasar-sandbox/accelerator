@@ -288,8 +288,7 @@ func (c *Config) GetManifestBlob(ctx context.Context, key store.ContentKey) ([]b
 //
 // Returns nil when the layer exists and the key is consistent; a "not found"
 // error when the blob is absent; an unseal error when it was sealed under a
-// different key. It does NOT read chunks, so a manifest whose chunks belong to a
-// PURGED store generation still passes — use a full Fetcher read (the
+// different key. It does NOT read chunks; use a full Fetcher read (the
 // manifest-ctl verify path) when chunk presence must also be proven.
 func (c *Config) CheckManifest(ctx context.Context, key store.ContentKey) error {
 	blob, err := c.GetManifestBlob(ctx, key)

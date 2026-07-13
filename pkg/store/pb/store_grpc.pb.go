@@ -48,10 +48,8 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type StoreClient interface {
-	// GetSalt returns the server's active generation name and the
-	// 32-byte salt derived from it. Clients combine this with any
-	// extra salt they control (CLI --salt flag, per-tenant nonces)
-	// and use the result as the convergent-encryption seed.
+	// GetSalt returns the server's opaque 32-byte convergent-encryption
+	// salt. Its derivation and lifecycle are store-internal concerns.
 	GetSalt(ctx context.Context, in *GetSaltRequest, opts ...grpc.CallOption) (*GetSaltResponse, error)
 	// Get streams an object's bytes back to the caller. On miss,
 	// the server returns NOT_FOUND (no stream payload). On hit, one
@@ -121,10 +119,8 @@ type Store_PutClient = grpc.ClientStreamingClient[PutRequest, PutResponse]
 // All implementations must embed UnimplementedStoreServer
 // for forward compatibility.
 type StoreServer interface {
-	// GetSalt returns the server's active generation name and the
-	// 32-byte salt derived from it. Clients combine this with any
-	// extra salt they control (CLI --salt flag, per-tenant nonces)
-	// and use the result as the convergent-encryption seed.
+	// GetSalt returns the server's opaque 32-byte convergent-encryption
+	// salt. Its derivation and lifecycle are store-internal concerns.
 	GetSalt(context.Context, *GetSaltRequest) (*GetSaltResponse, error)
 	// Get streams an object's bytes back to the caller. On miss,
 	// the server returns NOT_FOUND (no stream payload). On hit, one

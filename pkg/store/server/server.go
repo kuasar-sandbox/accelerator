@@ -11,7 +11,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/accelerator/pkg/store/pb"
 )
@@ -26,7 +25,6 @@ type Server struct {
 
 	backend   Backend
 	salt      [32]byte
-	gen       string
 	verifyKey bool
 
 	stats Stats
@@ -44,8 +42,8 @@ type Options struct {
 	VerifyKey bool
 }
 
-// New constructs a Server. Salt is derived at construction time from
-// the backend's active generation and surfaced via GetSalt.
+// New constructs a Server. The backend's active generation seeds an opaque
+// salt; generation identity never crosses the store service boundary.
 func New(opts Options) (*Server, error) {
 	if opts.Backend == nil {
 		return nil, errors.New("server: backend is required")
@@ -53,21 +51,19 @@ func New(opts Options) (*Server, error) {
 	gen := opts.Backend.ActiveGeneration()
 	return &Server{
 		backend:   opts.Backend,
-		salt:      crypto.DeriveSalt(gen),
-		gen:       gen,
+		salt:      deriveSalt(gen),
 		verifyKey: opts.VerifyKey,
 	}, nil
 }
 
-// GetSalt returns the active generation name and its derived salt.
-// The salt derivation algorithm is a server-side concern; clients
-// combine this salt with any extra salt they control.
+func deriveSalt(generation string) [32]byte {
+	return sha256.Sum256(append([]byte("accelerator-salt-v1"), generation...))
+}
+
+// GetSalt returns the store's opaque salt.
 func (s *Server) GetSalt(ctx context.Context, _ *pb.GetSaltRequest) (*pb.GetSaltResponse, error) {
 	s.stats.saltN.Add(1)
-	return &pb.GetSaltResponse{
-		Generation: s.gen,
-		Salt:       s.salt[:],
-	}, nil
+	return &pb.GetSaltResponse{Salt: s.salt[:]}, nil
 }
 
 // Get streams a stored object back to the caller. Miss → NotFound,

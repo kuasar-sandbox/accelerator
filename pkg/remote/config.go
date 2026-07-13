@@ -14,10 +14,12 @@ package remote
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"runtime"
+	"time"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	ggcrremote "github.com/google/go-containerregistry/pkg/v1/remote"
@@ -96,9 +98,6 @@ type CacheConfig struct {
 // RefererConfig configures OCI Referrers helpers. The artifact type is fixed
 // (RefererArtifactType), not configurable.
 type RefererConfig struct {
-	// Enabled is kept for callers that still use Config-level policy. The
-	// flatten-ctl CLI exposes referer lookup/put as explicit atomic commands.
-	Enabled bool `yaml:"enabled"`
 	// Desc is the public owner descriptor appended to the owner annotation.
 	Desc string `yaml:"desc"`
 	// Key is the HMAC message paired with the customer key; defaults to Desc.
@@ -160,6 +159,15 @@ func (c *Config) normalize() error {
 	}
 	if c.Referer.Key == "" {
 		c.Referer.Key = c.Referer.Desc
+	}
+	if c.Referer.Validity != "" {
+		d, err := time.ParseDuration(c.Referer.Validity)
+		if err != nil {
+			return fmt.Errorf("remote: referer.validity: %w", err)
+		}
+		if d <= 0 {
+			return errors.New("remote: referer.validity must be positive")
+		}
 	}
 	tr, err := c.buildTransport()
 	if err != nil {

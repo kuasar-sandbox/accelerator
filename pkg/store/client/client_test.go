@@ -149,12 +149,9 @@ func TestGetMiss(t *testing.T) {
 func TestGetSalt(t *testing.T) {
 	c := startBufconnPair(t, 1, true)
 
-	gen, salt, err := c.GetSalt(context.Background())
+	salt, err := c.GetSalt(context.Background())
 	if err != nil {
 		t.Fatalf("GetSalt: %v", err)
-	}
-	if gen != "G1" {
-		t.Errorf("Generation: got %q, want G1", gen)
 	}
 	var zero [32]byte
 	if salt == zero {
