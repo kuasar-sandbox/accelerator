@@ -26,7 +26,7 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck disable=SC1091
 source "$script_dir/common.sh"
 
-: "${ROCKSDB_TARBALL:=https://github.com/facebook/rocksdb/archive/refs/tags/v9.7.4.tar.gz#rocksdb-9.7.4.tar.gz}"
+: "${ROCKSDB_TARBALL:=https://codeload.github.com/facebook/rocksdb/tar.gz/refs/tags/v9.7.4#rocksdb-9.7.4.tar.gz}"
 : "${ROCKSDB_TARBALL_SHA256:=}"
 : "${BUILD_DIR:=$(pwd)/build}"
 : "${TARGET_ARCH:=$(uname -m)}"
