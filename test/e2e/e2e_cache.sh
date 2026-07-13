@@ -479,6 +479,11 @@ wait_ready "127.0.0.1:$FRONT_HEALTH_PORT"
 UP_HASH=$(payload_hash "$TMPDIR/test-upstream.bin")
 assert_eq "$ORIG_HASH" "$UP_HASH" "upstream tier read-through (cold)"
 
+# Fill/writeback is asynchronous. Drain it before stopping the front cache;
+# otherwise SIGTERM can cancel the writeback goroutines and make the remote
+# verification below race with shutdown.
+"$BIN/cache-ctl" info --endpoint "127.0.0.1:$FRONT_HEALTH_PORT" --wait-fills --timeout 10s
+
 # Kill front; remote must now serve the same manifest on its own.
 # makeCacheReader has no local-store fall-through — if writeback did
 # not populate remote, the next load fails with "chunk not found".
