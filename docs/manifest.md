@@ -76,7 +76,7 @@ flag 实参处停止解析)。
 manifest-ctl store [flags] <path|->        # <path|-> 省略或 - = stdin
 
 Flags:
-  --extra-salt string         额外 salt 字节,叠加到 generation salt
+  --extra-salt string         额外 salt 字节,叠加到 store 提供的 opaque salt
   --no-progress               禁用进度输出
 ```
 
@@ -91,7 +91,6 @@ stdout 输出一行 64 字符 hex —— 这是上传后的 manifest content key
 image size:   10.0 GiB
 stored bytes: 1.0 GiB
 chunks:       stored=2048 dedup=18432 zero=0
-generation:   gen-2026-05-01
 manifest key: a1b2c3d4...
 ```
 
@@ -390,9 +389,8 @@ Salt 隔离 dedup 域 —— 同样的明文用不同 salt 派生不同 key → 
 实际 salt 由两部分组合:
 
 - `server_salt` — manifest-ctl 启动时调一次 `store-ctl GetSalt()` 取得
-  active-generation salt(服务端从 generation ID 派生:
-  `SHA256("accelerator-salt-v1" || generation_id)`)。Generation 切换时
-  salt 变,跨代天然隔离。
+  store 提供的 opaque salt。Store 内部切换写入域时
+  salt 变,不同写入域天然隔离。manifest consumer 不感知 store 的内部代次。
 - `extra_salt` — `--extra-salt <bytes>` flag(§2.3),叠加到上面。
 
 最终:
@@ -402,7 +400,7 @@ final_salt = server_salt                                                       #
 final_salt = SHA256("accelerator-extra-salt-v1" || server_salt || extra_salt)  # extra_salt 非空
 ```
 
-`extra_salt` 用于在同一 generation 内做更细粒度隔离(例如多租户)。
+`extra_salt` 用于在同一 store salt 域内做更细粒度隔离(例如多租户)。
 
 ### 4.6 Manifest 二进制格式
 

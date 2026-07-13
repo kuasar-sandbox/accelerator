@@ -153,7 +153,7 @@ func readManifestData(path string) ([]byte, error) {
 
 func cmdStore(args []string) {
 	fs := flag.NewFlagSet("store", flag.ExitOnError)
-	extraSalt := fs.String("extra-salt", "", "optional extra-salt bytes mixed with the store-supplied generation salt")
+	extraSalt := fs.String("extra-salt", "", "optional extra-salt bytes mixed with the store-supplied salt")
 	noProgress := fs.Bool("no-progress", false, "suppress progress output")
 	gf := addGlobalFlags(fs)
 	fs.Parse(args)
@@ -233,7 +233,6 @@ func cmdStore(args []string) {
 	fmt.Fprintf(os.Stderr, "stored bytes: %s\n", formatSize(result.StoredBytes))
 	fmt.Fprintf(os.Stderr, "chunks:       stored=%d dedup=%d zero=%d\n",
 		result.StoredChunks, result.DedupChunks, result.ZeroChunks)
-	fmt.Fprintf(os.Stderr, "generation:   %s\n", result.Generation)
 	fmt.Fprintf(os.Stderr, "manifest key: %s\n", hex.EncodeToString(result.ManifestKey[:]))
 }
 

@@ -24,10 +24,8 @@ package cac.store.v1;
 option go_package = "github.com/kuasar-sandbox/accelerator/pkg/store/pb";
 
 service Store {
-    // GetSalt returns the server's active generation name and the
-    // 32-byte salt derived from it. Clients combine this with any
-    // extra salt they control (CLI --salt flag, per-tenant nonces)
-    // and use the result as the convergent-encryption seed.
+    // GetSalt returns the server's opaque 32-byte convergent-encryption
+    // salt. Its derivation and lifecycle are store-internal concerns.
     rpc GetSalt(GetSaltRequest) returns (GetSaltResponse);
 
     // Get streams an object's bytes back to the caller. On miss,
@@ -48,15 +46,9 @@ service Store {
 message GetSaltRequest {}
 
 message GetSaltResponse {
-    // Active generation name (e.g. "G1"). Informational — clients do
-    // not label their own Put/Get requests with it; the server uses
-    // this generation for all writes and includes it in reverse-
-    // search during Get.
-    string generation = 1;
-    // 32-byte salt derived from the generation via the server's
-    // opaque algorithm. Clients combine this with their own extra
-    // salt before deriving per-chunk encryption keys.
-    bytes  salt       = 2;
+    // Clients may combine this with their own extra salt before
+    // deriving per-chunk encryption keys.
+    bytes salt = 1;
 }
 
 enum Partition {

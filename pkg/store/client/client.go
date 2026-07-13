@@ -113,21 +113,20 @@ func (c *Client) withTimeout(ctx context.Context) (context.Context, context.Canc
 	return context.WithTimeout(ctx, c.timeout)
 }
 
-// GetSalt returns the server's active generation name and the salt
-// bytes derived from it. Callers combine this with their own
-// extra-salt to produce the convergent-encryption seed.
-func (c *Client) GetSalt(ctx context.Context) (generation string, salt [32]byte, err error) {
+// GetSalt returns the server's opaque salt. Callers may combine it with
+// their own extra salt to produce the convergent-encryption seed.
+func (c *Client) GetSalt(ctx context.Context) (salt [32]byte, err error) {
 	ctx, cancel := c.withTimeout(ctx)
 	defer cancel()
 	resp, err := c.pickStub().GetSalt(ctx, &pb.GetSaltRequest{})
 	if err != nil {
-		return "", [32]byte{}, fmt.Errorf("store: GetSalt: %w", err)
+		return [32]byte{}, fmt.Errorf("store: GetSalt: %w", err)
 	}
 	if len(resp.GetSalt()) != 32 {
-		return "", [32]byte{}, fmt.Errorf("store: GetSalt: salt length %d, want 32", len(resp.GetSalt()))
+		return [32]byte{}, fmt.Errorf("store: GetSalt: salt length %d, want 32", len(resp.GetSalt()))
 	}
 	copy(salt[:], resp.GetSalt())
-	return resp.GetGeneration(), salt, nil
+	return salt, nil
 }
 
 // Get fetches a stored object as raw bytes. The server-streamed

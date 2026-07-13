@@ -57,20 +57,88 @@ func TestFindReferrerByOwnerReportsUnsupported(t *testing.T) {
 	}
 }
 
-func TestIsExpired(t *testing.T) {
-	now := time.Now()
+func TestParseValidAt(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
 	imp := now.Add(-2 * time.Hour).Format(time.RFC3339)
-	if isExpired("", now) {
-		t.Error("empty valid_at must not be expired")
+	tests := []struct {
+		name string
+		raw  string
+		ok   bool
+	}{
+		{name: "missing", raw: ""},
+		{name: "malformed import", raw: "not-a-time"},
+		{name: "future import", raw: now.Add(time.Hour).Format(time.RFC3339)},
+		{name: "import only", raw: imp, ok: true},
+		{name: "past expiry", raw: imp + " " + now.Add(-time.Hour).Format(time.RFC3339)},
+		{name: "equal expiry", raw: imp + " " + now.Format(time.RFC3339)},
+		{name: "future expiry", raw: imp + " " + now.Add(time.Hour).Format(time.RFC3339), ok: true},
+		{name: "expiry before import", raw: imp + " " + now.Add(-3*time.Hour).Format(time.RFC3339)},
+		{name: "extra field", raw: imp + " " + now.Add(time.Hour).Format(time.RFC3339) + " extra"},
 	}
-	if isExpired(imp, now) {
-		t.Error("import-only valid_at must not be expired")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ok := parseValidAt(tt.raw, now)
+			if ok != tt.ok {
+				t.Fatalf("parseValidAt(%q) ok=%v, want %v", tt.raw, ok, tt.ok)
+			}
+		})
 	}
-	if !isExpired(imp+" "+now.Add(-time.Hour).Format(time.RFC3339), now) {
-		t.Error("past expiry must be expired")
+}
+
+func TestPutReferrerByOwnerRejectsEmptyOwner(t *testing.T) {
+	cfg := &Config{}
+	err := cfg.PutReferrerByOwner(context.Background(), nil,
+		"1111111111111111111111111111111111111111111111111111111111111111", " ")
+	if err == nil {
+		t.Fatal("empty owner was accepted")
 	}
-	if isExpired(imp+" "+now.Add(time.Hour).Format(time.RFC3339), now) {
-		t.Error("future expiry must not be expired")
+}
+
+func TestNormalizeRejectsNonPositiveRefererValidity(t *testing.T) {
+	for _, validity := range []string{"0s", "-1s"} {
+		cfg := &Config{Referer: RefererConfig{Validity: validity}}
+		if err := cfg.normalize(); err == nil {
+			t.Fatalf("normalize accepted validity %q", validity)
+		}
+	}
+}
+
+func TestValidAtPreservesSubsecondValidity(t *testing.T) {
+	cfg := &Config{Referer: RefererConfig{Validity: "1ns"}}
+	raw, err := cfg.validAtValue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := strings.Fields(raw)
+	if len(fields) != 2 {
+		t.Fatalf("valid_at=%q, want import and expiry", raw)
+	}
+	imported, err := time.Parse(time.RFC3339Nano, fields[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	expires, err := time.Parse(time.RFC3339Nano, fields[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !expires.After(imported) {
+		t.Fatalf("valid_at=%q lost positive subsecond validity", raw)
+	}
+}
+
+func TestPreferReferrerUsesNewestImportThenDigest(t *testing.T) {
+	now := time.Now()
+	if !preferReferrer(false, time.Time{}, "", now, "a") {
+		t.Fatal("first candidate was not selected")
+	}
+	if preferReferrer(true, now, "a", now.Add(-time.Second), "z") {
+		t.Fatal("older candidate replaced the current selection")
+	}
+	if !preferReferrer(true, now, "a", now.Add(time.Second), "a") {
+		t.Fatal("newer candidate was not selected")
+	}
+	if !preferReferrer(true, now, "a", now, "b") {
+		t.Fatal("digest tie-break did not select the deterministic winner")
 	}
 }
 
@@ -120,5 +188,83 @@ func TestReferrerRoundTrip(t *testing.T) {
 	// A different customer key yields a different owner → no match.
 	if _, ok, _ := cfg.FindReferrer(ctx, res, bytes.Repeat([]byte{9}, 32)); ok {
 		t.Fatal("a different customer key must not match the owner")
+	}
+}
+
+func TestExpiredReferrerIsMiss(t *testing.T) {
+	host := startRegistry(t)
+	img, err := random.Image(512, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := host + "/test/expired:v1"
+	pushImage(t, ref, img)
+
+	cfg := &Config{
+		Insecure: true,
+		Cache:    CacheConfig{Dir: t.TempDir()},
+		Referer: RefererConfig{
+			Desc:     "expired-owner",
+			Validity: "1s",
+		},
+	}
+	if err := cfg.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	res, err := cfg.Resolve(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := bytes.Repeat([]byte{3}, 32)
+	const manifestID = "2222222222222222222222222222222222222222222222222222222222222222"
+	if err := cfg.PutReferrer(ctx, res, manifestID, key); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	if id, ok, err := cfg.FindReferrer(ctx, res, key); err != nil || ok || id != "" {
+		t.Fatalf("expired lookup id=%q ok=%v err=%v", id, ok, err)
+	}
+}
+
+func TestExpiredNewerReferrerFallsBackToNewestValidCandidate(t *testing.T) {
+	host := startRegistry(t)
+	img, err := random.Image(512, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := host + "/test/expiry-fallback:v1"
+	pushImage(t, ref, img)
+
+	cfg := &Config{
+		Insecure: true,
+		Cache:    CacheConfig{Dir: t.TempDir()},
+		Referer:  RefererConfig{Desc: "expiry-fallback"},
+	}
+	if err := cfg.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	res, err := cfg.Resolve(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := bytes.Repeat([]byte{4}, 32)
+	const stableID = "3333333333333333333333333333333333333333333333333333333333333333"
+	const expiringID = "4444444444444444444444444444444444444444444444444444444444444444"
+	if err := cfg.PutReferrer(ctx, res, stableID, key); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	cfg.Referer.Validity = "3s"
+	if err := cfg.PutReferrer(ctx, res, expiringID, key); err != nil {
+		t.Fatal(err)
+	}
+	if id, ok, err := cfg.FindReferrer(ctx, res, key); err != nil || !ok || id != expiringID {
+		t.Fatalf("newest live lookup id=%q ok=%v err=%v", id, ok, err)
+	}
+	time.Sleep(3100 * time.Millisecond)
+	if id, ok, err := cfg.FindReferrer(ctx, res, key); err != nil || !ok || id != stableID {
+		t.Fatalf("post-expiry lookup id=%q ok=%v err=%v", id, ok, err)
 	}
 }

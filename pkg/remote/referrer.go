@@ -85,6 +85,9 @@ func (c *Config) FindReferrerByOwner(ctx context.Context, subj *Resolved, ownerV
 	if RefererArtifactType == "" {
 		return "", false, false, errors.New("remote: referrer artifact type is empty")
 	}
+	if strings.TrimSpace(ownerValue) == "" {
+		return "", false, false, errors.New("remote: referrer owner is empty")
+	}
 	supported, err = c.ReferrersSupported(ctx, subj)
 	if err != nil {
 		return "", false, false, err
@@ -97,7 +100,8 @@ func (c *Config) FindReferrerByOwner(ctx context.Context, subj *Resolved, ownerV
 }
 
 func (c *Config) findReferrerByOwner(ctx context.Context, subj *Resolved, ownerValue string) (id string, ok bool, err error) {
-	idx, err := ggcrremote.Referrers(subj.Digest, c.remoteOpts(ctx)...)
+	opts := append(c.remoteOpts(ctx), ggcrremote.WithFilter("artifactType", RefererArtifactType))
+	idx, err := ggcrremote.Referrers(subj.Digest, opts...)
 	if err != nil {
 		return "", false, fmt.Errorf("remote: list referrers for %s: %w", subj.Digest, err)
 	}
@@ -106,7 +110,12 @@ func (c *Config) findReferrerByOwner(ctx context.Context, subj *Resolved, ownerV
 		return "", false, fmt.Errorf("remote: read referrers index: %w", err)
 	}
 	now := time.Now()
+	var bestID, bestDigest string
+	var bestImported time.Time
 	for _, d := range im.Manifests {
+		if d.ArtifactType != "" && d.ArtifactType != RefererArtifactType {
+			continue
+		}
 		anns := d.Annotations
 		if anns[AnnOwner] == "" {
 			// The descriptor carries no annotations — e.g. ggcr's tag-schema
@@ -123,14 +132,25 @@ func (c *Config) findReferrerByOwner(ctx context.Context, subj *Resolved, ownerV
 				continue // unreadable / not an image manifest — skip
 			}
 		}
-		if anns[AnnOwner] != ownerValue || isExpired(anns[AnnValidAt], now) {
+		if anns[AnnOwner] != ownerValue {
 			continue
 		}
-		if mid := anns[AnnID]; validManifestID(mid) {
-			return mid, true, nil
+		imported, valid := parseValidAt(anns[AnnValidAt], now)
+		mid := anns[AnnID]
+		if !valid || !validManifestID(mid) {
+			continue
+		}
+		digest := d.Digest.String()
+		if preferReferrer(bestID != "", bestImported, bestDigest, imported, digest) {
+			bestID, bestImported, bestDigest = mid, imported, digest
 		}
 	}
-	return "", false, nil
+	return bestID, bestID != "", nil
+}
+
+func preferReferrer(hasBest bool, bestImported time.Time, bestDigest string, imported time.Time, digest string) bool {
+	return !hasBest || imported.After(bestImported) ||
+		(imported.Equal(bestImported) && digest > bestDigest)
 }
 
 // manifestAnnotations fetches a referrer manifest and returns its annotations.
@@ -207,6 +227,9 @@ func (c *Config) PutReferrer(ctx context.Context, subj *Resolved, id string, cus
 // PutReferrerByOwner writes a flatten-manifest referrer using a precomputed
 // owner annotation value. This keeps manifest customer keys out of build guests.
 func (c *Config) PutReferrerByOwner(ctx context.Context, subj *Resolved, id, ownerValue string) error {
+	if strings.TrimSpace(ownerValue) == "" {
+		return errors.New("remote: referrer owner is empty")
+	}
 	if !validManifestID(id) {
 		return fmt.Errorf("remote: manifest id %q is not a 64-hex key", id)
 	}
@@ -267,7 +290,7 @@ func validManifestID(id string) bool {
 // referer.validity is set, " <expiry RFC3339>".
 func (c *Config) validAtValue() (string, error) {
 	now := time.Now().UTC()
-	v := now.Format(time.RFC3339)
+	v := now.Format(time.RFC3339Nano)
 	if c.Referer.Validity == "" {
 		return v, nil
 	}
@@ -275,19 +298,29 @@ func (c *Config) validAtValue() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("remote: referer.validity: %w", err)
 	}
-	return v + " " + now.Add(dur).Format(time.RFC3339), nil
+	if dur <= 0 {
+		return "", errors.New("remote: referer.validity must be positive")
+	}
+	return v + " " + now.Add(dur).Format(time.RFC3339Nano), nil
 }
 
-// isExpired reports whether a valid_at annotation ("<import>[ <expiry>]") has
-// an expiry in the past. No expiry (or an unparseable one) → not expired.
-func isExpired(validAt string, now time.Time) bool {
+// parseValidAt validates "<import>[ <expiry>]" and reports whether the record
+// is eligible at now. Import-only records do not expire.
+func parseValidAt(validAt string, now time.Time) (time.Time, bool) {
 	fields := strings.Fields(validAt)
-	if len(fields) < 2 {
-		return false // import-only, no expiry
+	if len(fields) != 1 && len(fields) != 2 {
+		return time.Time{}, false
 	}
-	exp, err := time.Parse(time.RFC3339, fields[1])
-	if err != nil {
-		return false
+	imported, err := time.Parse(time.RFC3339Nano, fields[0])
+	if err != nil || imported.After(now) {
+		return time.Time{}, false
 	}
-	return now.After(exp)
+	if len(fields) == 1 {
+		return imported, true
+	}
+	expires, err := time.Parse(time.RFC3339Nano, fields[1])
+	if err != nil || !expires.After(imported) || !now.Before(expires) {
+		return time.Time{}, false
+	}
+	return imported, true
 }

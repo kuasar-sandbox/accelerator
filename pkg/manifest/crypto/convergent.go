@@ -4,17 +4,6 @@ import (
 	"crypto/sha256"
 )
 
-// DeriveSalt derives a 32-byte salt from a generation ID.
-// salt = SHA256("accelerator-salt-v1" || generationID)
-func DeriveSalt(generationID string) [32]byte {
-	h := sha256.New()
-	h.Write([]byte("accelerator-salt-v1"))
-	h.Write([]byte(generationID))
-	var salt [32]byte
-	copy(salt[:], h.Sum(nil))
-	return salt
-}
-
 // DeriveKey derives a convergent encryption key from salt and plaintext.
 // key = SHA256(salt || plaintext)
 func DeriveKey(salt [32]byte, plaintext []byte) [32]byte {

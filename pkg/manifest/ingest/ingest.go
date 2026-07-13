@@ -41,7 +41,7 @@ type CustomerKeyFunc func() ([32]byte, error)
 
 // ExtraSaltFunc supplies optional extra salt bytes that get mixed into
 // the convergent salt for this ingest. Returning nil / empty leaves
-// the store-supplied generation salt unmodified — the typical case for
+// the store-supplied salt unmodified — the typical case for
 // the platform's shared dedup domain. Non-empty bytes scope the dedup
 // domain narrower (per-tenant, per-image, etc.).
 type ExtraSaltFunc func() ([]byte, error)
@@ -49,7 +49,7 @@ type ExtraSaltFunc func() ([]byte, error)
 // StoreWriter is the narrow write surface the ingester needs from the
 // store layer. Two methods:
 //
-//   - GetSalt returns the current generation ID + 32-byte base salt;
+//   - GetSalt returns the store's opaque 32-byte base salt;
 //     called once per Ingest before chunking starts.
 //   - Put writes a single chunk or manifest blob keyed by content
 //     hash. Returns isNew=true on first write, isNew=false when the
@@ -58,7 +58,7 @@ type ExtraSaltFunc func() ([]byte, error)
 // The interface is deliberately narrow so tests can stub it without
 // pulling in pkg/store's RPC surface.
 type StoreWriter interface {
-	GetSalt(ctx context.Context) (generation string, salt [32]byte, err error)
+	GetSalt(ctx context.Context) (salt [32]byte, err error)
 	Put(ctx context.Context, p store.Partition, key store.ContentKey, data []byte) (isNew bool, err error)
 }
 
@@ -80,12 +80,6 @@ type Result struct {
 	// the store's manifest partition. Callers persist this key as the
 	// handle to the ingested image.
 	ManifestKey store.ContentKey
-
-	// Generation is the store generation ID that owned the salt used
-	// to derive chunk keys. Cross-generation reads must agree on this
-	// value; the read path doesn't need it (the manifest already
-	// carries every key it needs), but ingest exposes it for tooling.
-	Generation string
 
 	// Stats on the work performed.
 	StoredChunks uint32 // chunks newly written to the store
@@ -138,7 +132,7 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 		return nil, fmt.Errorf("ingest: customer key: %w", err)
 	}
 
-	generation, baseSalt, err := i.store.GetSalt(ctx)
+	baseSalt, err := i.store.GetSalt(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("ingest: get salt: %w", err)
 	}
@@ -381,7 +375,6 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 	}
 
 	res.ManifestKey = manifestKey
-	res.Generation = generation
 	return &res, nil
 }
 
