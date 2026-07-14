@@ -1,0 +1,11 @@
+mode: shard
+type: redis
+listen: 0.0.0.0:7070
+health_listen: 0.0.0.0:7071
+rpc_timeout: 2s
+
+redis:
+  socket: /run/kuasar-cache/redis.sock
+  get_pool: 32
+  set_pool: 8
+  timeout: 2s

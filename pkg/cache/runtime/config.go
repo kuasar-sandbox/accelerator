@@ -13,6 +13,7 @@ import (
 // Config is the top-level YAML configuration for cache-ctl serve.
 type Config struct {
 	Mode         string `yaml:"mode"`          // "local" | "shard" | "tiered"
+	Type         string `yaml:"type"`          // local/shard: "embedded" | "redis"
 	Listen       string `yaml:"listen"`        // e.g. "0.0.0.0:7070" (wire data)
 	HealthListen string `yaml:"health_listen"` // e.g. "0.0.0.0:7071" (gRPC health)
 	RPCTimeout   string `yaml:"rpc_timeout"`   // e.g. "2s"
@@ -25,7 +26,8 @@ type Config struct {
 	// perf investigation — leave empty in production.
 	PprofListen string        `yaml:"pprof_listen"` // e.g. "127.0.0.1:6060"
 	Freq        FreqConfig    `yaml:"freq"`
-	Rocks       RocksConfig   `yaml:"rocks"`  // used by local, shard, and embedded tier
+	Rocks       RocksConfig   `yaml:"rocks"`  // used by type=embedded
+	Redis       *RedisConfig  `yaml:"redis"`  // used by type=redis
 	Tiers       []TierConfig  `yaml:"tiers"`  // tiered mode only
 	Origin      *OriginConfig `yaml:"origin"` // tiered mode only
 }
@@ -63,13 +65,26 @@ type RocksConfig struct {
 	MaxBackgroundJobs int     `yaml:"max_background_jobs"` // default 8
 }
 
+// RedisConfig configures a Redis-compatible backend reached over a local Unix
+// socket. GET and SET use separate pools so asynchronous fill/repair traffic
+// cannot consume the read-side connection budget.
+type RedisConfig struct {
+	Socket  string `yaml:"socket"`
+	GetPool int    `yaml:"get_pool"`
+	SetPool int    `yaml:"set_pool"`
+	Timeout string `yaml:"timeout"`
+}
+
 // TierConfig describes one tier in a tiered-mode tier chain.
 type TierConfig struct {
-	Type        string `yaml:"type"`         // "embedded" | "upstream" | "ec"
+	Type        string `yaml:"type"`         // "embedded" | "redis" | "upstream" | "ec"
 	MaxInflight int    `yaml:"max_inflight"` // 0 = unlimited
 
 	// embedded
 	Rocks *RocksConfig `yaml:"rocks"`
+
+	// redis
+	Redis *RedisConfig `yaml:"redis"`
 
 	// upstream
 	Endpoint string `yaml:"endpoint"`
@@ -149,8 +164,23 @@ func LoadConfig(path string) (*Config, error) {
 func (c *Config) Validate() error {
 	switch c.Mode {
 	case "local", "shard":
-		if c.Rocks.Path == "" {
-			return fmt.Errorf("runtime: rocks.path is required for mode %q", c.Mode)
+		switch c.Type {
+		case "embedded":
+			if c.Rocks.Path == "" {
+				return fmt.Errorf("runtime: rocks.path is required for mode %q type=embedded", c.Mode)
+			}
+			if c.Redis != nil {
+				return fmt.Errorf("runtime: redis config is not valid for mode %q type=embedded", c.Mode)
+			}
+		case "redis":
+			if err := validateRedisConfig(c.Redis, fmt.Sprintf("mode %q type=redis", c.Mode)); err != nil {
+				return err
+			}
+			if c.Rocks != (RocksConfig{}) {
+				return fmt.Errorf("runtime: rocks config is not valid for mode %q type=redis", c.Mode)
+			}
+		default:
+			return fmt.Errorf("runtime: type must be \"embedded\" or \"redis\" for mode %q (got %q)", c.Mode, c.Type)
 		}
 	case "tiered":
 		if len(c.Tiers) == 0 {
@@ -163,7 +193,20 @@ func (c *Config) Validate() error {
 				if t.Rocks == nil || t.Rocks.Path == "" {
 					return fmt.Errorf("runtime: tiers[%d] (embedded): rocks.path is required", i)
 				}
+				if t.Redis != nil {
+					return fmt.Errorf("runtime: tiers[%d] (embedded): redis config is not valid", i)
+				}
 				embeddedCount++
+			case "redis":
+				if err := validateRedisConfig(t.Redis, fmt.Sprintf("tiers[%d] (redis)", i)); err != nil {
+					return err
+				}
+				if t.MaxInflight != 0 {
+					return fmt.Errorf("runtime: tiers[%d] (redis): max_inflight is not valid; use redis.get_pool and redis.set_pool", i)
+				}
+				if t.Rocks != nil {
+					return fmt.Errorf("runtime: tiers[%d] (redis): rocks config is not valid", i)
+				}
 			case "upstream":
 				if t.Endpoint == "" {
 					return fmt.Errorf("runtime: tiers[%d] (upstream): endpoint is required", i)
@@ -206,6 +249,31 @@ func (c *Config) Validate() error {
 
 	if c.Listen == "" {
 		return fmt.Errorf("runtime: listen address is required")
+	}
+	return nil
+}
+
+func validateRedisConfig(cfg *RedisConfig, scope string) error {
+	if cfg == nil {
+		return fmt.Errorf("runtime: %s: redis config is required", scope)
+	}
+	if cfg.Socket == "" {
+		return fmt.Errorf("runtime: %s: redis.socket is required", scope)
+	}
+	if !strings.HasPrefix(cfg.Socket, "/") {
+		return fmt.Errorf("runtime: %s: redis.socket must be an absolute Unix socket path", scope)
+	}
+	if cfg.GetPool < 0 {
+		return fmt.Errorf("runtime: %s: redis.get_pool must be >= 0", scope)
+	}
+	if cfg.SetPool < 0 {
+		return fmt.Errorf("runtime: %s: redis.set_pool must be >= 0", scope)
+	}
+	if cfg.Timeout != "" {
+		d, err := time.ParseDuration(cfg.Timeout)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("runtime: %s: redis.timeout must be a positive duration", scope)
+		}
 	}
 	return nil
 }

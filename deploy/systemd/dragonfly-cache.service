@@ -1,0 +1,34 @@
+[Unit]
+Description=Dragonfly Redis-compatible cache backend
+After=local-fs.target
+Before=cache-ctl.service
+
+[Service]
+Type=simple
+User=kuasar-cache
+Group=kuasar-cache
+RuntimeDirectory=kuasar-cache
+RuntimeDirectoryMode=0750
+EnvironmentFile=/etc/kuasar-cache/dragonfly.env
+ExecStartPre=/usr/bin/test -x /usr/local/libexec/kuasar-cache/dragonfly-v1.39.0
+ExecStart=/usr/local/libexec/kuasar-cache/dragonfly-v1.39.0 \
+  --port=0 \
+  --unixsocket=/run/kuasar-cache/redis.sock \
+  --unixsocketperm=0660 \
+  --version_check=false \
+  --cache_mode=true \
+  --maxmemory=${DRAGONFLY_MAX_MEMORY} \
+  --tiered_prefix=${DRAGONFLY_TIER_PREFIX} \
+  --tiered_max_file_size=${DRAGONFLY_TIER_BYTES} \
+  --tiered_offload_threshold=${DRAGONFLY_TIER_OFFLOAD_THRESHOLD} \
+  --tiered_upload_threshold=${DRAGONFLY_TIER_UPLOAD_THRESHOLD} \
+  --backing_file_direct=true \
+  --proactor_threads=${DRAGONFLY_PROACTOR_THREADS}
+Restart=on-failure
+RestartSec=1s
+LimitNOFILE=1048576
+NoNewPrivileges=true
+UMask=0007
+
+[Install]
+WantedBy=multi-user.target

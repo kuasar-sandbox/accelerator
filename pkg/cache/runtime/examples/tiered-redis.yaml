@@ -1,0 +1,33 @@
+mode: tiered
+listen: 0.0.0.0:7070
+health_listen: 0.0.0.0:7071
+rpc_timeout: 2s
+
+tiers:
+  - type: redis
+    redis:
+      socket: /run/kuasar-cache/redis.sock
+      get_pool: 32
+      set_pool: 8
+      timeout: 2s
+
+  - type: ec
+    cluster:
+      data_shards: 4
+      parity_shards: 1
+      peers:
+        - {id: l2-01, endpoint: 10.0.1.11:7070}
+        - {id: l2-02, endpoint: 10.0.1.12:7070}
+        - {id: l2-03, endpoint: 10.0.1.13:7070}
+        - {id: l2-04, endpoint: 10.0.1.14:7070}
+        - {id: l2-05, endpoint: 10.0.1.15:7070}
+      pool: 2
+      timeout: 2s
+
+origin:
+  type: store
+  store:
+    endpoint: 10.0.1.50:7100
+    pool: 4
+    timeout: 2s
+  max_inflight: 16

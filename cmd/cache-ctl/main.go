@@ -32,6 +32,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/client"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/ec"
 	cachepb "github.com/kuasar-sandbox/accelerator/pkg/cache/pb"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/redisstore"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/rocks"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/runtime"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/server"
@@ -123,6 +124,12 @@ const cacheConfigEnv = "CACHE_CONFIG"
 // network at all.
 const cacheEndpointEnv = "CACHE_ENDPOINT"
 
+type directStore interface {
+	cache.Tier
+	cache.ShardTier
+	Close() error
+}
+
 // resolveDataEndpoint returns the cache data endpoint chosen from, in
 // priority order, the --endpoint flag value then $CACHE_ENDPOINT.
 // Empty result -> caller should fatal.
@@ -154,23 +161,40 @@ func cmdServe(args []string) {
 		fatal("%v", err)
 	}
 
-	// Open RocksDB store for local/shard modes. Tiered mode builds its own
-	// rocks.Store(s) inside buildTieredChain below — main.go does not own
-	// any RocksDB resources in tiered mode.
-	var rocksStore rocks.Interface
+	// One process-level pool backs all payload-returning clients/stores. Redis
+	// reads use it directly; RocksDB retains its namespace-sized internal pools.
+	blobPool := cache.NewPool(512 << 10)
+
+	// local/shard use one concrete store for both object and shard opcodes.
+	// tiered constructs its stores in YAML order inside buildTieredChain.
+	var (
+		direct     directStore
+		rocksStore rocks.Interface
+		redisStore *redisstore.Store
+	)
 	switch cfg.Mode {
 	case "local", "shard":
-		rocksStore, err = rocks.Open(cfg.Rocks, cfg.Freq)
-		if err != nil {
-			fatal("open rocks: %v", err)
+		switch cfg.Type {
+		case "embedded":
+			rocksStore, err = rocks.Open(cfg.Rocks, cfg.Freq)
+			if err != nil {
+				fatal("open rocks: %v", err)
+			}
+			direct = rocksStore
+		case "redis":
+			redisStore, err = redisstore.Open(*cfg.Redis, blobPool)
+			if err != nil {
+				fatal("open redis: %v", err)
+			}
+			direct = redisStore
 		}
-		defer rocksStore.Close()
+		defer direct.Close()
 	}
 
 	// Per-mode backend wiring.
 	//
-	//   local / tiered mode  : tier non-nil, shard nil
-	//   shard mode           : tier nil, shard non-nil
+	//   local / shard mode : one direct store serves both interfaces
+	//   tiered mode        : object tier chain only
 	//
 	// primaryRocks is the rocks.Interface exposed via the Info gRPC
 	// service for top-level rocks CF stats (local/shard mode). nil in
@@ -179,6 +203,7 @@ func cmdServe(args []string) {
 		tierBackend  cache.Tier
 		shardBackend cache.ShardTier
 		primaryRocks rocks.Interface
+		primaryRedis *redisstore.Store
 	)
 
 	// tieredComps holds the tier chain in tiered mode so we can defer a
@@ -192,14 +217,14 @@ func cmdServe(args []string) {
 
 	switch cfg.Mode {
 	case "local", "shard":
-		// Unified handler: rocks.Interface satisfies both cache.Tier
-		// and cache.ShardTier, so the same backend serves object and
+		// Unified handler: both stores satisfy cache.Tier and
+		// cache.ShardTier, so the same backend serves object and
 		// shard opcodes. Mode naming reflects the *primary* workload
-		// rather than an exclusive opcode family — historical tests
-		// rely on cross-family support.
-		tierBackend = rocksStore
-		shardBackend = rocksStore
+		// rather than an exclusive opcode family.
+		tierBackend = direct
+		shardBackend = direct
 		primaryRocks = rocksStore
+		primaryRedis = redisStore
 	case "tiered":
 		// The process-global BlobPool is allocated once and threaded
 		// into every wire client (upstream origin, ec peers, etc.) for
@@ -217,8 +242,6 @@ func cmdServe(args []string) {
 		// pooled buffer without forcing an oversized realloc. Sizing
 		// the pool to the largest expected response avoids the
 		// "cap < size → fresh make()" branch in syncPool.Alloc.
-		blobPool := cache.NewPool(512 << 10)
-
 		comps, buildErr := buildTieredChain(cfg, blobPool)
 		if buildErr != nil {
 			fatal("%v", buildErr)
@@ -314,6 +337,8 @@ func cmdServe(args []string) {
 	var healthSrv interface {
 		SetServingStatus(string, healthgrpc.HealthCheckResponse_ServingStatus)
 	}
+	healthCtx, healthCancel := context.WithCancel(context.Background())
+	defer healthCancel()
 	if cfg.HealthListen != "" {
 		grpcServer = grpc.NewServer()
 		hsrv := server.RegisterHealth(grpcServer)
@@ -326,13 +351,25 @@ func cmdServe(args []string) {
 		if primaryRocks != nil {
 			infoSrv.SetTopLevelRocks(primaryRocks)
 		}
+		if primaryRedis != nil {
+			infoSrv.SetTopLevelRedis(primaryRedis)
+		}
 		cachepb.RegisterInfoServer(grpcServer, infoSrv)
 
 		healthLis, err := util.Listen(cfg.HealthListen)
 		if err != nil {
 			fatal("listen health %s: %v", cfg.HealthListen, err)
 		}
+		redisStores := collectRedisStores(primaryRedis, tieredComps)
+		if len(redisStores) > 0 {
+			// RegisterHealth defaults to SERVING. Redis-backed daemons must not
+			// expose that state until the dedicated end-to-end probe succeeds.
+			healthSrv.SetServingStatus("", healthgrpc.HealthCheckResponse_NOT_SERVING)
+		}
 		go grpcServer.Serve(healthLis)
+		if len(redisStores) > 0 {
+			go monitorRedisHealth(healthCtx, healthSrv, redisStores)
+		}
 		fmt.Fprintf(os.Stderr, "cache-ctl serve mode=%s listen=%s health=%s\n", cfg.Mode, cfg.Listen, cfg.HealthListen)
 	} else {
 		fmt.Fprintf(os.Stderr, "cache-ctl serve mode=%s listen=%s\n", cfg.Mode, cfg.Listen)
@@ -353,7 +390,7 @@ func cmdServe(args []string) {
 	// Runtime stats are served on-demand via the Info gRPC service (registered
 	// on the Health listener in Step 3). On top of that, an adaptive stats line
 	// is printed to stderr each period that saw traffic (silent when idle) —
-	// concurrency, bandwidth, latency p50/p99/max, hit cascade, and rocksdb
+	// concurrency, bandwidth, latency p50/p99/max, hit cascade, and backend
 	// gauges. stats_interval=0/off disables it. Stopped on shutdown.
 	var statsRocks rocks.Interface = primaryRocks
 	if tieredComps != nil {
@@ -362,7 +399,7 @@ func cmdServe(args []string) {
 	statsCtx, statsCancel := context.WithCancel(context.Background())
 	defer statsCancel()
 	go obstat.RunAdaptive(statsCtx, cfg.StatsIntervalDur(),
-		cacheSampler(cfg.Mode, ws, tieredCache, statsRocks), log.Printf)
+		cacheSampler(cfg.Mode, ws, tieredCache, statsRocks, collectRedisGaugeSources(primaryRedis, tieredComps)), log.Printf)
 
 	// Signal handling.
 	//
@@ -394,6 +431,68 @@ func cmdServe(args []string) {
 				// deadline by default; baseCtx cancellation reaps them).
 				tieredCache.Close()
 			}
+			return
+		}
+	}
+}
+
+func collectRedisStores(primary *redisstore.Store, comps *tieredComponents) []*redisstore.Store {
+	var stores []*redisstore.Store
+	if primary != nil {
+		stores = append(stores, primary)
+	}
+	if comps != nil {
+		for _, spec := range comps.TierSpecs {
+			if spec.RedisStore != nil {
+				stores = append(stores, spec.RedisStore)
+			}
+		}
+	}
+	return stores
+}
+
+func collectRedisGaugeSources(primary *redisstore.Store, comps *tieredComponents) []redisGaugeSource {
+	var sources []redisGaugeSource
+	if primary != nil {
+		sources = append(sources, redisGaugeSource{label: "redis", store: primary})
+	}
+	if comps != nil {
+		for i, spec := range comps.TierSpecs {
+			if spec.RedisStore != nil {
+				sources = append(sources, redisGaugeSource{
+					label: fmt.Sprintf("redis[L%d]", i),
+					store: spec.RedisStore,
+				})
+			}
+		}
+	}
+	return sources
+}
+
+func monitorRedisHealth(ctx context.Context, healthSrv interface {
+	SetServingStatus(string, healthgrpc.HealthCheckResponse_ServingStatus)
+}, stores []*redisstore.Store) {
+	probe := func() {
+		status := healthgrpc.HealthCheckResponse_SERVING
+		for _, store := range stores {
+			probeCtx, cancel := context.WithTimeout(ctx, time.Second)
+			err := store.Probe(probeCtx)
+			cancel()
+			if err != nil {
+				status = healthgrpc.HealthCheckResponse_NOT_SERVING
+				break
+			}
+		}
+		healthSrv.SetServingStatus("", status)
+	}
+	probe()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			probe()
+		case <-ctx.Done():
 			return
 		}
 	}

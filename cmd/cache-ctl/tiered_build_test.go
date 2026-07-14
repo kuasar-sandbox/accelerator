@@ -1,12 +1,15 @@
 package main
 
 import (
+	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/client"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/rocks"
@@ -60,6 +63,36 @@ func badEcTier() runtime.TierConfig {
 	}
 }
 
+func passiveRedisSocket(t *testing.T) string {
+	t.Helper()
+	socket := filepath.Join(t.TempDir(), "redis.sock")
+	lis, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var acceptWg sync.WaitGroup
+	acceptWg.Add(1)
+	go func() {
+		defer acceptWg.Done()
+		for {
+			conn, err := lis.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				var buf [1]byte
+				_, _ = conn.Read(buf[:])
+			}()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = lis.Close()
+		acceptWg.Wait()
+	})
+	return socket
+}
+
 func TestBuildTieredChain_EmbeddedOnly(t *testing.T) {
 	cfg := &runtime.Config{
 		Mode:  "tiered",
@@ -82,6 +115,130 @@ func TestBuildTieredChain_EmbeddedOnly(t *testing.T) {
 	}
 	// Sketch-construction invariant is covered by rocks package tests;
 	// this test only verifies tier-chain assembly.
+}
+
+func TestBuildTieredChain_RedisOnly(t *testing.T) {
+	socket := passiveRedisSocket(t)
+
+	cfg := &runtime.Config{
+		Mode: "tiered",
+		Tiers: []runtime.TierConfig{{
+			Type: "redis",
+			Redis: &runtime.RedisConfig{
+				Socket:  socket,
+				GetPool: 1,
+				SetPool: 1,
+				Timeout: "1s",
+			},
+		}},
+	}
+	comps, err := buildTieredChain(cfg, nil)
+	if err != nil {
+		t.Fatalf("buildTieredChain: %v", err)
+	}
+	if len(comps.Tiers) != 1 || len(comps.TierSpecs) != 1 {
+		t.Fatalf("unexpected component lengths: tiers=%d specs=%d", len(comps.Tiers), len(comps.TierSpecs))
+	}
+	if comps.TierSpecs[0].Type != "redis" || comps.TierSpecs[0].RedisStore == nil {
+		t.Fatalf("unexpected Redis tier spec: %+v", comps.TierSpecs[0])
+	}
+	if !comps.TierSpecs[0].RedisStore.Healthy() {
+		t.Fatal("Redis tier should have connected GET and SET workers")
+	}
+	if err := comps.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBuildTieredChain_ECThenRedisPreservesOrder(t *testing.T) {
+	socket := passiveRedisSocket(t)
+	cfg := &runtime.Config{
+		Mode: "tiered",
+		Tiers: []runtime.TierConfig{
+			ecTier(),
+			{
+				Type: "redis",
+				Redis: &runtime.RedisConfig{
+					Socket:  socket,
+					GetPool: 1,
+					SetPool: 1,
+					Timeout: "1s",
+				},
+			},
+		},
+	}
+	comps, err := buildTieredChain(cfg, nil)
+	if err != nil {
+		t.Fatalf("buildTieredChain: %v", err)
+	}
+	defer comps.Close()
+
+	if len(comps.TierSpecs) != 2 || comps.TierSpecs[0].Type != "ec" || comps.TierSpecs[1].Type != "redis" {
+		t.Fatalf("tier order: got %+v, want [ec, redis]", comps.TierSpecs)
+	}
+}
+
+func TestBuildTieredChain_RedisRollsBackOnLaterFailure(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "redis.sock")
+	lis, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+
+	accepted := make(chan net.Conn, 2)
+	acceptErr := make(chan error, 1)
+	go func() {
+		for i := 0; i < cap(accepted); i++ {
+			conn, err := lis.Accept()
+			if err != nil {
+				acceptErr <- err
+				return
+			}
+			accepted <- conn
+		}
+	}()
+
+	cfg := &runtime.Config{
+		Mode: "tiered",
+		Tiers: []runtime.TierConfig{
+			{
+				Type: "redis",
+				Redis: &runtime.RedisConfig{
+					Socket:  socket,
+					GetPool: 1,
+					SetPool: 1,
+					Timeout: "1s",
+				},
+			},
+			{Type: "unknown"},
+		},
+	}
+	comps, err := buildTieredChain(cfg, nil)
+	if err == nil {
+		t.Fatal("buildTieredChain should reject the later unknown tier")
+	}
+	if comps != nil {
+		t.Fatal("comps should be nil on partial failure")
+	}
+
+	for i := 0; i < cap(accepted); i++ {
+		var conn net.Conn
+		select {
+		case conn = <-accepted:
+		case err := <-acceptErr:
+			t.Fatalf("accept Redis worker %d: %v", i, err)
+		case <-time.After(time.Second):
+			t.Fatalf("timed out accepting Redis worker %d", i)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		var one [1]byte
+		_, err = conn.Read(one[:])
+		_ = conn.Close()
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("Redis worker %d was not closed by rollback: %v", i, err)
+		}
+	}
 }
 
 func TestBuildTieredChain_EmbeddedThenEC(t *testing.T) {

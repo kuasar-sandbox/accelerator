@@ -82,7 +82,7 @@ rpc_timeout: 5s
 
 # Periodic adaptive stats line to stderr: each period with traffic prints one
 # summary (rates, bandwidth, latency p50/p99/max, inflight/conns, hit cascade,
-# rocksdb gauges); idle periods are silent. Default 30s; "0"/"off" disables.
+# rocksdb/redis gauges); idle periods are silent. Default 30s; "0"/"off" disables.
 # stats_interval: 30s
 
 freq:
@@ -97,6 +97,14 @@ tiers:
       mem_ratio: 0.1
       direct_reads: true
       bloom_bits: 10
+
+  # Redis-compatible UDS alternative (replace the embedded tier above):
+  # - type: redis
+  #   redis:
+  #     socket: /run/kuasar-cache/redis.sock
+  #     get_pool: 32
+  #     set_pool: 8
+  #     timeout: 2s
 
 origin:
   type: store        # treat store-ctl as the cold tier

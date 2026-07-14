@@ -7,6 +7,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/internal/util/obstat"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/redisstore"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/rocks"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/server"
 )
@@ -15,8 +16,8 @@ import (
 // it diffs successive handler snapshots and renders one stats line per window,
 // reporting the window inactive (silent) when no get/put completed and nothing
 // is in flight. tc (tiered counters, may be nil) adds the per-tier hit cascade;
-// rk (rocks handle, may be nil) adds slow-moving rocksdb gauges.
-func cacheSampler(mode string, ws *server.WireServer, tc *cache.TieredCache, rk rocks.Interface) func(float64) (string, bool) {
+// rk and redisSources add slow-moving backend gauges when present.
+func cacheSampler(mode string, ws *server.WireServer, tc *cache.TieredCache, rk rocks.Interface, redisSources []redisGaugeSource) func(float64) (string, bool) {
 	h := ws.Handler()
 	prev := h.WireStats()
 	var prevTier cache.TieredCounters
@@ -69,12 +70,32 @@ func cacheSampler(mode string, ws *server.WireServer, tc *cache.TieredCache, rk 
 				fmt.Fprintf(&b, " | %s", seg)
 			}
 		}
+		for _, source := range redisSources {
+			if seg := redisGauge(source.label, source.store.Stats()); seg != "" {
+				fmt.Fprintf(&b, " | %s", seg)
+			}
+		}
 		if dErr > 0 {
 			fmt.Fprintf(&b, " | err %d", dErr)
 		}
 		prev = cur
 		return b.String(), true
 	}
+}
+
+type redisGaugeSource struct {
+	label string
+	store *redisstore.Store
+}
+
+func redisGauge(label string, s redisstore.Stats) string {
+	return fmt.Sprintf("%s get %d/%d set %d/%d in %d/%d wait %d drain %d cancel %d reconnect %d err %d p99 %s",
+		label,
+		s.GetConnected, s.GetPoolSize,
+		s.SetConnected, s.SetPoolSize,
+		s.GetInflight, s.SetInflight,
+		s.PoolWaiters, s.Draining, s.Cancelled, s.Reconnects, s.BackendErrors,
+		obstat.FmtNs(s.GetLatency.P99()))
 }
 
 // tierCascade renders where the window's hits landed across the cache tiers and

@@ -3,10 +3,8 @@
 // cfg.HealthListen listener (same port, distinct service name). No
 // new YAML config is required.
 //
-// The service exposes counter-only statistics: hits/misses/fills at
-// three layers — wire-handler (daemon external view), TieredCache
-// (per-tier cascade), and shardImpl (per-EC-peer). Daemon latency is
-// not collected; clients measure end-to-end latency themselves.
+// The service exposes hits/misses/fills at the wire, tier, and EC-peer
+// layers plus bounded Redis UDS pool and backend-latency snapshots.
 syntax = "proto3";
 
 package cac.cache.v1;
@@ -40,7 +38,7 @@ message WaitFillsRequest {}
 message WaitFillsReply {}
 
 message InfoReply {
-    // "local" | "shard" | "tiered" — determines which of tiered/rocks
+    // "local" | "shard" | "tiered" — determines which backend detail
     // fields are populated.
     string mode = 1;
     // Seconds since daemon start.
@@ -54,6 +52,9 @@ message InfoReply {
     // tiered has no single top-level rocks — per-tier rocks properties
     // appear inside TieredStats.tiers[].rocks instead.
     repeated RocksCFStats rocks = 5;
+    // Direct local/shard backend discriminator and Redis detail.
+    string     backend_type = 6;
+    RedisStats redis        = 7;
 }
 
 // ServerStats is the daemon-as-server view. A single external RPC
@@ -78,8 +79,9 @@ message TieredStats {
 // "we failed to ask". Fills = number of fill-aside ops initiated on
 // this tier.
 //
-// Exactly one of rocks/peers/endpoint is populated, per Type:
+// Exactly one of rocks/redis/peers/endpoint is populated, per Type:
 //   - "embedded": rocks
+//   - "redis":    redis
 //   - "ec":       peers
 //   - "upstream": endpoint
 message TierStats {
@@ -92,6 +94,7 @@ message TierStats {
     repeated PeerStats    peers    = 6;
     string                endpoint = 7;
     uint64                errors   = 8;
+    RedisStats            redis    = 9;
 }
 
 // OriginStats is the final cascade layer. Origin is a Getter (no
@@ -136,4 +139,34 @@ message RocksCFStats {
     string num_keys   = 2;
     string disk_usage = 3;
     string mem_usage  = 4;
+}
+
+message RedisStats {
+    string socket = 1;
+
+    int64 get_pool_size  = 2;
+    int64 set_pool_size  = 3;
+    int64 get_connected  = 4;
+    int64 set_connected  = 5;
+    int64 get_inflight   = 6;
+    int64 set_inflight   = 7;
+    int64 pool_waiters   = 8;
+    int64 draining       = 9;
+
+    uint64 get_hits           = 10;
+    uint64 get_misses         = 11;
+    uint64 sets               = 12;
+    uint64 cancelled          = 13;
+    uint64 late_bytes_drained = 14;
+    uint64 reconnects         = 15;
+    uint64 protocol_errors    = 16;
+    uint64 backend_errors     = 17;
+
+    uint64 get_p50_ns       = 18;
+    uint64 get_p99_ns       = 19;
+    uint64 get_p999_ns      = 20;
+    uint64 set_p50_ns       = 21;
+    uint64 set_p99_ns       = 22;
+    uint64 set_p999_ns      = 23;
+    uint64 pool_wait_p99_ns = 24;
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/internal/util/obstat"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 	cachepb "github.com/kuasar-sandbox/accelerator/pkg/cache/pb"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/rocks"
@@ -140,8 +141,9 @@ func fromPb(r *cachepb.InfoReply) cache.DaemonStats {
 		return cache.DaemonStats{}
 	}
 	ds := cache.DaemonStats{
-		Mode:      r.Mode,
-		UptimeSec: r.UptimeSec,
+		Mode:        r.Mode,
+		BackendType: r.BackendType,
+		UptimeSec:   r.UptimeSec,
 	}
 	if r.Server != nil {
 		ds.Server = cache.ServerStats{
@@ -160,6 +162,7 @@ func fromPb(r *cachepb.InfoReply) cache.DaemonStats {
 				Fills:    t.Fills,
 				Errors:   t.Errors,
 				Rocks:    rocksFromPb(t.Rocks),
+				Redis:    redisFromPb(t.Redis),
 				Peers:    peersFromPb(t.Peers),
 				Endpoint: t.Endpoint,
 			}
@@ -180,7 +183,40 @@ func fromPb(r *cachepb.InfoReply) cache.DaemonStats {
 	if len(r.Rocks) > 0 {
 		ds.Rocks = rocksFromPb(r.Rocks)
 	}
+	ds.Redis = redisFromPb(r.Redis)
 	return ds
+}
+
+func redisFromPb(s *cachepb.RedisStats) *cache.RedisStats {
+	if s == nil {
+		return nil
+	}
+	return &cache.RedisStats{
+		Socket:           s.Socket,
+		GetPoolSize:      s.GetPoolSize,
+		SetPoolSize:      s.SetPoolSize,
+		GetConnected:     s.GetConnected,
+		SetConnected:     s.SetConnected,
+		GetInflight:      s.GetInflight,
+		SetInflight:      s.SetInflight,
+		PoolWaiters:      s.PoolWaiters,
+		Draining:         s.Draining,
+		GetHits:          s.GetHits,
+		GetMisses:        s.GetMisses,
+		Sets:             s.Sets,
+		Cancelled:        s.Cancelled,
+		LateBytesDrained: s.LateBytesDrained,
+		Reconnects:       s.Reconnects,
+		ProtocolErrors:   s.ProtocolErrors,
+		BackendErrors:    s.BackendErrors,
+		GetP50Ns:         s.GetP50Ns,
+		GetP99Ns:         s.GetP99Ns,
+		GetP999Ns:        s.GetP999Ns,
+		SetP50Ns:         s.SetP50Ns,
+		SetP99Ns:         s.SetP99Ns,
+		SetP999Ns:        s.SetP999Ns,
+		PoolWaitP99Ns:    s.PoolWaitP99Ns,
+	}
 }
 
 func rocksFromPb(in []*cachepb.RocksCFStats) []cache.RocksCFStats {
@@ -222,7 +258,11 @@ func peersFromPb(in []*cachepb.PeerStats) []cache.PeerStats {
 // only the ones that apply to the current mode. Designed to be
 // inspected quickly during bench runs.
 func printInfoHuman(ds cache.DaemonStats) {
-	fmt.Printf("mode=%s uptime=%ds\n", ds.Mode, ds.UptimeSec)
+	fmt.Printf("mode=%s", ds.Mode)
+	if ds.BackendType != "" {
+		fmt.Printf(" type=%s", ds.BackendType)
+	}
+	fmt.Printf(" uptime=%ds\n", ds.UptimeSec)
 	// Server (wire-handler) counters — always present.
 	srvTot := ds.Server.Hits + ds.Server.Misses
 	srvHR := 0.0
@@ -254,7 +294,10 @@ func printInfoHuman(ds cache.DaemonStats) {
 		fmt.Printf("  %-14s %-12s %10d %10d %10s %10d %7.2f%%\n",
 			"origin", o.Type, o.Hits, o.Misses, "-", o.Errors, ohr)
 
-		for _, t := range ds.Tiered.Tiers {
+		for i, t := range ds.Tiered.Tiers {
+			if t.Redis != nil {
+				printRedisStats(fmt.Sprintf("redis[L%d]", i), t.Redis)
+			}
 			if len(t.Peers) == 0 {
 				continue
 			}
@@ -279,4 +322,16 @@ func printInfoHuman(ds cache.DaemonStats) {
 				cf.Name, cf.NumKeys, cf.DiskUsage, cf.MemUsage)
 		}
 	}
+	if ds.Redis != nil {
+		printRedisStats("redis", ds.Redis)
+	}
+}
+
+func printRedisStats(label string, s *cache.RedisStats) {
+	fmt.Printf("%s: socket=%s get=%d/%d set=%d/%d inflight=%d/%d waiters=%d draining=%d cancels=%d reconnects=%d errors=%d protocol=%d get-p50=%s get-p99=%s set-p99=%s\n",
+		label, s.Socket,
+		s.GetConnected, s.GetPoolSize, s.SetConnected, s.SetPoolSize,
+		s.GetInflight, s.SetInflight, s.PoolWaiters, s.Draining,
+		s.Cancelled, s.Reconnects, s.BackendErrors, s.ProtocolErrors,
+		obstat.FmtNs(s.GetP50Ns), obstat.FmtNs(s.GetP99Ns), obstat.FmtNs(s.SetP99Ns))
 }

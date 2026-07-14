@@ -106,6 +106,15 @@ jobs:
           ln -sfn /var/lib/kuasar-ci/tools/zot "$tool_dir/zot"
           ln -sfn /var/lib/kuasar-ci/tools/versitygw "$tool_dir/versitygw"
 
+      - name: Ensure Redis protocol test server
+        run: |
+          set -euo pipefail
+          if ! command -v redis-server >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends redis-server
+          fi
+          sudo systemctl disable --now redis-server.service >/dev/null 2>&1 || true
+
       - name: Build and test the platform
         working-directory: src/orchestrator/release-builder
         run: make test-e2e
