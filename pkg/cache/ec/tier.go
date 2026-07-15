@@ -329,15 +329,25 @@ func (t *impl) Get(ctx context.Context, p store.Partition, key store.ContentKey)
 			dataHits++
 		}
 	}
+	repairNeedsParity := false
+	if t.repairRunner != nil && len(missPeerPos) > 0 {
+		for i := data; i < total; i++ {
+			if !seenIdx[i] {
+				repairNeedsParity = true
+				break
+			}
+		}
+	}
 
 	// Pre-fill nil shard slots with pooled scratch so reedsolomon's
 	// Reconstruct reuses our buffers instead of allocating via its
 	// internal AllocAligned. Check: the library tests
 	// `cap(shards[i]) >= shardSize` and reuses the slot if so.
 	//
-	// Only needed when reconstruction will run (dataHits < data).
+	// Also reconstruct parity when repair will write a confirmed-missing parity
+	// shard. ReconstructData deliberately leaves parity slots empty.
 	var scratchSlots []int
-	if dataHits < data {
+	if dataHits < data || repairNeedsParity {
 		var shardSize int
 		for _, s := range shards {
 			if s != nil {
@@ -360,17 +370,19 @@ func (t *impl) Get(ctx context.Context, p store.Partition, key store.ContentKey)
 			scratchSlots = append(scratchSlots, i)
 		}
 
-		// Reconstruct only the data shards we need; parity slots can
-		// remain untouched. Pairs with the "skip if dataHits==data"
-		// gate above: RS runs only when it has actual work to do, and
-		// the work is bounded to data-shard recovery.
-		if err := t.enc.enc.ReconstructData(shards); err != nil {
+		var reconstructErr error
+		if repairNeedsParity {
+			reconstructErr = t.enc.enc.Reconstruct(shards)
+		} else {
+			reconstructErr = t.enc.enc.ReconstructData(shards)
+		}
+		if reconstructErr != nil {
 			// Return scratch and blobs cleanly.
 			for _, idx := range scratchSlots {
 				t.shardScratchPool.Put(shards[idx][:0])
 			}
 			releaseAll(blobs)
-			return cache.CacheMiss, nil, fmt.Errorf("ec: reconstruct: %w", err)
+			return cache.CacheMiss, nil, fmt.Errorf("ec: reconstruct: %w", reconstructErr)
 		}
 	}
 	if sample {
