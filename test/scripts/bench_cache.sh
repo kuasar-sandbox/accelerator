@@ -170,6 +170,7 @@ start_local_only() {
     config="$WORKDIR/local.yaml"
     cat > "$config" <<EOF
 mode: local
+type: embedded
 listen: 127.0.0.1:$data
 health_listen: 127.0.0.1:$health
 rpc_timeout: 5s
@@ -203,6 +204,7 @@ start_local_as_origin() {
     config="$WORKDIR/origin.yaml"
     cat > "$config" <<EOF
 mode: local
+type: embedded
 listen: 127.0.0.1:$data
 health_listen: 127.0.0.1:$health
 rpc_timeout: 5s
@@ -274,6 +276,7 @@ start_tiered_shard_l2() {
         sconfig="$WORKDIR/shard-$i.yaml"
         cat > "$sconfig" <<EOF
 mode: shard
+type: embedded
 listen: 127.0.0.1:$sdata
 health_listen: 127.0.0.1:$shealth
 rpc_timeout: 5s

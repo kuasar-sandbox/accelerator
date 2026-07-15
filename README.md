@@ -19,7 +19,7 @@ RocksDB / AWS SDK / Reed-Solomon 等重依赖:
 | `pkg/tarstream` | 单文件稀疏流的 tar 信封:`WriteTo`(任意 `sparse.Source` → GNU PAX sparse 1.0,仅数据字节上线)/ `ReadFrom` / `ReadSeekFrom`(tar 内零拷贝随机)/ `SourceFrom`·`SourceAt` / `ReadSeekFromIndex`,洞图精确往返;互操作 GNU tar 与 archive/tar |
 | `pkg/{flatten,image,remote,tar}` | OCI/目录 → EROFS 展平的公共实现:`flatten` 负责源模型与导出,`image` 负责 RuntimeConfig 投影,`remote` 负责 OCI registry 拉取/referrer/cache,`tar` 负责展平结果解包 |
 
-重后端(`*/server`、`pkg/cache/{rocks,ec}`、`pkg/store/{obs,fs}`)只在 `cmd/` 与守护进程内
+重后端(`*/server`、`pkg/cache/{rocks,redisstore,ec}`、`pkg/store/{obs,fs}`)只在 `cmd/` 与守护进程内
 编译,不进入下游闭包。`flatten-ctl` 二进制由 `guest-runtime` 发布,但其导入的
 展平公共包仍在本仓维护,供 CLI、测试和运行时读取 config 的代码复用。
 
@@ -57,4 +57,5 @@ make test                       # 单元测试(含 rocks,需 librocksdb);e2e 见
 - [docs/manifest.md](docs/manifest.md) — 二进制清单:分块 / 收敛加密 / 密钥表 / 读写 SDK。
 - [docs/store.md](docs/store.md) — 内容寻址存储:分代目录布局 / fs·obs 后端 / GC。
 - [docs/cache.md](docs/cache.md) — 三层缓存 + 纠删码:local / shard / tiered 与旁路填充。
+- [docs/cache-redis.md](docs/cache-redis.md) — Redis-compatible UDS 后端、取消语义与 Dragonfly 部署。
 OCI/目录 → EROFS 确定性展平 CLI 见 `guest-runtime/docs/flatten.md`。

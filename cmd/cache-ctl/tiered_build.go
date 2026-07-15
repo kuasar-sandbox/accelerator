@@ -8,6 +8,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/client"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/ec"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/redisstore"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/rocks"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/runtime"
 )
@@ -106,6 +107,21 @@ func buildTieredChain(cfg *runtime.Config, blobPool cache.BlobPool) (*tieredComp
 			comps.TierSpecs = append(comps.TierSpecs, TierSpec{
 				Type:          "embedded",
 				EmbeddedStore: store,
+			})
+
+		case "redis":
+			if t.Redis == nil {
+				return rollback(fmt.Errorf("tiered: tiers[%d] (redis): redis config is nil", i))
+			}
+			store, err := redisstore.Open(*t.Redis, blobPool)
+			if err != nil {
+				return rollback(fmt.Errorf("tiered: tiers[%d] (redis): open store: %w", i, err))
+			}
+			closers = append(closers, store.Close)
+			comps.Tiers = append(comps.Tiers, store)
+			comps.TierSpecs = append(comps.TierSpecs, TierSpec{
+				Type:       "redis",
+				RedisStore: store,
 			})
 
 		case "ec":

@@ -33,7 +33,8 @@ Bloom Filter 全部常驻内存)。
   socket 路径(`/run/sandbox/cache.sock` 或 `unix:///...`;为 socket 时启动清死
   socket、chmod 0600)。数据面客户端 `cache.endpoint` 填同址即可;控制面经 socket
   时,`ping` / `info --endpoint` 用 `unix:///` 形式。
-- **存储引擎**:RocksDB(BlobDB 旁路大 value),关闭压缩(密文熵高)。
+- **本地存储**:进程内 RocksDB,或通过 UDS 访问 Redis-compatible server;
+  后者的配置、取消语义和 Dragonfly 部署见 [cache-redis.md](cache-redis.md)。
 - **写入语义**:强制准入,无应用层 LRU/SLRU。淘汰由 CompactionFilter 在
   后台按 CMS 频率统计驱动。
 - **填充语义**:fill-aside,读路径上隐式回填上层。
@@ -169,6 +170,7 @@ Flags:
 
 ```yaml
 mode: local
+type: embedded
 listen: 0.0.0.0:7070           # wire 数据面;host:port 或 Unix socket(/run/sandbox/cache.sock 或 unix:///...)
 health_listen: 0.0.0.0:7071    # gRPC 健康检查(可省);同支持 Unix socket 路径
 stats_interval: 30s            # 周期自适应统计行(§6.6);缺省 30s,"0"/"off" 关闭
@@ -195,6 +197,7 @@ rocks:
 
 ```yaml
 mode: shard
+type: embedded
 listen: 0.0.0.0:7070
 health_listen: 0.0.0.0:7071
 rpc_timeout: 2s

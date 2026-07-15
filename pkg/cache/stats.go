@@ -4,11 +4,13 @@ package cache
 // service. Pure Go — no proto dependency. The server package owns the
 // Go ↔ proto conversion.
 type DaemonStats struct {
-	Mode      string         `json:"mode"`
-	UptimeSec int64          `json:"uptime_sec"`
-	Server    ServerStats    `json:"server"`
-	Tiered    *TieredStats   `json:"tiered,omitempty"`
-	Rocks     []RocksCFStats `json:"rocks,omitempty"`
+	Mode        string         `json:"mode"`
+	BackendType string         `json:"backend_type,omitempty"`
+	UptimeSec   int64          `json:"uptime_sec"`
+	Server      ServerStats    `json:"server"`
+	Tiered      *TieredStats   `json:"tiered,omitempty"`
+	Rocks       []RocksCFStats `json:"rocks,omitempty"`
+	Redis       *RedisStats    `json:"redis,omitempty"`
 }
 
 // ServerStats is the wire-handler view of the daemon's external RPC
@@ -42,6 +44,7 @@ type TierStats struct {
 	Errors uint64 `json:"errors"`
 
 	Rocks    []RocksCFStats `json:"rocks,omitempty"`
+	Redis    *RedisStats    `json:"redis,omitempty"`
 	Peers    []PeerStats    `json:"peers,omitempty"`
 	Endpoint string         `json:"endpoint,omitempty"`
 }
@@ -85,4 +88,36 @@ type RocksCFStats struct {
 	NumKeys   string `json:"num_keys"`
 	DiskUsage string `json:"disk_usage"`
 	MemUsage  string `json:"mem_usage"`
+}
+
+// RedisStats is the bounded UDS worker/pool view exported by a redisstore.
+// Latencies are cumulative backend percentiles in nanoseconds.
+type RedisStats struct {
+	Socket string `json:"socket"`
+
+	GetPoolSize  int64 `json:"get_pool_size"`
+	SetPoolSize  int64 `json:"set_pool_size"`
+	GetConnected int64 `json:"get_connected"`
+	SetConnected int64 `json:"set_connected"`
+	GetInflight  int64 `json:"get_inflight"`
+	SetInflight  int64 `json:"set_inflight"`
+	PoolWaiters  int64 `json:"pool_waiters"`
+	Draining     int64 `json:"draining"`
+
+	GetHits          uint64 `json:"get_hits"`
+	GetMisses        uint64 `json:"get_misses"`
+	Sets             uint64 `json:"sets"`
+	Cancelled        uint64 `json:"cancelled"`
+	LateBytesDrained uint64 `json:"late_bytes_drained"`
+	Reconnects       uint64 `json:"reconnects"`
+	ProtocolErrors   uint64 `json:"protocol_errors"`
+	BackendErrors    uint64 `json:"backend_errors"`
+
+	GetP50Ns      uint64 `json:"get_p50_ns"`
+	GetP99Ns      uint64 `json:"get_p99_ns"`
+	GetP999Ns     uint64 `json:"get_p999_ns"`
+	SetP50Ns      uint64 `json:"set_p50_ns"`
+	SetP99Ns      uint64 `json:"set_p99_ns"`
+	SetP999Ns     uint64 `json:"set_p999_ns"`
+	PoolWaitP99Ns uint64 `json:"pool_wait_p99_ns"`
 }

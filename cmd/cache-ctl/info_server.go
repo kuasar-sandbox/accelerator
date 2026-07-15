@@ -8,6 +8,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/client"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/ec"
 	cachepb "github.com/kuasar-sandbox/accelerator/pkg/cache/pb"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/redisstore"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/rocks"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/server"
 )
@@ -16,10 +17,11 @@ import (
 // matches that type. Populated alongside tier construction in
 // tiered_build.go; parallel to TieredCache.tiers.
 //
-// Exactly one of EmbeddedStore / EC / UpstreamEP is set, per Type.
+// Exactly one concrete reference is set, per Type.
 type TierSpec struct {
 	Type          string
 	EmbeddedStore rocks.Interface   // "embedded"
+	RedisStore    *redisstore.Store // "redis"
 	EC            ec.Interface      // "ec"
 	UpstreamEP    string            // "upstream"
 	Upstream      client.TierCloser // "upstream"; retained for future
@@ -36,7 +38,8 @@ type OriginSpec struct {
 
 // InfoServer is the gRPC handler for cac.cache.v1.Info/Get. It holds
 // references to every counter-owning component and assembles a
-// DaemonStats snapshot on each request. No latency data is collected.
+// DaemonStats snapshot on each request. Redis backend latency is sampled by
+// redisstore and copied into the snapshot here.
 type InfoServer struct {
 	cachepb.UnimplementedInfoServer
 
@@ -48,6 +51,7 @@ type InfoServer struct {
 	tierSpecs     []TierSpec           // parallel to tiered.tiers
 	origin        *OriginSpec          // non-nil when mode == "tiered"
 	topLevelRocks rocks.Interface      // non-nil when mode != "tiered"
+	topLevelRedis *redisstore.Store    // non-nil for local/shard type=redis
 }
 
 // NewInfoServer creates a fresh InfoServer with the wire handler
@@ -75,6 +79,11 @@ func (s *InfoServer) SetTiered(tc *cache.TieredCache, specs []TierSpec, origin *
 // rocks properties appear inside TieredStats.Tiers[].Rocks instead).
 func (s *InfoServer) SetTopLevelRocks(r rocks.Interface) {
 	s.topLevelRocks = r
+}
+
+// SetTopLevelRedis attaches the direct local/shard Redis-compatible store.
+func (s *InfoServer) SetTopLevelRedis(r *redisstore.Store) {
+	s.topLevelRedis = r
 }
 
 // Get implements cachepb.InfoServer. Assembles a cache.DaemonStats
@@ -124,6 +133,10 @@ func (s *InfoServer) snapshot() cache.DaemonStats {
 				if spec.EmbeddedStore != nil {
 					t.Rocks = toRocksCFStats(spec.EmbeddedStore.AllStats())
 				}
+			case "redis":
+				if spec.RedisStore != nil {
+					t.Redis = redisStats(spec.RedisStore.Stats())
+				}
 			case "ec":
 				if spec.EC != nil {
 					t.Peers = spec.EC.PeersStats()
@@ -146,9 +159,43 @@ func (s *InfoServer) snapshot() cache.DaemonStats {
 		ds.Tiered = &cache.TieredStats{Tiers: tiers, Origin: origin}
 	}
 	if s.topLevelRocks != nil {
+		ds.BackendType = "embedded"
 		ds.Rocks = toRocksCFStats(s.topLevelRocks.AllStats())
 	}
+	if s.topLevelRedis != nil {
+		ds.BackendType = "redis"
+		ds.Redis = redisStats(s.topLevelRedis.Stats())
+	}
 	return ds
+}
+
+func redisStats(s redisstore.Stats) *cache.RedisStats {
+	return &cache.RedisStats{
+		Socket:           s.Socket,
+		GetPoolSize:      s.GetPoolSize,
+		SetPoolSize:      s.SetPoolSize,
+		GetConnected:     s.GetConnected,
+		SetConnected:     s.SetConnected,
+		GetInflight:      s.GetInflight,
+		SetInflight:      s.SetInflight,
+		PoolWaiters:      s.PoolWaiters,
+		Draining:         s.Draining,
+		GetHits:          s.GetHits,
+		GetMisses:        s.GetMisses,
+		Sets:             s.Sets,
+		Cancelled:        s.Cancelled,
+		LateBytesDrained: s.LateBytesDrained,
+		Reconnects:       s.Reconnects,
+		ProtocolErrors:   s.ProtocolErrors,
+		BackendErrors:    s.BackendErrors,
+		GetP50Ns:         s.GetLatency.P50(),
+		GetP99Ns:         s.GetLatency.P99(),
+		GetP999Ns:        s.GetLatency.P999(),
+		SetP50Ns:         s.SetLatency.P50(),
+		SetP99Ns:         s.SetLatency.P99(),
+		SetP999Ns:        s.SetLatency.P999(),
+		PoolWaitP99Ns:    s.PoolWaitLatency.P99(),
+	}
 }
 
 // toRocksCFStats is a plain field copy from rocks.CFStats to the
@@ -172,8 +219,9 @@ func toRocksCFStats(in []rocks.CFStats) []cache.RocksCFStats {
 // No reflection or generics — fields are scalar + simple nested slices.
 func toPb(ds cache.DaemonStats) *cachepb.InfoReply {
 	reply := &cachepb.InfoReply{
-		Mode:      ds.Mode,
-		UptimeSec: ds.UptimeSec,
+		Mode:        ds.Mode,
+		BackendType: ds.BackendType,
+		UptimeSec:   ds.UptimeSec,
 		Server: &cachepb.ServerStats{
 			Hits:   ds.Server.Hits,
 			Misses: ds.Server.Misses,
@@ -190,6 +238,7 @@ func toPb(ds cache.DaemonStats) *cachepb.InfoReply {
 				Fills:    t.Fills,
 				Errors:   t.Errors,
 				Rocks:    rocksToPb(t.Rocks),
+				Redis:    redisToPb(t.Redis),
 				Peers:    peersToPb(t.Peers),
 				Endpoint: t.Endpoint,
 			}
@@ -209,7 +258,40 @@ func toPb(ds cache.DaemonStats) *cachepb.InfoReply {
 	if len(ds.Rocks) > 0 {
 		reply.Rocks = rocksToPb(ds.Rocks)
 	}
+	reply.Redis = redisToPb(ds.Redis)
 	return reply
+}
+
+func redisToPb(s *cache.RedisStats) *cachepb.RedisStats {
+	if s == nil {
+		return nil
+	}
+	return &cachepb.RedisStats{
+		Socket:           s.Socket,
+		GetPoolSize:      s.GetPoolSize,
+		SetPoolSize:      s.SetPoolSize,
+		GetConnected:     s.GetConnected,
+		SetConnected:     s.SetConnected,
+		GetInflight:      s.GetInflight,
+		SetInflight:      s.SetInflight,
+		PoolWaiters:      s.PoolWaiters,
+		Draining:         s.Draining,
+		GetHits:          s.GetHits,
+		GetMisses:        s.GetMisses,
+		Sets:             s.Sets,
+		Cancelled:        s.Cancelled,
+		LateBytesDrained: s.LateBytesDrained,
+		Reconnects:       s.Reconnects,
+		ProtocolErrors:   s.ProtocolErrors,
+		BackendErrors:    s.BackendErrors,
+		GetP50Ns:         s.GetP50Ns,
+		GetP99Ns:         s.GetP99Ns,
+		GetP999Ns:        s.GetP999Ns,
+		SetP50Ns:         s.SetP50Ns,
+		SetP99Ns:         s.SetP99Ns,
+		SetP999Ns:        s.SetP999Ns,
+		PoolWaitP99Ns:    s.PoolWaitP99Ns,
+	}
 }
 
 func rocksToPb(in []cache.RocksCFStats) []*cachepb.RocksCFStats {

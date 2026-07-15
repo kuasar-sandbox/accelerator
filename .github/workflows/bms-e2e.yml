@@ -106,6 +106,24 @@ jobs:
           ln -sfn /var/lib/kuasar-ci/tools/zot "$tool_dir/zot"
           ln -sfn /var/lib/kuasar-ci/tools/versitygw "$tool_dir/versitygw"
 
+      - name: Ensure Redis protocol test server
+        run: |
+          set -euo pipefail
+          if ! command -v redis-server >/dev/null 2>&1; then
+            if command -v dnf >/dev/null 2>&1; then
+              sudo dnf install -y --setopt=install_weak_deps=False redis
+            elif command -v yum >/dev/null 2>&1; then
+              sudo yum install -y redis
+            elif command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends redis-server
+            else
+              echo "redis-server is missing and no supported package manager is available" >&2
+              exit 1
+            fi
+          fi
+          sudo systemctl disable --now redis.service redis-server.service >/dev/null 2>&1 || true
+
       - name: Build and test the platform
         working-directory: src/orchestrator/release-builder
         run: make test-e2e

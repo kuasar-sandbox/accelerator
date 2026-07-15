@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # E2E test for cache-ctl + manifest-ctl integration.
-# Tests local mode, shard mode, and tiered (embedded + EC) mode.
+# Tests embedded and Redis-compatible local/shard/tiered modes.
 #
 # Usage:
 #   bash test/e2e/e2e_cache.sh
@@ -16,8 +16,19 @@ KEY=$(openssl rand -hex 32)
 PASS=0
 FAIL=0
 PIDS=()
+REDIS_SERVER="${REDIS_SERVER:-$(command -v redis-server || true)}"
+
+if [ -z "$REDIS_SERVER" ]; then
+    echo "ERROR: redis-server is required for Redis-compatible cache E2E" >&2
+    exit 1
+fi
 
 cleanup() {
+    # A SIGSTOP-based slow-peer test may abort before its matching SIGCONT.
+    # Resume every child first so TERM + wait cannot strand cleanup.
+    for pid in "${PIDS[@]}"; do
+        kill -CONT "$pid" 2>/dev/null || true
+    done
     for pid in "${PIDS[@]}"; do
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
@@ -60,6 +71,33 @@ wait_ready() {
 # Allocate a free port.
 free_port() {
     python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
+}
+
+# Start an isolated Redis protocol test server with UDS only. The function sets
+# REDIS_SOCKET and records the foreground server PID for global cleanup.
+start_redis() {
+    local name=$1
+    local dir="$TMPDIR/$name"
+    mkdir -p "$dir"
+    REDIS_SOCKET="$dir/redis.sock"
+    rm -f "$REDIS_SOCKET"
+    "$REDIS_SERVER" \
+        --port 0 \
+        --unixsocket "$REDIS_SOCKET" \
+        --unixsocketperm 700 \
+        --save "" \
+        --appendonly no \
+        --dir "$dir" \
+        --daemonize no >"$dir/redis.log" 2>&1 &
+    REDIS_PID=$!
+    PIDS+=("$REDIS_PID")
+    for _ in $(seq 1 50); do
+        [ -S "$REDIS_SOCKET" ] && return 0
+        sleep 0.1
+    done
+    echo "ERROR: redis-server did not create $REDIS_SOCKET" >&2
+    cat "$dir/redis.log" >&2 || true
+    return 1
 }
 
 # Hash the payload inside a tarstream artifact. store/load round-trip the
@@ -177,6 +215,7 @@ LOCAL_PORT=$(free_port)
 LOCAL_HEALTH_PORT=$(free_port)
 cat > "$TMPDIR/local.yaml" <<EOF
 mode: local
+type: embedded
 listen: 127.0.0.1:$LOCAL_PORT
 health_listen: 127.0.0.1:$LOCAL_HEALTH_PORT
 rpc_timeout: 2s
@@ -217,6 +256,7 @@ SHARD_PORT=$(free_port)
 SHARD_HEALTH_PORT=$(free_port)
 cat > "$TMPDIR/shard.yaml" <<EOF
 mode: shard
+type: embedded
 listen: 127.0.0.1:$SHARD_PORT
 health_listen: 127.0.0.1:$SHARD_HEALTH_PORT
 rpc_timeout: 2s
@@ -321,6 +361,7 @@ for i in $(seq 1 5); do
     SHARD_HEALTH_PORTS+=("$SHP")
     cat > "$TMPDIR/shard-$i.yaml" <<EOF
 mode: shard
+type: embedded
 listen: 127.0.0.1:$SP
 health_listen: 127.0.0.1:$SHP
 rpc_timeout: 2s
@@ -426,6 +467,7 @@ REMOTE_PORT=$(free_port)
 REMOTE_HEALTH_PORT=$(free_port)
 cat > "$TMPDIR/upstream-remote.yaml" <<EOF
 mode: local
+type: embedded
 listen: 127.0.0.1:$REMOTE_PORT
 health_listen: 127.0.0.1:$REMOTE_HEALTH_PORT
 rpc_timeout: 5s
@@ -530,6 +572,289 @@ else
     else
         fail "upstream bad endpoint error should mention dial/connection refused (got: $ERR_OUT)"
     fi
+fi
+
+# ============================================================
+echo ""
+echo "=== Test 12: Redis local mode — object and shard interfaces ==="
+start_redis redis-local
+REDIS_LOCAL_SOCKET=$REDIS_SOCKET
+REDIS_LOCAL_PORT=$(free_port)
+REDIS_LOCAL_HEALTH_PORT=$(free_port)
+cat > "$TMPDIR/redis-local.yaml" <<EOF
+mode: local
+type: redis
+listen: 127.0.0.1:$REDIS_LOCAL_PORT
+health_listen: 127.0.0.1:$REDIS_LOCAL_HEALTH_PORT
+rpc_timeout: 2s
+redis:
+  socket: $REDIS_LOCAL_SOCKET
+  get_pool: 2
+  set_pool: 2
+  timeout: 2s
+EOF
+"$BIN/cache-ctl" serve --config "$TMPDIR/redis-local.yaml" &
+PIDS+=($!)
+wait_ready "127.0.0.1:$REDIS_LOCAL_HEALTH_PORT"
+
+REDIS_HASH="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+echo -n "redis-object" | "$BIN/cache-ctl" object put --endpoint "127.0.0.1:$REDIS_LOCAL_PORT" --namespace chunk --hash "$REDIS_HASH" --value -
+GOT=$("$BIN/cache-ctl" object get --endpoint "127.0.0.1:$REDIS_LOCAL_PORT" --namespace chunk --hash "$REDIS_HASH")
+assert_eq "redis-object" "$GOT" "Redis local object put/get"
+echo -n "redis-shard" | "$BIN/cache-ctl" shard put --endpoint "127.0.0.1:$REDIS_LOCAL_PORT" --namespace chunk --hash "$REDIS_HASH" --idx 2 --total 5 --value -
+GOT=$("$BIN/cache-ctl" shard get --endpoint "127.0.0.1:$REDIS_LOCAL_PORT" --namespace chunk --hash "$REDIS_HASH" 2>/dev/null)
+assert_eq "redis-shard" "$GOT" "Redis local shard put/get"
+if "$BIN/cache-ctl" info --endpoint "127.0.0.1:$REDIS_LOCAL_HEALTH_PORT" --json | \
+    python3 -c 'import json,sys; assert json.load(sys.stdin)["backend_type"] == "redis"'; then
+    ok "Redis local Info reports backend type"
+else
+    fail "Redis local Info should report backend_type=redis"
+fi
+
+# ============================================================
+echo ""
+echo "=== Test 13: tiered type=redis — cold fill and warm hit ==="
+start_redis redis-tiered
+REDIS_TIER_SOCKET=$REDIS_SOCKET
+REDIS_TIER_PORT=$(free_port)
+REDIS_TIER_HEALTH_PORT=$(free_port)
+cat > "$TMPDIR/redis-tiered.yaml" <<EOF
+mode: tiered
+listen: 127.0.0.1:$REDIS_TIER_PORT
+health_listen: 127.0.0.1:$REDIS_TIER_HEALTH_PORT
+rpc_timeout: 5s
+tiers:
+  - type: redis
+    redis:
+      socket: $REDIS_TIER_SOCKET
+      get_pool: 2
+      set_pool: 2
+      timeout: 2s
+origin:
+  type: store
+  store:
+    endpoint: 127.0.0.1:$STORE_PORT
+    pool: 2
+    timeout: 2s
+  max_inflight: 16
+EOF
+"$BIN/cache-ctl" serve --config "$TMPDIR/redis-tiered.yaml" &
+PIDS+=($!)
+wait_ready "127.0.0.1:$REDIS_TIER_HEALTH_PORT"
+"$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$REDIS_TIER_PORT")" \
+    --output "$TMPDIR/test-redis-tier-cold.bin" --no-progress "$MKEY" 2>&1
+"$BIN/cache-ctl" info --endpoint "127.0.0.1:$REDIS_TIER_HEALTH_PORT" --wait-fills --timeout 10s
+"$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$REDIS_TIER_PORT")" \
+    --output "$TMPDIR/test-redis-tier-warm.bin" --no-progress "$MKEY" 2>&1
+REDIS_TIER_HASH=$(payload_hash "$TMPDIR/test-redis-tier-warm.bin")
+assert_eq "$ORIG_HASH" "$REDIS_TIER_HASH" "tiered Redis warm load roundtrip"
+if "$BIN/cache-ctl" info --endpoint "127.0.0.1:$REDIS_TIER_HEALTH_PORT" --json | \
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["tiered"]["tiers"][0]["type"] == "redis"; assert d["tiered"]["tiers"][0]["hits"] > 0'; then
+    ok "tiered Redis reports warm hits"
+else
+    fail "tiered Redis should report warm hits"
+fi
+
+# ============================================================
+echo ""
+echo "=== Test 14: five Redis shard peers — EC fill and origin-free hit ==="
+REDIS_SHARD_PORTS=()
+REDIS_SHARD_HEALTH_PORTS=()
+REDIS_SHARD_PIDS=()
+for i in $(seq 1 5); do
+    start_redis "redis-ec-$i"
+    sock=$REDIS_SOCKET
+    REDIS_SHARD_PIDS+=("$REDIS_PID")
+    data_port=$(free_port)
+    health_port=$(free_port)
+    REDIS_SHARD_PORTS+=("$data_port")
+    REDIS_SHARD_HEALTH_PORTS+=("$health_port")
+    cat > "$TMPDIR/redis-shard-$i.yaml" <<EOF
+mode: shard
+type: redis
+listen: 127.0.0.1:$data_port
+health_listen: 127.0.0.1:$health_port
+rpc_timeout: 2s
+redis:
+  socket: $sock
+  get_pool: 2
+  set_pool: 2
+  timeout: 2s
+EOF
+    "$BIN/cache-ctl" serve --config "$TMPDIR/redis-shard-$i.yaml" &
+    cache_pid=$!
+    PIDS+=("$cache_pid")
+done
+for health_port in "${REDIS_SHARD_HEALTH_PORTS[@]}"; do
+    wait_ready "127.0.0.1:$health_port"
+done
+
+REDIS_EC_PORT=$(free_port)
+REDIS_EC_HEALTH_PORT=$(free_port)
+cat > "$TMPDIR/redis-ec-tiered.yaml" <<EOF
+mode: tiered
+listen: 127.0.0.1:$REDIS_EC_PORT
+health_listen: 127.0.0.1:$REDIS_EC_HEALTH_PORT
+rpc_timeout: 5s
+tiers:
+  - type: ec
+    cluster:
+      data_shards: 4
+      parity_shards: 1
+      peers:
+        - {id: r1, endpoint: "127.0.0.1:${REDIS_SHARD_PORTS[0]}"}
+        - {id: r2, endpoint: "127.0.0.1:${REDIS_SHARD_PORTS[1]}"}
+        - {id: r3, endpoint: "127.0.0.1:${REDIS_SHARD_PORTS[2]}"}
+        - {id: r4, endpoint: "127.0.0.1:${REDIS_SHARD_PORTS[3]}"}
+        - {id: r5, endpoint: "127.0.0.1:${REDIS_SHARD_PORTS[4]}"}
+      pool: 1
+      timeout: 2s
+origin:
+  type: store
+  store:
+    endpoint: 127.0.0.1:$STORE_PORT
+    pool: 2
+    timeout: 2s
+  max_inflight: 16
+EOF
+"$BIN/cache-ctl" serve --config "$TMPDIR/redis-ec-tiered.yaml" &
+PIDS+=($!)
+wait_ready "127.0.0.1:$REDIS_EC_HEALTH_PORT"
+"$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$REDIS_EC_PORT")" \
+    --output "$TMPDIR/test-redis-ec-cold.bin" --no-progress "$MKEY" 2>&1
+"$BIN/cache-ctl" info --endpoint "127.0.0.1:$REDIS_EC_HEALTH_PORT" --wait-fills --timeout 10s
+
+# The main test artifact has one chunk (asserted by the ingest output above).
+# Select its larger content object rather than the 64 KiB standalone Test 0
+# object, then prove EC fill wrote both namespaces to every Redis shard peer.
+MAIN_CHUNK_KEY=$(find "$STORE_ROOT/chunk/G1" -type f -printf '%s %f\n' | sort -nr | head -1 | awk '{print $2}')
+ALL_SHARDS_PRESENT=1
+for peer_port in "${REDIS_SHARD_PORTS[@]}"; do
+    for pair in "manifest:$MKEY" "chunk:$MAIN_CHUNK_KEY"; do
+        namespace=${pair%%:*}
+        object_key=${pair#*:}
+        if ! "$BIN/cache-ctl" shard get --endpoint "127.0.0.1:$peer_port" \
+            --namespace "$namespace" --hash "$object_key" >/dev/null 2>&1; then
+            ALL_SHARDS_PRESENT=0
+        fi
+    done
+done
+assert_eq "1" "$ALL_SHARDS_PRESENT" "EC cold fill populated every Redis shard peer"
+
+# Stop one Redis process without closing its sockets. The corresponding shard
+# cache enters Redis drain after the EC coordinator obtains four fast shards
+# and sends wire CANCEL. The object read must complete before the Redis command
+# timeout, and normal cancellation must not reconnect the UDS data worker.
+SLOW_REDIS_PID=${REDIS_SHARD_PIDS[4]}
+kill -STOP "$SLOW_REDIS_PID"
+SLOW_START_MS=$(date +%s%3N)
+"$BIN/cache-ctl" object get --endpoint "127.0.0.1:$REDIS_EC_PORT" \
+    --namespace manifest --hash "$MKEY" >/dev/null
+SLOW_ELAPSED_MS=$(( $(date +%s%3N) - SLOW_START_MS ))
+kill -CONT "$SLOW_REDIS_PID"
+if [ "$SLOW_ELAPSED_MS" -lt 1500 ]; then
+    ok "EC returns after four Redis shards without waiting for slow peer (${SLOW_ELAPSED_MS}ms)"
+else
+    fail "EC slow-peer read took ${SLOW_ELAPSED_MS}ms (Redis timeout is 2000ms)"
+fi
+CANCEL_SEEN=0
+for _ in $(seq 1 50); do
+    if "$BIN/cache-ctl" info --endpoint "127.0.0.1:$REDIS_EC_HEALTH_PORT" --json | \
+        python3 -c 'import json,sys; d=json.load(sys.stdin); assert any(p["cancelled"] > 0 for p in d["tiered"]["tiers"][0]["peers"])' 2>/dev/null; then
+        CANCEL_SEEN=1
+        break
+    fi
+    sleep 0.1
+done
+assert_eq "1" "$CANCEL_SEEN" "EC slow peer observed wire CANCEL"
+DRAINED=0
+for _ in $(seq 1 50); do
+    if "$BIN/cache-ctl" info --endpoint "127.0.0.1:${REDIS_SHARD_HEALTH_PORTS[4]}" --json | \
+        python3 -c 'import json,sys; r=json.load(sys.stdin)["redis"]; assert r["draining"] == 0 and r["reconnects"] == 0' 2>/dev/null; then
+        DRAINED=1
+        break
+    fi
+    sleep 0.1
+done
+assert_eq "1" "$DRAINED" "Redis cancel drain completed without UDS reconnect"
+wait_ready "127.0.0.1:${REDIS_SHARD_HEALTH_PORTS[4]}"
+
+ALL_SHARDS_PRESENT=1
+for peer_port in "${REDIS_SHARD_PORTS[@]}"; do
+    for pair in "manifest:$MKEY" "chunk:$MAIN_CHUNK_KEY"; do
+        namespace=${pair%%:*}
+        object_key=${pair#*:}
+        if ! "$BIN/cache-ctl" shard get --endpoint "127.0.0.1:$peer_port" \
+            --namespace "$namespace" --hash "$object_key" >/dev/null 2>&1; then
+            ALL_SHARDS_PRESENT=0
+        fi
+    done
+done
+assert_eq "1" "$ALL_SHARDS_PRESENT" "all Redis shards remain readable after CANCEL drain"
+
+# The warm read must now be fully satisfied by EC. Stopping the origin turns
+# any accidental fallthrough into a deterministic test failure.
+kill "$STORE_PID" 2>/dev/null || true
+wait "$STORE_PID" 2>/dev/null || true
+"$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$REDIS_EC_PORT")" \
+    --output "$TMPDIR/test-redis-ec-warm.bin" --no-progress "$MKEY" 2>&1
+REDIS_EC_HASH=$(payload_hash "$TMPDIR/test-redis-ec-warm.bin")
+assert_eq "$ORIG_HASH" "$REDIS_EC_HASH" "Redis shard EC warm load without origin"
+
+# Cold-restart one Redis shard backend in place. cache-ctl stays alive, replaces
+# its broken workers, and reports a confirmed miss from the empty server. EC
+# reconstructs the manifest from the other four peers and repairs the cold one.
+RESTARTED_REDIS_PID=${REDIS_SHARD_PIDS[0]}
+kill "$RESTARTED_REDIS_PID" 2>/dev/null || true
+wait "$RESTARTED_REDIS_PID" 2>/dev/null || true
+REDIS_NOT_SERVING=0
+for _ in $(seq 1 30); do
+    if "$BIN/cache-ctl" ping --endpoint "127.0.0.1:${REDIS_SHARD_HEALTH_PORTS[0]}" 2>/dev/null | grep -q NOT_SERVING; then
+        REDIS_NOT_SERVING=1
+        break
+    fi
+    sleep 0.1
+done
+assert_eq "1" "$REDIS_NOT_SERVING" "Redis backend failure marks cache-ctl NOT_SERVING"
+start_redis redis-ec-1
+REDIS_SHARD_PIDS[0]=$REDIS_PID
+wait_ready "127.0.0.1:${REDIS_SHARD_HEALTH_PORTS[0]}"
+
+COLD_MISS=0
+for _ in $(seq 1 50); do
+    COLD_OUT=$("$BIN/cache-ctl" shard get --endpoint "127.0.0.1:${REDIS_SHARD_PORTS[0]}" \
+        --namespace manifest --hash "$MKEY" 2>&1 || true)
+    if echo "$COLD_OUT" | grep -q MISS; then
+        COLD_MISS=1
+        break
+    fi
+    sleep 0.1
+done
+assert_eq "1" "$COLD_MISS" "restarted Redis shard is a confirmed cold miss"
+
+REPAIRED=0
+for _ in $(seq 1 5); do
+    "$BIN/cache-ctl" object get --endpoint "127.0.0.1:$REDIS_EC_PORT" \
+        --namespace manifest --hash "$MKEY" >/dev/null
+    "$BIN/cache-ctl" info --endpoint "127.0.0.1:$REDIS_EC_HEALTH_PORT" --wait-fills --timeout 10s
+    if "$BIN/cache-ctl" shard get --endpoint "127.0.0.1:${REDIS_SHARD_PORTS[0]}" \
+        --namespace manifest --hash "$MKEY" >/dev/null 2>&1; then
+        REPAIRED=1
+        break
+    fi
+done
+assert_eq "1" "$REPAIRED" "EC repaired manifest shard after Redis cold restart"
+
+# Remove a different backend: a successful origin-free read now necessarily
+# includes the repaired shard from peer 1 among its four inputs.
+SECOND_REDIS_PID=${REDIS_SHARD_PIDS[1]}
+kill "$SECOND_REDIS_PID" 2>/dev/null || true
+wait "$SECOND_REDIS_PID" 2>/dev/null || true
+if "$BIN/cache-ctl" object get --endpoint "127.0.0.1:$REDIS_EC_PORT" \
+    --namespace manifest --hash "$MKEY" >/dev/null; then
+    ok "repaired Redis shard participates in 4-of-5 read"
+else
+    fail "4-of-5 read failed after repairing restarted Redis shard"
 fi
 
 # ============================================================

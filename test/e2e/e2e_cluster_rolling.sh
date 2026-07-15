@@ -181,6 +181,7 @@ for i in $(seq 1 6); do
     SHARD_HEALTH_PORTS+=("$SHP")
     cat > "$TMPDIR/shard-$i.yaml" <<EOF
 mode: shard
+type: embedded
 listen: 127.0.0.1:$SP
 health_listen: 127.0.0.1:$SHP
 rpc_timeout: 2s

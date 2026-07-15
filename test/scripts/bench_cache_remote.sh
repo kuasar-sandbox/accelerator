@@ -185,6 +185,7 @@ require() {
 gen_shard_yaml() {
     cat <<EOF
 mode: shard
+type: embedded
 listen: 0.0.0.0:${SHARD_PORT}
 health_listen: 0.0.0.0:${SHARD_HEALTH}
 pprof_listen: 0.0.0.0:${SHARD_PPROF}
@@ -205,6 +206,7 @@ EOF
 gen_local_yaml() {
     cat <<EOF
 mode: local
+type: embedded
 listen: 0.0.0.0:${LOCAL_PORT}
 health_listen: 0.0.0.0:${LOCAL_HEALTH}
 pprof_listen: 0.0.0.0:${LOCAL_PPROF}
