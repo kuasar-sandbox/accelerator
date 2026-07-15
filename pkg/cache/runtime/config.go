@@ -78,7 +78,7 @@ type RedisConfig struct {
 // TierConfig describes one tier in a tiered-mode tier chain.
 type TierConfig struct {
 	Type        string `yaml:"type"`         // "embedded" | "redis" | "upstream" | "ec"
-	MaxInflight int    `yaml:"max_inflight"` // 0 = unlimited
+	MaxInflight int    `yaml:"max_inflight"` // synchronous lookup limit; 0 = unlimited
 
 	// embedded
 	Rocks *RocksConfig `yaml:"rocks"`
@@ -188,6 +188,9 @@ func (c *Config) Validate() error {
 		}
 		embeddedCount := 0
 		for i, t := range c.Tiers {
+			if t.MaxInflight < 0 {
+				return fmt.Errorf("runtime: tiers[%d]: max_inflight must be >= 0", i)
+			}
 			switch t.Type {
 			case "embedded":
 				if t.Rocks == nil || t.Rocks.Path == "" {

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/client"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/rocks"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/runtime"
@@ -113,8 +114,48 @@ func TestBuildTieredChain_EmbeddedOnly(t *testing.T) {
 	if comps.EmbeddedStore == nil {
 		t.Fatal("EmbeddedStore should be non-nil for embedded tier")
 	}
+	if _, ok := comps.Tiers[0].(cache.Semaphore); ok {
+		t.Fatal("unlimited embedded tier should remain unwrapped")
+	}
 	// Sketch-construction invariant is covered by rocks package tests;
 	// this test only verifies tier-chain assembly.
+}
+
+func TestBuildTieredChain_AppliesTierMaxInflight(t *testing.T) {
+	tier := embeddedTier(t)
+	tier.MaxInflight = 1
+	cfg := &runtime.Config{Mode: "tiered", Tiers: []runtime.TierConfig{tier}}
+	comps, err := buildTieredChain(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer comps.Close()
+	if _, ok := comps.Tiers[0].(cache.Semaphore); !ok {
+		t.Fatalf("limited tier type %T does not implement cache.Semaphore", comps.Tiers[0])
+	}
+	if comps.TierSpecs[0].EmbeddedStore == nil {
+		t.Fatal("limiting the tier discarded its concrete Info reference")
+	}
+}
+
+func TestBuildTieredChain_RejectsRedisMaxInflightWithoutValidation(t *testing.T) {
+	cfg := &runtime.Config{Mode: "tiered", Tiers: []runtime.TierConfig{{
+		Type: "redis", MaxInflight: 1,
+		Redis: &runtime.RedisConfig{Socket: "/run/cache/redis.sock", GetPool: 1, SetPool: 1},
+	}}}
+	comps, err := buildTieredChain(cfg, nil)
+	if err == nil || !strings.Contains(err.Error(), "redis.get_pool and redis.set_pool") {
+		t.Fatalf("buildTieredChain comps=%v err=%v", comps, err)
+	}
+}
+
+func TestBuildTieredChain_RejectsNegativeMaxInflightWithoutValidation(t *testing.T) {
+	tier := ecTier()
+	tier.MaxInflight = -1
+	comps, err := buildTieredChain(&runtime.Config{Mode: "tiered", Tiers: []runtime.TierConfig{tier}}, nil)
+	if err == nil || !strings.Contains(err.Error(), "max_inflight must be >= 0") {
+		t.Fatalf("buildTieredChain comps=%v err=%v", comps, err)
+	}
 }
 
 func TestBuildTieredChain_RedisOnly(t *testing.T) {

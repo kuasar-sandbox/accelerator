@@ -84,6 +84,9 @@ func buildTieredChain(cfg *runtime.Config, blobPool cache.BlobPool) (*tieredComp
 	}
 
 	for i, t := range cfg.Tiers {
+		if t.MaxInflight < 0 {
+			return rollback(fmt.Errorf("tiered: tiers[%d]: max_inflight must be >= 0", i))
+		}
 		switch t.Type {
 		case "embedded":
 			// Defensive: Validate already enforces embedded ≤1, but we
@@ -103,13 +106,16 @@ func buildTieredChain(cfg *runtime.Config, blobPool cache.BlobPool) (*tieredComp
 			closers = append(closers, store.Close)
 			comps.EmbeddedStore = store
 			// rocks.Interface implements cache.Tier directly — no wrapper.
-			comps.Tiers = append(comps.Tiers, store)
+			comps.Tiers = append(comps.Tiers, cache.NewTierAdapter(store, t.MaxInflight))
 			comps.TierSpecs = append(comps.TierSpecs, TierSpec{
 				Type:          "embedded",
 				EmbeddedStore: store,
 			})
 
 		case "redis":
+			if t.MaxInflight != 0 {
+				return rollback(fmt.Errorf("tiered: tiers[%d] (redis): max_inflight is not valid; use redis.get_pool and redis.set_pool", i))
+			}
 			if t.Redis == nil {
 				return rollback(fmt.Errorf("tiered: tiers[%d] (redis): redis config is nil", i))
 			}
@@ -146,7 +152,7 @@ func buildTieredChain(cfg *runtime.Config, blobPool cache.BlobPool) (*tieredComp
 				return rollback(fmt.Errorf("tiered: tiers[%d] (ec): create tier: %w", i, err))
 			}
 			closers = append(closers, ecTier.Close)
-			comps.Tiers = append(comps.Tiers, ecTier)
+			comps.Tiers = append(comps.Tiers, cache.NewTierAdapter(ecTier, t.MaxInflight))
 			comps.TierSpecs = append(comps.TierSpecs, TierSpec{
 				Type: "ec",
 				EC:   ecTier,
@@ -171,7 +177,7 @@ func buildTieredChain(cfg *runtime.Config, blobPool cache.BlobPool) (*tieredComp
 				return rollback(fmt.Errorf("tiered: tiers[%d] (upstream): dial %s: %w", i, t.Endpoint, err))
 			}
 			closers = append(closers, c.Close)
-			comps.Tiers = append(comps.Tiers, c)
+			comps.Tiers = append(comps.Tiers, cache.NewTierAdapter(c, t.MaxInflight))
 			comps.TierSpecs = append(comps.TierSpecs, TierSpec{
 				Type:       "upstream",
 				UpstreamEP: t.Endpoint,

@@ -191,7 +191,7 @@ func NewTieredCache(origin Getter, tiers ...Tier) *TieredCache {
 		tierErrors:   make([]atomic.Uint64, len(tiers)),
 	}
 	for i, t := range tiers {
-		r, ok := t.(Repairable)
+		r, ok := unwrapTier(t).(Repairable)
 		if !ok {
 			continue
 		}
@@ -354,7 +354,7 @@ func (tc *TieredCache) startFill(tierIdx int, p store.Partition, key store.Conte
 
 // startFillMiss invokes FillMiss on the tier if it implements the optional interface.
 func (tc *TieredCache) startFillMiss(tierIdx int, p store.Partition, key store.ContentKey) {
-	mf, ok := tc.tiers[tierIdx].(FillMiss)
+	mf, ok := unwrapTier(tc.tiers[tierIdx]).(FillMiss)
 	if !ok {
 		return
 	}
@@ -422,6 +422,33 @@ func (s *semaphore) Release() {
 		return
 	}
 	<-s.ch
+}
+
+// tierAdapter adds a lookup concurrency budget without hiding optional tier
+// capabilities such as Repairable and FillMiss from TieredCache.
+type tierAdapter struct {
+	Tier
+	*semaphore
+}
+
+// NewTierAdapter limits synchronous lookups against inner. Fills retain the
+// concrete tier's own concurrency controls. A non-positive limit leaves the
+// tier unchanged.
+func NewTierAdapter(inner Tier, maxInflight int) Tier {
+	if maxInflight <= 0 {
+		return inner
+	}
+	return &tierAdapter{Tier: inner, semaphore: newSemaphore(maxInflight)}
+}
+
+func unwrapTier(t Tier) Tier {
+	for {
+		adapter, ok := t.(*tierAdapter)
+		if !ok {
+			return t
+		}
+		t = adapter.Tier
+	}
 }
 
 // ───────────────────────────── origin adapter ─────────────────────────────

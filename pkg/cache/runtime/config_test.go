@@ -111,3 +111,18 @@ func TestValidateTieredRedis(t *testing.T) {
 		t.Fatalf("Validate error=%v, want Redis pool guidance", err)
 	}
 }
+
+func TestValidateTieredRejectsNegativeMaxInflight(t *testing.T) {
+	cfg := Config{
+		Mode:   "tiered",
+		Listen: "127.0.0.1:7070",
+		Tiers: []TierConfig{{
+			Type: "ec", MaxInflight: -1,
+			Cluster: &ECClusterConfig{Peers: []PeerConfig{{ID: "p0", Endpoint: "127.0.0.1:1"}}},
+		}},
+		Origin: &OriginConfig{Type: "store", Store: &StoreClientConfig{Endpoint: "127.0.0.1:7100"}},
+	}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "max_inflight must be >= 0") {
+		t.Fatalf("Validate error=%v, want negative max_inflight rejection", err)
+	}
+}
