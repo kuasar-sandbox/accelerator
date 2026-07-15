@@ -100,9 +100,16 @@ load_hash_via_tiered() {
     return 1
 }
 
-wait_tiered_fills() {
-    "$BIN/cache-ctl" info --endpoint "127.0.0.1:$TIERED_HEALTH_PORT" \
-        --wait-fills --timeout 30s
+wait_shard_present() {
+    local endpoint=$1 key=$2 attempts=${3:-100}
+    for _ in $(seq 1 "$attempts"); do
+        if "$BIN/cache-ctl" shard get --endpoint "$endpoint" \
+            --namespace manifest --hash "$key" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.05
+    done
+    return 1
 }
 
 origin_hits() {
@@ -269,7 +276,14 @@ echo "=== Pre-warm: load each manifest through tiered (populates EC cache) ==="
 for i in $(seq 1 $N); do
     load_hash_via_tiered "${MKEYS[$((i-1))]}" "$TMPDIR/val-$i.prewarm" "prewarm key $i" >/dev/null || exit 1
 done
-wait_tiered_fills || { fail "prewarm fills did not drain"; exit 1; }
+for i in $(seq 1 $N); do
+    for peer in 1 2 3 4 5; do
+        wait_shard_present "127.0.0.1:${SHARD_PORTS[$((peer-1))]}" "${MKEYS[$((i-1))]}" || {
+            fail "prewarm key $i was not readable from shard s$peer"
+            exit 1
+        }
+    done
+done
 ok "$N keys prewarmed through EC tier"
 
 # ============================================================
@@ -302,7 +316,21 @@ if [ "$all_match" = "1" ]; then
 fi
 origin_hits_after=$(origin_hits)
 assert_eq "$origin_hits_before" "$origin_hits_after" "rolling-swap reads did not fall through to origin"
-wait_tiered_fills || { fail "post-swap repair fills did not drain"; exit 1; }
+for i in $(seq 1 $N); do
+    repaired=0
+    for _ in $(seq 1 100); do
+        if wait_shard_present "127.0.0.1:${SHARD_PORTS[5]}" "${MKEYS[$((i-1))]}" 1; then
+            repaired=1
+            break
+        fi
+        load_hash_via_tiered "${MKEYS[$((i-1))]}" "$TMPDIR/val-$i.repair" "repair key $i" >/dev/null || exit 1
+    done
+    if [ "$repaired" != "1" ]; then
+        fail "post-swap key $i was not repaired onto shard s6"
+        exit 1
+    fi
+done
+ok "$N keys repaired onto the replacement shard"
 
 # ============================================================
 # Monotone epoch guard: second SIGHUP with the same peer set should be

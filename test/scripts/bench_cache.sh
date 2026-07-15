@@ -407,7 +407,7 @@ run_bench() {
     # Capture bench-TARGET CPU profile in the background via its
     # pprof_listen endpoint. Duration matches DURATION so the window
     # aligns with the bench measurement window. Delayed start (prefill
-    # + warm + WaitFills usually take a few seconds — pprof pulling
+    # + observable warm verification usually take a few seconds — pprof pulling
     # for DURATION will cover the bench window plus a bit of tail).
     local target_pprof_pid=""
     if [ -n "${PPROF_ENDPOINT:-}" ]; then

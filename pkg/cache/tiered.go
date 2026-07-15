@@ -101,7 +101,7 @@ type FillMiss interface {
 // once.
 //
 // TieredCache auto-calls EnableRepair on tiers that implement this, so
-// repair goroutines become visible to WaitFills and graceful shutdown.
+// repair goroutines participate in graceful shutdown.
 type Repairable interface {
 	EnableRepair(runner func(fn func()))
 }
@@ -116,11 +116,14 @@ func (tc *TieredCache) fillCtx() (context.Context, context.CancelFunc) {
 	return context.WithCancel(tc.baseCtx)
 }
 
-// Close cancels all in-flight async fill/repair goroutines. Idempotent.
-// Pair with WaitFills to drain them on graceful shutdown.
+// Close cancels and drains all in-flight async fill/repair goroutines.
+// Call it after the serving path has stopped admitting new requests.
 func (tc *TieredCache) Close() {
 	if tc.baseCancel != nil {
 		tc.baseCancel()
+	}
+	for i := range tc.fillInflight {
+		tc.fillInflight[i].Wait()
 	}
 }
 
@@ -175,8 +178,7 @@ type TieredCounters struct {
 //
 // Tiers that implement Repairable are auto-enabled with a runner that
 // tracks repair goroutines in the tier's fillInflight WaitGroup, so
-// WaitFills and graceful shutdown correctly account for in-flight
-// repairs.
+// graceful shutdown correctly accounts for in-flight repairs.
 func NewTieredCache(origin Getter, tiers ...Tier) *TieredCache {
 	baseCtx, baseCancel := context.WithCancel(context.Background())
 	tc := &TieredCache{
@@ -365,24 +367,6 @@ func (tc *TieredCache) startFillMiss(tierIdx int, p store.Partition, key store.C
 		defer cancel()
 		_ = mf.FillMiss(ctx, p, key)
 	}()
-}
-
-// WaitFills blocks until all in-flight fill goroutines have completed or ctx is cancelled.
-// Callers should defer this before exiting to avoid losing fills.
-func (tc *TieredCache) WaitFills(ctx context.Context) error {
-	done := make(chan struct{})
-	go func() {
-		for i := range tc.fillInflight {
-			tc.fillInflight[i].Wait()
-		}
-		close(done)
-	}()
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 // ───────────────────────────── semaphore (internal) ─────────────────────────────

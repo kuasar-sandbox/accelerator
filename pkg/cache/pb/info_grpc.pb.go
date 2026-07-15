@@ -27,8 +27,7 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Info_Get_FullMethodName       = "/cac.cache.v1.Info/Get"
-	Info_WaitFills_FullMethodName = "/cac.cache.v1.Info/WaitFills"
+	Info_Get_FullMethodName = "/cac.cache.v1.Info/Get"
 )
 
 // InfoClient is the client API for Info service.
@@ -40,17 +39,6 @@ type InfoClient interface {
 	// lifetime; clients compute deltas by subtracting successive
 	// snapshots.
 	Get(ctx context.Context, in *InfoRequest, opts ...grpc.CallOption) (*InfoReply, error)
-	// WaitFills blocks until all in-flight fill goroutines on the
-	// daemon's TieredCache have drained, or the client's ctx deadline
-	// fires. Intended for test/bench workflows that need to observe a
-	// quiescent-after-warm state before taking measurements.
-	//
-	// In tiered mode this delegates to cache.TieredCache.WaitFills. In
-	// other modes there is no fill-inflight tracking, so this returns
-	// immediately with nil. Clients should set a ctx deadline — the
-	// call will block indefinitely if fills never drain (e.g., a peer
-	// is permanently stuck).
-	WaitFills(ctx context.Context, in *WaitFillsRequest, opts ...grpc.CallOption) (*WaitFillsReply, error)
 }
 
 type infoClient struct {
@@ -71,16 +59,6 @@ func (c *infoClient) Get(ctx context.Context, in *InfoRequest, opts ...grpc.Call
 	return out, nil
 }
 
-func (c *infoClient) WaitFills(ctx context.Context, in *WaitFillsRequest, opts ...grpc.CallOption) (*WaitFillsReply, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(WaitFillsReply)
-	err := c.cc.Invoke(ctx, Info_WaitFills_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 // InfoServer is the server API for Info service.
 // All implementations must embed UnimplementedInfoServer
 // for forward compatibility.
@@ -90,17 +68,6 @@ type InfoServer interface {
 	// lifetime; clients compute deltas by subtracting successive
 	// snapshots.
 	Get(context.Context, *InfoRequest) (*InfoReply, error)
-	// WaitFills blocks until all in-flight fill goroutines on the
-	// daemon's TieredCache have drained, or the client's ctx deadline
-	// fires. Intended for test/bench workflows that need to observe a
-	// quiescent-after-warm state before taking measurements.
-	//
-	// In tiered mode this delegates to cache.TieredCache.WaitFills. In
-	// other modes there is no fill-inflight tracking, so this returns
-	// immediately with nil. Clients should set a ctx deadline — the
-	// call will block indefinitely if fills never drain (e.g., a peer
-	// is permanently stuck).
-	WaitFills(context.Context, *WaitFillsRequest) (*WaitFillsReply, error)
 	mustEmbedUnimplementedInfoServer()
 }
 
@@ -113,9 +80,6 @@ type UnimplementedInfoServer struct{}
 
 func (UnimplementedInfoServer) Get(context.Context, *InfoRequest) (*InfoReply, error) {
 	return nil, status.Error(codes.Unimplemented, "method Get not implemented")
-}
-func (UnimplementedInfoServer) WaitFills(context.Context, *WaitFillsRequest) (*WaitFillsReply, error) {
-	return nil, status.Error(codes.Unimplemented, "method WaitFills not implemented")
 }
 func (UnimplementedInfoServer) mustEmbedUnimplementedInfoServer() {}
 func (UnimplementedInfoServer) testEmbeddedByValue()              {}
@@ -156,24 +120,6 @@ func _Info_Get_Handler(srv interface{}, ctx context.Context, dec func(interface{
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Info_WaitFills_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(WaitFillsRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(InfoServer).WaitFills(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Info_WaitFills_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(InfoServer).WaitFills(ctx, req.(*WaitFillsRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 // Info_ServiceDesc is the grpc.ServiceDesc for Info service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -184,10 +130,6 @@ var Info_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Get",
 			Handler:    _Info_Get_Handler,
-		},
-		{
-			MethodName: "WaitFills",
-			Handler:    _Info_WaitFills_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

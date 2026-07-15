@@ -68,6 +68,31 @@ wait_ready() {
     return 1
 }
 
+wait_shard_present() {
+    local endpoint=$1 namespace=$2 hash=$3
+    for _ in $(seq 1 100); do
+        if "$BIN/cache-ctl" shard get --endpoint "$endpoint" \
+            --namespace "$namespace" --hash "$hash" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.05
+    done
+    return 1
+}
+
+wait_manifest_load() {
+    local config=$1 output=$2 key=$3 expected_hash=$4
+    for _ in $(seq 1 100); do
+        if "$BIN/manifest-ctl" load --manifest-config "$config" \
+            --output "$output" --no-progress "$key" >/dev/null 2>&1 &&
+            [ "$(payload_hash "$output" 2>/dev/null)" = "$expected_hash" ]; then
+            return 0
+        fi
+        sleep 0.05
+    done
+    return 1
+}
+
 # Allocate a free port.
 free_port() {
     python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
@@ -526,10 +551,14 @@ wait_ready "127.0.0.1:$FRONT_HEALTH_PORT"
 UP_HASH=$(payload_hash "$TMPDIR/test-upstream.bin")
 assert_eq "$ORIG_HASH" "$UP_HASH" "upstream tier read-through (cold)"
 
-# Fill/writeback is asynchronous. Drain it before stopping the front cache;
-# otherwise SIGTERM can cancel the writeback goroutines and make the remote
-# verification below race with shutdown.
-"$BIN/cache-ctl" info --endpoint "127.0.0.1:$FRONT_HEALTH_PORT" --wait-fills --timeout 10s
+# Fill/writeback is asynchronous. Verify the complete artifact directly on the
+# remote before stopping the front cache; this checks manifest and chunk data,
+# rather than an internal goroutine count.
+if ! wait_manifest_load "$(accel_cfg_for_cache "127.0.0.1:$REMOTE_PORT")" \
+    "$TMPDIR/test-from-remote-ready.bin" "$MKEY" "$ORIG_HASH"; then
+    fail "upstream tier writeback did not become readable on remote"
+    exit 1
+fi
 
 # Kill front; remote must now serve the same manifest on its own.
 # makeCacheReader has no local-store fall-through — if writeback did
@@ -649,7 +678,18 @@ PIDS+=($!)
 wait_ready "127.0.0.1:$REDIS_TIER_HEALTH_PORT"
 "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$REDIS_TIER_PORT")" \
     --output "$TMPDIR/test-redis-tier-cold.bin" --no-progress "$MKEY" 2>&1
-"$BIN/cache-ctl" info --endpoint "127.0.0.1:$REDIS_TIER_HEALTH_PORT" --wait-fills --timeout 10s
+REDIS_TIER_WARM=0
+for _ in $(seq 1 100); do
+    "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$REDIS_TIER_PORT")" \
+        --output "$TMPDIR/test-redis-tier-probe.bin" --no-progress "$MKEY" >/dev/null 2>&1 || true
+    if "$BIN/cache-ctl" info --endpoint "127.0.0.1:$REDIS_TIER_HEALTH_PORT" --json | \
+        python3 -c 'import json,sys; assert json.load(sys.stdin)["tiered"]["tiers"][0]["hits"] >= 2' 2>/dev/null; then
+        REDIS_TIER_WARM=1
+        break
+    fi
+    sleep 0.05
+done
+assert_eq "1" "$REDIS_TIER_WARM" "tiered Redis manifest and chunk became warm"
 "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$REDIS_TIER_PORT")" \
     --output "$TMPDIR/test-redis-tier-warm.bin" --no-progress "$MKEY" 2>&1
 REDIS_TIER_HASH=$(payload_hash "$TMPDIR/test-redis-tier-warm.bin")
@@ -735,7 +775,6 @@ PIDS+=($!)
 wait_ready "127.0.0.1:$REDIS_EC_HEALTH_PORT"
 "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$REDIS_EC_PORT")" \
     --output "$TMPDIR/test-redis-ec-cold.bin" --no-progress "$MKEY" 2>&1
-"$BIN/cache-ctl" info --endpoint "127.0.0.1:$REDIS_EC_HEALTH_PORT" --wait-fills --timeout 10s
 
 # The main test artifact has one chunk (asserted by the ingest output above).
 # Select its larger content object rather than the 64 KiB standalone Test 0
@@ -746,8 +785,7 @@ for peer_port in "${REDIS_SHARD_PORTS[@]}"; do
     for pair in "manifest:$MKEY" "chunk:$MAIN_CHUNK_KEY"; do
         namespace=${pair%%:*}
         object_key=${pair#*:}
-        if ! "$BIN/cache-ctl" shard get --endpoint "127.0.0.1:$peer_port" \
-            --namespace "$namespace" --hash "$object_key" >/dev/null 2>&1; then
+        if ! wait_shard_present "127.0.0.1:$peer_port" "$namespace" "$object_key"; then
             ALL_SHARDS_PRESENT=0
         fi
     done
@@ -846,15 +884,15 @@ done
 assert_eq "1" "$COLD_MISS" "restarted Redis shard is a confirmed cold miss"
 
 REPAIRED=0
-for _ in $(seq 1 5); do
+for _ in $(seq 1 100); do
     "$BIN/cache-ctl" object get --endpoint "127.0.0.1:$REDIS_EC_PORT" \
         --namespace manifest --hash "$MKEY" >/dev/null
-    "$BIN/cache-ctl" info --endpoint "127.0.0.1:$REDIS_EC_HEALTH_PORT" --wait-fills --timeout 10s
     if "$BIN/cache-ctl" shard get --endpoint "127.0.0.1:${REDIS_SHARD_PORTS[0]}" \
         --namespace manifest --hash "$MKEY" >/dev/null 2>&1; then
         REPAIRED=1
         break
     fi
+    sleep 0.05
 done
 assert_eq "1" "$REPAIRED" "EC repaired manifest shard after Redis cold restart"
 
