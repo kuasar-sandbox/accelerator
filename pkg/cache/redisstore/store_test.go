@@ -256,11 +256,17 @@ func TestStoreSupportsUnixAndTCP(t *testing.T) {
 			server := newFakeRedisNetwork(t, network)
 			s := openTestStore(t, server, nil)
 			key := testKey(17)
-			if err := s.Fill(context.Background(), store.PartitionChunk, key, []byte(network)); err != nil {
+			ctx := context.Background()
+			if err := s.Fill(ctx, store.PartitionChunk, key, []byte(network+"-object")); err != nil {
 				t.Fatal(err)
 			}
-			result, blob, err := s.Get(context.Background(), store.PartitionChunk, key)
-			requireValue(t, result, blob, err, []byte(network))
+			if err := s.FillShard(ctx, store.PartitionChunk, key, []byte(network+"-shard")); err != nil {
+				t.Fatal(err)
+			}
+			result, blob, err := s.Get(ctx, store.PartitionChunk, key)
+			requireValue(t, result, blob, err, []byte(network+"-object"))
+			result, blob, err = s.GetShard(ctx, store.PartitionChunk, key)
+			requireValue(t, result, blob, err, []byte(network+"-shard"))
 			stats := s.Stats()
 			if stats.Endpoint != server.endpoint || stats.Transport != network {
 				t.Fatalf("stats endpoint=%q transport=%q, want %q/%q", stats.Endpoint, stats.Transport, server.endpoint, network)
