@@ -314,7 +314,7 @@ tiers:
 | `stats_interval` | 周期自适应 stderr 统计行的基准周期(§6.6)。缺省/空 = 30s(默认开);`0`/`off` 关闭。有流量的周期打一行(吞吐/带宽/时延 p50/p99/max/并发/命中级联/rocks 量规),空闲周期静默 |
 | `freq.disable_eviction` | bool。关掉频率式 compaction-filter 淘汰:sketch 仍维护(供 stats),但 filter 永不挂载,任何 key 都不会按访问计数被淘汰。用于某台 local cache-ctl 充当下游 tiered 的 origin(bench 场景)——写入落一次就必须留住 |
 | `pool` | 到单个 peer 的并行 TCP 连接数。wire 是 sync request/response,单连接会把并发请求串行化 |
-| `max_inflight` | 客户端到该 tier 的最大并发对象请求数。embedded 推荐不设;origin 建议 16-32 |
+| `max_inflight` | 到该 tier 的同步查询并发上限;`0` 表示不限制。异步 fill 使用各 backend 自身的连接池/并发控制。Redis tier 禁止设置,应使用 `redis.get_pool` / `redis.set_pool` |
 | `rpc_timeout` | 服务端每请求 wall-clock 上限。**缺省/空/非法 = 0 = 无 per-request deadline**:请求只受客户端连接 / 调用方取消约束,不强加任意值。显式设有限值时,超时返回 `StatusError`,TieredCache 视作该层 miss 继续下一层。卡死请求的可观测性改由 `CACHE_CTL_DEBUG` 追踪(§6.5) |
 | `timeout`(tier/origin) | 客户端对该 tier / origin 单次 RPC 的 wall-clock 上限。同 `rpc_timeout` 语义:缺省/空 = 0 = 不设上界,只受调用方 ctx / 连接约束 |
 | `pprof_listen` | 非空时另起一个 HTTP listener 暴露 `/debug/pprof/*`(如 `127.0.0.1:6060`)。**生产留空**;仅离线诊断临时开启(§6.4) |

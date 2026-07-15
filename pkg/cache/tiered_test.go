@@ -55,6 +55,21 @@ type mockTier struct {
 	fillBytes  chan []byte
 }
 
+type optionalTier struct {
+	*mockTier
+	repairEnabled atomic.Bool
+	missFills     atomic.Int32
+}
+
+func (t *optionalTier) EnableRepair(runner func(fn func())) {
+	t.repairEnabled.Store(runner != nil)
+}
+
+func (t *optionalTier) FillMiss(ctx context.Context, p store.Partition, key store.ContentKey) error {
+	t.missFills.Add(1)
+	return nil
+}
+
 func newMockTier() *mockTier {
 	return &mockTier{fillBytes: make(chan []byte, 4)}
 }
@@ -70,6 +85,39 @@ func (m *mockTier) Fill(ctx context.Context, p store.Partition, key store.Conten
 	// after Fill returns).
 	m.fillBytes <- append([]byte(nil), data...)
 	return nil
+}
+
+func TestTierAdapterLimitsLookupsAndPreservesOptionalCapabilities(t *testing.T) {
+	inner := &optionalTier{mockTier: newMockTier()}
+	limited := NewTierAdapter(inner, 1)
+	sem, ok := limited.(Semaphore)
+	if !ok {
+		t.Fatalf("limited tier type %T does not implement Semaphore", limited)
+	}
+	if waited, err := sem.Acquire(context.Background()); err != nil || waited {
+		t.Fatalf("first acquire waited=%v err=%v", waited, err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := sem.Acquire(canceled); err == nil {
+		t.Fatal("second acquire should block until its context is canceled")
+	}
+	sem.Release()
+
+	tc := NewTieredCache(missGetter{}, limited)
+	if !inner.repairEnabled.Load() {
+		t.Fatal("tier adapter hid Repairable from TieredCache")
+	}
+	tc.startFillMiss(0, store.PartitionChunk, store.ContentKey{1})
+	if err := tc.WaitFills(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := inner.missFills.Load(); got != 1 {
+		t.Fatalf("FillMiss calls=%d, want 1", got)
+	}
+	if got := NewTierAdapter(inner, 0); got != inner {
+		t.Fatalf("unlimited tier was wrapped: %T", got)
+	}
 }
 
 // TestTieredCache_StartFillClonesBlob asserts the contract baked into
