@@ -33,7 +33,7 @@ Bloom Filter 全部常驻内存)。
   socket 路径(`/run/sandbox/cache.sock` 或 `unix:///...`;为 socket 时启动清死
   socket、chmod 0600)。数据面客户端 `cache.endpoint` 填同址即可;控制面经 socket
   时,`ping` / `info --endpoint` 用 `unix:///` 形式。
-- **本地存储**:进程内 RocksDB,或通过 UDS 访问 Redis-compatible server;
+- **本地存储**:进程内 RocksDB,或通过 UDS/TCP 访问 Redis-compatible server;
   后者的配置、取消语义和 Dragonfly 部署见 [cache-redis.md](cache-redis.md)。
 - **写入语义**:强制准入,无应用层 LRU/SLRU。淘汰由 CompactionFilter 在
   后台按 CMS 频率统计驱动。
@@ -159,9 +159,9 @@ Flags:
 | 维度 | local | shard | tiered |
 |---|---|---|---|
 | 定位 | 单节点完整对象 KV | EC 分片 KV(集群成员) | 多级缓存代理 |
-| handler 后端 | 直连 RocksDB | 直连 RocksDB | TieredCache(§4.6) |
+| handler 后端 | embedded RocksDB / Redis-compatible | embedded RocksDB / Redis-compatible | TieredCache(§4.6) |
 | tier chain | 无 | 无 | 按 YAML `tiers:` 顺序 |
-| 写操作 | 直写 RocksDB | 直写 RocksDB | 拒绝(`StatusError`) |
+| 写操作 | 直写所选 backend | 直写所选 backend | 拒绝(`StatusError`) |
 | 读操作 | 查 RocksDB | 查 RocksDB | 穿 tier chain,命中后 fill-aside |
 | origin 凭证 | 不需要 | 不需要 | 需要(L3 读权限) |
 | 典型部署 | 测试/调试/单节点 | L2 EC 集群 × 5 | 与 manifest-ctl 同节点(边车) |
@@ -723,7 +723,7 @@ cache-ctl serve --config /etc/cache/tiered.yaml
 2. wire server graceful stop:排空 in-flight,硬上限 5 s;
 3. gRPC 控制面 server graceful stop(Health + Info 同在该 server);
 4. tiered 模式调 `TieredCache.Close()` 取消在途 async fill;tier chain 反序
-   级联关闭(embedded → ec → upstream),local/shard 模式下关 RocksDB。
+   级联关闭(embedded → redis → ec → upstream),local/shard 模式下关闭所选 backend。
 
 ### 6.3 运行时计数(pull-only)
 

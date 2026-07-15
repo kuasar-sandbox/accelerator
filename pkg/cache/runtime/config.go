@@ -2,11 +2,15 @@
 package runtime
 
 import (
+	"errors"
 	"fmt"
+	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/internal/util"
 	"gopkg.in/yaml.v3"
 )
 
@@ -65,14 +69,14 @@ type RocksConfig struct {
 	MaxBackgroundJobs int     `yaml:"max_background_jobs"` // default 8
 }
 
-// RedisConfig configures a Redis-compatible backend reached over a local Unix
-// socket. GET and SET use separate pools so asynchronous fill/repair traffic
-// cannot consume the read-side connection budget.
+// RedisConfig configures a Redis-compatible backend reached over UDS or TCP.
+// GET and SET use separate pools so asynchronous fill/repair traffic cannot
+// consume the read-side connection budget.
 type RedisConfig struct {
-	Socket  string `yaml:"socket"`
-	GetPool int    `yaml:"get_pool"`
-	SetPool int    `yaml:"set_pool"`
-	Timeout string `yaml:"timeout"`
+	Endpoint string `yaml:"endpoint"`
+	GetPool  int    `yaml:"get_pool"`
+	SetPool  int    `yaml:"set_pool"`
+	Timeout  string `yaml:"timeout"`
 }
 
 // TierConfig describes one tier in a tiered-mode tier chain.
@@ -260,11 +264,8 @@ func validateRedisConfig(cfg *RedisConfig, scope string) error {
 	if cfg == nil {
 		return fmt.Errorf("runtime: %s: redis config is required", scope)
 	}
-	if cfg.Socket == "" {
-		return fmt.Errorf("runtime: %s: redis.socket is required", scope)
-	}
-	if !strings.HasPrefix(cfg.Socket, "/") {
-		return fmt.Errorf("runtime: %s: redis.socket must be an absolute Unix socket path", scope)
+	if _, _, err := ParseRedisEndpoint(cfg.Endpoint); err != nil {
+		return fmt.Errorf("runtime: %s: %w", scope, err)
 	}
 	if cfg.GetPool < 0 {
 		return fmt.Errorf("runtime: %s: redis.get_pool must be >= 0", scope)
@@ -279,6 +280,28 @@ func validateRedisConfig(cfg *RedisConfig, scope string) error {
 		}
 	}
 	return nil
+}
+
+// ParseRedisEndpoint resolves the configured Redis endpoint into arguments for
+// net.Dialer. Absolute paths and unix: forms select UDS; host:port selects TCP.
+func ParseRedisEndpoint(endpoint string) (network, address string, err error) {
+	if endpoint == "" {
+		return "", "", errors.New("redis.endpoint is required")
+	}
+	if endpoint != strings.TrimSpace(endpoint) {
+		return "", "", errors.New("redis.endpoint must not contain surrounding whitespace")
+	}
+	if path, ok := util.UnixAddr(endpoint); ok {
+		if !filepath.IsAbs(path) {
+			return "", "", errors.New("redis.endpoint Unix socket path must be absolute")
+		}
+		return "unix", path, nil
+	}
+	host, port, splitErr := net.SplitHostPort(endpoint)
+	if splitErr != nil || host == "" || port == "" {
+		return "", "", errors.New("redis.endpoint must be an absolute Unix socket path, unix:/path, or TCP host:port")
+	}
+	return "tcp", endpoint, nil
 }
 
 // ParseRPCTimeout parses the rpc_timeout field. Empty/absent/invalid =

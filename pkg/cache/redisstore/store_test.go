@@ -31,7 +31,8 @@ type fakeAction struct {
 type fakeRedis struct {
 	t        *testing.T
 	listener net.Listener
-	path     string
+	endpoint string
+	network  string
 	done     chan struct{}
 	wg       sync.WaitGroup
 
@@ -44,15 +45,28 @@ type fakeRedis struct {
 
 func newFakeRedis(t *testing.T) *fakeRedis {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "redis.sock")
-	lis, err := net.Listen("unix", path)
+	return newFakeRedisNetwork(t, "unix")
+}
+
+func newFakeRedisNetwork(t *testing.T, network string) *fakeRedis {
+	t.Helper()
+	address := "127.0.0.1:0"
+	if network == "unix" {
+		address = filepath.Join(t.TempDir(), "redis.sock")
+	}
+	lis, err := net.Listen(network, address)
 	if err != nil {
 		t.Fatal(err)
+	}
+	endpoint := lis.Addr().String()
+	if network == "unix" {
+		endpoint = "unix://" + address
 	}
 	f := &fakeRedis{
 		t:        t,
 		listener: lis,
-		path:     path,
+		endpoint: endpoint,
+		network:  network,
 		done:     make(chan struct{}),
 		values:   make(map[string][]byte),
 	}
@@ -168,7 +182,12 @@ func (f *fakeRedis) close() {
 		close(f.done)
 		_ = f.listener.Close()
 		f.wg.Wait()
-		_ = os.Remove(f.path)
+		if f.network == "unix" {
+			_, address, err := runtime.ParseRedisEndpoint(f.endpoint)
+			if err == nil {
+				_ = os.Remove(address)
+			}
+		}
 	}
 }
 
@@ -219,16 +238,35 @@ func isClosedConn(err error) bool {
 func openTestStore(t *testing.T, server *fakeRedis, pool cache.BlobPool) *Store {
 	t.Helper()
 	s, err := Open(runtime.RedisConfig{
-		Socket:  server.path,
-		GetPool: 1,
-		SetPool: 1,
-		Timeout: "2s",
+		Endpoint: server.endpoint,
+		GetPool:  1,
+		SetPool:  1,
+		Timeout:  "2s",
 	}, pool)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	return s
+}
+
+func TestStoreSupportsUnixAndTCP(t *testing.T) {
+	for _, network := range []string{"unix", "tcp"} {
+		t.Run(network, func(t *testing.T) {
+			server := newFakeRedisNetwork(t, network)
+			s := openTestStore(t, server, nil)
+			key := testKey(17)
+			if err := s.Fill(context.Background(), store.PartitionChunk, key, []byte(network)); err != nil {
+				t.Fatal(err)
+			}
+			result, blob, err := s.Get(context.Background(), store.PartitionChunk, key)
+			requireValue(t, result, blob, err, []byte(network))
+			stats := s.Stats()
+			if stats.Endpoint != server.endpoint || stats.Transport != network {
+				t.Fatalf("stats endpoint=%q transport=%q, want %q/%q", stats.Endpoint, stats.Transport, server.endpoint, network)
+			}
+		})
+	}
 }
 
 func testKey(seed byte) store.ContentKey {

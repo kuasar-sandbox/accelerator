@@ -1,7 +1,7 @@
-# Redis-compatible local cache backend
+# Redis-compatible cache backend
 
-`cache-ctl` can use a Redis-compatible server over a local Unix socket for all
-physical cache roles:
+`cache-ctl` can use a Redis-compatible server over a Unix domain socket (UDS)
+or a direct TCP connection for all physical cache roles:
 
 - `mode: local`: complete objects;
 - `mode: shard`: EC shard values;
@@ -23,7 +23,7 @@ health_listen: 0.0.0.0:7071
 rpc_timeout: 2s
 
 redis:
-  socket: /run/kuasar-cache/redis.sock
+  endpoint: unix:///run/kuasar-cache/redis.sock
   get_pool: 32
   set_pool: 8
   timeout: 2s
@@ -36,7 +36,7 @@ mode: tiered
 tiers:
   - type: redis
     redis:
-      socket: /run/kuasar-cache/redis.sock
+      endpoint: 10.0.1.60:6379
       get_pool: 32
       set_pool: 8
       timeout: 2s
@@ -53,8 +53,12 @@ and `redis.set_pool` are the independent hard concurrency budgets; keeping
 them separate prevents asynchronous fill and repair writes from consuming the
 read-side budget. Validation rejects the ambiguous combined limit.
 
-Only absolute Unix socket paths are accepted. The backend cannot be configured
-with a TCP endpoint, AUTH credentials, Redis Cluster, or a remote service.
+`redis.endpoint` accepts an absolute socket path, `unix:/abs/path`,
+`unix:///abs/path`, or one TCP `host:port`. Bracket IPv6 literals, for example
+`[2001:db8::60]:6379`. UDS remains the recommended node-local low-latency
+transport. TCP is plain RESP2 and has no AUTH/ACL or TLS support in this
+backend; use it only on a trusted network protected by bind rules and a
+firewall. Redis Cluster discovery is not supported.
 
 ## Data model
 
@@ -76,15 +80,15 @@ fallthrough.
 
 ## Connection and cancellation behavior
 
-GET and SET use separate, eagerly connected, fixed-size UDS worker pools. One
+GET and SET use separate, eagerly connected, fixed-size worker pools. One
 connection carries at most one in-flight command, making RESP FIFO ownership
 explicit and preventing fill traffic from consuming the read pool.
 
 When an object or shard GET is cancelled, the caller returns immediately. The
 worker reads and discards the late response before returning the connection to
 the pool. A normal cancellation never closes the external wire connection or
-the Redis UDS connection. A malformed response or real UDS I/O failure closes
-and reconnects only that worker.
+the Redis backend connection. A malformed response or real UDS/TCP I/O failure
+closes and reconnects only that worker using the configured transport.
 
 SET uses `net.Buffers` for header/key/value `writev`. The caller's value remains
 borrowed until the socket write completes. If cancellation arrives after the
@@ -98,9 +102,9 @@ connection. Probe traffic does not use the data pools or alter hit/miss
 counters. A failed Redis probe marks the daemon `NOT_SERVING`; it does not
 change EC membership or placement epochs.
 
-`cache-ctl info` exposes backend type, socket, pool size/connectivity,
-in-flight and draining counts, cancellations, late bytes, reconnects, protocol
-errors, backend errors, and GET/SET latency percentiles.
+`cache-ctl info` exposes backend type, endpoint, transport, pool
+size/connectivity, in-flight and draining counts, cancellations, late bytes,
+reconnects, protocol errors, backend errors, and GET/SET latency percentiles.
 
 ## Dragonfly deployment
 
@@ -148,6 +152,9 @@ Run Dragonfly and `cache-ctl` in separate cpusets and align them with the NVMe
 NUMA node. The unit disables the TCP listener and exposes only
 `/run/kuasar-cache/redis.sock`. It also disables Dragonfly's daily release
 check, so the service performs no version-site request from the target host.
+This unit is the recommended node-local topology. A separately managed remote
+server may expose TCP, but its bind/firewall policy and network latency are
+operator responsibilities.
 
 Dragonfly v1.39.0 is distributed under BSL 1.1. Its Additional Use Grant allows
 use as part of another product or service when that offering is not an

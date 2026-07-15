@@ -192,7 +192,8 @@ func redisFromPb(s *cachepb.RedisStats) *cache.RedisStats {
 		return nil
 	}
 	return &cache.RedisStats{
-		Socket:           s.Socket,
+		Endpoint:         s.Endpoint,
+		Transport:        s.Transport,
 		GetPoolSize:      s.GetPoolSize,
 		SetPoolSize:      s.SetPoolSize,
 		GetConnected:     s.GetConnected,
@@ -328,8 +329,8 @@ func printInfoHuman(ds cache.DaemonStats) {
 }
 
 func printRedisStats(label string, s *cache.RedisStats) {
-	fmt.Printf("%s: socket=%s get=%d/%d set=%d/%d inflight=%d/%d waiters=%d draining=%d cancels=%d reconnects=%d errors=%d protocol=%d get-p50=%s get-p99=%s set-p99=%s\n",
-		label, s.Socket,
+	fmt.Printf("%s: endpoint=%s transport=%s get=%d/%d set=%d/%d inflight=%d/%d waiters=%d draining=%d cancels=%d reconnects=%d errors=%d protocol=%d get-p50=%s get-p99=%s set-p99=%s\n",
+		label, s.Endpoint, s.Transport,
 		s.GetConnected, s.GetPoolSize, s.SetConnected, s.SetPoolSize,
 		s.GetInflight, s.SetInflight, s.PoolWaiters, s.Draining,
 		s.Cancelled, s.Reconnects, s.BackendErrors, s.ProtocolErrors,

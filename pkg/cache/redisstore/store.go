@@ -1,5 +1,5 @@
 // Package redisstore implements object and shard cache storage through the
-// narrow RESP2 GET/SET surface of a Redis-compatible server on a local UDS.
+// narrow RESP2 GET/SET surface of a Redis-compatible server over UDS or TCP.
 package redisstore
 
 import (
@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,9 +47,11 @@ const (
 // Store implements both complete-object and EC-shard cache contracts. The
 // methods share one codec and differ only in the encoded key kind.
 type Store struct {
-	socket  string
-	timeout time.Duration
-	blobs   cache.BlobPool
+	endpoint string
+	network  string
+	address  string
+	timeout  time.Duration
+	blobs    cache.BlobPool
 
 	stop      chan struct{}
 	closed    atomic.Bool
@@ -120,14 +121,12 @@ type operationResult struct {
 	err    error
 }
 
-// Open creates and eagerly connects all UDS workers. Startup fails if the
+// Open creates and eagerly connects all backend workers. Startup fails if the
 // configured Redis-compatible server cannot satisfy the complete pool.
 func Open(cfg runtime.RedisConfig, blobs cache.BlobPool) (*Store, error) {
-	if cfg.Socket == "" {
-		return nil, errors.New("redisstore: socket is required")
-	}
-	if !filepath.IsAbs(cfg.Socket) {
-		return nil, errors.New("redisstore: socket must be an absolute path")
+	network, address, err := runtime.ParseRedisEndpoint(cfg.Endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("redisstore: %w", err)
 	}
 	getSize := cfg.GetPool
 	if getSize == 0 {
@@ -153,10 +152,12 @@ func Open(cfg runtime.RedisConfig, blobs cache.BlobPool) (*Store, error) {
 	}
 
 	s := &Store{
-		socket:  cfg.Socket,
-		timeout: timeout,
-		blobs:   blobs,
-		stop:    make(chan struct{}),
+		endpoint: cfg.Endpoint,
+		network:  network,
+		address:  address,
+		timeout:  timeout,
+		blobs:    blobs,
+		stop:     make(chan struct{}),
 	}
 	s.get = workerPool{kind: getPool, size: getSize, available: make(chan *worker, getSize), store: s}
 	s.set = workerPool{kind: setPool, size: setSize, available: make(chan *worker, setSize), store: s}
@@ -205,7 +206,7 @@ func (s *Store) dial() (net.Conn, error) {
 }
 
 func (s *Store) dialContext(ctx context.Context) (net.Conn, error) {
-	return (&net.Dialer{}).DialContext(ctx, "unix", s.socket)
+	return (&net.Dialer{}).DialContext(ctx, s.network, s.address)
 }
 
 func (s *Store) Get(ctx context.Context, p store.Partition, key store.ContentKey) (cache.CacheResult, cache.Blob, error) {
@@ -595,7 +596,8 @@ func (s *Store) dropProbeLocked() {
 
 func (s *Store) Stats() Stats {
 	return Stats{
-		Socket:           s.socket,
+		Endpoint:         s.endpoint,
+		Transport:        s.network,
 		GetPoolSize:      int64(s.get.size),
 		SetPoolSize:      int64(s.set.size),
 		GetConnected:     s.getConnected.Load(),

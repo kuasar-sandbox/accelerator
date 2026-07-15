@@ -4,7 +4,7 @@
 // new YAML config is required.
 //
 // The service exposes hits/misses/fills at the wire, tier, and EC-peer
-// layers plus bounded Redis UDS pool and backend-latency snapshots.
+// layers plus bounded Redis pool and backend-latency snapshots.
 syntax = "proto3";
 
 package cac.cache.v1;
@@ -142,7 +142,7 @@ message RocksCFStats {
 }
 
 message RedisStats {
-    string socket = 1;
+    string endpoint = 1;
 
     int64 get_pool_size  = 2;
     int64 set_pool_size  = 3;
@@ -169,4 +169,5 @@ message RedisStats {
     uint64 set_p99_ns       = 22;
     uint64 set_p999_ns      = 23;
     uint64 pool_wait_p99_ns = 24;
+    string transport        = 25;
 }

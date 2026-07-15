@@ -9,7 +9,8 @@ import (
 
 func TestRedisInfoProtoRoundTrip(t *testing.T) {
 	redis := &cache.RedisStats{
-		Socket:           "/run/kuasar-cache/redis.sock",
+		Endpoint:         "redis.internal:6379",
+		Transport:        "tcp",
 		GetPoolSize:      32,
 		SetPoolSize:      8,
 		GetConnected:     31,

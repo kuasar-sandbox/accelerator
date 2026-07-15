@@ -171,7 +171,8 @@ func (s *InfoServer) snapshot() cache.DaemonStats {
 
 func redisStats(s redisstore.Stats) *cache.RedisStats {
 	return &cache.RedisStats{
-		Socket:           s.Socket,
+		Endpoint:         s.Endpoint,
+		Transport:        s.Transport,
 		GetPoolSize:      s.GetPoolSize,
 		SetPoolSize:      s.SetPoolSize,
 		GetConnected:     s.GetConnected,
@@ -267,7 +268,8 @@ func redisToPb(s *cache.RedisStats) *cachepb.RedisStats {
 		return nil
 	}
 	return &cachepb.RedisStats{
-		Socket:           s.Socket,
+		Endpoint:         s.Endpoint,
+		Transport:        s.Transport,
 		GetPoolSize:      s.GetPoolSize,
 		SetPoolSize:      s.SetPoolSize,
 		GetConnected:     s.GetConnected,
