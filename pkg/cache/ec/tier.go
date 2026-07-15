@@ -225,8 +225,8 @@ func (t *impl) Get(ctx context.Context, p store.Partition, key store.ContentKey)
 				results <- res
 				return
 			}
-			idx, peerTotal, _, ok := cache.ParseShardPrefix(blob.Bytes())
-			if !ok || int(peerTotal) != total || int(idx) >= total {
+			idx, ok := validShardIndex(blob.Bytes(), total)
+			if !ok {
 				// Stale shard from a different RS scheme, corrupt prefix,
 				// or idx out of range. Release the blob and treat as an
 				// invalid response (not a confirmed miss — we don't want
@@ -239,7 +239,7 @@ func (t *impl) Get(ctx context.Context, p store.Partition, key store.ContentKey)
 				results <- res
 				return
 			}
-			res := shardResult{peerPos: peerPos, shardIdx: int(idx), blob: blob}
+			res := shardResult{peerPos: peerPos, shardIdx: idx, blob: blob}
 			if sample {
 				res.arrivedAt = time.Now()
 			}
@@ -329,15 +329,25 @@ func (t *impl) Get(ctx context.Context, p store.Partition, key store.ContentKey)
 			dataHits++
 		}
 	}
+	repairNeedsParity := false
+	if t.repairRunner != nil && len(missPeerPos) > 0 {
+		for i := data; i < total; i++ {
+			if !seenIdx[i] {
+				repairNeedsParity = true
+				break
+			}
+		}
+	}
 
 	// Pre-fill nil shard slots with pooled scratch so reedsolomon's
 	// Reconstruct reuses our buffers instead of allocating via its
 	// internal AllocAligned. Check: the library tests
 	// `cap(shards[i]) >= shardSize` and reuses the slot if so.
 	//
-	// Only needed when reconstruction will run (dataHits < data).
+	// Also reconstruct parity when repair will write a confirmed-missing parity
+	// shard. ReconstructData deliberately leaves parity slots empty.
 	var scratchSlots []int
-	if dataHits < data {
+	if dataHits < data || repairNeedsParity {
 		var shardSize int
 		for _, s := range shards {
 			if s != nil {
@@ -360,17 +370,19 @@ func (t *impl) Get(ctx context.Context, p store.Partition, key store.ContentKey)
 			scratchSlots = append(scratchSlots, i)
 		}
 
-		// Reconstruct only the data shards we need; parity slots can
-		// remain untouched. Pairs with the "skip if dataHits==data"
-		// gate above: RS runs only when it has actual work to do, and
-		// the work is bounded to data-shard recovery.
-		if err := t.enc.enc.ReconstructData(shards); err != nil {
+		var reconstructErr error
+		if repairNeedsParity {
+			reconstructErr = t.enc.enc.Reconstruct(shards)
+		} else {
+			reconstructErr = t.enc.enc.ReconstructData(shards)
+		}
+		if reconstructErr != nil {
 			// Return scratch and blobs cleanly.
 			for _, idx := range scratchSlots {
 				t.shardScratchPool.Put(shards[idx][:0])
 			}
 			releaseAll(blobs)
-			return cache.CacheMiss, nil, fmt.Errorf("ec: reconstruct: %w", err)
+			return cache.CacheMiss, nil, fmt.Errorf("ec: reconstruct: %w", reconstructErr)
 		}
 	}
 	if sample {
@@ -468,13 +480,19 @@ func (t *impl) scheduleRepair(shards [][]byte, seenIdx []bool, missPeerPos []int
 		peerPos int
 		value   []byte
 	}
-	jobs := make([]repairJob, n)
+	jobs := make([]repairJob, 0, n)
 	for i := 0; i < n; i++ {
 		idx := missingIdx[i]
-		jobs[i] = repairJob{
+		if len(shards[idx]) == 0 {
+			continue
+		}
+		jobs = append(jobs, repairJob{
 			peerPos: missPeerPos[i],
 			value:   WrapShard(shards[idx], idx, total),
-		}
+		})
+	}
+	if len(jobs) == 0 {
+		return
 	}
 
 	// Snapshot router/peer state for the goroutine.
@@ -503,6 +521,14 @@ func releaseAll(blobs []cache.Blob) {
 			b.Release()
 		}
 	}
+}
+
+func validShardIndex(value []byte, wantTotal int) (int, bool) {
+	idx, total, data, ok := cache.ParseShardPrefix(value)
+	if !ok || len(data) == 0 || int(total) != wantTotal || int(idx) >= wantTotal {
+		return 0, false
+	}
+	return int(idx), true
 }
 
 // Fill implements cache.Filler synchronously. Encodes the value into
