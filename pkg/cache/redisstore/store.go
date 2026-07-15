@@ -27,7 +27,10 @@ const (
 	readerSize     = 4 << 10
 )
 
-var ErrClosed = errors.New("redisstore: closed")
+var (
+	ErrClosed        = errors.New("redisstore: closed")
+	ErrValueTooLarge = errors.New("redisstore: value exceeds cache payload limit")
+)
 
 type poolKind uint8
 
@@ -219,6 +222,9 @@ func (s *Store) Fill(ctx context.Context, p store.Partition, key store.ContentKe
 	if err != nil {
 		return err
 	}
+	if err := validateFillSize(data); err != nil {
+		return err
+	}
 	return s.do(ctx, &s.set, encoded, data).err
 }
 
@@ -236,7 +242,17 @@ func (s *Store) FillShard(ctx context.Context, p store.Partition, key store.Cont
 	if err != nil {
 		return err
 	}
+	if err := validateFillSize(value); err != nil {
+		return err
+	}
 	return s.do(ctx, &s.set, encoded, value).err
+}
+
+func validateFillSize(value []byte) error {
+	if len(value) > maxBulkSize {
+		return fmt.Errorf("%w: %d > %d", ErrValueTooLarge, len(value), maxBulkSize)
+	}
+	return nil
 }
 
 func (s *Store) do(ctx context.Context, pool *workerPool, key [keySize]byte, value []byte) operationResult {
