@@ -162,6 +162,8 @@ spawn_daemon() {
 
 # ── Scenario helpers ──────────────────────────────────────────────────────
 
+# Benchmark-owned Rocks stores keep the prefilled dataset intact. Production
+# eviction would turn a backend-hit measurement into a miss/fallthrough test.
 start_local_only() {
     local data health rocks config
     data=$(free_port)
@@ -177,6 +179,7 @@ rpc_timeout: 5s
 freq:
   counters: 1M
   reset_after: 100K
+  disable_eviction: true
 rocks:
   path: $rocks
   disk_bytes: 4GiB
@@ -240,6 +243,7 @@ rpc_timeout: 5s
 freq:
   counters: 1M
   reset_after: 100K
+  disable_eviction: true
 tiers:
   - type: embedded
     rocks:
@@ -283,6 +287,7 @@ rpc_timeout: 5s
 freq:
   counters: 1M
   reset_after: 100K
+  disable_eviction: true
 rocks:
   path: $srocks
   disk_bytes: 4GiB

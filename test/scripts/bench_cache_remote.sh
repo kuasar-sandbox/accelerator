@@ -182,6 +182,8 @@ require() {
 
 # ── YAML generators ───────────────────────────────────────────────────────
 
+# Keep the prefilled dataset intact so the run measures shard hits rather than
+# frequency-eviction misses and origin fallthrough.
 gen_shard_yaml() {
     cat <<EOF
 mode: shard
@@ -193,6 +195,7 @@ rpc_timeout: 5s
 freq:
   counters: 1M
   reset_after: 100K
+  disable_eviction: true
 rocks:
   path: \$HOME/${REMOTE_DIR}/rocks-shard
   disk_bytes: ${SHARD_DISK}
