@@ -545,6 +545,52 @@ func TestStoreOversizedBulkDoesNotAllocateAndReconnects(t *testing.T) {
 	}
 }
 
+func TestStoreRejectsOversizedFillBeforeWrite(t *testing.T) {
+	server := newFakeRedis(t)
+	var sets atomic.Int64
+	server.setHook(func(command string, key, value []byte) fakeAction {
+		if command == "SET" {
+			sets.Add(1)
+		}
+		return fakeAction{}
+	})
+	s := openTestStore(t, server, nil)
+	value := make([]byte, maxBulkSize+1)
+
+	tests := []struct {
+		name string
+		fill func() error
+	}{
+		{name: "object", fill: func() error {
+			return s.Fill(context.Background(), store.PartitionChunk, testKey(17), value)
+		}},
+		{name: "shard", fill: func() error {
+			return s.FillShard(context.Background(), store.PartitionChunk, testKey(18), value)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.fill(); !errors.Is(err, ErrValueTooLarge) {
+				t.Fatalf("oversized Fill error=%v, want ErrValueTooLarge", err)
+			}
+		})
+	}
+	if got := sets.Load(); got != 0 {
+		t.Fatalf("oversized fills sent %d SET commands", got)
+	}
+	stats := s.Stats()
+	if stats.Sets != 0 || stats.BackendErrors != 0 || stats.Reconnects != 0 {
+		t.Fatalf("oversized fills changed backend stats: %+v", stats)
+	}
+
+	key := testKey(19)
+	if err := s.Fill(context.Background(), store.PartitionChunk, key, []byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+	result, blob, err := s.Get(context.Background(), store.PartitionChunk, key)
+	requireValue(t, result, blob, err, []byte("ok"))
+}
+
 func TestStoreCancelCompletionRaceDoesNotLeakBlob(t *testing.T) {
 	server := newFakeRedis(t)
 	server.setHook(func(command string, key, value []byte) fakeAction {
