@@ -601,6 +601,59 @@ func TestStoreProbeUsesDedicatedConnectionAndCountersStayClean(t *testing.T) {
 	}
 }
 
+func TestWorkerExitDropsInstalledConnection(t *testing.T) {
+	stop := make(chan struct{})
+	close(stop)
+	s := &Store{stop: stop}
+	pool := &workerPool{kind: getPool, store: s, available: make(chan *worker, 1)}
+	w := &worker{store: s, pool: pool, ops: make(chan *operation)}
+	workerConn, peerConn := net.Pipe()
+	defer peerConn.Close()
+	w.installConn(workerConn)
+	s.wg.Add(1)
+	go w.run()
+	s.wg.Wait()
+	if got := s.getConnected.Load(); got != 0 {
+		t.Fatalf("connected workers=%d, want 0", got)
+	}
+	requirePeerClosed(t, peerConn)
+}
+
+func TestReconnectDoesNotInstallConnectionAfterStop(t *testing.T) {
+	stop := make(chan struct{})
+	close(stop)
+	s := &Store{stop: stop}
+	pool := &workerPool{kind: getPool, store: s}
+	w := &worker{store: s, pool: pool}
+	workerConn, peerConn := net.Pipe()
+	defer peerConn.Close()
+	if w.installReconnected(workerConn) {
+		t.Fatal("connection installed after stop")
+	}
+	if got := s.getConnected.Load(); got != 0 {
+		t.Fatalf("connected workers=%d, want 0", got)
+	}
+	requirePeerClosed(t, peerConn)
+}
+
+func requirePeerClosed(t *testing.T, conn net.Conn) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		var one [1]byte
+		_, err := conn.Read(one[:])
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("connection remained open: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("connection remained open")
+	}
+}
+
 type trackingPool struct {
 	allocated atomic.Int64
 	released  atomic.Int64

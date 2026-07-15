@@ -1,0 +1,54 @@
+package main
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	healthgrpc "google.golang.org/grpc/health/grpc_health_v1"
+)
+
+type healthStatusRecorder struct {
+	mu       sync.Mutex
+	statuses []healthgrpc.HealthCheckResponse_ServingStatus
+}
+
+func (r *healthStatusRecorder) SetServingStatus(_ string, status healthgrpc.HealthCheckResponse_ServingStatus) {
+	r.mu.Lock()
+	r.statuses = append(r.statuses, status)
+	r.mu.Unlock()
+}
+
+func (r *healthStatusRecorder) snapshot() []healthgrpc.HealthCheckResponse_ServingStatus {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]healthgrpc.HealthCheckResponse_ServingStatus(nil), r.statuses...)
+}
+
+func TestRedisHealthMonitorCanBeJoinedBeforeFinalStatus(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	recorder := &healthStatusRecorder{}
+	done := startRedisHealthMonitor(ctx, recorder, nil)
+
+	deadline := time.Now().Add(time.Second)
+	for len(recorder.snapshot()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	statuses := recorder.snapshot()
+	if len(statuses) == 0 || statuses[len(statuses)-1] != healthgrpc.HealthCheckResponse_SERVING {
+		t.Fatalf("initial statuses=%v", statuses)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("health monitor did not stop after cancellation")
+	}
+	recorder.SetServingStatus("", healthgrpc.HealthCheckResponse_NOT_SERVING)
+	statuses = recorder.snapshot()
+	if statuses[len(statuses)-1] != healthgrpc.HealthCheckResponse_NOT_SERVING {
+		t.Fatalf("final statuses=%v", statuses)
+	}
+}

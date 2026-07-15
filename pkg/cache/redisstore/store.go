@@ -338,6 +338,7 @@ func (p *workerPool) release(w *worker) {
 
 func (w *worker) run() {
 	defer w.store.wg.Done()
+	defer w.dropConn()
 	for {
 		select {
 		case <-w.store.stop:
@@ -439,7 +440,9 @@ func (w *worker) reconnect() bool {
 		}
 		conn, err := w.store.dial()
 		if err == nil {
-			w.installConn(conn)
+			if !w.installReconnected(conn) {
+				return false
+			}
 			w.store.reconnects.Add(1)
 			return true
 		}
@@ -456,6 +459,17 @@ func (w *worker) reconnect() bool {
 				delay = time.Second
 			}
 		}
+	}
+}
+
+func (w *worker) installReconnected(conn net.Conn) bool {
+	select {
+	case <-w.store.stop:
+		_ = conn.Close()
+		return false
+	default:
+		w.installConn(conn)
+		return true
 	}
 }
 
