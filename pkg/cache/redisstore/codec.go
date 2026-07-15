@@ -9,11 +9,12 @@ import (
 	"strconv"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
+	"github.com/kuasar-sandbox/accelerator/pkg/cache/wire"
 )
 
 const (
 	maxRESPLine = 512
-	maxBulkSize = 1 << 30
+	maxBulkSize = wire.MaxFrameSize - wire.ResponseHeaderSize
 )
 
 var (
