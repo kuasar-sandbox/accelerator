@@ -131,3 +131,15 @@ func TestGetReconstructsParityBeforeRepair(t *testing.T) {
 		t.Fatal("4-of-5 Get returned corrupt data")
 	}
 }
+
+func TestValidShardIndexRejectsPrefixOnlyValue(t *testing.T) {
+	value := make([]byte, cache.ShardPrefixSize)
+	cache.EncodeShardPrefix(value, 4, 5)
+	if _, ok := validShardIndex(value, 5); ok {
+		t.Fatal("prefix-only shard counted as a usable hit")
+	}
+	value = append(value, 0x01)
+	if idx, ok := validShardIndex(value, 5); !ok || idx != 4 {
+		t.Fatalf("non-empty shard idx=%d ok=%v, want 4/true", idx, ok)
+	}
+}

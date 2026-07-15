@@ -225,8 +225,8 @@ func (t *impl) Get(ctx context.Context, p store.Partition, key store.ContentKey)
 				results <- res
 				return
 			}
-			idx, peerTotal, _, ok := cache.ParseShardPrefix(blob.Bytes())
-			if !ok || int(peerTotal) != total || int(idx) >= total {
+			idx, ok := validShardIndex(blob.Bytes(), total)
+			if !ok {
 				// Stale shard from a different RS scheme, corrupt prefix,
 				// or idx out of range. Release the blob and treat as an
 				// invalid response (not a confirmed miss — we don't want
@@ -239,7 +239,7 @@ func (t *impl) Get(ctx context.Context, p store.Partition, key store.ContentKey)
 				results <- res
 				return
 			}
-			res := shardResult{peerPos: peerPos, shardIdx: int(idx), blob: blob}
+			res := shardResult{peerPos: peerPos, shardIdx: idx, blob: blob}
 			if sample {
 				res.arrivedAt = time.Now()
 			}
@@ -480,13 +480,19 @@ func (t *impl) scheduleRepair(shards [][]byte, seenIdx []bool, missPeerPos []int
 		peerPos int
 		value   []byte
 	}
-	jobs := make([]repairJob, n)
+	jobs := make([]repairJob, 0, n)
 	for i := 0; i < n; i++ {
 		idx := missingIdx[i]
-		jobs[i] = repairJob{
+		if len(shards[idx]) == 0 {
+			continue
+		}
+		jobs = append(jobs, repairJob{
 			peerPos: missPeerPos[i],
 			value:   WrapShard(shards[idx], idx, total),
-		}
+		})
+	}
+	if len(jobs) == 0 {
+		return
 	}
 
 	// Snapshot router/peer state for the goroutine.
@@ -515,6 +521,14 @@ func releaseAll(blobs []cache.Blob) {
 			b.Release()
 		}
 	}
+}
+
+func validShardIndex(value []byte, wantTotal int) (int, bool) {
+	idx, total, data, ok := cache.ParseShardPrefix(value)
+	if !ok || len(data) == 0 || int(total) != wantTotal || int(idx) >= wantTotal {
+		return 0, false
+	}
+	return int(idx), true
 }
 
 // Fill implements cache.Filler synchronously. Encodes the value into
