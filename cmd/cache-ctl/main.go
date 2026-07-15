@@ -339,6 +339,7 @@ func cmdServe(args []string) {
 	}
 	healthCtx, healthCancel := context.WithCancel(context.Background())
 	defer healthCancel()
+	var healthMonitorDone <-chan struct{}
 	if cfg.HealthListen != "" {
 		grpcServer = grpc.NewServer()
 		hsrv := server.RegisterHealth(grpcServer)
@@ -368,7 +369,7 @@ func cmdServe(args []string) {
 		}
 		go grpcServer.Serve(healthLis)
 		if len(redisStores) > 0 {
-			go monitorRedisHealth(healthCtx, healthSrv, redisStores)
+			healthMonitorDone = startRedisHealthMonitor(healthCtx, healthSrv, redisStores)
 		}
 		fmt.Fprintf(os.Stderr, "cache-ctl serve mode=%s listen=%s health=%s\n", cfg.Mode, cfg.Listen, cfg.HealthListen)
 	} else {
@@ -418,6 +419,10 @@ func cmdServe(args []string) {
 			continue
 		default:
 			fmt.Fprintf(os.Stderr, "\ncache-ctl: received %v, shutting down...\n", sig)
+			healthCancel()
+			if healthMonitorDone != nil {
+				<-healthMonitorDone
+			}
 			if healthSrv != nil {
 				healthSrv.SetServingStatus("", healthgrpc.HealthCheckResponse_NOT_SERVING)
 			}
@@ -434,6 +439,17 @@ func cmdServe(args []string) {
 			return
 		}
 	}
+}
+
+func startRedisHealthMonitor(ctx context.Context, healthSrv interface {
+	SetServingStatus(string, healthgrpc.HealthCheckResponse_ServingStatus)
+}, stores []*redisstore.Store) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		monitorRedisHealth(ctx, healthSrv, stores)
+	}()
+	return done
 }
 
 func collectRedisStores(primary *redisstore.Store, comps *tieredComponents) []*redisstore.Store {
