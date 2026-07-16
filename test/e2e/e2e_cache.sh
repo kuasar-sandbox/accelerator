@@ -710,20 +710,27 @@ wait_ready "127.0.0.1:$REDIS_TIER_HEALTH_PORT"
     --output "$TMPDIR/test-redis-tier-cold.bin" --no-progress "$MKEY" 2>&1
 REDIS_TIER_WARM=0
 for _ in $(seq 1 100); do
-    "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$REDIS_TIER_PORT")" \
-        --output "$TMPDIR/test-redis-tier-probe.bin" --no-progress "$MKEY" >/dev/null 2>&1 || true
-    if "$BIN/cache-ctl" info --endpoint "127.0.0.1:$REDIS_TIER_HEALTH_PORT" --json | \
-        python3 -c 'import json,sys; assert json.load(sys.stdin)["tiered"]["tiers"][0]["hits"] >= 2' 2>/dev/null; then
-        REDIS_TIER_WARM=1
-        break
+    REDIS_TIER_PROBE_ORIGIN_BEFORE=$(origin_hits "127.0.0.1:$REDIS_TIER_HEALTH_PORT")
+    if "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$REDIS_TIER_PORT")" \
+        --output "$TMPDIR/test-redis-tier-probe.bin" --no-progress "$MKEY" >/dev/null 2>&1 &&
+        [ "$(payload_hash "$TMPDIR/test-redis-tier-probe.bin" 2>/dev/null)" = "$ORIG_HASH" ]; then
+        REDIS_TIER_PROBE_ORIGIN_AFTER=$(origin_hits "127.0.0.1:$REDIS_TIER_HEALTH_PORT")
+        if [ "$REDIS_TIER_PROBE_ORIGIN_BEFORE" = "$REDIS_TIER_PROBE_ORIGIN_AFTER" ]; then
+            REDIS_TIER_WARM=1
+            break
+        fi
     fi
     sleep 0.05
 done
-assert_eq "1" "$REDIS_TIER_WARM" "tiered Redis manifest and chunk became warm"
+assert_eq "1" "$REDIS_TIER_WARM" "tiered Redis complete artifact became warm without origin"
+REDIS_TIER_ORIGIN_BEFORE=$(origin_hits "127.0.0.1:$REDIS_TIER_HEALTH_PORT")
 "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$REDIS_TIER_PORT")" \
     --output "$TMPDIR/test-redis-tier-warm.bin" --no-progress "$MKEY" 2>&1
 REDIS_TIER_HASH=$(payload_hash "$TMPDIR/test-redis-tier-warm.bin")
 assert_eq "$ORIG_HASH" "$REDIS_TIER_HASH" "tiered Redis warm load roundtrip"
+REDIS_TIER_ORIGIN_AFTER=$(origin_hits "127.0.0.1:$REDIS_TIER_HEALTH_PORT")
+assert_eq "$REDIS_TIER_ORIGIN_BEFORE" "$REDIS_TIER_ORIGIN_AFTER" \
+    "tiered Redis warm load did not fall through to origin"
 if "$BIN/cache-ctl" info --endpoint "127.0.0.1:$REDIS_TIER_HEALTH_PORT" --json | \
     EXPECTED_REDIS_ENDPOINT="$REDIS_TIER_ENDPOINT" python3 -c 'import json,os,sys; d=json.load(sys.stdin); r=d["tiered"]["tiers"][0]; assert r["type"] == "redis" and r["hits"] > 0; assert r["redis"]["endpoint"] == os.environ["EXPECTED_REDIS_ENDPOINT"]; assert r["redis"]["transport"] == "tcp"'; then
     ok "tiered Redis over TCP reports warm hits and transport"
