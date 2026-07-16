@@ -80,6 +80,12 @@ wait_shard_present() {
     return 1
 }
 
+origin_hits() {
+    local endpoint=$1
+    "$BIN/cache-ctl" info --endpoint "$endpoint" --json | \
+        python3 -c 'import json,sys; print(json.load(sys.stdin)["tiered"]["origin"]["hits"])'
+}
+
 wait_manifest_load() {
     local config=$1 output=$2 key=$3 expected_hash=$4
     for _ in $(seq 1 100); do
@@ -96,6 +102,32 @@ wait_manifest_load() {
 # Allocate a free port.
 free_port() {
     python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
+}
+
+# Start a disposable origin over the already initialized FS store. Tests use
+# this process only for reads, then stop it without disrupting the main origin.
+start_store_reader() {
+    local name=$1
+    STORE_READER_PORT=$(free_port)
+    cat > "$TMPDIR/$name.yaml" <<EOF
+listen: 127.0.0.1:$STORE_READER_PORT
+backend: fs
+fs:
+  root: $STORE_ROOT
+  verify_content_key: true
+EOF
+    "$BIN/store-ctl" serve --config "$TMPDIR/$name.yaml" >"$TMPDIR/$name.log" 2>&1 &
+    STORE_READER_PID=$!
+    PIDS+=("$STORE_READER_PID")
+    for _ in $(seq 1 50); do
+        if (echo >/dev/tcp/127.0.0.1/"$STORE_READER_PORT") 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "ERROR: store reader $name did not listen on 127.0.0.1:$STORE_READER_PORT" >&2
+    cat "$TMPDIR/$name.log" >&2 || true
+    return 1
 }
 
 # Start an isolated Redis protocol test server with both loopback TCP and UDS.
@@ -138,9 +170,9 @@ payload_hash() {
     tar xOf "$1" | sha256sum | awk '{print $1}'
 }
 
-# Prepare a ~512 KiB payload wrapped in a tarstream artifact — manifest-ctl
-# ingests tarstream-contained payloads, not raw bytes.
-dd if=/dev/urandom of="$TMPDIR/payload.bin" bs=1024 count=512 2>/dev/null
+# Prepare a 2 MiB payload wrapped in a tarstream artifact. The default CDC max
+# is 1 MiB, so the readiness checks below always exercise multiple chunks.
+dd if=/dev/urandom of="$TMPDIR/payload.bin" bs=1024 count=2048 2>/dev/null
 tar cf "$TMPDIR/test.bin" -C "$TMPDIR" payload.bin
 
 # ============================================================
@@ -222,13 +254,26 @@ MKEY=$("$BIN/manifest-ctl" store $COMMON --no-progress "$TMPDIR/test.bin")
 ORIG_HASH=$(payload_hash "$TMPDIR/test.bin")
 echo "  Stored. SHA256=$ORIG_HASH  manifest-key=$MKEY"
 
+# The store is empty before the main artifact is ingested, so this snapshot is
+# exactly the set of non-zero chunks referenced by MKEY. Capture it before
+# Test 0 adds its unrelated object.
+mapfile -t MAIN_CHUNK_KEYS < <(find "$STORE_ROOT/chunk/G1" -type f -printf '%f\n' | sort)
+if [ "${#MAIN_CHUNK_KEYS[@]}" -lt 2 ]; then
+    echo "ERROR: 2 MiB main artifact produced fewer than two CDC chunks" >&2
+    exit 1
+fi
+MAIN_CACHE_OBJECTS=("manifest:$MKEY")
+for chunk_key in "${MAIN_CHUNK_KEYS[@]}"; do
+    MAIN_CACHE_OBJECTS+=("chunk:$chunk_key")
+done
+
 # ============================================================
 echo ""
 echo "=== Test 0: store-ctl standalone roundtrip ==="
 # Write + read a distinct manifest through manifest-ctl → store-ctl
 # to prove the standalone path is healthy before any cache-ctl
 # tests run. Uses a fresh 64 KiB payload so it doesn't collide with
-# the main 512 KiB blob's chunks.
+# the main artifact's chunks.
 dd if=/dev/urandom of="$TMPDIR/store0-payload.bin" bs=1024 count=64 2>/dev/null
 tar cf "$TMPDIR/store0.bin" -C "$TMPDIR" store0-payload.bin
 MKEY0=$("$BIN/manifest-ctl" store $COMMON --no-progress "$TMPDIR/store0.bin")
@@ -319,6 +364,9 @@ assert_eq "obj-on-shard" "$GOT" "object put/get on shard mode (unified handler)"
 # ============================================================
 echo ""
 echo "=== Test 5: tiered mode (embedded only) — manifest-ctl load through cache ==="
+start_store_reader embedded-origin
+TIERED_ORIGIN_PORT=$STORE_READER_PORT
+TIERED_ORIGIN_PID=$STORE_READER_PID
 TIERED_PORT=$(free_port)
 TIERED_HEALTH_PORT=$(free_port)
 cat > "$TMPDIR/tiered.yaml" <<EOF
@@ -340,7 +388,7 @@ tiers:
 origin:
   type: store
   store:
-    endpoint: 127.0.0.1:$STORE_PORT
+    endpoint: 127.0.0.1:$TIERED_ORIGIN_PORT
     pool: 2
     timeout: 2s
   max_inflight: 16
@@ -350,20 +398,30 @@ EOF
 TIERED_PID=$!
 PIDS+=($TIERED_PID)
 wait_ready "127.0.0.1:$TIERED_HEALTH_PORT"
+TIERED_MANIFEST_CONFIG=$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")
 
 # Load via cache (first read — cold, fills embedded from origin).
-"$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
+"$BIN/manifest-ctl" load --manifest-config "$TIERED_MANIFEST_CONFIG" \
     --output "$TMPDIR/test-cached.bin" --no-progress "$MKEY" 2>&1
 CACHED_HASH=$(payload_hash "$TMPDIR/test-cached.bin")
 assert_eq "$ORIG_HASH" "$CACHED_HASH" "tiered load roundtrip (cold)"
+kill "$TIERED_ORIGIN_PID" 2>/dev/null || true
+wait "$TIERED_ORIGIN_PID" 2>/dev/null || true
+if wait_manifest_load "$TIERED_MANIFEST_CONFIG" "$TMPDIR/test-embedded-probe.bin" \
+    "$MKEY" "$ORIG_HASH"; then
+    ok "tiered embedded cold fill became readable with origin stopped"
+else
+    fail "tiered embedded cold fill did not become readable with origin stopped"
+    exit 1
+fi
 
 # ============================================================
 echo ""
 echo "=== Test 6: tiered mode — warm read (second load hits embedded cache) ==="
-"$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
+"$BIN/manifest-ctl" load --manifest-config "$TIERED_MANIFEST_CONFIG" \
     --output "$TMPDIR/test-warm.bin" --no-progress "$MKEY" 2>&1
 WARM_HASH=$(payload_hash "$TMPDIR/test-warm.bin")
-assert_eq "$ORIG_HASH" "$WARM_HASH" "tiered load roundtrip (warm)"
+assert_eq "$ORIG_HASH" "$WARM_HASH" "tiered embedded warm load without origin"
 
 # ============================================================
 echo ""
@@ -428,13 +486,6 @@ freq:
   counters: 1M
   reset_after: 100K
 tiers:
-  - type: embedded
-    rocks:
-      path: $TMPDIR/rocks-tiered-ec
-      disk_bytes: 1GiB
-      mem_ratio: 0.05
-      direct_reads: false
-      bloom_bits: 10
   - type: ec
     cluster:
       data_shards: 4
@@ -466,6 +517,24 @@ wait_ready "127.0.0.1:$EC_TIERED_HEALTH_PORT"
 EC_HASH=$(payload_hash "$TMPDIR/test-ec.bin")
 assert_eq "$ORIG_HASH" "$EC_HASH" "tiered+EC load roundtrip"
 
+# Observe the manifest and every referenced chunk through each shard peer's
+# public data plane before injecting a failure.
+ALL_SHARDS_PRESENT=1
+for peer_port in "${SHARD_PORTS[@]}"; do
+    for pair in "${MAIN_CACHE_OBJECTS[@]}"; do
+        namespace=${pair%%:*}
+        object_key=${pair#*:}
+        if ! wait_shard_present "127.0.0.1:$peer_port" "$namespace" "$object_key"; then
+            ALL_SHARDS_PRESENT=0
+        fi
+    done
+done
+assert_eq "1" "$ALL_SHARDS_PRESENT" "EC cold fill populated every embedded shard peer"
+if [ "$ALL_SHARDS_PRESENT" != "1" ]; then
+    exit 1
+fi
+EC_ORIGIN_HITS_BEFORE=$(origin_hits "127.0.0.1:$EC_TIERED_HEALTH_PORT")
+
 # ============================================================
 echo ""
 echo "=== Test 9: EC failure injection — kill 1 shard node ==="
@@ -473,11 +542,14 @@ echo "=== Test 9: EC failure injection — kill 1 shard node ==="
 kill "${SHARD_PIDS[0]}" 2>/dev/null || true
 wait "${SHARD_PIDS[0]}" 2>/dev/null || true
 
-# Second load (warm from embedded + EC with 1 node down — should still work).
+# Second load must reconstruct from four EC shards without falling through.
 "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$EC_TIERED_PORT")" \
     --output "$TMPDIR/test-ec-1down.bin" --no-progress "$MKEY" 2>&1
 DOWN1_HASH=$(payload_hash "$TMPDIR/test-ec-1down.bin")
 assert_eq "$ORIG_HASH" "$DOWN1_HASH" "tiered+EC load with 1 shard down"
+EC_ORIGIN_HITS_AFTER=$(origin_hits "127.0.0.1:$EC_TIERED_HEALTH_PORT")
+assert_eq "$EC_ORIGIN_HITS_BEFORE" "$EC_ORIGIN_HITS_AFTER" \
+    "EC load with 1 shard down did not fall through to origin"
 
 # ============================================================
 echo ""
@@ -651,6 +723,9 @@ echo ""
 echo "=== Test 13: tiered type=redis — cold fill and warm hit ==="
 start_redis redis-tiered
 REDIS_TIER_ENDPOINT="127.0.0.1:$REDIS_TCP_PORT"
+start_store_reader redis-tier-origin
+REDIS_TIER_ORIGIN_PORT=$STORE_READER_PORT
+REDIS_TIER_ORIGIN_PID=$STORE_READER_PID
 REDIS_TIER_PORT=$(free_port)
 REDIS_TIER_HEALTH_PORT=$(free_port)
 cat > "$TMPDIR/redis-tiered.yaml" <<EOF
@@ -668,7 +743,7 @@ tiers:
 origin:
   type: store
   store:
-    endpoint: 127.0.0.1:$STORE_PORT
+    endpoint: 127.0.0.1:$REDIS_TIER_ORIGIN_PORT
     pool: 2
     timeout: 2s
   max_inflight: 16
@@ -676,24 +751,22 @@ EOF
 "$BIN/cache-ctl" serve --config "$TMPDIR/redis-tiered.yaml" &
 PIDS+=($!)
 wait_ready "127.0.0.1:$REDIS_TIER_HEALTH_PORT"
-"$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$REDIS_TIER_PORT")" \
+REDIS_TIER_MANIFEST_CONFIG=$(accel_cfg_for_cache "127.0.0.1:$REDIS_TIER_PORT")
+"$BIN/manifest-ctl" load --manifest-config "$REDIS_TIER_MANIFEST_CONFIG" \
     --output "$TMPDIR/test-redis-tier-cold.bin" --no-progress "$MKEY" 2>&1
-REDIS_TIER_WARM=0
-for _ in $(seq 1 100); do
-    "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$REDIS_TIER_PORT")" \
-        --output "$TMPDIR/test-redis-tier-probe.bin" --no-progress "$MKEY" >/dev/null 2>&1 || true
-    if "$BIN/cache-ctl" info --endpoint "127.0.0.1:$REDIS_TIER_HEALTH_PORT" --json | \
-        python3 -c 'import json,sys; assert json.load(sys.stdin)["tiered"]["tiers"][0]["hits"] >= 2' 2>/dev/null; then
-        REDIS_TIER_WARM=1
-        break
-    fi
-    sleep 0.05
-done
-assert_eq "1" "$REDIS_TIER_WARM" "tiered Redis manifest and chunk became warm"
-"$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$REDIS_TIER_PORT")" \
+kill "$REDIS_TIER_ORIGIN_PID" 2>/dev/null || true
+wait "$REDIS_TIER_ORIGIN_PID" 2>/dev/null || true
+if wait_manifest_load "$REDIS_TIER_MANIFEST_CONFIG" "$TMPDIR/test-redis-tier-probe.bin" \
+    "$MKEY" "$ORIG_HASH"; then
+    ok "tiered Redis cold fill became readable with origin stopped"
+else
+    fail "tiered Redis cold fill did not become readable with origin stopped"
+    exit 1
+fi
+"$BIN/manifest-ctl" load --manifest-config "$REDIS_TIER_MANIFEST_CONFIG" \
     --output "$TMPDIR/test-redis-tier-warm.bin" --no-progress "$MKEY" 2>&1
 REDIS_TIER_HASH=$(payload_hash "$TMPDIR/test-redis-tier-warm.bin")
-assert_eq "$ORIG_HASH" "$REDIS_TIER_HASH" "tiered Redis warm load roundtrip"
+assert_eq "$ORIG_HASH" "$REDIS_TIER_HASH" "tiered Redis warm load without origin"
 if "$BIN/cache-ctl" info --endpoint "127.0.0.1:$REDIS_TIER_HEALTH_PORT" --json | \
     EXPECTED_REDIS_ENDPOINT="$REDIS_TIER_ENDPOINT" python3 -c 'import json,os,sys; d=json.load(sys.stdin); r=d["tiered"]["tiers"][0]; assert r["type"] == "redis" and r["hits"] > 0; assert r["redis"]["endpoint"] == os.environ["EXPECTED_REDIS_ENDPOINT"]; assert r["redis"]["transport"] == "tcp"'; then
     ok "tiered Redis over TCP reports warm hits and transport"
@@ -776,13 +849,11 @@ wait_ready "127.0.0.1:$REDIS_EC_HEALTH_PORT"
 "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$REDIS_EC_PORT")" \
     --output "$TMPDIR/test-redis-ec-cold.bin" --no-progress "$MKEY" 2>&1
 
-# The main test artifact has one chunk (asserted by the ingest output above).
-# Select its larger content object rather than the 64 KiB standalone Test 0
-# object, then prove EC fill wrote both namespaces to every Redis shard peer.
-MAIN_CHUNK_KEY=$(find "$STORE_ROOT/chunk/G1" -type f -printf '%s %f\n' | sort -nr | head -1 | awk '{print $2}')
+# Prove EC fill wrote the manifest and every referenced chunk to each Redis
+# shard peer.
 ALL_SHARDS_PRESENT=1
 for peer_port in "${REDIS_SHARD_PORTS[@]}"; do
-    for pair in "manifest:$MKEY" "chunk:$MAIN_CHUNK_KEY"; do
+    for pair in "${MAIN_CACHE_OBJECTS[@]}"; do
         namespace=${pair%%:*}
         object_key=${pair#*:}
         if ! wait_shard_present "127.0.0.1:$peer_port" "$namespace" "$object_key"; then
@@ -791,6 +862,9 @@ for peer_port in "${REDIS_SHARD_PORTS[@]}"; do
     done
 done
 assert_eq "1" "$ALL_SHARDS_PRESENT" "EC cold fill populated every Redis shard peer"
+if [ "$ALL_SHARDS_PRESENT" != "1" ]; then
+    exit 1
+fi
 
 # Stop one Redis process without closing its sockets. The corresponding shard
 # cache enters Redis drain after the EC coordinator obtains four fast shards
@@ -832,7 +906,7 @@ wait_ready "127.0.0.1:${REDIS_SHARD_HEALTH_PORTS[4]}"
 
 ALL_SHARDS_PRESENT=1
 for peer_port in "${REDIS_SHARD_PORTS[@]}"; do
-    for pair in "manifest:$MKEY" "chunk:$MAIN_CHUNK_KEY"; do
+    for pair in "${MAIN_CACHE_OBJECTS[@]}"; do
         namespace=${pair%%:*}
         object_key=${pair#*:}
         if ! "$BIN/cache-ctl" shard get --endpoint "127.0.0.1:$peer_port" \
