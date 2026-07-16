@@ -7,6 +7,21 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 )
 
+func TestStringListFlagPreservesEndpoints(t *testing.T) {
+	var endpoints stringListFlag
+	for _, endpoint := range []string{"127.0.0.1:7701", "127.0.0.1:7702"} {
+		if err := endpoints.Set(endpoint); err != nil {
+			t.Fatalf("Set(%q): %v", endpoint, err)
+		}
+	}
+	if got, want := []string(endpoints), []string{"127.0.0.1:7701", "127.0.0.1:7702"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("endpoints = %v, want %v", got, want)
+	}
+	if got, want := endpoints.String(), "127.0.0.1:7701,127.0.0.1:7702"; got != want {
+		t.Fatalf("String() = %q, want %q", got, want)
+	}
+}
+
 func TestDiffCountersIncludesRedisWindow(t *testing.T) {
 	beforeRedis := &cache.RedisStats{
 		Endpoint:         "/run/redis.sock",

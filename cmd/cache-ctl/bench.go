@@ -12,6 +12,7 @@ import (
 	"runtime/pprof"
 	"runtime/trace"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +20,17 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/client"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
+
+type stringListFlag []string
+
+func (v *stringListFlag) String() string {
+	return strings.Join(*v, ",")
+}
+
+func (v *stringListFlag) Set(value string) error {
+	*v = append(*v, value)
+	return nil
+}
 
 // selectKey chooses the next read key per the access pattern, optionally
 // drawing a cold (L2-miss → origin/L3) key with probability missRatio. warm
@@ -102,7 +114,8 @@ func cmdBench(args []string) {
 	fs := flag.NewFlagSet("bench", flag.ExitOnError)
 	endpoint := fs.String("endpoint", "", "cache-ctl data endpoint, bench target (overrides CACHE_ENDPOINT env)")
 	prefillEndpoint := fs.String("prefill-endpoint", "", "separate prefill write endpoint (default: use --endpoint; non-empty implies --mode get)")
-	infoEndpoint := fs.String("info-endpoint", "", "bench target's Info gRPC endpoint (HealthListen); enables bench-window counter printout")
+	var infoEndpoints stringListFlag
+	fs.Var(&infoEndpoints, "info-endpoint", "Info gRPC endpoint (HealthListen), repeatable; the first endpoint is the bench target")
 	concurrency := fs.Int("concurrency", 8, "number of parallel workers")
 	duration := fs.Duration("duration", 10*time.Second, "benchmark duration")
 	valueSize := fs.Int("value-size", 256*1024, "value size in bytes")
@@ -252,8 +265,8 @@ func cmdBench(args []string) {
 			}
 			// Verify the observable condition needed by the measurement: every
 			// working-set key can complete a full pass from tier 0.
-			if *infoEndpoint != "" {
-				if err := waitFirstTierWarm(benchReader, *infoEndpoint, store.Partition(*namespace), keys, 30*time.Second); err != nil {
+			if len(infoEndpoints) > 0 {
+				if err := waitFirstTierWarm(benchReader, infoEndpoints[0], store.Partition(*namespace), keys, 30*time.Second); err != nil {
 					fatal("bench target did not become warm: %v", err)
 				}
 			}
@@ -263,18 +276,18 @@ func cmdBench(args []string) {
 
 	// Baseline counter snapshot. Captured after prefill and warm verification
 	// so the bench window excludes the Put/Get+backfill storm that
-	// populated the working set. Soft-fail: if --info-endpoint is empty
-	// or the dial errors, we skip the delta print; the bench runs.
-	var baseline cache.DaemonStats
-	var haveBaseline bool
-	if *infoEndpoint != "" {
-		b, err := fetchInfo(*infoEndpoint, 3*time.Second)
+	// populated the working set. Each endpoint soft-fails independently, so one
+	// unavailable shard does not prevent the benchmark itself from running.
+	baselines := make([]cache.DaemonStats, len(infoEndpoints))
+	haveBaseline := make([]bool, len(infoEndpoints))
+	for i, endpoint := range infoEndpoints {
+		b, err := fetchInfo(endpoint, 3*time.Second)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "warn: baseline info fetch failed: %v\n", err)
-		} else {
-			baseline = b
-			haveBaseline = true
+			fmt.Fprintf(os.Stderr, "warn: baseline info fetch %s failed: %v\n", endpoint, err)
+			continue
 		}
+		baselines[i] = b
+		haveBaseline[i] = true
 	}
 
 	// Benchmark.
@@ -427,16 +440,19 @@ func cmdBench(args []string) {
 
 	// Final counter snapshot. Fill counters increment when work is initiated, so
 	// the delta is independent of whether a backend write is still completing.
-	var final cache.DaemonStats
-	haveFinal := false
-	if haveBaseline {
-		f, err := fetchInfo(*infoEndpoint, 3*time.Second)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "warn: final info fetch failed: %v\n", err)
-		} else {
-			final = f
-			haveFinal = true
+	finals := make([]cache.DaemonStats, len(infoEndpoints))
+	haveFinal := make([]bool, len(infoEndpoints))
+	for i, endpoint := range infoEndpoints {
+		if !haveBaseline[i] {
+			continue
 		}
+		f, err := fetchInfo(endpoint, 3*time.Second)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warn: final info fetch %s failed: %v\n", endpoint, err)
+			continue
+		}
+		finals[i] = f
+		haveFinal[i] = true
 	}
 
 	// Compute percentiles.
@@ -483,9 +499,14 @@ func cmdBench(args []string) {
 		fmt.Printf("    gc-pause-ms:  %d\n", pauseNs/1_000_000)
 	}
 
-	if haveFinal {
-		delta := diffCounters(baseline, final)
-		printBenchWindow(delta)
+	for i, endpoint := range infoEndpoints {
+		if !haveFinal[i] {
+			continue
+		}
+		if len(infoEndpoints) > 1 {
+			fmt.Printf("  info endpoint: %s\n", endpoint)
+		}
+		printBenchWindow(diffCounters(baselines[i], finals[i]))
 	}
 }
 

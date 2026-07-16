@@ -49,6 +49,7 @@ set -euo pipefail
 #   GET_CONCS="" PUT_CONCS="1 4 8"        bash test/scripts/bench_cache.sh  # PUT only
 
 BENCH_SCENARIO="${BENCH_SCENARIO:-local}"
+BENCH_BACKEND_EXPLICIT="${BENCH_BACKEND+x}"
 BENCH_BACKEND="${BENCH_BACKEND:-embedded}"
 BENCH_EXTERNAL_ENDPOINT="${BENCH_EXTERNAL_ENDPOINT:-}"
 BENCH_EXTERNAL_PREFILL_ENDPOINT="${BENCH_EXTERNAL_PREFILL_ENDPOINT:-}"
@@ -88,6 +89,7 @@ RAW="$WORKDIR/raw.tsv"
 BENCH_ENDPOINT=""
 PREFILL_ENDPOINT=""
 HEALTH_ENDPOINT=""
+SHARD_HEALTH_ENDPOINTS=()
 
 # ALL_PIDS holds every daemon PID we spawn so cleanup can reap them on
 # exit. External mode leaves this array empty and the trap is a noop.
@@ -173,11 +175,28 @@ if [ -z "$BENCH_EXTERNAL_ENDPOINT" ] && [ "$BENCH_BACKEND" = redis ]; then
                 echo "ERROR: redis tiered-shard-l2 requires exactly 5 REDIS_SHARD_ENDPOINTS" >&2
                 exit 1
             fi
+            declare -A seen_redis_shard_endpoints=()
+            for endpoint in "${REDIS_SHARD_ENDPOINT_ARRAY[@]}"; do
+                if [ -n "${seen_redis_shard_endpoints[$endpoint]+x}" ]; then
+                    echo "ERROR: redis tiered-shard-l2 requires distinct REDIS_SHARD_ENDPOINTS; duplicate: $endpoint" >&2
+                    exit 1
+                fi
+                seen_redis_shard_endpoints[$endpoint]=1
+            done
             ;;
     esac
 fi
 
-if [ "$COLD_PREFILL" -ne 0 ] || [ "$MISS_RATIO" != 0 ]; then
+miss_ratio_nonzero() {
+    awk -v ratio="$MISS_RATIO" 'BEGIN { exit !(ratio + 0 != 0) }'
+}
+
+if [ "$COLD_PREFILL" -eq 0 ] && miss_ratio_nonzero; then
+    echo "ERROR: MISS_RATIO requires COLD_PREFILL > 0" >&2
+    exit 1
+fi
+
+if [ "$COLD_PREFILL" -ne 0 ] || miss_ratio_nonzero; then
     if [ "$BENCH_SCENARIO" = local ] && [ -z "$BENCH_EXTERNAL_PREFILL_ENDPOINT" ]; then
         echo "ERROR: COLD_PREFILL/MISS_RATIO require a split prefill endpoint" >&2
         exit 1
@@ -399,6 +418,9 @@ EOF
         shard_peers+=("  - id: s$i")
         shard_peers+=("    endpoint: 127.0.0.1:$sdata")
         shard_eps+=("127.0.0.1:$sdata")
+        if [ "$BENCH_BACKEND" = redis ]; then
+            SHARD_HEALTH_ENDPOINTS+=("127.0.0.1:$shealth")
+        fi
     done
 
     local data health pprof config
@@ -481,12 +503,15 @@ run_bench() {
         prefill_flag=(--prefill-endpoint "$PREFILL_ENDPOINT")
     fi
 
-    # Thread the info endpoint (bench target's HealthListen port) through
-    # so cache-ctl bench can snapshot daemon counters before/after the
-    # bench window and print hit rates that exclude prefill noise.
+    # Thread the bench target's HealthListen port through first, followed by
+    # Redis EC shard Info endpoints. cache-ctl bench snapshots each daemon
+    # before/after the window so the counters exclude prefill noise.
     local info_flag=()
     if [ -n "$HEALTH_ENDPOINT" ]; then
         info_flag=(--info-endpoint "$HEALTH_ENDPOINT")
+        for endpoint in "${SHARD_HEALTH_ENDPOINTS[@]}"; do
+            info_flag+=(--info-endpoint "$endpoint")
+        done
     fi
 
     # Run the bench; capture stdout+stderr so the awk parser below
@@ -518,10 +543,13 @@ run_bench() {
     fi
 
     local rc=0
-    local workload_flags=(--access "$ACCESS" --zipf-s "$ZIPF_S" --timeout "$TIMEOUT")
-    if [ "$COLD_PREFILL" -gt 0 ]; then
-        workload_flags+=(--cold-prefill "$COLD_PREFILL" --miss-ratio "$MISS_RATIO")
-    fi
+    local workload_flags=(
+        --access "$ACCESS"
+        --zipf-s "$ZIPF_S"
+        --timeout "$TIMEOUT"
+        --cold-prefill "$COLD_PREFILL"
+        --miss-ratio "$MISS_RATIO"
+    )
     if [ -n "$CLIENT_CORES" ]; then
         taskset -c "$CLIENT_CORES" "$BIN/cache-ctl" bench \
             --endpoint "$BENCH_ENDPOINT" \
@@ -567,8 +595,8 @@ run_bench() {
                    mode, conc, ops, thrpt, bw, p50, p99, p999
         }' "$out" >> "$RAW"
 
-    # Surface the bench-window counter section printed by cache-ctl bench
-    # (only present when --info-endpoint was threaded through).
+    # Surface every bench-window counter section printed by cache-ctl bench
+    # (only present when at least one --info-endpoint was supplied).
     awk '/^  ── bench-window counters ──$/,0' "$out" >&2
 }
 
@@ -603,12 +631,18 @@ fi
 # snapshot here.
 SCOUNT=$(count_cores "$SERVER_CORES")
 CCOUNT=$(count_cores "$CLIENT_CORES")
+REPORT_BACKEND="$BENCH_BACKEND"
+if [ -n "$BENCH_EXTERNAL_ENDPOINT" ] && [ -z "$BENCH_BACKEND_EXPLICIT" ]; then
+    REPORT_BACKEND="external/unknown"
+fi
 
 awk -v scores="${SERVER_CORES:-unbound}" -v ccores="${CLIENT_CORES:-unbound}" \
-    -v backend="$BENCH_BACKEND" -v backend_ep="${REDIS_ENDPOINT:-$REDIS_SHARD_ENDPOINTS}" \
+    -v backend="$REPORT_BACKEND" -v backend_ep="${REDIS_ENDPOINT:-$REDIS_SHARD_ENDPOINTS}" \
     -v bcores="${BACKEND_CORES:-external/unbound}" \
     -v scount="$SCOUNT" -v ccount="$CCOUNT" \
-    -v valsz="$VALUE_SIZE" -v duration="$DURATION" \
+    -v valsz="$VALUE_SIZE" -v duration="$DURATION" -v prefill="$PREFILL" \
+    -v access="$ACCESS" -v zipf_s="$ZIPF_S" -v cold_prefill="$COLD_PREFILL" \
+    -v miss_ratio="$MISS_RATIO" -v timeout="$TIMEOUT" \
     -v scenario="$BENCH_SCENARIO" -v bench_ep="$BENCH_ENDPOINT" -v prefill_ep="$PREFILL_ENDPOINT" '
 function commify(n,   s, out, len) {
     s = sprintf("%d", n)
@@ -691,9 +725,13 @@ END {
         printf "  Prefill EP   : %s\n", prefill_ep
     }
     printf "  Server cores : %s\n", fmt_cores(scores, scount)
-    if (backend == "redis") printf "  Backend cores: %s\n", bcores
+    if (backend == "redis" || backend == "external/unknown") printf "  Backend cores: %s\n", bcores
     printf "  Client cores : %s\n", fmt_cores(ccores, ccount)
     printf "  Value size   : %s\n", fmt_size(valsz+0)
+    printf "  Prefill      : %s warm / %s cold keys\n", prefill, cold_prefill
+    printf "  Access       : %s (zipf-s=%s)\n", access, zipf_s
+    printf "  Miss ratio   : %s\n", miss_ratio
+    printf "  Op timeout   : %s\n", timeout
     printf "  Duration     : %s per run\n", duration
     print ""
     if (ng > 0) emit_section("GET", ng)

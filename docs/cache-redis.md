@@ -177,7 +177,7 @@ without changing its client workload:
 
 ```bash
 # Embedded RocksDB baseline.
-SERVER_CORES=0-3 CLIENT_CORES=8-11 \
+SERVER_CORES=0-7 CLIENT_CORES=8-11 \
   ACCESS=uniform GET_CONCS='1 4 16 32' MIXED_CONCS=8 \
   bash test/scripts/bench_cache.sh
 
