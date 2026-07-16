@@ -6,7 +6,8 @@
 # Inputs (env):
 #   ROCKSDB_TARBALL         URL or local path; supports "url#filename" form.
 #                           Default: facebook/rocksdb v9.7.4 github archive.
-#   ROCKSDB_TARBALL_SHA256  Optional expected SHA256. Empty → skip verify.
+#   ROCKSDB_TARBALL_SHA256  Optional exact archive SHA256 for a stable mirror.
+#   ROCKSDB_SOURCE_SHA256   Expected normalized source-tree SHA256.
 #   BUILD_DIR               Absolute path to the per-arch build directory
 #                           (e.g. build/x86_64). librocksdb.a lands at
 #                           $BUILD_DIR/rocksdb/lib/librocksdb.a.
@@ -28,6 +29,7 @@ source "$script_dir/common.sh"
 
 : "${ROCKSDB_TARBALL:=https://codeload.github.com/facebook/rocksdb/tar.gz/refs/tags/v9.7.4#rocksdb-9.7.4.tar.gz}"
 : "${ROCKSDB_TARBALL_SHA256:=}"
+: "${ROCKSDB_SOURCE_SHA256:=641e8539ff6fbca16f41d1a4b3ad5ce6838088a42599bbb01352fd299b778e5f}"
 : "${BUILD_DIR:=$(pwd)/build}"
 : "${TARGET_ARCH:=$(uname -m)}"
 : "${CROSS_PREFIX:=}"
@@ -53,6 +55,9 @@ tarball="$(resolve_tarball "$ROCKSDB_TARBALL" "$ROCKSDB_TARBALL_SHA256")"
 shared_src_root="$(dirname "$BUILD_DIR")"   # = build/
 src_dir="$shared_src_root/src/rocksdb"
 extract_tarball "$tarball" "$src_dir" >/dev/null
+source_sha256="$(source_tree_sha256 "$src_dir")"
+[ "$source_sha256" = "$ROCKSDB_SOURCE_SHA256" ] \
+    || die "rocksdb source tree checksum mismatch: got $source_sha256"
 
 # Out-of-source build: object files under $prefix/build, install into
 # $prefix/{lib,include}. Keeps source tree clean and per-arch builds
