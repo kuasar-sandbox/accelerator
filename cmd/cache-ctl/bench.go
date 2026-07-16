@@ -41,6 +41,54 @@ func selectKey(access string, warm, cold [][32]byte, missRatio float64, rng *mra
 	}
 }
 
+// waitFirstTierWarm verifies the data-plane condition the benchmark needs: one
+// complete pass over the working set is served by tier 0. Counter deltas are
+// used instead of waiting for implementation goroutines, so nested tiers and
+// backend retries cannot produce a false-ready result.
+func waitFirstTierWarm(reader client.GetCloser, infoEndpoint string, p store.Partition, keys [][32]byte, timeout time.Duration) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	for {
+		before, err := fetchInfo(infoEndpoint, 3*time.Second)
+		if err != nil {
+			return err
+		}
+		if before.Tiered == nil || len(before.Tiered.Tiers) == 0 {
+			return fmt.Errorf("Info endpoint does not report a tiered cache")
+		}
+		for _, key := range keys {
+			_, blob, err := reader.Get(ctx, p, key)
+			if err != nil {
+				return fmt.Errorf("warm verification get: %w", err)
+			}
+			if blob == nil {
+				return fmt.Errorf("warm verification get: key %x not found", key)
+			}
+			blob.Release()
+		}
+		after, err := fetchInfo(infoEndpoint, 3*time.Second)
+		if err != nil {
+			return err
+		}
+		if after.Tiered == nil || len(after.Tiered.Tiers) == 0 {
+			return fmt.Errorf("Info endpoint stopped reporting a tiered cache")
+		}
+		beforeHits := before.Tiered.Tiers[0].Hits
+		afterHits := after.Tiered.Tiers[0].Hits
+		if afterHits >= beforeHits && afterHits-beforeHits >= uint64(len(keys)) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("tier 0 did not serve a complete warm pass within %s", timeout)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
 // cmdBench runs a concurrency sweep + latency percentiles against a
 // cache-ctl endpoint. See docs/cache.md for a full flag reference.
 //
@@ -202,23 +250,18 @@ func cmdBench(args []string) {
 				}
 				blob.Release()
 			}
-			// After warm, the bench target's TieredCache still has
-			// in-flight fill goroutines (each warm Get triggers a
-			// startFill goroutine that writes back to L2; with sync
-			// EC.Fill those block until all shards land on peers).
-			// Block here until they've drained so the baseline snapshot
-			// below and the first bench window don't observe a mid-
-			// drain state that produces spurious misses.
+			// Verify the observable condition needed by the measurement: every
+			// working-set key can complete a full pass from tier 0.
 			if *infoEndpoint != "" {
-				if err := waitFills(*infoEndpoint, 30*time.Second); err != nil {
-					fmt.Fprintf(os.Stderr, "warn: WaitFills failed: %v\n", err)
+				if err := waitFirstTierWarm(benchReader, *infoEndpoint, store.Partition(*namespace), keys, 30*time.Second); err != nil {
+					fatal("bench target did not become warm: %v", err)
 				}
 			}
 		}
 		fmt.Fprintln(os.Stderr, "Prefill done.")
 	}
 
-	// Baseline counter snapshot. Captured after prefill+warm+WaitFills
+	// Baseline counter snapshot. Captured after prefill and warm verification
 	// so the bench window excludes the Put/Get+backfill storm that
 	// populated the working set. Soft-fail: if --info-endpoint is empty
 	// or the dial errors, we skip the delta print; the bench runs.
@@ -382,10 +425,8 @@ func cmdBench(args []string) {
 		}
 	}
 
-	// Final counter snapshot. The gRPC RTT here naturally drains the
-	// tail of async startFill goroutines, so delta counts include all
-	// fills *initiated* during the bench window — the semantically
-	// correct number for hit-rate analysis.
+	// Final counter snapshot. Fill counters increment when work is initiated, so
+	// the delta is independent of whether a backend write is still completing.
 	var final cache.DaemonStats
 	haveFinal := false
 	if haveBaseline {

@@ -4,7 +4,7 @@
 // new YAML config is required.
 //
 // The service exposes hits/misses/fills at the wire, tier, and EC-peer
-// layers plus bounded Redis UDS pool and backend-latency snapshots.
+// layers plus bounded Redis pool and backend-latency snapshots.
 syntax = "proto3";
 
 package cac.cache.v1;
@@ -17,25 +17,9 @@ service Info {
     // lifetime; clients compute deltas by subtracting successive
     // snapshots.
     rpc Get(InfoRequest) returns (InfoReply);
-
-    // WaitFills blocks until all in-flight fill goroutines on the
-    // daemon's TieredCache have drained, or the client's ctx deadline
-    // fires. Intended for test/bench workflows that need to observe a
-    // quiescent-after-warm state before taking measurements.
-    //
-    // In tiered mode this delegates to cache.TieredCache.WaitFills. In
-    // other modes there is no fill-inflight tracking, so this returns
-    // immediately with nil. Clients should set a ctx deadline — the
-    // call will block indefinitely if fills never drain (e.g., a peer
-    // is permanently stuck).
-    rpc WaitFills(WaitFillsRequest) returns (WaitFillsReply);
 }
 
 message InfoRequest {}
-
-message WaitFillsRequest {}
-
-message WaitFillsReply {}
 
 message InfoReply {
     // "local" | "shard" | "tiered" — determines which backend detail
@@ -142,7 +126,7 @@ message RocksCFStats {
 }
 
 message RedisStats {
-    string socket = 1;
+    string endpoint = 1;
 
     int64 get_pool_size  = 2;
     int64 set_pool_size  = 3;
@@ -169,4 +153,5 @@ message RedisStats {
     uint64 set_p99_ns       = 22;
     uint64 set_p999_ns      = 23;
     uint64 pool_wait_p99_ns = 24;
+    string transport        = 25;
 }

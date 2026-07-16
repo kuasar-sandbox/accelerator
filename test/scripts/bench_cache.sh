@@ -162,6 +162,8 @@ spawn_daemon() {
 
 # ── Scenario helpers ──────────────────────────────────────────────────────
 
+# Benchmark-owned Rocks stores keep the prefilled dataset intact. Production
+# eviction would turn a backend-hit measurement into a miss/fallthrough test.
 start_local_only() {
     local data health rocks config
     data=$(free_port)
@@ -177,6 +179,7 @@ rpc_timeout: 5s
 freq:
   counters: 1M
   reset_after: 100K
+  disable_eviction: true
 rocks:
   path: $rocks
   disk_bytes: 4GiB
@@ -240,6 +243,7 @@ rpc_timeout: 5s
 freq:
   counters: 1M
   reset_after: 100K
+  disable_eviction: true
 tiers:
   - type: embedded
     rocks:
@@ -283,6 +287,7 @@ rpc_timeout: 5s
 freq:
   counters: 1M
   reset_after: 100K
+  disable_eviction: true
 rocks:
   path: $srocks
   disk_bytes: 4GiB
@@ -402,7 +407,7 @@ run_bench() {
     # Capture bench-TARGET CPU profile in the background via its
     # pprof_listen endpoint. Duration matches DURATION so the window
     # aligns with the bench measurement window. Delayed start (prefill
-    # + warm + WaitFills usually take a few seconds — pprof pulling
+    # + observable warm verification usually take a few seconds — pprof pulling
     # for DURATION will cover the bench window plus a bit of tail).
     local target_pprof_pid=""
     if [ -n "${PPROF_ENDPOINT:-}" ]; then

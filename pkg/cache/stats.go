@@ -90,10 +90,11 @@ type RocksCFStats struct {
 	MemUsage  string `json:"mem_usage"`
 }
 
-// RedisStats is the bounded UDS worker/pool view exported by a redisstore.
+// RedisStats is the bounded backend worker/pool view exported by a redisstore.
 // Latencies are cumulative backend percentiles in nanoseconds.
 type RedisStats struct {
-	Socket string `json:"socket"`
+	Endpoint  string `json:"endpoint"`
+	Transport string `json:"transport"`
 
 	GetPoolSize  int64 `json:"get_pool_size"`
 	SetPoolSize  int64 `json:"set_pool_size"`

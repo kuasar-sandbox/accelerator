@@ -93,20 +93,6 @@ func (s *InfoServer) Get(ctx context.Context, req *cachepb.InfoRequest) (*cachep
 	return toPb(ds), nil
 }
 
-// WaitFills blocks until all in-flight fill goroutines tracked by the
-// TieredCache have drained, or the client's ctx deadline fires. In
-// non-tiered modes there's no fill-inflight tracking, so this returns
-// immediately. The client is expected to set a ctx deadline — a stuck
-// peer could otherwise block the call indefinitely.
-func (s *InfoServer) WaitFills(ctx context.Context, req *cachepb.WaitFillsRequest) (*cachepb.WaitFillsReply, error) {
-	if s.tiered != nil {
-		if err := s.tiered.WaitFills(ctx); err != nil {
-			return nil, err
-		}
-	}
-	return &cachepb.WaitFillsReply{}, nil
-}
-
 // snapshot builds the pure-Go DaemonStats. Split from Get so we can
 // test the assembly logic without touching proto types.
 func (s *InfoServer) snapshot() cache.DaemonStats {
@@ -171,7 +157,8 @@ func (s *InfoServer) snapshot() cache.DaemonStats {
 
 func redisStats(s redisstore.Stats) *cache.RedisStats {
 	return &cache.RedisStats{
-		Socket:           s.Socket,
+		Endpoint:         s.Endpoint,
+		Transport:        s.Transport,
 		GetPoolSize:      s.GetPoolSize,
 		SetPoolSize:      s.SetPoolSize,
 		GetConnected:     s.GetConnected,
@@ -267,7 +254,8 @@ func redisToPb(s *cache.RedisStats) *cachepb.RedisStats {
 		return nil
 	}
 	return &cachepb.RedisStats{
-		Socket:           s.Socket,
+		Endpoint:         s.Endpoint,
+		Transport:        s.Transport,
 		GetPoolSize:      s.GetPoolSize,
 		SetPoolSize:      s.SetPoolSize,
 		GetConnected:     s.GetConnected,

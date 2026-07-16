@@ -55,6 +55,22 @@ type mockTier struct {
 	fillBytes  chan []byte
 }
 
+type cancelFillTier struct {
+	started  chan struct{}
+	finished chan struct{}
+}
+
+func (t *cancelFillTier) Get(context.Context, store.Partition, store.ContentKey) (CacheResult, Blob, error) {
+	return CacheMiss, nil, nil
+}
+
+func (t *cancelFillTier) Fill(ctx context.Context, _ store.Partition, _ store.ContentKey, _ []byte) error {
+	close(t.started)
+	<-ctx.Done()
+	close(t.finished)
+	return ctx.Err()
+}
+
 type optionalTier struct {
 	*mockTier
 	repairEnabled atomic.Bool
@@ -109,9 +125,7 @@ func TestTierAdapterLimitsLookupsAndPreservesOptionalCapabilities(t *testing.T) 
 		t.Fatal("tier adapter hid Repairable from TieredCache")
 	}
 	tc.startFillMiss(0, store.PartitionChunk, store.ContentKey{1})
-	if err := tc.WaitFills(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	tc.Close()
 	if got := inner.missFills.Load(); got != 1 {
 		t.Fatalf("FillMiss calls=%d, want 1", got)
 	}
@@ -152,10 +166,8 @@ func TestTieredCache_StartFillClonesBlob(t *testing.T) {
 		t.Fatal("Fill was not called within 2s")
 	}
 
-	// Join the fill WaitGroup to ensure Release has happened.
-	if err := tc.WaitFills(context.Background()); err != nil {
-		t.Fatalf("WaitFills: %v", err)
-	}
+	// Close joins the fill goroutine and ensures Release has happened.
+	tc.Close()
 
 	// Validate the clone accounting. The original blob still has
 	// refcount = 1 (caller owns it); the fill-goroutine's clone has
@@ -178,6 +190,32 @@ func TestTieredCache_StartFillClonesBlob(t *testing.T) {
 		t.Errorf("original blob corrupted after startFill")
 	}
 	blob.Release()
+}
+
+func TestTieredCacheCloseCancelsAndDrainsFill(t *testing.T) {
+	tier := &cancelFillTier{started: make(chan struct{}), finished: make(chan struct{})}
+	tc := NewTieredCache(missGetter{}, tier)
+	blob := newCountingBlob([]byte("payload"))
+	tc.startFill(0, store.PartitionChunk, store.ContentKey{1}, blob)
+
+	select {
+	case <-tier.started:
+	case <-time.After(time.Second):
+		t.Fatal("fill did not start")
+	}
+	tc.Close()
+	select {
+	case <-tier.finished:
+	default:
+		t.Fatal("Close returned before the canceled fill exited")
+	}
+	if got := blob.handles.Load(); got != 1 {
+		t.Fatalf("live handle count after Close=%d, want caller's original handle", got)
+	}
+	blob.Release()
+
+	// Cancellation and waiting are both safe to repeat after the drain.
+	tc.Close()
 }
 
 // hitTier is a Tier that always reports CacheHit and returns a fresh
@@ -219,10 +257,8 @@ func TestTieredCache_CountersCascade(t *testing.T) {
 	}
 	blob.Release()
 
-	// Wait for backfill to complete.
-	if err := tc.WaitFills(context.Background()); err != nil {
-		t.Fatalf("WaitFills: %v", err)
-	}
+	// Stop accepting work and drain the backfill before reading counters.
+	tc.Close()
 
 	c := tc.Counters()
 	if c.TierHits[0] != 0 || c.TierMisses[0] != 1 {

@@ -98,10 +98,10 @@ tiers:
       direct_reads: true
       bloom_bits: 10
 
-  # Redis-compatible UDS alternative (replace the embedded tier above):
+  # Redis-compatible UDS or TCP alternative (replace the embedded tier above):
   # - type: redis
   #   redis:
-  #     socket: /run/kuasar-cache/redis.sock
+  #     endpoint: unix:///run/kuasar-cache/redis.sock
   #     get_pool: 32
   #     set_pool: 8
   #     timeout: 2s

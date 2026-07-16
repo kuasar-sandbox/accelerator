@@ -28,12 +28,12 @@ Bloom Filter 全部常驻内存)。
 
 - **数据面**:自定义 wire 协议(39 B 请求头 / 8 B 响应头,6 个 opcode)。
 - **控制面**:`health_listen` 独立端口同时跑两个 gRPC 服务——标准 `grpc.health.v1.Health`
-  探活,以及 `cac.cache.v1.Info`(`Get` 拉运行时计数快照 + `WaitFills` 等待 fill 排空)。
+  探活,以及 `cac.cache.v1.Info`(`Get` 拉运行时计数快照)。
 - **监听地址**:`listen` / `health_listen` 均取 `host:port`(TCP)或一个 Unix
   socket 路径(`/run/sandbox/cache.sock` 或 `unix:///...`;为 socket 时启动清死
   socket、chmod 0600)。数据面客户端 `cache.endpoint` 填同址即可;控制面经 socket
   时,`ping` / `info --endpoint` 用 `unix:///` 形式。
-- **本地存储**:进程内 RocksDB,或通过 UDS 访问 Redis-compatible server;
+- **本地存储**:进程内 RocksDB,或通过 UDS/TCP 访问 Redis-compatible server;
   后者的配置、取消语义和 Dragonfly 部署见 [cache-redis.md](cache-redis.md)。
 - **写入语义**:强制准入,无应用层 LRU/SLRU。淘汰由 CompactionFilter 在
   后台按 CMS 频率统计驱动。
@@ -90,7 +90,6 @@ fill-aside 经 `EncodePrefixed` 完成。
 ```
 cache-ctl ping --endpoint host:port            # gRPC 健康探测 (--endpoint 指向 health_listen)
 cache-ctl info --endpoint host:port [--json]   # 实时 stats(同 health_listen);--json 输出原始 JSON
-cache-ctl info --endpoint host:port --wait-fills [--timeout 30s]
 cache-ctl info --rocks-path PATH               # 离线只读打开 RocksDB,查看属性
 ```
 
@@ -98,8 +97,6 @@ cache-ctl info --rocks-path PATH               # 离线只读打开 RocksDB,查�
 **不是**数据端口,都不走 wire 协议。两者调不同 gRPC 服务:`ping` 调
 `grpc.health.v1.Health/Check`;`info --endpoint` 调 `cac.cache.v1.Info/Get`,把运行时
 计数快照拉回来(`--json` 输出原始 JSON,否则人类可读表格)。
-`info --wait-fills` 调 `cac.cache.v1.Info/WaitFills`,直到 tiered cache 的当前
-fill/repair 任务排空或 `--timeout` 到期;它不改变异步 fill-aside 的数据面语义。
 `info --rocks-path` 走 RocksDB secondary instance(只读并行打开),不打扰
 运行中的 cache-ctl。
 
@@ -159,9 +156,9 @@ Flags:
 | 维度 | local | shard | tiered |
 |---|---|---|---|
 | 定位 | 单节点完整对象 KV | EC 分片 KV(集群成员) | 多级缓存代理 |
-| handler 后端 | 直连 RocksDB | 直连 RocksDB | TieredCache(§4.6) |
+| handler 后端 | embedded RocksDB / Redis-compatible | embedded RocksDB / Redis-compatible | TieredCache(§4.6) |
 | tier chain | 无 | 无 | 按 YAML `tiers:` 顺序 |
-| 写操作 | 直写 RocksDB | 直写 RocksDB | 拒绝(`StatusError`) |
+| 写操作 | 直写所选 backend | 直写所选 backend | 拒绝(`StatusError`) |
 | 读操作 | 查 RocksDB | 查 RocksDB | 穿 tier chain,命中后 fill-aside |
 | origin 凭证 | 不需要 | 不需要 | 需要(L3 读权限) |
 | 典型部署 | 测试/调试/单节点 | L2 EC 集群 × 5 | 与 manifest-ctl 同节点(边车) |
@@ -310,7 +307,7 @@ tiers:
 | 参数 | 说明 |
 |---|---|
 | `listen` | wire 数据面 TCP 监听 |
-| `health_listen` | gRPC 控制面监听,同端口跑两个服务:`grpc.health.v1.Health`(探活)+ `cac.cache.v1.Info`(`Get` 拉计数快照 / `WaitFills` 等 fill 排空)。省略则两者都不启动 |
+| `health_listen` | gRPC 控制面监听,同端口跑两个服务:`grpc.health.v1.Health`(探活)+ `cac.cache.v1.Info`(`Get` 拉计数快照)。省略则两者都不启动 |
 | `stats_interval` | 周期自适应 stderr 统计行的基准周期(§6.6)。缺省/空 = 30s(默认开);`0`/`off` 关闭。有流量的周期打一行(吞吐/带宽/时延 p50/p99/max/并发/命中级联/rocks 量规),空闲周期静默 |
 | `freq.disable_eviction` | bool。关掉频率式 compaction-filter 淘汰:sketch 仍维护(供 stats),但 filter 永不挂载,任何 key 都不会按访问计数被淘汰。用于某台 local cache-ctl 充当下游 tiered 的 origin(bench 场景)——写入落一次就必须留住 |
 | `pool` | 到单个 peer 的并行 TCP 连接数。wire 是 sync request/response,单连接会把并发请求串行化 |
@@ -592,9 +589,9 @@ handle 给 fill goroutine,`defer cloned.Release()`。原 blob 由 Get 调用
 方持有直到外层 wire 响应写完。两者引用计数独立。
 
 **异步、fire-and-forget**:读路径不等写完成。fill 默认**无 deadline**——
-goroutine 挂在 TieredCache 的 baseCtx 下,关停时 `Close()` 统一取消(§6.2),
-卡死的 origin 不会泄漏 fill goroutine;控制面 Info 服务的 `WaitFills` 可等待
-在途 fill 排空。**幂等**:重复 fill 无副作用(rocks Put 覆盖,wire ShardPut
+goroutine 挂在 TieredCache 的 baseCtx 下,关停时 `Close()` 统一取消并回收(§6.2),
+卡死的 origin 不会泄漏 fill goroutine。测试和预热流程通过实际 Get/ShardGet
+确认数据已可读,不依赖内部 goroutine 是否暂时排空。**幂等**:重复 fill 无副作用(rocks Put 覆盖,wire ShardPut
 覆盖)。
 
 #### EC 分片缺失修复
@@ -723,7 +720,7 @@ cache-ctl serve --config /etc/cache/tiered.yaml
 2. wire server graceful stop:排空 in-flight,硬上限 5 s;
 3. gRPC 控制面 server graceful stop(Health + Info 同在该 server);
 4. tiered 模式调 `TieredCache.Close()` 取消在途 async fill;tier chain 反序
-   级联关闭(embedded → ec → upstream),local/shard 模式下关 RocksDB。
+   级联关闭(embedded → redis → ec → upstream),local/shard 模式下关闭所选 backend。
 
 ### 6.3 运行时计数(pull-only)
 

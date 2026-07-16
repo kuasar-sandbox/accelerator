@@ -5,7 +5,8 @@ import "github.com/kuasar-sandbox/accelerator/internal/util/obstat"
 // Stats is a point-in-time snapshot of the Redis backend. Inflight includes
 // requests whose caller was cancelled while the worker drains the RESP reply.
 type Stats struct {
-	Socket string
+	Endpoint  string
+	Transport string
 
 	GetPoolSize  int64
 	SetPoolSize  int64

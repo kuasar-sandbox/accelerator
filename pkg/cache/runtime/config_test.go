@@ -31,7 +31,15 @@ func TestValidateDirectBackend(t *testing.T) {
 			name: "shard redis",
 			cfg: func() Config {
 				cfg := baseConfig("shard", "redis")
-				cfg.Redis = &RedisConfig{Socket: "/run/cache/redis.sock", GetPool: 4, SetPool: 2, Timeout: "2s"}
+				cfg.Redis = &RedisConfig{Endpoint: "unix:///run/cache/redis.sock", GetPool: 4, SetPool: 2, Timeout: "2s"}
+				return cfg
+			}(),
+		},
+		{
+			name: "local redis tcp",
+			cfg: func() Config {
+				cfg := baseConfig("local", "redis")
+				cfg.Redis = &RedisConfig{Endpoint: "redis.internal:6379", GetPool: 4, SetPool: 2, Timeout: "2s"}
 				return cfg
 			}(),
 		},
@@ -51,19 +59,19 @@ func TestValidateDirectBackend(t *testing.T) {
 			wantErr: "redis config is required",
 		},
 		{
-			name: "redis relative socket",
+			name: "redis invalid endpoint",
 			cfg: func() Config {
 				cfg := baseConfig("local", "redis")
-				cfg.Redis = &RedisConfig{Socket: "redis.sock"}
+				cfg.Redis = &RedisConfig{Endpoint: "redis.sock"}
 				return cfg
 			}(),
-			wantErr: "absolute Unix socket",
+			wantErr: "absolute Unix socket path, unix:/path, or TCP host:port",
 		},
 		{
 			name: "redis rejects rocks",
 			cfg: func() Config {
 				cfg := baseConfig("local", "redis")
-				cfg.Redis = &RedisConfig{Socket: "/run/redis.sock"}
+				cfg.Redis = &RedisConfig{Endpoint: "/run/redis.sock"}
 				cfg.Rocks.DiskBytes = "1GiB"
 				return cfg
 			}(),
@@ -87,12 +95,50 @@ func TestValidateDirectBackend(t *testing.T) {
 	}
 }
 
+func TestParseRedisEndpoint(t *testing.T) {
+	tests := []struct {
+		name        string
+		endpoint    string
+		wantNetwork string
+		wantAddress string
+		wantErr     bool
+	}{
+		{name: "absolute path", endpoint: "/run/cache/redis.sock", wantNetwork: "unix", wantAddress: "/run/cache/redis.sock"},
+		{name: "unix short", endpoint: "unix:/run/cache/redis.sock", wantNetwork: "unix", wantAddress: "/run/cache/redis.sock"},
+		{name: "unix URI", endpoint: "unix:///run/cache/redis.sock", wantNetwork: "unix", wantAddress: "/run/cache/redis.sock"},
+		{name: "IPv4", endpoint: "10.0.1.60:6379", wantNetwork: "tcp", wantAddress: "10.0.1.60:6379"},
+		{name: "DNS", endpoint: "redis.internal:6379", wantNetwork: "tcp", wantAddress: "redis.internal:6379"},
+		{name: "IPv6", endpoint: "[2001:db8::60]:6379", wantNetwork: "tcp", wantAddress: "[2001:db8::60]:6379"},
+		{name: "empty", wantErr: true},
+		{name: "relative path", endpoint: "redis.sock", wantErr: true},
+		{name: "relative unix", endpoint: "unix:redis.sock", wantErr: true},
+		{name: "missing host", endpoint: ":6379", wantErr: true},
+		{name: "missing port", endpoint: "redis.internal:", wantErr: true},
+		{name: "unbracketed IPv6", endpoint: "2001:db8::60:6379", wantErr: true},
+		{name: "surrounding whitespace", endpoint: " redis.internal:6379", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			network, address, err := ParseRedisEndpoint(tt.endpoint)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ParseRedisEndpoint(%q)=(%q,%q,nil), want error", tt.endpoint, network, address)
+				}
+				return
+			}
+			if err != nil || network != tt.wantNetwork || address != tt.wantAddress {
+				t.Fatalf("ParseRedisEndpoint(%q)=(%q,%q,%v), want (%q,%q,nil)", tt.endpoint, network, address, err, tt.wantNetwork, tt.wantAddress)
+			}
+		})
+	}
+}
+
 func TestValidateTieredRedis(t *testing.T) {
 	cfg := Config{
 		Mode:   "tiered",
 		Listen: "127.0.0.1:7070",
 		Tiers: []TierConfig{
-			{Type: "redis", Redis: &RedisConfig{Socket: "/run/cache/redis.sock", GetPool: 4, SetPool: 2}},
+			{Type: "redis", Redis: &RedisConfig{Endpoint: "/run/cache/redis.sock", GetPool: 4, SetPool: 2}},
 			{Type: "upstream", Endpoint: "127.0.0.1:7072"},
 		},
 		Origin: &OriginConfig{Type: "store", Store: &StoreClientConfig{Endpoint: "127.0.0.1:7100"}},

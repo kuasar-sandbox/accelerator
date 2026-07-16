@@ -31,25 +31,11 @@ func cmdInfo(args []string) {
 		"Offline: open rocksdb read-only at this path")
 	asJSON := fs.Bool("json", false,
 		"output raw JSON (default: human-readable table)")
-	wait := fs.Bool("wait-fills", false,
-		"wait for in-flight tiered fills to drain instead of reading stats")
-	timeout := fs.Duration("timeout", 30*time.Second,
-		"timeout for --wait-fills")
 	fs.Parse(args)
 
 	switch {
 	case *endpoint != "" && *rocksPath != "":
 		fatal("--endpoint and --rocks-path are mutually exclusive")
-	case *wait && *endpoint == "":
-		fatal("--wait-fills requires --endpoint")
-	case *wait && *asJSON:
-		fatal("--wait-fills and --json are mutually exclusive")
-	case *wait && *timeout <= 0:
-		fatal("--timeout must be positive")
-	case *wait:
-		if err := waitFills(*endpoint, *timeout); err != nil {
-			fatal("%v", err)
-		}
 	case *endpoint != "":
 		cmdInfoRemote(*endpoint, *asJSON)
 	case *rocksPath != "":
@@ -94,27 +80,6 @@ func fetchInfo(endpoint string, timeout time.Duration) (cache.DaemonStats, error
 		return cache.DaemonStats{}, fmt.Errorf("Info.Get: %w", err)
 	}
 	return fromPb(reply), nil
-}
-
-// waitFills blocks until the daemon's TieredCache has drained all
-// in-flight fill goroutines, or timeout fires. Non-tiered modes return
-// immediately server-side. Safe to call on daemons where Info isn't
-// reachable — returns err, caller decides.
-func waitFills(endpoint string, timeout time.Duration) error {
-	conn, err := grpc.NewClient(endpoint,
-		grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return fmt.Errorf("dial %s: %w", endpoint, err)
-	}
-	defer conn.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	_, err = cachepb.NewInfoClient(conn).WaitFills(ctx, &cachepb.WaitFillsRequest{})
-	if err != nil {
-		return fmt.Errorf("Info.WaitFills: %w", err)
-	}
-	return nil
 }
 
 // cmdInfoLocal opens rocksdb read-only and prints CF properties. This
@@ -192,7 +157,8 @@ func redisFromPb(s *cachepb.RedisStats) *cache.RedisStats {
 		return nil
 	}
 	return &cache.RedisStats{
-		Socket:           s.Socket,
+		Endpoint:         s.Endpoint,
+		Transport:        s.Transport,
 		GetPoolSize:      s.GetPoolSize,
 		SetPoolSize:      s.SetPoolSize,
 		GetConnected:     s.GetConnected,
@@ -328,8 +294,8 @@ func printInfoHuman(ds cache.DaemonStats) {
 }
 
 func printRedisStats(label string, s *cache.RedisStats) {
-	fmt.Printf("%s: socket=%s get=%d/%d set=%d/%d inflight=%d/%d waiters=%d draining=%d cancels=%d reconnects=%d errors=%d protocol=%d get-p50=%s get-p99=%s set-p99=%s\n",
-		label, s.Socket,
+	fmt.Printf("%s: endpoint=%s transport=%s get=%d/%d set=%d/%d inflight=%d/%d waiters=%d draining=%d cancels=%d reconnects=%d errors=%d protocol=%d get-p50=%s get-p99=%s set-p99=%s\n",
+		label, s.Endpoint, s.Transport,
 		s.GetConnected, s.GetPoolSize, s.SetConnected, s.SetPoolSize,
 		s.GetInflight, s.SetInflight, s.PoolWaiters, s.Draining,
 		s.Cancelled, s.Reconnects, s.BackendErrors, s.ProtocolErrors,

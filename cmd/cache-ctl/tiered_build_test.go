@@ -141,7 +141,7 @@ func TestBuildTieredChain_AppliesTierMaxInflight(t *testing.T) {
 func TestBuildTieredChain_RejectsRedisMaxInflightWithoutValidation(t *testing.T) {
 	cfg := &runtime.Config{Mode: "tiered", Tiers: []runtime.TierConfig{{
 		Type: "redis", MaxInflight: 1,
-		Redis: &runtime.RedisConfig{Socket: "/run/cache/redis.sock", GetPool: 1, SetPool: 1},
+		Redis: &runtime.RedisConfig{Endpoint: "/run/cache/redis.sock", GetPool: 1, SetPool: 1},
 	}}}
 	comps, err := buildTieredChain(cfg, nil)
 	if err == nil || !strings.Contains(err.Error(), "redis.get_pool and redis.set_pool") {
@@ -166,10 +166,10 @@ func TestBuildTieredChain_RedisOnly(t *testing.T) {
 		Tiers: []runtime.TierConfig{{
 			Type: "redis",
 			Redis: &runtime.RedisConfig{
-				Socket:  socket,
-				GetPool: 1,
-				SetPool: 1,
-				Timeout: "1s",
+				Endpoint: socket,
+				GetPool:  1,
+				SetPool:  1,
+				Timeout:  "1s",
 			},
 		}},
 	}
@@ -200,10 +200,10 @@ func TestBuildTieredChain_ECThenRedisPreservesOrder(t *testing.T) {
 			{
 				Type: "redis",
 				Redis: &runtime.RedisConfig{
-					Socket:  socket,
-					GetPool: 1,
-					SetPool: 1,
-					Timeout: "1s",
+					Endpoint: socket,
+					GetPool:  1,
+					SetPool:  1,
+					Timeout:  "1s",
 				},
 			},
 		},
@@ -246,10 +246,10 @@ func TestBuildTieredChain_RedisRollsBackOnLaterFailure(t *testing.T) {
 			{
 				Type: "redis",
 				Redis: &runtime.RedisConfig{
-					Socket:  socket,
-					GetPool: 1,
-					SetPool: 1,
-					Timeout: "1s",
+					Endpoint: socket,
+					GetPool:  1,
+					SetPool:  1,
+					Timeout:  "1s",
 				},
 			},
 			{Type: "unknown"},

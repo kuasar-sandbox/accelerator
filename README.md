@@ -57,5 +57,5 @@ make test                       # 单元测试(含 rocks,需 librocksdb);e2e 见
 - [docs/manifest.md](docs/manifest.md) — 二进制清单:分块 / 收敛加密 / 密钥表 / 读写 SDK。
 - [docs/store.md](docs/store.md) — 内容寻址存储:分代目录布局 / fs·obs 后端 / GC。
 - [docs/cache.md](docs/cache.md) — 三层缓存 + 纠删码:local / shard / tiered 与旁路填充。
-- [docs/cache-redis.md](docs/cache-redis.md) — Redis-compatible UDS 后端、取消语义与 Dragonfly 部署。
+- [docs/cache-redis.md](docs/cache-redis.md) — Redis-compatible UDS/TCP 后端、取消语义与 Dragonfly 部署。
 OCI/目录 → EROFS 确定性展平 CLI 见 `guest-runtime/docs/flatten.md`。
