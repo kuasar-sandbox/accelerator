@@ -144,9 +144,9 @@ payload_hash() {
     tar xOf "$1" | sha256sum | awk '{print $1}'
 }
 
-# Prepare a ~512 KiB payload wrapped in a tarstream artifact — manifest-ctl
-# ingests tarstream-contained payloads, not raw bytes.
-dd if=/dev/urandom of="$TMPDIR/payload.bin" bs=1024 count=512 2>/dev/null
+# Prepare a 2 MiB payload wrapped in a tarstream artifact. The default CDC max
+# is 1 MiB, so the readiness checks below always exercise multiple chunks.
+dd if=/dev/urandom of="$TMPDIR/payload.bin" bs=1024 count=2048 2>/dev/null
 tar cf "$TMPDIR/test.bin" -C "$TMPDIR" payload.bin
 
 # ============================================================
@@ -228,13 +228,26 @@ MKEY=$("$BIN/manifest-ctl" store $COMMON --no-progress "$TMPDIR/test.bin")
 ORIG_HASH=$(payload_hash "$TMPDIR/test.bin")
 echo "  Stored. SHA256=$ORIG_HASH  manifest-key=$MKEY"
 
+# The store is empty before the main artifact is ingested, so this snapshot is
+# exactly the set of non-zero chunks referenced by MKEY. Capture it before
+# Test 0 adds its unrelated object.
+mapfile -t MAIN_CHUNK_KEYS < <(find "$STORE_ROOT/chunk/G1" -type f -printf '%f\n' | sort)
+if [ "${#MAIN_CHUNK_KEYS[@]}" -lt 2 ]; then
+    echo "ERROR: 2 MiB main artifact produced fewer than two CDC chunks" >&2
+    exit 1
+fi
+MAIN_CACHE_OBJECTS=("manifest:$MKEY")
+for chunk_key in "${MAIN_CHUNK_KEYS[@]}"; do
+    MAIN_CACHE_OBJECTS+=("chunk:$chunk_key")
+done
+
 # ============================================================
 echo ""
 echo "=== Test 0: store-ctl standalone roundtrip ==="
 # Write + read a distinct manifest through manifest-ctl → store-ctl
 # to prove the standalone path is healthy before any cache-ctl
 # tests run. Uses a fresh 64 KiB payload so it doesn't collide with
-# the main 512 KiB blob's chunks.
+# the main artifact's chunks.
 dd if=/dev/urandom of="$TMPDIR/store0-payload.bin" bs=1024 count=64 2>/dev/null
 tar cf "$TMPDIR/store0.bin" -C "$TMPDIR" store0-payload.bin
 MKEY0=$("$BIN/manifest-ctl" store $COMMON --no-progress "$TMPDIR/store0.bin")
@@ -465,17 +478,11 @@ wait_ready "127.0.0.1:$EC_TIERED_HEALTH_PORT"
 EC_HASH=$(payload_hash "$TMPDIR/test-ec.bin")
 assert_eq "$ORIG_HASH" "$EC_HASH" "tiered+EC load roundtrip"
 
-# The main artifact has one 512 KiB content object. Select it rather than the
-# 64 KiB standalone Test 0 object, then observe both EC fills through every
-# shard peer's public data plane before injecting a failure.
-MAIN_CHUNK_KEY=$(find "$STORE_ROOT/chunk/G1" -type f -printf '%s %f\n' | sort -nr | head -1 | awk '{print $2}')
-if [ -z "$MAIN_CHUNK_KEY" ]; then
-    echo "ERROR: main test artifact chunk key was not found" >&2
-    exit 1
-fi
+# Observe the manifest and every referenced chunk through each shard peer's
+# public data plane before injecting a failure.
 ALL_SHARDS_PRESENT=1
 for peer_port in "${SHARD_PORTS[@]}"; do
-    for pair in "manifest:$MKEY" "chunk:$MAIN_CHUNK_KEY"; do
+    for pair in "${MAIN_CACHE_OBJECTS[@]}"; do
         namespace=${pair%%:*}
         object_key=${pair#*:}
         if ! wait_shard_present "127.0.0.1:$peer_port" "$namespace" "$object_key"; then
@@ -799,11 +806,11 @@ wait_ready "127.0.0.1:$REDIS_EC_HEALTH_PORT"
 "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$REDIS_EC_PORT")" \
     --output "$TMPDIR/test-redis-ec-cold.bin" --no-progress "$MKEY" 2>&1
 
-# Reuse the main artifact chunk key selected in Test 8, then prove EC fill
-# wrote both namespaces to every Redis shard peer.
+# Prove EC fill wrote the manifest and every referenced chunk to each Redis
+# shard peer.
 ALL_SHARDS_PRESENT=1
 for peer_port in "${REDIS_SHARD_PORTS[@]}"; do
-    for pair in "manifest:$MKEY" "chunk:$MAIN_CHUNK_KEY"; do
+    for pair in "${MAIN_CACHE_OBJECTS[@]}"; do
         namespace=${pair%%:*}
         object_key=${pair#*:}
         if ! wait_shard_present "127.0.0.1:$peer_port" "$namespace" "$object_key"; then
@@ -853,7 +860,7 @@ wait_ready "127.0.0.1:${REDIS_SHARD_HEALTH_PORTS[4]}"
 
 ALL_SHARDS_PRESENT=1
 for peer_port in "${REDIS_SHARD_PORTS[@]}"; do
-    for pair in "manifest:$MKEY" "chunk:$MAIN_CHUNK_KEY"; do
+    for pair in "${MAIN_CACHE_OBJECTS[@]}"; do
         namespace=${pair%%:*}
         object_key=${pair#*:}
         if ! "$BIN/cache-ctl" shard get --endpoint "127.0.0.1:$peer_port" \
