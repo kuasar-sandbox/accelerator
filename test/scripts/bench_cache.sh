@@ -53,6 +53,10 @@ BENCH_BACKEND_EXPLICIT="${BENCH_BACKEND+x}"
 BENCH_BACKEND="${BENCH_BACKEND:-embedded}"
 BENCH_EXTERNAL_ENDPOINT="${BENCH_EXTERNAL_ENDPOINT:-}"
 BENCH_EXTERNAL_PREFILL_ENDPOINT="${BENCH_EXTERNAL_PREFILL_ENDPOINT:-}"
+CONCS_EXPLICIT="${CONCS+x}"
+GET_CONCS_EXPLICIT="${GET_CONCS+x}"
+PUT_CONCS_EXPLICIT="${PUT_CONCS+x}"
+MIXED_CONCS_EXPLICIT="${MIXED_CONCS+x}"
 REDIS_ENDPOINT_EXPLICIT="${REDIS_ENDPOINT+x}"
 REDIS_SHARD_ENDPOINTS_EXPLICIT="${REDIS_SHARD_ENDPOINTS+x}"
 REDIS_GET_POOL_EXPLICIT="${REDIS_GET_POOL+x}"
@@ -81,6 +85,24 @@ ZIPF_S="${ZIPF_S:-1.1}"
 COLD_PREFILL="${COLD_PREFILL:-0}"
 MISS_RATIO="${MISS_RATIO:-0}"
 TIMEOUT="${TIMEOUT:-10s}"
+
+# An external target cannot be reset between points. Its no-override default is
+# one GET c1 point; once any phase is explicit, unspecified phases stay empty.
+if [ -n "$BENCH_EXTERNAL_ENDPOINT" ]; then
+    if [ -n "$CONCS_EXPLICIT" ]; then
+        GET_CONCS="$CONCS"
+        PUT_CONCS=""
+        MIXED_CONCS=""
+    elif [ -z "$GET_CONCS_EXPLICIT$PUT_CONCS_EXPLICIT$MIXED_CONCS_EXPLICIT" ]; then
+        GET_CONCS=1
+        PUT_CONCS=""
+        MIXED_CONCS=""
+    else
+        [ -n "$GET_CONCS_EXPLICIT" ] || GET_CONCS=""
+        [ -n "$PUT_CONCS_EXPLICIT" ] || PUT_CONCS=""
+        [ -n "$MIXED_CONCS_EXPLICIT" ] || MIXED_CONCS=""
+    fi
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -575,8 +597,13 @@ if [ -n "$BENCH_EXTERNAL_ENDPOINT" ]; then
     else
         active_rounds=$(( $(wc -w <<<"$GET_CONCS") + $(wc -w <<<"$PUT_CONCS") + $(wc -w <<<"$MIXED_CONCS") ))
     fi
-    if [ "$active_rounds" -gt 1 ]; then
-        echo "ERROR: external mode permits one sweep point because the harness cannot reset external state" >&2
+    if [ "$PREFILL_ENDPOINT" != "$BENCH_ENDPOINT" ] \
+        && { [ -n "$PUT_CONCS" ] || [ -n "$MIXED_CONCS" ]; }; then
+        echo "ERROR: split-endpoint external mode supports only a GET point" >&2
+        exit 1
+    fi
+    if [ "$active_rounds" -ne 1 ]; then
+        echo "ERROR: external mode requires exactly one point because the harness cannot reset external state" >&2
         exit 1
     fi
 fi
@@ -746,6 +773,8 @@ fi
 REPORT_REDIS_GET_POOL="$REDIS_GET_POOL"
 REPORT_REDIS_SET_POOL="$REDIS_SET_POOL"
 REPORT_REDIS_TIMEOUT="$REDIS_TIMEOUT"
+if [ "$REPORT_REDIS_GET_POOL" = 0 ]; then REPORT_REDIS_GET_POOL=32; fi
+if [ "$REPORT_REDIS_SET_POOL" = 0 ]; then REPORT_REDIS_SET_POOL=8; fi
 if [ -n "$BENCH_EXTERNAL_ENDPOINT" ]; then
     if [ "$BENCH_SCENARIO" = tiered-shard-l2 ]; then
         if [ -z "$REDIS_SHARD_ENDPOINTS_EXPLICIT" ] || [ -z "$REDIS_SHARD_ENDPOINTS" ]; then

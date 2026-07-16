@@ -206,6 +206,10 @@ identical across the sweep. External cache-ctl mode cannot reset backing state
 and accepts only one point per invocation. In that mode, Redis endpoint, pool
 and timeout fields are reported only when explicitly provided; otherwise the
 report marks them as unknown.
+With no phase override, external mode runs one GET point at concurrency 1.
+Setting `GET_CONCS`, `PUT_CONCS`, or `MIXED_CONCS` makes unspecified phases
+empty, and the selected phase must still contain exactly one point. A pool size
+of zero is reported as its effective cache-ctl default (32 GET, 8 SET).
 
 For the EC path, provide exactly five independent Redis endpoints:
 

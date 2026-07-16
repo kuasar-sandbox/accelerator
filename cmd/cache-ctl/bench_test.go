@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -17,6 +18,12 @@ func TestBenchmarkKeySaltIsolatesRounds(t *testing.T) {
 	}
 	if benchmarkKey("cold", "round-1", 7) != benchmarkKey("cold", "round-1", 7) {
 		t.Fatal("benchmark key generation is not deterministic")
+	}
+	if benchmarkWriteKey("round-1", 2, 7) == benchmarkWriteKey("round-2", 2, 7) {
+		t.Fatal("write keys ignored the round salt")
+	}
+	if benchmarkWriteKey("round-1", 2, 7) == benchmarkWriteKey("round-1", 3, 7) {
+		t.Fatal("write keys ignored the worker ID")
 	}
 }
 
@@ -78,6 +85,30 @@ func TestSnapshotFinalCountersWaitsForDetachedTierFill(t *testing.T) {
 	}
 	if got := finals[0].Tiered.Tiers[0].FillsInflight; got != 0 {
 		t.Fatalf("final fills in flight=%d, want 0", got)
+	}
+}
+
+func TestSnapshotFinalCountersDiscardsSnapshotAfterFetchFailure(t *testing.T) {
+	calls := 0
+	fetch := func(string, time.Duration) (cache.DaemonStats, error) {
+		calls++
+		if calls == 1 {
+			return cache.DaemonStats{Redis: &cache.RedisStats{
+				GetPoolSize: 1,
+				Draining:    1,
+			}}, nil
+		}
+		return cache.DaemonStats{}, errors.New("endpoint unavailable")
+	}
+
+	finals, haveFinal, settled := snapshotFinalCounters(
+		[]string{"127.0.0.1:7701"}, []bool{true}, 20*time.Millisecond, fetch,
+	)
+	if settled {
+		t.Fatal("failed endpoint was reported as settled")
+	}
+	if haveFinal[0] || finals[0].Redis != nil {
+		t.Fatalf("stale successful snapshot survived fetch failure: %#v", finals[0])
 	}
 }
 

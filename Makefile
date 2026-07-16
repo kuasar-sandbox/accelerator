@@ -92,6 +92,7 @@ test: deps-rocksdb
 	CGO_CFLAGS="$(CGO_CFLAGS)" \
 	CGO_LDFLAGS="-L$(ROCKS_PREFIX)/lib -lrocksdb -lstdc++ -lm -lpthread -ldl" \
 		$(GO) test ./...
+	bash test/scripts/bench_cache_test.sh
 
 # vet the CGO-free client surface (no librocksdb needed).
 vet:

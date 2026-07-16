@@ -40,6 +40,10 @@ func benchmarkKey(kind, salt string, index int) [32]byte {
 	return sha256.Sum256(fmt.Appendf(nil, "bench-%s:%d:%s:%d", kind, len(salt), salt, index))
 }
 
+func benchmarkWriteKey(salt string, workerID, index int) [32]byte {
+	return sha256.Sum256(fmt.Appendf(nil, "bench-put:%d:%s:%d:%d", len(salt), salt, workerID, index))
+}
+
 func redisStatsIdle(stats *cache.RedisStats) bool {
 	if stats == nil {
 		return true
@@ -90,6 +94,8 @@ func snapshotFinalCounters(endpoints []string, haveBaseline []bool, timeout time
 			}
 			stats, err := fetch(endpoint, 250*time.Millisecond)
 			if err != nil {
+				finals[i] = cache.DaemonStats{}
+				haveFinal[i] = false
 				idle = false
 				continue
 			}
@@ -453,7 +459,7 @@ func cmdBench(args []string) {
 					if benchWriter == nil {
 						fatal("--mode put requires bench target to accept writes")
 					}
-					k := sha256.Sum256(fmt.Appendf(nil, "bench-put-%d-%d", workerID, i))
+					k := benchmarkWriteKey(*keySalt, workerID, i)
 					opErr = benchWriter.Fill(ctx, store.Partition(*namespace), k, value)
 				case "mixed":
 					if benchWriter == nil {
@@ -467,7 +473,7 @@ func cmdBench(args []string) {
 						}
 						opErr = err
 					} else {
-						k := sha256.Sum256(fmt.Appendf(nil, "bench-put-%d-%d", workerID, i))
+						k := benchmarkWriteKey(*keySalt, workerID, i)
 						opErr = benchWriter.Fill(ctx, store.Partition(*namespace), k, value)
 					}
 				}
