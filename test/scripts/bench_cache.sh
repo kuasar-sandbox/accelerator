@@ -53,6 +53,11 @@ BENCH_BACKEND_EXPLICIT="${BENCH_BACKEND+x}"
 BENCH_BACKEND="${BENCH_BACKEND:-embedded}"
 BENCH_EXTERNAL_ENDPOINT="${BENCH_EXTERNAL_ENDPOINT:-}"
 BENCH_EXTERNAL_PREFILL_ENDPOINT="${BENCH_EXTERNAL_PREFILL_ENDPOINT:-}"
+REDIS_ENDPOINT_EXPLICIT="${REDIS_ENDPOINT+x}"
+REDIS_SHARD_ENDPOINTS_EXPLICIT="${REDIS_SHARD_ENDPOINTS+x}"
+REDIS_GET_POOL_EXPLICIT="${REDIS_GET_POOL+x}"
+REDIS_SET_POOL_EXPLICIT="${REDIS_SET_POOL+x}"
+REDIS_TIMEOUT_EXPLICIT="${REDIS_TIMEOUT+x}"
 REDIS_ENDPOINT="${REDIS_ENDPOINT:-}"
 REDIS_SHARD_ENDPOINTS="${REDIS_SHARD_ENDPOINTS:-}"
 REDIS_GET_POOL="${REDIS_GET_POOL:-32}"
@@ -90,6 +95,7 @@ BENCH_ENDPOINT=""
 PREFILL_ENDPOINT=""
 HEALTH_ENDPOINT=""
 SHARD_HEALTH_ENDPOINTS=()
+BENCH_ROUND=0
 
 # ALL_PIDS holds every daemon PID we spawn so cleanup can reap them on
 # exit. External mode leaves this array empty and the trap is a noop.
@@ -493,6 +499,8 @@ run_bench() {
     local conc=$2
     shift 2
 
+    BENCH_ROUND=$((BENCH_ROUND + 1))
+    local key_salt="round-$BENCH_ROUND-$mode-$conc"
     local out="$WORKDIR/bench-$mode-$conc.out"
     printf "  running %s c=%s\n" "$mode" "$conc" >&2
 
@@ -549,6 +557,7 @@ run_bench() {
         --timeout "$TIMEOUT"
         --cold-prefill "$COLD_PREFILL"
         --miss-ratio "$MISS_RATIO"
+        --key-salt "$key_salt"
     )
     if [ -n "$CLIENT_CORES" ]; then
         taskset -c "$CLIENT_CORES" "$BIN/cache-ctl" bench \
@@ -601,9 +610,9 @@ run_bench() {
 }
 
 # ── Runs ──────────────────────────────────────────────────────────────────
-# Every GET round passes --prefill $PREFILL so the key space is identical
-# across rounds; omitting it would make later rounds fall back to the Go
-# default (1000) and silently change the workload model.
+# Every round passes a unique key salt so a prior sweep point cannot warm the
+# next point's cold pool. GET/mixed still pass --prefill $PREFILL so each point
+# has the same working-set size.
 #
 # In non-local scenarios we always run GET (the bench target may be a
 # tiered instance that rejects writes). PUT rounds are skipped unless
@@ -639,12 +648,27 @@ REPORT_BACKEND_ENDPOINT="$REDIS_ENDPOINT"
 if [ "$BENCH_SCENARIO" = tiered-shard-l2 ]; then
     REPORT_BACKEND_ENDPOINT="$REDIS_SHARD_ENDPOINTS"
 fi
+REPORT_REDIS_GET_POOL="$REDIS_GET_POOL"
+REPORT_REDIS_SET_POOL="$REDIS_SET_POOL"
+REPORT_REDIS_TIMEOUT="$REDIS_TIMEOUT"
+if [ -n "$BENCH_EXTERNAL_ENDPOINT" ]; then
+    if [ "$BENCH_SCENARIO" = tiered-shard-l2 ]; then
+        if [ -z "$REDIS_SHARD_ENDPOINTS_EXPLICIT" ] || [ -z "$REDIS_SHARD_ENDPOINTS" ]; then
+            REPORT_BACKEND_ENDPOINT="unknown"
+        fi
+    elif [ -z "$REDIS_ENDPOINT_EXPLICIT" ] || [ -z "$REDIS_ENDPOINT" ]; then
+        REPORT_BACKEND_ENDPOINT="unknown"
+    fi
+    if [ -z "$REDIS_GET_POOL_EXPLICIT" ] || [ -z "$REDIS_GET_POOL" ]; then REPORT_REDIS_GET_POOL="unknown"; fi
+    if [ -z "$REDIS_SET_POOL_EXPLICIT" ] || [ -z "$REDIS_SET_POOL" ]; then REPORT_REDIS_SET_POOL="unknown"; fi
+    if [ -z "$REDIS_TIMEOUT_EXPLICIT" ] || [ -z "$REDIS_TIMEOUT" ]; then REPORT_REDIS_TIMEOUT="unknown"; fi
+fi
 
 awk -v scores="${SERVER_CORES:-unbound}" -v ccores="${CLIENT_CORES:-unbound}" \
     -v backend="$REPORT_BACKEND" -v backend_ep="$REPORT_BACKEND_ENDPOINT" \
     -v bcores="${BACKEND_CORES:-external/unbound}" \
-    -v redis_get_pool="$REDIS_GET_POOL" -v redis_set_pool="$REDIS_SET_POOL" \
-    -v redis_timeout="$REDIS_TIMEOUT" \
+    -v redis_get_pool="$REPORT_REDIS_GET_POOL" -v redis_set_pool="$REPORT_REDIS_SET_POOL" \
+    -v redis_timeout="$REPORT_REDIS_TIMEOUT" \
     -v scount="$SCOUNT" -v ccount="$CCOUNT" \
     -v valsz="$VALUE_SIZE" -v duration="$DURATION" -v prefill="$PREFILL" \
     -v access="$ACCESS" -v zipf_s="$ZIPF_S" -v cold_prefill="$COLD_PREFILL" \
@@ -742,6 +766,7 @@ END {
     printf "  Prefill      : %s warm / %s cold keys\n", prefill, cold_prefill
     printf "  Access       : %s (zipf-s=%s)\n", access, zipf_s
     printf "  Miss ratio   : %s\n", miss_ratio
+    printf "  Key spaces   : isolated per run\n"
     printf "  Op timeout   : %s\n", timeout
     printf "  Duration     : %s per run\n", duration
     print ""

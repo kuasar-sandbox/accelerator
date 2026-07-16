@@ -3,9 +3,58 @@ package main
 import (
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 )
+
+func TestBenchmarkKeySaltIsolatesRounds(t *testing.T) {
+	if benchmarkKey("cold", "round-1", 7) == benchmarkKey("cold", "round-2", 7) {
+		t.Fatal("different round salts produced the same key")
+	}
+	if benchmarkKey("warm", "round-1", 7) == benchmarkKey("cold", "round-1", 7) {
+		t.Fatal("warm and cold key spaces overlap")
+	}
+	if benchmarkKey("cold", "round-1", 7) != benchmarkKey("cold", "round-1", 7) {
+		t.Fatal("benchmark key generation is not deterministic")
+	}
+}
+
+func TestSnapshotFinalCountersWaitsForRedisDrainAndReconnect(t *testing.T) {
+	calls := 0
+	fetch := func(string, time.Duration) (cache.DaemonStats, error) {
+		calls++
+		redis := &cache.RedisStats{
+			GetPoolSize: 1,
+			SetPoolSize: 1,
+			Draining:    1,
+		}
+		if calls > 1 {
+			redis.GetConnected = 1
+			redis.SetConnected = 1
+			redis.Draining = 0
+			redis.LateBytesDrained = 4096
+			redis.Reconnects = 1
+		}
+		return cache.DaemonStats{Redis: redis}, nil
+	}
+
+	finals, haveFinal, settled := snapshotFinalCounters(
+		[]string{"127.0.0.1:7701"}, []bool{true}, time.Second, fetch,
+	)
+	if !settled {
+		t.Fatal("counter snapshot did not settle")
+	}
+	if calls < 2 {
+		t.Fatalf("fetch calls = %d, want at least 2", calls)
+	}
+	if !haveFinal[0] || finals[0].Redis == nil {
+		t.Fatalf("final Redis snapshot missing: %#v", finals)
+	}
+	if got := finals[0].Redis.LateBytesDrained; got != 4096 {
+		t.Fatalf("late bytes = %d, want 4096", got)
+	}
+}
 
 func TestStringListFlagPreservesEndpoints(t *testing.T) {
 	var endpoints stringListFlag

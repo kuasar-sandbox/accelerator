@@ -197,6 +197,10 @@ is an external deployment component, so the operator must pin its process to
 `BACKEND_CORES` is recorded in the report but is not applied by the script.
 Report both cache-ctl and backend CPU allocations; comparing an unbounded
 Dragonfly process with a bounded embedded process is not a valid A/B.
+Each sweep point uses a separate warm/cold key space, so cold reads filled by an
+earlier concurrency point cannot turn into hits in a later point. In external
+mode, Redis endpoint, pool and timeout fields are reported only when explicitly
+provided; otherwise the report marks them as unknown.
 
 For the EC path, provide exactly five independent Redis endpoints:
 

@@ -23,6 +23,10 @@ import (
 
 type stringListFlag []string
 
+type infoFetcher func(string, time.Duration) (cache.DaemonStats, error)
+
+const finalCounterSnapshotTimeout = 5 * time.Second
+
 func (v *stringListFlag) String() string {
 	return strings.Join(*v, ",")
 }
@@ -30,6 +34,67 @@ func (v *stringListFlag) String() string {
 func (v *stringListFlag) Set(value string) error {
 	*v = append(*v, value)
 	return nil
+}
+
+func benchmarkKey(kind, salt string, index int) [32]byte {
+	return sha256.Sum256(fmt.Appendf(nil, "bench-%s:%d:%s:%d", kind, len(salt), salt, index))
+}
+
+func redisStatsIdle(stats *cache.RedisStats) bool {
+	if stats == nil {
+		return true
+	}
+	return stats.GetInflight == 0 && stats.SetInflight == 0 &&
+		stats.PoolWaiters == 0 && stats.Draining == 0 &&
+		stats.GetConnected == stats.GetPoolSize &&
+		stats.SetConnected == stats.SetPoolSize
+}
+
+func daemonRedisIdle(stats cache.DaemonStats) bool {
+	if !redisStatsIdle(stats.Redis) {
+		return false
+	}
+	if stats.Tiered != nil {
+		for _, tier := range stats.Tiered.Tiers {
+			if !redisStatsIdle(tier.Redis) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// snapshotFinalCounters waits only for observable Redis operations and worker
+// reconnects to settle. It is bounded so a failed backend cannot stall a sweep.
+func snapshotFinalCounters(endpoints []string, haveBaseline []bool, timeout time.Duration, fetch infoFetcher) ([]cache.DaemonStats, []bool, bool) {
+	finals := make([]cache.DaemonStats, len(endpoints))
+	haveFinal := make([]bool, len(endpoints))
+	deadline := time.Now().Add(timeout)
+	for {
+		idle := true
+		for i, endpoint := range endpoints {
+			if !haveBaseline[i] {
+				continue
+			}
+			stats, err := fetch(endpoint, 250*time.Millisecond)
+			if err != nil {
+				idle = false
+				continue
+			}
+			finals[i] = stats
+			haveFinal[i] = true
+			if !daemonRedisIdle(stats) {
+				idle = false
+			}
+		}
+		if idle {
+			return finals, haveFinal, true
+		}
+		if !time.Now().Before(deadline) {
+			return finals, haveFinal, false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // selectKey chooses the next read key per the access pattern, optionally
@@ -129,6 +194,7 @@ func cmdBench(args []string) {
 	zipfS := fs.Float64("zipf-s", 1.1, "Zipf skew exponent s (>1; higher = more skew) when --access zipf")
 	coldPrefill := fs.Int("cold-prefill", 0, "extra keys prefilled to --prefill-endpoint ONLY (not warmed into the bench target) — L2-miss → origin/L3 targets")
 	missRatio := fs.Float64("miss-ratio", 0, "fraction of reads that hit cold keys → L2 miss → origin/L3 (needs --cold-prefill>0 and --prefill-endpoint)")
+	keySalt := fs.String("key-salt", "", "salt for an isolated benchmark key space")
 	timeout := fs.Duration("timeout", 10*time.Second, "per-op client TCP deadline; raise for a slow/stalling origin during large prefills (a sustained 512KiB write burst can stall RocksDB past 10s)")
 	fs.Parse(args)
 
@@ -237,7 +303,7 @@ func cmdBench(args []string) {
 	if *mode != "put" {
 		fmt.Fprintf(os.Stderr, "Prefilling %d objects (%d bytes each) to %s ...\n", *prefill, *valueSize, prefillEP)
 		for i := range keys {
-			keys[i] = sha256.Sum256(fmt.Appendf(nil, "bench-key-%d", i))
+			keys[i] = benchmarkKey("warm", *keySalt, i)
 			if err := prefillClient.Fill(context.Background(), store.Partition(*namespace), keys[i], value); err != nil {
 				fatal("prefill put: %v", err)
 			}
@@ -245,7 +311,7 @@ func cmdBench(args []string) {
 		if *coldPrefill > 0 {
 			fmt.Fprintf(os.Stderr, "Prefilling %d cold objects to %s (origin only — L2-miss targets) ...\n", *coldPrefill, prefillEP)
 			for i := range coldKeys {
-				coldKeys[i] = sha256.Sum256(fmt.Appendf(nil, "bench-cold-%d", i))
+				coldKeys[i] = benchmarkKey("cold", *keySalt, i)
 				if err := prefillClient.Fill(context.Background(), store.Partition(*namespace), coldKeys[i], value); err != nil {
 					fatal("cold prefill put: %v", err)
 				}
@@ -438,21 +504,19 @@ func cmdBench(args []string) {
 		}
 	}
 
-	// Final counter snapshot. Fill counters increment when work is initiated, so
-	// the delta is independent of whether a backend write is still completing.
-	finals := make([]cache.DaemonStats, len(infoEndpoints))
-	haveFinal := make([]bool, len(infoEndpoints))
+	// Capture cancellation/drain/reconnect counters after Redis workers settle.
+	// This is an Info-only bounded wait; it does not inspect implementation fill
+	// goroutines or add a separate operational command.
+	finals, haveFinal, countersSettled := snapshotFinalCounters(
+		infoEndpoints, haveBaseline, finalCounterSnapshotTimeout, fetchInfo,
+	)
+	if !countersSettled {
+		fmt.Fprintf(os.Stderr, "warn: Redis counters did not settle within %s; final state is included in the report\n", finalCounterSnapshotTimeout)
+	}
 	for i, endpoint := range infoEndpoints {
-		if !haveBaseline[i] {
-			continue
+		if haveBaseline[i] && !haveFinal[i] {
+			fmt.Fprintf(os.Stderr, "warn: final info fetch %s did not succeed\n", endpoint)
 		}
-		f, err := fetchInfo(endpoint, 3*time.Second)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "warn: final info fetch %s failed: %v\n", endpoint, err)
-			continue
-		}
-		finals[i] = f
-		haveFinal[i] = true
 	}
 
 	// Compute percentiles.
@@ -475,6 +539,9 @@ func cmdBench(args []string) {
 	fmt.Printf("  endpoint:   %s\n", *endpoint)
 	if *prefillEndpoint != "" {
 		fmt.Printf("  prefill_endpoint: %s\n", *prefillEndpoint)
+	}
+	if *keySalt != "" {
+		fmt.Printf("  key_salt:   %s\n", *keySalt)
 	}
 	fmt.Printf("  ops:        %d\n", totalOps)
 	fmt.Printf("  throughput: %.0f ops/sec\n", throughput)
