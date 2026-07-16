@@ -203,6 +203,9 @@ func TestTieredCacheCloseCancelsAndDrainsFill(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("fill did not start")
 	}
+	if got := tc.Counters().TierFillsInflight[0]; got != 1 {
+		t.Fatalf("fills in flight=%d, want 1", got)
+	}
 	tc.Close()
 	select {
 	case <-tier.finished:
@@ -211,6 +214,9 @@ func TestTieredCacheCloseCancelsAndDrainsFill(t *testing.T) {
 	}
 	if got := blob.handles.Load(); got != 1 {
 		t.Fatalf("live handle count after Close=%d, want caller's original handle", got)
+	}
+	if got := tc.Counters().TierFillsInflight[0]; got != 0 {
+		t.Fatalf("fills in flight after Close=%d, want 0", got)
 	}
 	blob.Release()
 

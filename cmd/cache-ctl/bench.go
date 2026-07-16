@@ -12,6 +12,7 @@ import (
 	"runtime/pprof"
 	"runtime/trace"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +20,100 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/client"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
+
+type stringListFlag []string
+
+type infoFetcher func(string, time.Duration) (cache.DaemonStats, error)
+
+const finalCounterSnapshotTimeout = 5 * time.Second
+
+func (v *stringListFlag) String() string {
+	return strings.Join(*v, ",")
+}
+
+func (v *stringListFlag) Set(value string) error {
+	*v = append(*v, value)
+	return nil
+}
+
+func benchmarkKey(kind, salt string, index int) [32]byte {
+	return sha256.Sum256(fmt.Appendf(nil, "bench-%s:%d:%s:%d", kind, len(salt), salt, index))
+}
+
+func benchmarkWriteKey(salt string, workerID, index int) [32]byte {
+	return sha256.Sum256(fmt.Appendf(nil, "bench-put:%d:%s:%d:%d", len(salt), salt, workerID, index))
+}
+
+func redisStatsIdle(stats *cache.RedisStats) bool {
+	if stats == nil {
+		return true
+	}
+	return stats.GetInflight == 0 && stats.SetInflight == 0 &&
+		stats.PoolWaiters == 0 && stats.Draining == 0 &&
+		stats.GetConnected == stats.GetPoolSize &&
+		stats.SetConnected == stats.SetPoolSize
+}
+
+func daemonRedisIdle(stats cache.DaemonStats) bool {
+	if !redisStatsIdle(stats.Redis) {
+		return false
+	}
+	if stats.Tiered != nil {
+		for _, tier := range stats.Tiered.Tiers {
+			if !redisStatsIdle(tier.Redis) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func daemonFillsIdle(stats cache.DaemonStats) bool {
+	if stats.Tiered == nil {
+		return true
+	}
+	for _, tier := range stats.Tiered.Tiers {
+		if tier.FillsInflight != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// snapshotFinalCounters waits for observable coordinator fills and Redis worker
+// state to settle. It is bounded so a failed backend cannot stall a sweep.
+func snapshotFinalCounters(endpoints []string, haveBaseline []bool, timeout time.Duration, fetch infoFetcher) ([]cache.DaemonStats, []bool, bool) {
+	finals := make([]cache.DaemonStats, len(endpoints))
+	haveFinal := make([]bool, len(endpoints))
+	deadline := time.Now().Add(timeout)
+	for {
+		idle := true
+		for i, endpoint := range endpoints {
+			if !haveBaseline[i] {
+				continue
+			}
+			stats, err := fetch(endpoint, 250*time.Millisecond)
+			if err != nil {
+				finals[i] = cache.DaemonStats{}
+				haveFinal[i] = false
+				idle = false
+				continue
+			}
+			finals[i] = stats
+			haveFinal[i] = true
+			if !daemonFillsIdle(stats) || !daemonRedisIdle(stats) {
+				idle = false
+			}
+		}
+		if idle {
+			return finals, haveFinal, true
+		}
+		if !time.Now().Before(deadline) {
+			return finals, haveFinal, false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
 
 // selectKey chooses the next read key per the access pattern, optionally
 // drawing a cold (L2-miss → origin/L3) key with probability missRatio. warm
@@ -102,7 +197,8 @@ func cmdBench(args []string) {
 	fs := flag.NewFlagSet("bench", flag.ExitOnError)
 	endpoint := fs.String("endpoint", "", "cache-ctl data endpoint, bench target (overrides CACHE_ENDPOINT env)")
 	prefillEndpoint := fs.String("prefill-endpoint", "", "separate prefill write endpoint (default: use --endpoint; non-empty implies --mode get)")
-	infoEndpoint := fs.String("info-endpoint", "", "bench target's Info gRPC endpoint (HealthListen); enables bench-window counter printout")
+	var infoEndpoints stringListFlag
+	fs.Var(&infoEndpoints, "info-endpoint", "Info gRPC endpoint (HealthListen), repeatable; the first endpoint is the bench target")
 	concurrency := fs.Int("concurrency", 8, "number of parallel workers")
 	duration := fs.Duration("duration", 10*time.Second, "benchmark duration")
 	valueSize := fs.Int("value-size", 256*1024, "value size in bytes")
@@ -116,6 +212,7 @@ func cmdBench(args []string) {
 	zipfS := fs.Float64("zipf-s", 1.1, "Zipf skew exponent s (>1; higher = more skew) when --access zipf")
 	coldPrefill := fs.Int("cold-prefill", 0, "extra keys prefilled to --prefill-endpoint ONLY (not warmed into the bench target) — L2-miss → origin/L3 targets")
 	missRatio := fs.Float64("miss-ratio", 0, "fraction of reads that hit cold keys → L2 miss → origin/L3 (needs --cold-prefill>0 and --prefill-endpoint)")
+	keySalt := fs.String("key-salt", "", "salt for an isolated benchmark key space")
 	timeout := fs.Duration("timeout", 10*time.Second, "per-op client TCP deadline; raise for a slow/stalling origin during large prefills (a sustained 512KiB write burst can stall RocksDB past 10s)")
 	fs.Parse(args)
 
@@ -224,7 +321,7 @@ func cmdBench(args []string) {
 	if *mode != "put" {
 		fmt.Fprintf(os.Stderr, "Prefilling %d objects (%d bytes each) to %s ...\n", *prefill, *valueSize, prefillEP)
 		for i := range keys {
-			keys[i] = sha256.Sum256(fmt.Appendf(nil, "bench-key-%d", i))
+			keys[i] = benchmarkKey("warm", *keySalt, i)
 			if err := prefillClient.Fill(context.Background(), store.Partition(*namespace), keys[i], value); err != nil {
 				fatal("prefill put: %v", err)
 			}
@@ -232,7 +329,7 @@ func cmdBench(args []string) {
 		if *coldPrefill > 0 {
 			fmt.Fprintf(os.Stderr, "Prefilling %d cold objects to %s (origin only — L2-miss targets) ...\n", *coldPrefill, prefillEP)
 			for i := range coldKeys {
-				coldKeys[i] = sha256.Sum256(fmt.Appendf(nil, "bench-cold-%d", i))
+				coldKeys[i] = benchmarkKey("cold", *keySalt, i)
 				if err := prefillClient.Fill(context.Background(), store.Partition(*namespace), coldKeys[i], value); err != nil {
 					fatal("cold prefill put: %v", err)
 				}
@@ -252,8 +349,8 @@ func cmdBench(args []string) {
 			}
 			// Verify the observable condition needed by the measurement: every
 			// working-set key can complete a full pass from tier 0.
-			if *infoEndpoint != "" {
-				if err := waitFirstTierWarm(benchReader, *infoEndpoint, store.Partition(*namespace), keys, 30*time.Second); err != nil {
+			if len(infoEndpoints) > 0 {
+				if err := waitFirstTierWarm(benchReader, infoEndpoints[0], store.Partition(*namespace), keys, 30*time.Second); err != nil {
 					fatal("bench target did not become warm: %v", err)
 				}
 			}
@@ -263,18 +360,18 @@ func cmdBench(args []string) {
 
 	// Baseline counter snapshot. Captured after prefill and warm verification
 	// so the bench window excludes the Put/Get+backfill storm that
-	// populated the working set. Soft-fail: if --info-endpoint is empty
-	// or the dial errors, we skip the delta print; the bench runs.
-	var baseline cache.DaemonStats
-	var haveBaseline bool
-	if *infoEndpoint != "" {
-		b, err := fetchInfo(*infoEndpoint, 3*time.Second)
+	// populated the working set. Each endpoint soft-fails independently, so one
+	// unavailable shard does not prevent the benchmark itself from running.
+	baselines := make([]cache.DaemonStats, len(infoEndpoints))
+	haveBaseline := make([]bool, len(infoEndpoints))
+	for i, endpoint := range infoEndpoints {
+		b, err := fetchInfo(endpoint, 3*time.Second)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "warn: baseline info fetch failed: %v\n", err)
-		} else {
-			baseline = b
-			haveBaseline = true
+			fmt.Fprintf(os.Stderr, "warn: baseline info fetch %s failed: %v\n", endpoint, err)
+			continue
 		}
+		baselines[i] = b
+		haveBaseline[i] = true
 	}
 
 	// Benchmark.
@@ -362,7 +459,7 @@ func cmdBench(args []string) {
 					if benchWriter == nil {
 						fatal("--mode put requires bench target to accept writes")
 					}
-					k := sha256.Sum256(fmt.Appendf(nil, "bench-put-%d-%d", workerID, i))
+					k := benchmarkWriteKey(*keySalt, workerID, i)
 					opErr = benchWriter.Fill(ctx, store.Partition(*namespace), k, value)
 				case "mixed":
 					if benchWriter == nil {
@@ -376,7 +473,7 @@ func cmdBench(args []string) {
 						}
 						opErr = err
 					} else {
-						k := sha256.Sum256(fmt.Appendf(nil, "bench-put-%d-%d", workerID, i))
+						k := benchmarkWriteKey(*keySalt, workerID, i)
 						opErr = benchWriter.Fill(ctx, store.Partition(*namespace), k, value)
 					}
 				}
@@ -425,17 +522,17 @@ func cmdBench(args []string) {
 		}
 	}
 
-	// Final counter snapshot. Fill counters increment when work is initiated, so
-	// the delta is independent of whether a backend write is still completing.
-	var final cache.DaemonStats
-	haveFinal := false
-	if haveBaseline {
-		f, err := fetchInfo(*infoEndpoint, 3*time.Second)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "warn: final info fetch failed: %v\n", err)
-		} else {
-			final = f
-			haveFinal = true
+	// Capture counters after coordinator fills and Redis workers settle. This is
+	// a bounded poll of the normal Info API, not a separate lifecycle command.
+	finals, haveFinal, countersSettled := snapshotFinalCounters(
+		infoEndpoints, haveBaseline, finalCounterSnapshotTimeout, fetchInfo,
+	)
+	if !countersSettled {
+		fmt.Fprintf(os.Stderr, "warn: Redis counters did not settle within %s; final state is included in the report\n", finalCounterSnapshotTimeout)
+	}
+	for i, endpoint := range infoEndpoints {
+		if haveBaseline[i] && !haveFinal[i] {
+			fmt.Fprintf(os.Stderr, "warn: final info fetch %s did not succeed\n", endpoint)
 		}
 	}
 
@@ -460,6 +557,9 @@ func cmdBench(args []string) {
 	if *prefillEndpoint != "" {
 		fmt.Printf("  prefill_endpoint: %s\n", *prefillEndpoint)
 	}
+	if *keySalt != "" {
+		fmt.Printf("  key_salt:   %s\n", *keySalt)
+	}
 	fmt.Printf("  ops:        %d\n", totalOps)
 	fmt.Printf("  throughput: %.0f ops/sec\n", throughput)
 	fmt.Printf("  bandwidth:  %.1f MiB/sec\n", bandwidth)
@@ -483,9 +583,14 @@ func cmdBench(args []string) {
 		fmt.Printf("    gc-pause-ms:  %d\n", pauseNs/1_000_000)
 	}
 
-	if haveFinal {
-		delta := diffCounters(baseline, final)
-		printBenchWindow(delta)
+	for i, endpoint := range infoEndpoints {
+		if !haveFinal[i] {
+			continue
+		}
+		if len(infoEndpoints) > 1 {
+			fmt.Printf("  info endpoint: %s\n", endpoint)
+		}
+		printBenchWindow(diffCounters(baselines[i], finals[i]))
 	}
 }
 
@@ -498,24 +603,28 @@ func cmdBench(args []string) {
 // window is misleading.
 func diffCounters(before, after cache.DaemonStats) cache.DaemonStats {
 	out := cache.DaemonStats{
-		Mode:      after.Mode,
-		UptimeSec: after.UptimeSec,
+		Mode:        after.Mode,
+		BackendType: after.BackendType,
+		UptimeSec:   after.UptimeSec,
 		Server: cache.ServerStats{
 			Hits:   after.Server.Hits - before.Server.Hits,
 			Misses: after.Server.Misses - before.Server.Misses,
 			Fills:  after.Server.Fills - before.Server.Fills,
 		},
+		Redis: diffRedisCounters(before.Redis, after.Redis),
 	}
 	if after.Tiered != nil {
 		tiers := make([]cache.TierStats, len(after.Tiered.Tiers))
 		for i, t := range after.Tiered.Tiers {
 			d := cache.TierStats{
-				Type:     t.Type,
-				Endpoint: t.Endpoint,
-				Hits:     t.Hits,
-				Misses:   t.Misses,
-				Fills:    t.Fills,
-				Errors:   t.Errors,
+				Type:          t.Type,
+				Endpoint:      t.Endpoint,
+				Hits:          t.Hits,
+				Misses:        t.Misses,
+				Fills:         t.Fills,
+				Errors:        t.Errors,
+				FillsInflight: t.FillsInflight,
+				Redis:         diffRedisCounters(nil, t.Redis),
 			}
 			// Subtract matching tier from baseline if present.
 			if before.Tiered != nil && i < len(before.Tiered.Tiers) {
@@ -524,6 +633,7 @@ func diffCounters(before, after cache.DaemonStats) cache.DaemonStats {
 				d.Misses -= b.Misses
 				d.Fills -= b.Fills
 				d.Errors -= b.Errors
+				d.Redis = diffRedisCounters(b.Redis, t.Redis)
 			}
 			if len(t.Peers) > 0 {
 				d.Peers = make([]cache.PeerStats, len(t.Peers))
@@ -569,6 +679,46 @@ func diffCounters(before, after cache.DaemonStats) cache.DaemonStats {
 	return out
 }
 
+// diffRedisCounters keeps endpoint and final pool state while subtracting only
+// monotonic counters. Redis latency percentiles are cumulative histograms, so
+// they are intentionally omitted from a benchmark-window delta.
+func diffRedisCounters(before, after *cache.RedisStats) *cache.RedisStats {
+	if after == nil {
+		return nil
+	}
+	out := &cache.RedisStats{
+		Endpoint:         after.Endpoint,
+		Transport:        after.Transport,
+		GetPoolSize:      after.GetPoolSize,
+		SetPoolSize:      after.SetPoolSize,
+		GetConnected:     after.GetConnected,
+		SetConnected:     after.SetConnected,
+		GetInflight:      after.GetInflight,
+		SetInflight:      after.SetInflight,
+		PoolWaiters:      after.PoolWaiters,
+		Draining:         after.Draining,
+		GetHits:          after.GetHits,
+		GetMisses:        after.GetMisses,
+		Sets:             after.Sets,
+		Cancelled:        after.Cancelled,
+		LateBytesDrained: after.LateBytesDrained,
+		Reconnects:       after.Reconnects,
+		ProtocolErrors:   after.ProtocolErrors,
+		BackendErrors:    after.BackendErrors,
+	}
+	if before != nil {
+		out.GetHits -= before.GetHits
+		out.GetMisses -= before.GetMisses
+		out.Sets -= before.Sets
+		out.Cancelled -= before.Cancelled
+		out.LateBytesDrained -= before.LateBytesDrained
+		out.Reconnects -= before.Reconnects
+		out.ProtocolErrors -= before.ProtocolErrors
+		out.BackendErrors -= before.BackendErrors
+	}
+	return out
+}
+
 // printBenchWindow renders the delta as a compact block appended to
 // the bench summary. Same layout as info.go's printInfoHuman but with
 // a "bench-window" header and without the rocks section.
@@ -582,19 +732,22 @@ func printBenchWindow(d cache.DaemonStats) {
 	fmt.Printf("  server: hits=%d misses=%d fills=%d hit%%=%.2f\n",
 		d.Server.Hits, d.Server.Misses, d.Server.Fills, srvHR)
 
+	if d.Redis != nil {
+		printRedisBenchWindow("redis", d.Redis)
+	}
 	if d.Tiered == nil {
 		return
 	}
-	fmt.Printf("  %-12s %-10s %10s %10s %10s %10s %8s\n",
-		"layer", "type", "hits", "misses", "fills", "errors", "hit%")
+	fmt.Printf("  %-12s %-10s %10s %10s %10s %10s %10s %8s\n",
+		"layer", "type", "hits", "misses", "fills", "end-flight", "errors", "hit%")
 	for i, t := range d.Tiered.Tiers {
 		tot := t.Hits + t.Misses
 		hr := 0.0
 		if tot > 0 {
 			hr = 100.0 * float64(t.Hits) / float64(tot)
 		}
-		fmt.Printf("  tier-%-7d %-10s %10d %10d %10d %10d %7.2f%%\n",
-			i, t.Type, t.Hits, t.Misses, t.Fills, t.Errors, hr)
+		fmt.Printf("  tier-%-7d %-10s %10d %10d %10d %10d %10d %7.2f%%\n",
+			i, t.Type, t.Hits, t.Misses, t.Fills, t.FillsInflight, t.Errors, hr)
 	}
 	o := d.Tiered.Origin
 	otot := o.Hits + o.Misses
@@ -602,10 +755,13 @@ func printBenchWindow(d cache.DaemonStats) {
 	if otot > 0 {
 		ohr = 100.0 * float64(o.Hits) / float64(otot)
 	}
-	fmt.Printf("  %-12s %-10s %10d %10d %10s %10d %7.2f%%\n",
-		"origin", o.Type, o.Hits, o.Misses, "-", o.Errors, ohr)
+	fmt.Printf("  %-12s %-10s %10d %10d %10s %10s %10d %7.2f%%\n",
+		"origin", o.Type, o.Hits, o.Misses, "-", "-", o.Errors, ohr)
 
 	for _, t := range d.Tiered.Tiers {
+		if t.Redis != nil {
+			printRedisBenchWindow("redis tier", t.Redis)
+		}
 		if len(t.Peers) == 0 {
 			continue
 		}
@@ -621,4 +777,11 @@ func printBenchWindow(d cache.DaemonStats) {
 		}
 		break
 	}
+}
+
+func printRedisBenchWindow(label string, s *cache.RedisStats) {
+	fmt.Printf("  %s: endpoint=%s transport=%s get-hits=%d get-misses=%d sets=%d cancels=%d late-bytes=%d reconnects=%d backend-errors=%d protocol-errors=%d end-inflight=%d/%d end-waiters=%d end-draining=%d\n",
+		label, s.Endpoint, s.Transport, s.GetHits, s.GetMisses, s.Sets,
+		s.Cancelled, s.LateBytesDrained, s.Reconnects, s.BackendErrors,
+		s.ProtocolErrors, s.GetInflight, s.SetInflight, s.PoolWaiters, s.Draining)
 }

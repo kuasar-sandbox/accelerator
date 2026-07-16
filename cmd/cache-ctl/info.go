@@ -121,15 +121,16 @@ func fromPb(r *cachepb.InfoReply) cache.DaemonStats {
 		tiers := make([]cache.TierStats, len(r.Tiered.Tiers))
 		for i, t := range r.Tiered.Tiers {
 			tiers[i] = cache.TierStats{
-				Type:     t.Type,
-				Hits:     t.Hits,
-				Misses:   t.Misses,
-				Fills:    t.Fills,
-				Errors:   t.Errors,
-				Rocks:    rocksFromPb(t.Rocks),
-				Redis:    redisFromPb(t.Redis),
-				Peers:    peersFromPb(t.Peers),
-				Endpoint: t.Endpoint,
+				Type:          t.Type,
+				Hits:          t.Hits,
+				Misses:        t.Misses,
+				Fills:         t.Fills,
+				Errors:        t.Errors,
+				FillsInflight: t.FillsInflight,
+				Rocks:         rocksFromPb(t.Rocks),
+				Redis:         redisFromPb(t.Redis),
+				Peers:         peersFromPb(t.Peers),
+				Endpoint:      t.Endpoint,
 			}
 		}
 		origin := cache.OriginStats{}
@@ -240,16 +241,16 @@ func printInfoHuman(ds cache.DaemonStats) {
 
 	if ds.Tiered != nil {
 		fmt.Println("tiers:")
-		fmt.Printf("  %-14s %-12s %10s %10s %10s %10s %8s\n",
-			"layer", "type", "hits", "misses", "fills", "errors", "hit%")
+		fmt.Printf("  %-14s %-12s %10s %10s %10s %10s %10s %8s\n",
+			"layer", "type", "hits", "misses", "fills", "inflight", "errors", "hit%")
 		for i, t := range ds.Tiered.Tiers {
 			tot := t.Hits + t.Misses
 			hr := 0.0
 			if tot > 0 {
 				hr = 100.0 * float64(t.Hits) / float64(tot)
 			}
-			fmt.Printf("  tier-%-9d %-12s %10d %10d %10d %10d %7.2f%%\n",
-				i, t.Type, t.Hits, t.Misses, t.Fills, t.Errors, hr)
+			fmt.Printf("  tier-%-9d %-12s %10d %10d %10d %10d %10d %7.2f%%\n",
+				i, t.Type, t.Hits, t.Misses, t.Fills, t.FillsInflight, t.Errors, hr)
 		}
 		o := ds.Tiered.Origin
 		otot := o.Hits + o.Misses
@@ -257,8 +258,8 @@ func printInfoHuman(ds cache.DaemonStats) {
 		if otot > 0 {
 			ohr = 100.0 * float64(o.Hits) / float64(otot)
 		}
-		fmt.Printf("  %-14s %-12s %10d %10d %10s %10d %7.2f%%\n",
-			"origin", o.Type, o.Hits, o.Misses, "-", o.Errors, ohr)
+		fmt.Printf("  %-14s %-12s %10d %10d %10s %10s %10d %7.2f%%\n",
+			"origin", o.Type, o.Hits, o.Misses, "-", "-", o.Errors, ohr)
 
 		for i, t := range ds.Tiered.Tiers {
 			if t.Redis != nil {

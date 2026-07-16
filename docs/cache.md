@@ -118,7 +118,7 @@ Flags:
   --namespace string        "chunk" | "manifest"
   --prefill int             get/mixed 模式预写对象数 (default 1000)
   --prefill-endpoint string 独立预写端点(默认同 --endpoint)
-  --info-endpoint string    bench 目标的 Info gRPC 端点(HealthListen);开启 bench 窗口计数显示
+  --info-endpoint value     Info gRPC 端点(HealthListen)，可重复；第一个端点同时用于 bench 目标预热判定
   --access string           "seq" | "uniform" | "zipf" 读访问模式 (default "seq")
   --zipf-s float            Zipf 偏斜指数 s (>1,越大越偏;仅 --access zipf) (default 1.1)
   --cold-prefill int        额外只写 prefill 端点、不暖 bench 目标的冷 key 数(喂 L2-miss → L3)

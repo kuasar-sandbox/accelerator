@@ -43,12 +43,13 @@ func TestRedisInfoProtoRoundTrip(t *testing.T) {
 		Redis:       redis,
 		Tiered: &cache.TieredStats{
 			Tiers: []cache.TierStats{{
-				Type:   "redis",
-				Hits:   9,
-				Misses: 8,
-				Fills:  7,
-				Errors: 6,
-				Redis:  redis,
+				Type:          "redis",
+				Hits:          9,
+				Misses:        8,
+				Fills:         7,
+				Errors:        6,
+				FillsInflight: 2,
+				Redis:         redis,
 			}},
 			Origin: cache.OriginStats{Type: "store", Hits: 5, Misses: 4, Errors: 3, Endpoint: "127.0.0.1:7100"},
 		},
@@ -67,7 +68,8 @@ func TestRedisInfoProtoRoundTrip(t *testing.T) {
 	if !reflect.DeepEqual(got.Tiered.Tiers[0].Redis, redis) {
 		t.Fatalf("tier Redis round trip mismatch: got=%#v want=%#v", got.Tiered.Tiers[0].Redis, redis)
 	}
-	if got.Tiered.Tiers[0].Type != "redis" || got.Tiered.Tiers[0].Hits != 9 || got.Tiered.Origin != want.Tiered.Origin {
+	if got.Tiered.Tiers[0].Type != "redis" || got.Tiered.Tiers[0].Hits != 9 ||
+		got.Tiered.Tiers[0].FillsInflight != 2 || got.Tiered.Origin != want.Tiered.Origin {
 		t.Fatalf("tier metadata round trip mismatch: got=%#v want=%#v", got.Tiered, want.Tiered)
 	}
 }

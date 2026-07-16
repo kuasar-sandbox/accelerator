@@ -79,6 +79,8 @@ message TierStats {
     string                endpoint = 7;
     uint64                errors   = 8;
     RedisStats            redis    = 9;
+    // Current async fill/repair goroutines. Unlike fills, this is a gauge.
+    uint64                fills_inflight = 10;
 }
 
 // OriginStats is the final cascade layer. Origin is a Getter (no

@@ -37,11 +37,12 @@ type TieredStats struct {
 // failure, etc.) — kept separate from Misses so observability shows
 // "peer confirmed absent" distinctly from "we failed to ask".
 type TierStats struct {
-	Type   string `json:"type"`
-	Hits   uint64 `json:"hits"`
-	Misses uint64 `json:"misses"`
-	Fills  uint64 `json:"fills"`
-	Errors uint64 `json:"errors"`
+	Type          string `json:"type"`
+	Hits          uint64 `json:"hits"`
+	Misses        uint64 `json:"misses"`
+	Fills         uint64 `json:"fills"`
+	Errors        uint64 `json:"errors"`
+	FillsInflight uint64 `json:"fills_inflight"`
 
 	Rocks    []RocksCFStats `json:"rocks,omitempty"`
 	Redis    *RedisStats    `json:"redis,omitempty"`

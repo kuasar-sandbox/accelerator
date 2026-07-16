@@ -10,10 +10,21 @@ set -euo pipefail
 # Scenarios (BENCH_SCENARIO env var, default "local"):
 #
 #   local            1 local cache-ctl (today's default behaviour)
-#   tiered-l1        1 local (store role) + 1 tiered (L1 embedded rocks,
+#   tiered-l1        1 local (store role) + 1 tiered (L1 selected backend,
 #                    origin: upstream → local)
 #   tiered-shard-l2  1 local (store role) + 5 shard (L2 EC cluster) +
 #                    1 tiered (no L1, tiers=[ec], origin: upstream → local)
+#
+# BENCH_BACKEND selects the physical store used by the measured cache-ctl
+# daemon(s):
+#
+#   embedded          in-process RocksDB (default)
+#   redis             external Redis-compatible server over UDS or TCP
+#
+# Redis server lifecycle is deliberately external to this protocol-neutral
+# harness. local/tiered-l1 require REDIS_ENDPOINT; tiered-shard-l2 requires
+# five whitespace-separated REDIS_SHARD_ENDPOINTS, one independent storage
+# namespace per physical shard peer.
 #
 # External mode (skip spin-up, bench a pre-started instance):
 #
@@ -24,6 +35,11 @@ set -euo pipefail
 #   bash test/scripts/bench_cache.sh
 #   BENCH_SCENARIO=tiered-l1 bash test/scripts/bench_cache.sh
 #   BENCH_SCENARIO=tiered-shard-l2 bash test/scripts/bench_cache.sh
+#   BENCH_BACKEND=redis REDIS_ENDPOINT=unix:///run/dragonfly/redis.sock \
+#     bash test/scripts/bench_cache.sh
+#   BENCH_BACKEND=redis BENCH_SCENARIO=tiered-shard-l2 \
+#     REDIS_SHARD_ENDPOINTS='unix:///run/df1.sock ... unix:///run/df5.sock' \
+#     bash test/scripts/bench_cache.sh
 #   BENCH_EXTERNAL_ENDPOINT=127.0.0.1:7700 bash test/scripts/bench_cache.sh
 #
 #   SERVER_CORES=0   CLIENT_CORES=1       bash test/scripts/bench_cache.sh
@@ -33,8 +49,26 @@ set -euo pipefail
 #   GET_CONCS="" PUT_CONCS="1 4 8"        bash test/scripts/bench_cache.sh  # PUT only
 
 BENCH_SCENARIO="${BENCH_SCENARIO:-local}"
+BENCH_BACKEND_EXPLICIT="${BENCH_BACKEND+x}"
+BENCH_BACKEND="${BENCH_BACKEND:-embedded}"
 BENCH_EXTERNAL_ENDPOINT="${BENCH_EXTERNAL_ENDPOINT:-}"
 BENCH_EXTERNAL_PREFILL_ENDPOINT="${BENCH_EXTERNAL_PREFILL_ENDPOINT:-}"
+CONCS_EXPLICIT="${CONCS+x}"
+GET_CONCS_EXPLICIT="${GET_CONCS+x}"
+PUT_CONCS_EXPLICIT="${PUT_CONCS+x}"
+MIXED_CONCS_EXPLICIT="${MIXED_CONCS+x}"
+REDIS_ENDPOINT_EXPLICIT="${REDIS_ENDPOINT+x}"
+REDIS_SHARD_ENDPOINTS_EXPLICIT="${REDIS_SHARD_ENDPOINTS+x}"
+REDIS_GET_POOL_EXPLICIT="${REDIS_GET_POOL+x}"
+REDIS_SET_POOL_EXPLICIT="${REDIS_SET_POOL+x}"
+REDIS_TIMEOUT_EXPLICIT="${REDIS_TIMEOUT+x}"
+REDIS_ENDPOINT="${REDIS_ENDPOINT:-}"
+REDIS_SHARD_ENDPOINTS="${REDIS_SHARD_ENDPOINTS:-}"
+REDIS_GET_POOL="${REDIS_GET_POOL:-32}"
+REDIS_SET_POOL="${REDIS_SET_POOL:-8}"
+REDIS_TIMEOUT="${REDIS_TIMEOUT:-5s}"
+REDIS_RESET="${REDIS_RESET:-}"
+BACKEND_CORES="${BACKEND_CORES:-}"
 
 SERVER_CORES="${SERVER_CORES:-0-1}"
 CLIENT_CORES="${CLIENT_CORES:-2-3}"
@@ -45,6 +79,30 @@ PREFILL="${PREFILL:-2000}"
 # e.g. GET_CONCS="" to run PUT only.
 GET_CONCS="${CONCS:-${GET_CONCS-1 2 4 8}}"
 PUT_CONCS="${CONCS:-${PUT_CONCS-1}}"
+MIXED_CONCS="${MIXED_CONCS-}"
+ACCESS="${ACCESS:-seq}"
+ZIPF_S="${ZIPF_S:-1.1}"
+COLD_PREFILL="${COLD_PREFILL:-0}"
+MISS_RATIO="${MISS_RATIO:-0}"
+TIMEOUT="${TIMEOUT:-10s}"
+
+# An external target cannot be reset between points. Its no-override default is
+# one GET c1 point; once any phase is explicit, unspecified phases stay empty.
+if [ -n "$BENCH_EXTERNAL_ENDPOINT" ]; then
+    if [ -n "$CONCS_EXPLICIT" ]; then
+        GET_CONCS="$CONCS"
+        PUT_CONCS=""
+        MIXED_CONCS=""
+    elif [ -z "$GET_CONCS_EXPLICIT$PUT_CONCS_EXPLICIT$MIXED_CONCS_EXPLICIT" ]; then
+        GET_CONCS=1
+        PUT_CONCS=""
+        MIXED_CONCS=""
+    else
+        [ -n "$GET_CONCS_EXPLICIT" ] || GET_CONCS=""
+        [ -n "$PUT_CONCS_EXPLICIT" ] || PUT_CONCS=""
+        [ -n "$MIXED_CONCS_EXPLICIT" ] || MIXED_CONCS=""
+    fi
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -59,6 +117,9 @@ RAW="$WORKDIR/raw.tsv"
 BENCH_ENDPOINT=""
 PREFILL_ENDPOINT=""
 HEALTH_ENDPOINT=""
+SHARD_HEALTH_ENDPOINTS=()
+BENCH_ROUND=0
+BENCH_RUN_ID="${BENCH_RUN_ID:-$(date +%s%N)-$$}"
 
 # ALL_PIDS holds every daemon PID we spawn so cleanup can reap them on
 # exit. External mode leaves this array empty and the trap is a noop.
@@ -68,14 +129,19 @@ HEALTH_ENDPOINT=""
 ALL_PIDS=()
 ALL_LOGS=()
 
-cleanup() {
-    local rc=$?
+stop_daemons() {
     for pid in "${ALL_PIDS[@]:-}"; do
         if [ -n "$pid" ]; then
             kill "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
         fi
     done
+    ALL_PIDS=()
+}
+
+cleanup() {
+    local rc=$?
+    stop_daemons
     if [ "$rc" -ne 0 ]; then
         for log in "${ALL_LOGS[@]:-}"; do
             if [ -n "$log" ] && [ -s "$log" ]; then
@@ -122,8 +188,107 @@ count_cores() {
     echo "$total"
 }
 
+case "$BENCH_BACKEND" in
+    embedded|redis) ;;
+    *)
+        echo "ERROR: BENCH_BACKEND must be embedded or redis" >&2
+        exit 1
+        ;;
+esac
+
+if [ -z "$BENCH_EXTERNAL_ENDPOINT" ] && [ "$BENCH_BACKEND" = redis ]; then
+    case "$BENCH_SCENARIO" in
+        local|tiered-l1)
+            if [ -z "$REDIS_ENDPOINT" ]; then
+                echo "ERROR: BENCH_BACKEND=redis with $BENCH_SCENARIO requires REDIS_ENDPOINT" >&2
+                exit 1
+            fi
+            ;;
+        tiered-shard-l2)
+            read -r -a REDIS_SHARD_ENDPOINT_ARRAY <<< "$REDIS_SHARD_ENDPOINTS"
+            if [ "${#REDIS_SHARD_ENDPOINT_ARRAY[@]}" -ne 5 ]; then
+                echo "ERROR: redis tiered-shard-l2 requires exactly 5 REDIS_SHARD_ENDPOINTS" >&2
+                exit 1
+            fi
+            declare -A seen_redis_shard_endpoints=()
+            for endpoint in "${REDIS_SHARD_ENDPOINT_ARRAY[@]}"; do
+                if [ -n "${seen_redis_shard_endpoints[$endpoint]+x}" ]; then
+                    echo "ERROR: redis tiered-shard-l2 requires distinct REDIS_SHARD_ENDPOINTS; duplicate: $endpoint" >&2
+                    exit 1
+                fi
+                seen_redis_shard_endpoints[$endpoint]=1
+            done
+            ;;
+    esac
+    if [ "$REDIS_RESET" != flushdb ]; then
+        echo "ERROR: Redis benchmarks require REDIS_RESET=flushdb and dedicated benchmark-only endpoints" >&2
+        exit 1
+    fi
+fi
+
+miss_ratio_nonzero() {
+    awk -v ratio="$MISS_RATIO" 'BEGIN { exit !(ratio + 0 != 0) }'
+}
+
+if [ "$COLD_PREFILL" -eq 0 ] && miss_ratio_nonzero; then
+    echo "ERROR: MISS_RATIO requires COLD_PREFILL > 0" >&2
+    exit 1
+fi
+
+if [ "$COLD_PREFILL" -ne 0 ] || miss_ratio_nonzero; then
+    if [ "$BENCH_SCENARIO" = local ] && [ -z "$BENCH_EXTERNAL_PREFILL_ENDPOINT" ]; then
+        echo "ERROR: COLD_PREFILL/MISS_RATIO require a split prefill endpoint" >&2
+        exit 1
+    fi
+fi
+
 free_port() {
     python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
+}
+
+flush_redis_endpoints() {
+    python3 - "$@" <<'PY'
+import socket
+import sys
+
+for endpoint in sys.argv[1:]:
+    if endpoint.startswith("unix://"):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        address = endpoint[len("unix://"):]
+    elif endpoint.startswith("unix:"):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        address = endpoint[len("unix:"):]
+    elif endpoint.startswith("/"):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        address = endpoint
+    else:
+        if endpoint.startswith("["):
+            host, port = endpoint[1:].rsplit("]:", 1)
+        else:
+            host, port = endpoint.rsplit(":", 1)
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        address = (host, int(port))
+    sock.settimeout(10)
+    try:
+        sock.connect(address)
+        sock.sendall(b"*1\r\n$7\r\nFLUSHDB\r\n")
+        with sock.makefile("rb") as reader:
+            reply = reader.readline(64)
+        if reply != b"+OK\r\n":
+            raise RuntimeError(f"unexpected FLUSHDB reply {reply!r}")
+    finally:
+        sock.close()
+    print(f"reset Redis benchmark endpoint {endpoint}", file=sys.stderr)
+PY
+}
+
+reset_redis_backends() {
+    if [ "$BENCH_SCENARIO" = tiered-shard-l2 ]; then
+        flush_redis_endpoints "${REDIS_SHARD_ENDPOINT_ARRAY[@]}"
+    else
+        flush_redis_endpoints "$REDIS_ENDPOINT"
+    fi
 }
 
 # spawn_daemon <config-path> <health-port> <label>
@@ -172,10 +337,13 @@ start_local_only() {
     config="$WORKDIR/local.yaml"
     cat > "$config" <<EOF
 mode: local
-type: embedded
+type: $BENCH_BACKEND
 listen: 127.0.0.1:$data
 health_listen: 127.0.0.1:$health
 rpc_timeout: 5s
+EOF
+    if [ "$BENCH_BACKEND" = embedded ]; then
+        cat >> "$config" <<EOF
 freq:
   counters: 1M
   reset_after: 100K
@@ -187,6 +355,15 @@ rocks:
   direct_reads: false
   bloom_bits: 10
 EOF
+    else
+        cat >> "$config" <<EOF
+redis:
+  endpoint: $REDIS_ENDPOINT
+  get_pool: $REDIS_GET_POOL
+  set_pool: $REDIS_SET_POOL
+  timeout: $REDIS_TIMEOUT
+EOF
+    fi
     spawn_daemon "$config" "$health" "local"
     BENCH_ENDPOINT="127.0.0.1:$data"
     PREFILL_ENDPOINT="127.0.0.1:$data"
@@ -245,13 +422,27 @@ freq:
   reset_after: 100K
   disable_eviction: true
 tiers:
-  - type: embedded
+  - type: $BENCH_BACKEND
+EOF
+    if [ "$BENCH_BACKEND" = embedded ]; then
+        cat >> "$config" <<EOF
     rocks:
       path: $rocks
       disk_bytes: 4GiB
       mem_ratio: 0.1
       direct_reads: false
       bloom_bits: 10
+EOF
+    else
+        cat >> "$config" <<EOF
+    redis:
+      endpoint: $REDIS_ENDPOINT
+      get_pool: $REDIS_GET_POOL
+      set_pool: $REDIS_SET_POOL
+      timeout: $REDIS_TIMEOUT
+EOF
+    fi
+    cat >> "$config" <<EOF
 origin:
   type: upstream
   upstream:
@@ -280,10 +471,13 @@ start_tiered_shard_l2() {
         sconfig="$WORKDIR/shard-$i.yaml"
         cat > "$sconfig" <<EOF
 mode: shard
-type: embedded
+type: $BENCH_BACKEND
 listen: 127.0.0.1:$sdata
 health_listen: 127.0.0.1:$shealth
 rpc_timeout: 5s
+EOF
+        if [ "$BENCH_BACKEND" = embedded ]; then
+            cat >> "$sconfig" <<EOF
 freq:
   counters: 1M
   reset_after: 100K
@@ -295,10 +489,22 @@ rocks:
   direct_reads: false
   bloom_bits: 10
 EOF
+        else
+            cat >> "$sconfig" <<EOF
+redis:
+  endpoint: ${REDIS_SHARD_ENDPOINT_ARRAY[$((i - 1))]}
+  get_pool: $REDIS_GET_POOL
+  set_pool: $REDIS_SET_POOL
+  timeout: $REDIS_TIMEOUT
+EOF
+        fi
         spawn_daemon "$sconfig" "$shealth" "shard-$i"
         shard_peers+=("  - id: s$i")
         shard_peers+=("    endpoint: 127.0.0.1:$sdata")
         shard_eps+=("127.0.0.1:$sdata")
+        if [ "$BENCH_BACKEND" = redis ]; then
+            SHARD_HEALTH_ENDPOINTS+=("127.0.0.1:$shealth")
+        fi
     done
 
     local data health pprof config
@@ -345,12 +551,34 @@ EOF
     PPROF_ENDPOINT="127.0.0.1:$pprof"
 }
 
+reset_owned_scenario() {
+    stop_daemons
+    rm -rf "$WORKDIR/local-rocks" "$WORKDIR/origin-rocks" \
+        "$WORKDIR/tiered-l1-rocks" "$WORKDIR"/shard-*-rocks
+    SHARD_HEALTH_ENDPOINTS=()
+    BENCH_ENDPOINT=""
+    PREFILL_ENDPOINT=""
+    HEALTH_ENDPOINT=""
+    PPROF_ENDPOINT=""
+    if [ "$BENCH_BACKEND" = redis ]; then
+        reset_redis_backends
+    fi
+    case "$BENCH_SCENARIO" in
+        local)           start_local_only ;;
+        tiered-l1)       start_tiered_l1 ;;
+        tiered-shard-l2) start_tiered_shard_l2 ;;
+    esac
+}
+
 # ── Resolve endpoints ─────────────────────────────────────────────────────
 if [ -n "$BENCH_EXTERNAL_ENDPOINT" ]; then
     BENCH_ENDPOINT="$BENCH_EXTERNAL_ENDPOINT"
     PREFILL_ENDPOINT="${BENCH_EXTERNAL_PREFILL_ENDPOINT:-$BENCH_EXTERNAL_ENDPOINT}"
     echo "External mode: bench=$BENCH_ENDPOINT prefill=$PREFILL_ENDPOINT" >&2
 else
+    if [ "$BENCH_BACKEND" = redis ]; then
+        reset_redis_backends
+    fi
     case "$BENCH_SCENARIO" in
         local)           start_local_only ;;
         tiered-l1)       start_tiered_l1 ;;
@@ -362,6 +590,24 @@ else
     esac
 fi
 
+if [ -n "$BENCH_EXTERNAL_ENDPOINT" ]; then
+    active_rounds=0
+    if [ "$PREFILL_ENDPOINT" != "$BENCH_ENDPOINT" ]; then
+        active_rounds=$(wc -w <<<"$GET_CONCS")
+    else
+        active_rounds=$(( $(wc -w <<<"$GET_CONCS") + $(wc -w <<<"$PUT_CONCS") + $(wc -w <<<"$MIXED_CONCS") ))
+    fi
+    if [ "$PREFILL_ENDPOINT" != "$BENCH_ENDPOINT" ] \
+        && { [ -n "$PUT_CONCS" ] || [ -n "$MIXED_CONCS" ]; }; then
+        echo "ERROR: split-endpoint external mode supports only a GET point" >&2
+        exit 1
+    fi
+    if [ "$active_rounds" -ne 1 ]; then
+        echo "ERROR: external mode requires exactly one point because the harness cannot reset external state" >&2
+        exit 1
+    fi
+fi
+
 # ── Bench driver ──────────────────────────────────────────────────────────
 # run_bench <mode> <conc> [extra-flags...]
 # Runs cache-ctl bench and appends raw numbers to $RAW as a TSV row.
@@ -371,6 +617,11 @@ run_bench() {
     local conc=$2
     shift 2
 
+    if [ "$BENCH_ROUND" -gt 0 ]; then
+        reset_owned_scenario
+    fi
+    BENCH_ROUND=$((BENCH_ROUND + 1))
+    local key_salt="$BENCH_RUN_ID-round-$BENCH_ROUND-$mode-$conc"
     local out="$WORKDIR/bench-$mode-$conc.out"
     printf "  running %s c=%s\n" "$mode" "$conc" >&2
 
@@ -381,12 +632,15 @@ run_bench() {
         prefill_flag=(--prefill-endpoint "$PREFILL_ENDPOINT")
     fi
 
-    # Thread the info endpoint (bench target's HealthListen port) through
-    # so cache-ctl bench can snapshot daemon counters before/after the
-    # bench window and print hit rates that exclude prefill noise.
+    # Thread the bench target's HealthListen port through first, followed by
+    # Redis EC shard Info endpoints. cache-ctl bench snapshots each daemon
+    # before/after the window so the counters exclude prefill noise.
     local info_flag=()
     if [ -n "$HEALTH_ENDPOINT" ]; then
         info_flag=(--info-endpoint "$HEALTH_ENDPOINT")
+        for endpoint in "${SHARD_HEALTH_ENDPOINTS[@]}"; do
+            info_flag+=(--info-endpoint "$endpoint")
+        done
     fi
 
     # Run the bench; capture stdout+stderr so the awk parser below
@@ -418,12 +672,21 @@ run_bench() {
     fi
 
     local rc=0
+    local workload_flags=(
+        --access "$ACCESS"
+        --zipf-s "$ZIPF_S"
+        --timeout "$TIMEOUT"
+        --cold-prefill "$COLD_PREFILL"
+        --miss-ratio "$MISS_RATIO"
+        --key-salt "$key_salt"
+    )
     if [ -n "$CLIENT_CORES" ]; then
         taskset -c "$CLIENT_CORES" "$BIN/cache-ctl" bench \
             --endpoint "$BENCH_ENDPOINT" \
             "${prefill_flag[@]}" \
             "${info_flag[@]}" \
             "${profile_flags[@]}" \
+            "${workload_flags[@]}" \
             --concurrency "$conc" --duration "$DURATION" \
             --value-size "$VALUE_SIZE" --mode "$mode" "$@" >"$out" 2>&1 || rc=$?
     else
@@ -432,6 +695,7 @@ run_bench() {
             "${prefill_flag[@]}" \
             "${info_flag[@]}" \
             "${profile_flags[@]}" \
+            "${workload_flags[@]}" \
             --concurrency "$conc" --duration "$DURATION" \
             --value-size "$VALUE_SIZE" --mode "$mode" "$@" >"$out" 2>&1 || rc=$?
     fi
@@ -461,15 +725,16 @@ run_bench() {
                    mode, conc, ops, thrpt, bw, p50, p99, p999
         }' "$out" >> "$RAW"
 
-    # Surface the bench-window counter section printed by cache-ctl bench
-    # (only present when --info-endpoint was threaded through).
+    # Surface every bench-window counter section printed by cache-ctl bench
+    # (only present when at least one --info-endpoint was supplied).
     awk '/^  ── bench-window counters ──$/,0' "$out" >&2
 }
 
 # ── Runs ──────────────────────────────────────────────────────────────────
-# Every GET round passes --prefill $PREFILL so the key space is identical
-# across rounds; omitting it would make later rounds fall back to the Go
-# default (1000) and silently change the workload model.
+# Every owned round starts with empty measured and origin state. Embedded
+# stores are recreated; dedicated Redis endpoints are FLUSHDB'd only after the
+# caller explicitly opts in. A run-unique key salt also prevents accidental
+# reuse when external mode runs its single operator-reset point.
 #
 # In non-local scenarios we always run GET (the bench target may be a
 # tiered instance that rejects writes). PUT rounds are skipped unless
@@ -486,6 +751,9 @@ else
     for c in $PUT_CONCS; do
         run_bench put "$c"
     done
+    for c in $MIXED_CONCS; do
+        run_bench mixed "$c" --prefill "$PREFILL"
+    done
 fi
 
 # ── Report ────────────────────────────────────────────────────────────────
@@ -494,10 +762,46 @@ fi
 # snapshot here.
 SCOUNT=$(count_cores "$SERVER_CORES")
 CCOUNT=$(count_cores "$CLIENT_CORES")
+REPORT_BACKEND="$BENCH_BACKEND"
+if [ -n "$BENCH_EXTERNAL_ENDPOINT" ] && [ -z "$BENCH_BACKEND_EXPLICIT" ]; then
+    REPORT_BACKEND="external/unknown"
+fi
+REPORT_BACKEND_ENDPOINT="$REDIS_ENDPOINT"
+if [ "$BENCH_SCENARIO" = tiered-shard-l2 ]; then
+    REPORT_BACKEND_ENDPOINT="$REDIS_SHARD_ENDPOINTS"
+fi
+REPORT_REDIS_GET_POOL="$REDIS_GET_POOL"
+REPORT_REDIS_SET_POOL="$REDIS_SET_POOL"
+REPORT_REDIS_TIMEOUT="$REDIS_TIMEOUT"
+if [ "$REPORT_REDIS_GET_POOL" = 0 ]; then REPORT_REDIS_GET_POOL=32; fi
+if [ "$REPORT_REDIS_SET_POOL" = 0 ]; then REPORT_REDIS_SET_POOL=8; fi
+if [ -n "$BENCH_EXTERNAL_ENDPOINT" ]; then
+    if [ "$BENCH_SCENARIO" = tiered-shard-l2 ]; then
+        if [ -z "$REDIS_SHARD_ENDPOINTS_EXPLICIT" ] || [ -z "$REDIS_SHARD_ENDPOINTS" ]; then
+            REPORT_BACKEND_ENDPOINT="unknown"
+        fi
+    elif [ -z "$REDIS_ENDPOINT_EXPLICIT" ] || [ -z "$REDIS_ENDPOINT" ]; then
+        REPORT_BACKEND_ENDPOINT="unknown"
+    fi
+    if [ -z "$REDIS_GET_POOL_EXPLICIT" ] || [ -z "$REDIS_GET_POOL" ]; then REPORT_REDIS_GET_POOL="unknown"; fi
+    if [ -z "$REDIS_SET_POOL_EXPLICIT" ] || [ -z "$REDIS_SET_POOL" ]; then REPORT_REDIS_SET_POOL="unknown"; fi
+    if [ -z "$REDIS_TIMEOUT_EXPLICIT" ] || [ -z "$REDIS_TIMEOUT" ]; then REPORT_REDIS_TIMEOUT="unknown"; fi
+fi
+REPORT_RESET="recreated per point"
+if [ -n "$BENCH_EXTERNAL_ENDPOINT" ]; then
+    REPORT_RESET="operator-owned; one point only"
+fi
 
 awk -v scores="${SERVER_CORES:-unbound}" -v ccores="${CLIENT_CORES:-unbound}" \
+    -v backend="$REPORT_BACKEND" -v backend_ep="$REPORT_BACKEND_ENDPOINT" \
+    -v bcores="${BACKEND_CORES:-external/unbound}" \
+    -v redis_get_pool="$REPORT_REDIS_GET_POOL" -v redis_set_pool="$REPORT_REDIS_SET_POOL" \
+    -v redis_timeout="$REPORT_REDIS_TIMEOUT" \
     -v scount="$SCOUNT" -v ccount="$CCOUNT" \
-    -v valsz="$VALUE_SIZE" -v duration="$DURATION" \
+    -v valsz="$VALUE_SIZE" -v duration="$DURATION" -v prefill="$PREFILL" \
+    -v access="$ACCESS" -v zipf_s="$ZIPF_S" -v cold_prefill="$COLD_PREFILL" \
+    -v miss_ratio="$MISS_RATIO" -v timeout="$TIMEOUT" \
+    -v state_reset="$REPORT_RESET" \
     -v scenario="$BENCH_SCENARIO" -v bench_ep="$BENCH_ENDPOINT" -v prefill_ep="$PREFILL_ENDPOINT" '
 function commify(n,   s, out, len) {
     s = sprintf("%d", n)
@@ -536,16 +840,19 @@ function emit_section(label, n,   i, HDR, ROW) {
         if (label == "GET") {
             printf ROW, g_conc[i], commify(g_thrpt[i]), g_bw[i]+0,
                    fmt_lat(g_p50[i]), fmt_lat(g_p99[i]), fmt_lat(g_p999[i])
-        } else {
+        } else if (label == "PUT") {
             printf ROW, p_conc[i], commify(p_thrpt[i]), p_bw[i]+0,
                    fmt_lat(p_p50[i]), fmt_lat(p_p99[i]), fmt_lat(p_p999[i])
+        } else {
+            printf ROW, m_conc[i], commify(m_thrpt[i]), m_bw[i]+0,
+                   fmt_lat(m_p50[i]), fmt_lat(m_p99[i]), fmt_lat(m_p999[i])
         }
     }
     print ""
 }
 BEGIN {
     FS = "\t"
-    ng = 0; np = 0
+    ng = 0; np = 0; nm = 0
 }
 {
     mode = $1; conc = $2; ops = $3; thrpt = $4; bw = $5
@@ -558,6 +865,10 @@ BEGIN {
         p_conc[np] = conc; p_thrpt[np] = thrpt; p_bw[np] = bw
         p_p50[np] = p50; p_p99[np] = p99; p_p999[np] = p999
         np++
+    } else if (mode == "mixed") {
+        m_conc[nm] = conc; m_thrpt[nm] = thrpt; m_bw[nm] = bw
+        m_p50[nm] = p50; m_p99[nm] = p99; m_p999[nm] = p999
+        nm++
     }
 }
 END {
@@ -566,16 +877,30 @@ END {
     print "                          Cache Bench Report"
     print "═══════════════════════════════════════════════════════════════════════════"
     printf "  Scenario     : %s\n", scenario
+    printf "  Backend      : %s\n", backend
+    if (backend == "redis" && backend_ep != "") printf "  Redis EP(s)  : %s\n", backend_ep
     printf "  Bench EP     : %s\n", bench_ep
     if (prefill_ep != bench_ep) {
         printf "  Prefill EP   : %s\n", prefill_ep
     }
     printf "  Server cores : %s\n", fmt_cores(scores, scount)
+    if (backend == "redis" || backend == "external/unknown") {
+        printf "  Backend cores: %s\n", bcores
+    }
+    if (backend == "redis") {
+        printf "  Redis pools  : get=%s set=%s timeout=%s\n", redis_get_pool, redis_set_pool, redis_timeout
+    }
     printf "  Client cores : %s\n", fmt_cores(ccores, ccount)
     printf "  Value size   : %s\n", fmt_size(valsz+0)
+    printf "  Prefill      : %s warm / %s cold keys\n", prefill, cold_prefill
+    printf "  Access       : %s (zipf-s=%s)\n", access, zipf_s
+    printf "  Miss ratio   : %s\n", miss_ratio
+    printf "  State reset  : %s\n", state_reset
+    printf "  Op timeout   : %s\n", timeout
     printf "  Duration     : %s per run\n", duration
     print ""
     if (ng > 0) emit_section("GET", ng)
     if (np > 0) emit_section("PUT", np)
+    if (nm > 0) emit_section("MIXED", nm)
 }
 ' "$RAW"
