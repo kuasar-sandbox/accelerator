@@ -29,7 +29,7 @@ source "$script_dir/common.sh"
 
 : "${ROCKSDB_TARBALL:=https://codeload.github.com/facebook/rocksdb/tar.gz/refs/tags/v9.7.4#rocksdb-9.7.4.tar.gz}"
 : "${ROCKSDB_TARBALL_SHA256:=}"
-: "${ROCKSDB_SOURCE_SHA256:=641e8539ff6fbca16f41d1a4b3ad5ce6838088a42599bbb01352fd299b778e5f}"
+: "${ROCKSDB_SOURCE_SHA256:=1341893a5951347a7f658151c10f0b15e0ddd67c28b3804fdfed9a4a7736f52b}"
 : "${BUILD_DIR:=$(pwd)/build}"
 : "${TARGET_ARCH:=$(uname -m)}"
 : "${CROSS_PREFIX:=}"
