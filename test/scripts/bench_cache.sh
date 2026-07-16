@@ -635,10 +635,16 @@ REPORT_BACKEND="$BENCH_BACKEND"
 if [ -n "$BENCH_EXTERNAL_ENDPOINT" ] && [ -z "$BENCH_BACKEND_EXPLICIT" ]; then
     REPORT_BACKEND="external/unknown"
 fi
+REPORT_BACKEND_ENDPOINT="$REDIS_ENDPOINT"
+if [ "$BENCH_SCENARIO" = tiered-shard-l2 ]; then
+    REPORT_BACKEND_ENDPOINT="$REDIS_SHARD_ENDPOINTS"
+fi
 
 awk -v scores="${SERVER_CORES:-unbound}" -v ccores="${CLIENT_CORES:-unbound}" \
-    -v backend="$REPORT_BACKEND" -v backend_ep="${REDIS_ENDPOINT:-$REDIS_SHARD_ENDPOINTS}" \
+    -v backend="$REPORT_BACKEND" -v backend_ep="$REPORT_BACKEND_ENDPOINT" \
     -v bcores="${BACKEND_CORES:-external/unbound}" \
+    -v redis_get_pool="$REDIS_GET_POOL" -v redis_set_pool="$REDIS_SET_POOL" \
+    -v redis_timeout="$REDIS_TIMEOUT" \
     -v scount="$SCOUNT" -v ccount="$CCOUNT" \
     -v valsz="$VALUE_SIZE" -v duration="$DURATION" -v prefill="$PREFILL" \
     -v access="$ACCESS" -v zipf_s="$ZIPF_S" -v cold_prefill="$COLD_PREFILL" \
@@ -725,7 +731,12 @@ END {
         printf "  Prefill EP   : %s\n", prefill_ep
     }
     printf "  Server cores : %s\n", fmt_cores(scores, scount)
-    if (backend == "redis" || backend == "external/unknown") printf "  Backend cores: %s\n", bcores
+    if (backend == "redis" || backend == "external/unknown") {
+        printf "  Backend cores: %s\n", bcores
+    }
+    if (backend == "redis") {
+        printf "  Redis pools  : get=%s set=%s timeout=%s\n", redis_get_pool, redis_set_pool, redis_timeout
+    }
     printf "  Client cores : %s\n", fmt_cores(ccores, ccount)
     printf "  Value size   : %s\n", fmt_size(valsz+0)
     printf "  Prefill      : %s warm / %s cold keys\n", prefill, cold_prefill
