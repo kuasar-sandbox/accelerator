@@ -169,6 +169,9 @@ shard peer at a time and rate-limit repair while that peer is cold.
 
 ## Backend A/B benchmark
 
+The current BMS hot-path result and deployment decision are recorded in
+[`cache-backend-ab-2026-07-17.md`](cache-backend-ab-2026-07-17.md).
+
 The repository's existing cache wire benchmark can select the physical store
 without changing its client workload:
 

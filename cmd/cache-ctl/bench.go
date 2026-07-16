@@ -498,13 +498,15 @@ func cmdBench(args []string) {
 // window is misleading.
 func diffCounters(before, after cache.DaemonStats) cache.DaemonStats {
 	out := cache.DaemonStats{
-		Mode:      after.Mode,
-		UptimeSec: after.UptimeSec,
+		Mode:        after.Mode,
+		BackendType: after.BackendType,
+		UptimeSec:   after.UptimeSec,
 		Server: cache.ServerStats{
 			Hits:   after.Server.Hits - before.Server.Hits,
 			Misses: after.Server.Misses - before.Server.Misses,
 			Fills:  after.Server.Fills - before.Server.Fills,
 		},
+		Redis: diffRedisCounters(before.Redis, after.Redis),
 	}
 	if after.Tiered != nil {
 		tiers := make([]cache.TierStats, len(after.Tiered.Tiers))
@@ -516,6 +518,7 @@ func diffCounters(before, after cache.DaemonStats) cache.DaemonStats {
 				Misses:   t.Misses,
 				Fills:    t.Fills,
 				Errors:   t.Errors,
+				Redis:    diffRedisCounters(nil, t.Redis),
 			}
 			// Subtract matching tier from baseline if present.
 			if before.Tiered != nil && i < len(before.Tiered.Tiers) {
@@ -524,6 +527,7 @@ func diffCounters(before, after cache.DaemonStats) cache.DaemonStats {
 				d.Misses -= b.Misses
 				d.Fills -= b.Fills
 				d.Errors -= b.Errors
+				d.Redis = diffRedisCounters(b.Redis, t.Redis)
 			}
 			if len(t.Peers) > 0 {
 				d.Peers = make([]cache.PeerStats, len(t.Peers))
@@ -569,6 +573,46 @@ func diffCounters(before, after cache.DaemonStats) cache.DaemonStats {
 	return out
 }
 
+// diffRedisCounters keeps endpoint and final pool state while subtracting only
+// monotonic counters. Redis latency percentiles are cumulative histograms, so
+// they are intentionally omitted from a benchmark-window delta.
+func diffRedisCounters(before, after *cache.RedisStats) *cache.RedisStats {
+	if after == nil {
+		return nil
+	}
+	out := &cache.RedisStats{
+		Endpoint:         after.Endpoint,
+		Transport:        after.Transport,
+		GetPoolSize:      after.GetPoolSize,
+		SetPoolSize:      after.SetPoolSize,
+		GetConnected:     after.GetConnected,
+		SetConnected:     after.SetConnected,
+		GetInflight:      after.GetInflight,
+		SetInflight:      after.SetInflight,
+		PoolWaiters:      after.PoolWaiters,
+		Draining:         after.Draining,
+		GetHits:          after.GetHits,
+		GetMisses:        after.GetMisses,
+		Sets:             after.Sets,
+		Cancelled:        after.Cancelled,
+		LateBytesDrained: after.LateBytesDrained,
+		Reconnects:       after.Reconnects,
+		ProtocolErrors:   after.ProtocolErrors,
+		BackendErrors:    after.BackendErrors,
+	}
+	if before != nil {
+		out.GetHits -= before.GetHits
+		out.GetMisses -= before.GetMisses
+		out.Sets -= before.Sets
+		out.Cancelled -= before.Cancelled
+		out.LateBytesDrained -= before.LateBytesDrained
+		out.Reconnects -= before.Reconnects
+		out.ProtocolErrors -= before.ProtocolErrors
+		out.BackendErrors -= before.BackendErrors
+	}
+	return out
+}
+
 // printBenchWindow renders the delta as a compact block appended to
 // the bench summary. Same layout as info.go's printInfoHuman but with
 // a "bench-window" header and without the rocks section.
@@ -582,6 +626,9 @@ func printBenchWindow(d cache.DaemonStats) {
 	fmt.Printf("  server: hits=%d misses=%d fills=%d hit%%=%.2f\n",
 		d.Server.Hits, d.Server.Misses, d.Server.Fills, srvHR)
 
+	if d.Redis != nil {
+		printRedisBenchWindow("redis", d.Redis)
+	}
 	if d.Tiered == nil {
 		return
 	}
@@ -606,6 +653,9 @@ func printBenchWindow(d cache.DaemonStats) {
 		"origin", o.Type, o.Hits, o.Misses, "-", o.Errors, ohr)
 
 	for _, t := range d.Tiered.Tiers {
+		if t.Redis != nil {
+			printRedisBenchWindow("redis tier", t.Redis)
+		}
 		if len(t.Peers) == 0 {
 			continue
 		}
@@ -621,4 +671,11 @@ func printBenchWindow(d cache.DaemonStats) {
 		}
 		break
 	}
+}
+
+func printRedisBenchWindow(label string, s *cache.RedisStats) {
+	fmt.Printf("  %s: endpoint=%s transport=%s get-hits=%d get-misses=%d sets=%d cancels=%d late-bytes=%d reconnects=%d backend-errors=%d protocol-errors=%d end-inflight=%d/%d end-waiters=%d end-draining=%d\n",
+		label, s.Endpoint, s.Transport, s.GetHits, s.GetMisses, s.Sets,
+		s.Cancelled, s.LateBytesDrained, s.Reconnects, s.BackendErrors,
+		s.ProtocolErrors, s.GetInflight, s.SetInflight, s.PoolWaiters, s.Draining)
 }
