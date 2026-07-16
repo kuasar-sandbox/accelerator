@@ -108,11 +108,12 @@ func (s *InfoServer) snapshot() cache.DaemonStats {
 		tiers := make([]cache.TierStats, len(s.tierSpecs))
 		for i, spec := range s.tierSpecs {
 			t := cache.TierStats{
-				Type:   spec.Type,
-				Hits:   cnt.TierHits[i],
-				Misses: cnt.TierMisses[i],
-				Fills:  cnt.TierFills[i],
-				Errors: cnt.TierErrors[i],
+				Type:          spec.Type,
+				Hits:          cnt.TierHits[i],
+				Misses:        cnt.TierMisses[i],
+				Fills:         cnt.TierFills[i],
+				Errors:        cnt.TierErrors[i],
+				FillsInflight: cnt.TierFillsInflight[i],
 			}
 			switch spec.Type {
 			case "embedded":
@@ -219,15 +220,16 @@ func toPb(ds cache.DaemonStats) *cachepb.InfoReply {
 		tiers := make([]*cachepb.TierStats, len(ds.Tiered.Tiers))
 		for i, t := range ds.Tiered.Tiers {
 			tiers[i] = &cachepb.TierStats{
-				Type:     t.Type,
-				Hits:     t.Hits,
-				Misses:   t.Misses,
-				Fills:    t.Fills,
-				Errors:   t.Errors,
-				Rocks:    rocksToPb(t.Rocks),
-				Redis:    redisToPb(t.Redis),
-				Peers:    peersToPb(t.Peers),
-				Endpoint: t.Endpoint,
+				Type:          t.Type,
+				Hits:          t.Hits,
+				Misses:        t.Misses,
+				Fills:         t.Fills,
+				Errors:        t.Errors,
+				FillsInflight: t.FillsInflight,
+				Rocks:         rocksToPb(t.Rocks),
+				Redis:         redisToPb(t.Redis),
+				Peers:         peersToPb(t.Peers),
+				Endpoint:      t.Endpoint,
 			}
 		}
 		reply.Tiered = &cachepb.TieredStats{

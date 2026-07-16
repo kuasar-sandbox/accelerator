@@ -56,6 +56,31 @@ func TestSnapshotFinalCountersWaitsForRedisDrainAndReconnect(t *testing.T) {
 	}
 }
 
+func TestSnapshotFinalCountersWaitsForDetachedTierFill(t *testing.T) {
+	calls := 0
+	fetch := func(string, time.Duration) (cache.DaemonStats, error) {
+		calls++
+		inflight := uint64(1)
+		if calls > 1 {
+			inflight = 0
+		}
+		return cache.DaemonStats{Tiered: &cache.TieredStats{Tiers: []cache.TierStats{{
+			Type:          "redis",
+			FillsInflight: inflight,
+		}}}}, nil
+	}
+
+	finals, _, settled := snapshotFinalCounters(
+		[]string{"127.0.0.1:7701"}, []bool{true}, time.Second, fetch,
+	)
+	if !settled || calls < 2 {
+		t.Fatalf("settled=%v calls=%d, want a second snapshot", settled, calls)
+	}
+	if got := finals[0].Tiered.Tiers[0].FillsInflight; got != 0 {
+		t.Fatalf("final fills in flight=%d, want 0", got)
+	}
+}
+
 func TestStringListFlagPreservesEndpoints(t *testing.T) {
 	var endpoints stringListFlag
 	for _, endpoint := range []string{"127.0.0.1:7701", "127.0.0.1:7702"} {
@@ -110,8 +135,9 @@ func TestDiffCountersIncludesRedisWindow(t *testing.T) {
 	before := cache.DaemonStats{
 		Redis: beforeRedis,
 		Tiered: &cache.TieredStats{Tiers: []cache.TierStats{{
-			Type:  "redis",
-			Redis: beforeRedis,
+			Type:          "redis",
+			FillsInflight: 1,
+			Redis:         beforeRedis,
 		}}},
 	}
 	after := cache.DaemonStats{
@@ -119,8 +145,9 @@ func TestDiffCountersIncludesRedisWindow(t *testing.T) {
 		BackendType: "redis",
 		Redis:       afterRedis,
 		Tiered: &cache.TieredStats{Tiers: []cache.TierStats{{
-			Type:  "redis",
-			Redis: afterRedis,
+			Type:          "redis",
+			FillsInflight: 0,
+			Redis:         afterRedis,
 		}}},
 	}
 
@@ -157,5 +184,8 @@ func TestDiffCountersIncludesRedisWindow(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.Tiered.Tiers[0].Redis, want) {
 		t.Fatalf("tier Redis delta mismatch:\n got: %#v\nwant: %#v", got.Tiered.Tiers[0].Redis, want)
+	}
+	if got.Tiered.Tiers[0].FillsInflight != 0 {
+		t.Fatalf("tier final fills in flight=%d, want 0", got.Tiered.Tiers[0].FillsInflight)
 	}
 }

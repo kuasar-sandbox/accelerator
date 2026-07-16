@@ -139,6 +139,7 @@ type TieredCache struct {
 	tiers        []Tier
 	origin       Getter
 	fillInflight []sync.WaitGroup // per-tier inflight fill WaitGroups
+	fillActive   []atomic.Int64   // observable fill/repair goroutines per tier
 
 	// baseCtx parents every async fill/repair goroutine; baseCancel
 	// (called by Close) cancels them all on shutdown. This is what
@@ -164,13 +165,14 @@ type TieredCache struct {
 // The server package composes these with per-tier type detail (rocks
 // properties, EC peers, upstream endpoint) to produce cache.TieredStats.
 type TieredCounters struct {
-	TierHits     []uint64
-	TierMisses   []uint64
-	TierFills    []uint64
-	TierErrors   []uint64
-	OriginHits   uint64
-	OriginMisses uint64
-	OriginErrors uint64
+	TierHits          []uint64
+	TierMisses        []uint64
+	TierFills         []uint64
+	TierFillsInflight []uint64
+	TierErrors        []uint64
+	OriginHits        uint64
+	OriginMisses      uint64
+	OriginErrors      uint64
 }
 
 // NewTieredCache builds a TieredCache from an origin and zero or more cache tiers.
@@ -187,6 +189,7 @@ func NewTieredCache(origin Getter, tiers ...Tier) *TieredCache {
 		baseCtx:      baseCtx,
 		baseCancel:   baseCancel,
 		fillInflight: make([]sync.WaitGroup, len(tiers)),
+		fillActive:   make([]atomic.Int64, len(tiers)),
 		tierHits:     make([]atomic.Uint64, len(tiers)),
 		tierMisses:   make([]atomic.Uint64, len(tiers)),
 		tierFills:    make([]atomic.Uint64, len(tiers)),
@@ -200,8 +203,10 @@ func NewTieredCache(origin Getter, tiers ...Tier) *TieredCache {
 		idx := i
 		r.EnableRepair(func(fn func()) {
 			tc.fillInflight[idx].Add(1)
+			tc.fillActive[idx].Add(1)
 			go func() {
 				defer tc.fillInflight[idx].Done()
+				defer tc.fillActive[idx].Add(-1)
 				fn()
 			}()
 		})
@@ -213,18 +218,20 @@ func NewTieredCache(origin Getter, tiers ...Tier) *TieredCache {
 // call concurrently with Get/startFill.
 func (tc *TieredCache) Counters() TieredCounters {
 	c := TieredCounters{
-		TierHits:     make([]uint64, len(tc.tiers)),
-		TierMisses:   make([]uint64, len(tc.tiers)),
-		TierFills:    make([]uint64, len(tc.tiers)),
-		TierErrors:   make([]uint64, len(tc.tiers)),
-		OriginHits:   tc.originHits.Load(),
-		OriginMisses: tc.originMisses.Load(),
-		OriginErrors: tc.originErrors.Load(),
+		TierHits:          make([]uint64, len(tc.tiers)),
+		TierMisses:        make([]uint64, len(tc.tiers)),
+		TierFills:         make([]uint64, len(tc.tiers)),
+		TierFillsInflight: make([]uint64, len(tc.tiers)),
+		TierErrors:        make([]uint64, len(tc.tiers)),
+		OriginHits:        tc.originHits.Load(),
+		OriginMisses:      tc.originMisses.Load(),
+		OriginErrors:      tc.originErrors.Load(),
 	}
 	for i := range tc.tiers {
 		c.TierHits[i] = tc.tierHits[i].Load()
 		c.TierMisses[i] = tc.tierMisses[i].Load()
 		c.TierFills[i] = tc.tierFills[i].Load()
+		c.TierFillsInflight[i] = uint64(tc.fillActive[i].Load())
 		c.TierErrors[i] = tc.tierErrors[i].Load()
 	}
 	return c
@@ -344,9 +351,11 @@ func tryTier(ctx context.Context, c Getter, p store.Partition, key store.Content
 func (tc *TieredCache) startFill(tierIdx int, p store.Partition, key store.ContentKey, blob Blob) {
 	cloned := blob.Clone()
 	tc.fillInflight[tierIdx].Add(1)
+	tc.fillActive[tierIdx].Add(1)
 	tc.tierFills[tierIdx].Add(1)
 	go func() {
 		defer tc.fillInflight[tierIdx].Done()
+		defer tc.fillActive[tierIdx].Add(-1)
 		defer cloned.Release()
 		ctx, cancel := tc.fillCtx()
 		defer cancel()
@@ -361,8 +370,10 @@ func (tc *TieredCache) startFillMiss(tierIdx int, p store.Partition, key store.C
 		return
 	}
 	tc.fillInflight[tierIdx].Add(1)
+	tc.fillActive[tierIdx].Add(1)
 	go func() {
 		defer tc.fillInflight[tierIdx].Done()
+		defer tc.fillActive[tierIdx].Add(-1)
 		ctx, cancel := tc.fillCtx()
 		defer cancel()
 		_ = mf.FillMiss(ctx, p, key)

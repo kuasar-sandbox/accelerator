@@ -63,6 +63,7 @@ REDIS_SHARD_ENDPOINTS="${REDIS_SHARD_ENDPOINTS:-}"
 REDIS_GET_POOL="${REDIS_GET_POOL:-32}"
 REDIS_SET_POOL="${REDIS_SET_POOL:-8}"
 REDIS_TIMEOUT="${REDIS_TIMEOUT:-5s}"
+REDIS_RESET="${REDIS_RESET:-}"
 BACKEND_CORES="${BACKEND_CORES:-}"
 
 SERVER_CORES="${SERVER_CORES:-0-1}"
@@ -96,6 +97,7 @@ PREFILL_ENDPOINT=""
 HEALTH_ENDPOINT=""
 SHARD_HEALTH_ENDPOINTS=()
 BENCH_ROUND=0
+BENCH_RUN_ID="${BENCH_RUN_ID:-$(date +%s%N)-$$}"
 
 # ALL_PIDS holds every daemon PID we spawn so cleanup can reap them on
 # exit. External mode leaves this array empty and the trap is a noop.
@@ -105,14 +107,19 @@ BENCH_ROUND=0
 ALL_PIDS=()
 ALL_LOGS=()
 
-cleanup() {
-    local rc=$?
+stop_daemons() {
     for pid in "${ALL_PIDS[@]:-}"; do
         if [ -n "$pid" ]; then
             kill "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
         fi
     done
+    ALL_PIDS=()
+}
+
+cleanup() {
+    local rc=$?
+    stop_daemons
     if [ "$rc" -ne 0 ]; then
         for log in "${ALL_LOGS[@]:-}"; do
             if [ -n "$log" ] && [ -s "$log" ]; then
@@ -191,6 +198,10 @@ if [ -z "$BENCH_EXTERNAL_ENDPOINT" ] && [ "$BENCH_BACKEND" = redis ]; then
             done
             ;;
     esac
+    if [ "$REDIS_RESET" != flushdb ]; then
+        echo "ERROR: Redis benchmarks require REDIS_RESET=flushdb and dedicated benchmark-only endpoints" >&2
+        exit 1
+    fi
 fi
 
 miss_ratio_nonzero() {
@@ -211,6 +222,51 @@ fi
 
 free_port() {
     python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
+}
+
+flush_redis_endpoints() {
+    python3 - "$@" <<'PY'
+import socket
+import sys
+
+for endpoint in sys.argv[1:]:
+    if endpoint.startswith("unix://"):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        address = endpoint[len("unix://"):]
+    elif endpoint.startswith("unix:"):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        address = endpoint[len("unix:"):]
+    elif endpoint.startswith("/"):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        address = endpoint
+    else:
+        if endpoint.startswith("["):
+            host, port = endpoint[1:].rsplit("]:", 1)
+        else:
+            host, port = endpoint.rsplit(":", 1)
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        address = (host, int(port))
+    sock.settimeout(10)
+    try:
+        sock.connect(address)
+        sock.sendall(b"*1\r\n$7\r\nFLUSHDB\r\n")
+        with sock.makefile("rb") as reader:
+            reply = reader.readline(64)
+        if reply != b"+OK\r\n":
+            raise RuntimeError(f"unexpected FLUSHDB reply {reply!r}")
+    finally:
+        sock.close()
+    print(f"reset Redis benchmark endpoint {endpoint}", file=sys.stderr)
+PY
+}
+
+reset_redis_backends() {
+    if [ "$BENCH_SCENARIO" = tiered-shard-l2 ]; then
+        flush_redis_endpoints "${REDIS_SHARD_ENDPOINT_ARRAY[@]}"
+    else
+        flush_redis_endpoints "$REDIS_ENDPOINT"
+    fi
 }
 
 # spawn_daemon <config-path> <health-port> <label>
@@ -473,12 +529,34 @@ EOF
     PPROF_ENDPOINT="127.0.0.1:$pprof"
 }
 
+reset_owned_scenario() {
+    stop_daemons
+    rm -rf "$WORKDIR/local-rocks" "$WORKDIR/origin-rocks" \
+        "$WORKDIR/tiered-l1-rocks" "$WORKDIR"/shard-*-rocks
+    SHARD_HEALTH_ENDPOINTS=()
+    BENCH_ENDPOINT=""
+    PREFILL_ENDPOINT=""
+    HEALTH_ENDPOINT=""
+    PPROF_ENDPOINT=""
+    if [ "$BENCH_BACKEND" = redis ]; then
+        reset_redis_backends
+    fi
+    case "$BENCH_SCENARIO" in
+        local)           start_local_only ;;
+        tiered-l1)       start_tiered_l1 ;;
+        tiered-shard-l2) start_tiered_shard_l2 ;;
+    esac
+}
+
 # ── Resolve endpoints ─────────────────────────────────────────────────────
 if [ -n "$BENCH_EXTERNAL_ENDPOINT" ]; then
     BENCH_ENDPOINT="$BENCH_EXTERNAL_ENDPOINT"
     PREFILL_ENDPOINT="${BENCH_EXTERNAL_PREFILL_ENDPOINT:-$BENCH_EXTERNAL_ENDPOINT}"
     echo "External mode: bench=$BENCH_ENDPOINT prefill=$PREFILL_ENDPOINT" >&2
 else
+    if [ "$BENCH_BACKEND" = redis ]; then
+        reset_redis_backends
+    fi
     case "$BENCH_SCENARIO" in
         local)           start_local_only ;;
         tiered-l1)       start_tiered_l1 ;;
@@ -490,6 +568,19 @@ else
     esac
 fi
 
+if [ -n "$BENCH_EXTERNAL_ENDPOINT" ]; then
+    active_rounds=0
+    if [ "$PREFILL_ENDPOINT" != "$BENCH_ENDPOINT" ]; then
+        active_rounds=$(wc -w <<<"$GET_CONCS")
+    else
+        active_rounds=$(( $(wc -w <<<"$GET_CONCS") + $(wc -w <<<"$PUT_CONCS") + $(wc -w <<<"$MIXED_CONCS") ))
+    fi
+    if [ "$active_rounds" -gt 1 ]; then
+        echo "ERROR: external mode permits one sweep point because the harness cannot reset external state" >&2
+        exit 1
+    fi
+fi
+
 # ── Bench driver ──────────────────────────────────────────────────────────
 # run_bench <mode> <conc> [extra-flags...]
 # Runs cache-ctl bench and appends raw numbers to $RAW as a TSV row.
@@ -499,8 +590,11 @@ run_bench() {
     local conc=$2
     shift 2
 
+    if [ "$BENCH_ROUND" -gt 0 ]; then
+        reset_owned_scenario
+    fi
     BENCH_ROUND=$((BENCH_ROUND + 1))
-    local key_salt="round-$BENCH_ROUND-$mode-$conc"
+    local key_salt="$BENCH_RUN_ID-round-$BENCH_ROUND-$mode-$conc"
     local out="$WORKDIR/bench-$mode-$conc.out"
     printf "  running %s c=%s\n" "$mode" "$conc" >&2
 
@@ -610,9 +704,10 @@ run_bench() {
 }
 
 # ── Runs ──────────────────────────────────────────────────────────────────
-# Every round passes a unique key salt so a prior sweep point cannot warm the
-# next point's cold pool. GET/mixed still pass --prefill $PREFILL so each point
-# has the same working-set size.
+# Every owned round starts with empty measured and origin state. Embedded
+# stores are recreated; dedicated Redis endpoints are FLUSHDB'd only after the
+# caller explicitly opts in. A run-unique key salt also prevents accidental
+# reuse when external mode runs its single operator-reset point.
 #
 # In non-local scenarios we always run GET (the bench target may be a
 # tiered instance that rejects writes). PUT rounds are skipped unless
@@ -663,6 +758,10 @@ if [ -n "$BENCH_EXTERNAL_ENDPOINT" ]; then
     if [ -z "$REDIS_SET_POOL_EXPLICIT" ] || [ -z "$REDIS_SET_POOL" ]; then REPORT_REDIS_SET_POOL="unknown"; fi
     if [ -z "$REDIS_TIMEOUT_EXPLICIT" ] || [ -z "$REDIS_TIMEOUT" ]; then REPORT_REDIS_TIMEOUT="unknown"; fi
 fi
+REPORT_RESET="recreated per point"
+if [ -n "$BENCH_EXTERNAL_ENDPOINT" ]; then
+    REPORT_RESET="operator-owned; one point only"
+fi
 
 awk -v scores="${SERVER_CORES:-unbound}" -v ccores="${CLIENT_CORES:-unbound}" \
     -v backend="$REPORT_BACKEND" -v backend_ep="$REPORT_BACKEND_ENDPOINT" \
@@ -673,6 +772,7 @@ awk -v scores="${SERVER_CORES:-unbound}" -v ccores="${CLIENT_CORES:-unbound}" \
     -v valsz="$VALUE_SIZE" -v duration="$DURATION" -v prefill="$PREFILL" \
     -v access="$ACCESS" -v zipf_s="$ZIPF_S" -v cold_prefill="$COLD_PREFILL" \
     -v miss_ratio="$MISS_RATIO" -v timeout="$TIMEOUT" \
+    -v state_reset="$REPORT_RESET" \
     -v scenario="$BENCH_SCENARIO" -v bench_ep="$BENCH_ENDPOINT" -v prefill_ep="$PREFILL_ENDPOINT" '
 function commify(n,   s, out, len) {
     s = sprintf("%d", n)
@@ -766,7 +866,7 @@ END {
     printf "  Prefill      : %s warm / %s cold keys\n", prefill, cold_prefill
     printf "  Access       : %s (zipf-s=%s)\n", access, zipf_s
     printf "  Miss ratio   : %s\n", miss_ratio
-    printf "  Key spaces   : isolated per run\n"
+    printf "  State reset  : %s\n", state_reset
     printf "  Op timeout   : %s\n", timeout
     printf "  Duration     : %s per run\n", duration
     print ""

@@ -183,7 +183,7 @@ SERVER_CORES=0-7 CLIENT_CORES=8-11 \
   bash test/scripts/bench_cache.sh
 
 # Redis-compatible local backend. Start a disposable, empty server first.
-BENCH_BACKEND=redis \
+BENCH_BACKEND=redis REDIS_RESET=flushdb \
   REDIS_ENDPOINT=unix:///run/kuasar-bench/redis.sock \
   SERVER_CORES=0-3 BACKEND_CORES=4-7 CLIENT_CORES=8-11 \
   PREFILL=1000 DURATION=5s \
@@ -193,19 +193,24 @@ BENCH_BACKEND=redis \
 
 `bench_cache.sh` manages only cache-ctl processes. The Redis-compatible server
 is an external deployment component, so the operator must pin its process to
-`BACKEND_CORES`, start it with an empty namespace, and stop it after the run.
+`BACKEND_CORES`, give the benchmark an isolated namespace, and stop it after
+the run.
 `BACKEND_CORES` is recorded in the report but is not applied by the script.
 Report both cache-ctl and backend CPU allocations; comparing an unbounded
 Dragonfly process with a bounded embedded process is not a valid A/B.
-Each sweep point uses a separate warm/cold key space, so cold reads filled by an
-earlier concurrency point cannot turn into hits in a later point. In external
-mode, Redis endpoint, pool and timeout fields are reported only when explicitly
-provided; otherwise the report marks them as unknown.
+`REDIS_RESET=flushdb` is deliberately explicit and destructive: every endpoint
+must be dedicated to the benchmark. The harness clears it before the first
+point and between points, then restarts its cache-ctl daemons. Embedded runs
+recreate their RocksDB paths instead. This keeps capacity and cold-key state
+identical across the sweep. External cache-ctl mode cannot reset backing state
+and accepts only one point per invocation. In that mode, Redis endpoint, pool
+and timeout fields are reported only when explicitly provided; otherwise the
+report marks them as unknown.
 
 For the EC path, provide exactly five independent Redis endpoints:
 
 ```bash
-BENCH_SCENARIO=tiered-shard-l2 BENCH_BACKEND=redis \
+BENCH_SCENARIO=tiered-shard-l2 BENCH_BACKEND=redis REDIS_RESET=flushdb \
   REDIS_SHARD_ENDPOINTS='unix:///run/df1.sock unix:///run/df2.sock unix:///run/df3.sock unix:///run/df4.sock unix:///run/df5.sock' \
   SERVER_CORES=0-3 BACKEND_CORES=4-7 CLIENT_CORES=8-11 \
   ACCESS=uniform GET_CONCS='1 4 16 32' \

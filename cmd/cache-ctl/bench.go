@@ -64,8 +64,20 @@ func daemonRedisIdle(stats cache.DaemonStats) bool {
 	return true
 }
 
-// snapshotFinalCounters waits only for observable Redis operations and worker
-// reconnects to settle. It is bounded so a failed backend cannot stall a sweep.
+func daemonFillsIdle(stats cache.DaemonStats) bool {
+	if stats.Tiered == nil {
+		return true
+	}
+	for _, tier := range stats.Tiered.Tiers {
+		if tier.FillsInflight != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// snapshotFinalCounters waits for observable coordinator fills and Redis worker
+// state to settle. It is bounded so a failed backend cannot stall a sweep.
 func snapshotFinalCounters(endpoints []string, haveBaseline []bool, timeout time.Duration, fetch infoFetcher) ([]cache.DaemonStats, []bool, bool) {
 	finals := make([]cache.DaemonStats, len(endpoints))
 	haveFinal := make([]bool, len(endpoints))
@@ -83,7 +95,7 @@ func snapshotFinalCounters(endpoints []string, haveBaseline []bool, timeout time
 			}
 			finals[i] = stats
 			haveFinal[i] = true
-			if !daemonRedisIdle(stats) {
+			if !daemonFillsIdle(stats) || !daemonRedisIdle(stats) {
 				idle = false
 			}
 		}
@@ -504,9 +516,8 @@ func cmdBench(args []string) {
 		}
 	}
 
-	// Capture cancellation/drain/reconnect counters after Redis workers settle.
-	// This is an Info-only bounded wait; it does not inspect implementation fill
-	// goroutines or add a separate operational command.
+	// Capture counters after coordinator fills and Redis workers settle. This is
+	// a bounded poll of the normal Info API, not a separate lifecycle command.
 	finals, haveFinal, countersSettled := snapshotFinalCounters(
 		infoEndpoints, haveBaseline, finalCounterSnapshotTimeout, fetchInfo,
 	)
@@ -600,13 +611,14 @@ func diffCounters(before, after cache.DaemonStats) cache.DaemonStats {
 		tiers := make([]cache.TierStats, len(after.Tiered.Tiers))
 		for i, t := range after.Tiered.Tiers {
 			d := cache.TierStats{
-				Type:     t.Type,
-				Endpoint: t.Endpoint,
-				Hits:     t.Hits,
-				Misses:   t.Misses,
-				Fills:    t.Fills,
-				Errors:   t.Errors,
-				Redis:    diffRedisCounters(nil, t.Redis),
+				Type:          t.Type,
+				Endpoint:      t.Endpoint,
+				Hits:          t.Hits,
+				Misses:        t.Misses,
+				Fills:         t.Fills,
+				Errors:        t.Errors,
+				FillsInflight: t.FillsInflight,
+				Redis:         diffRedisCounters(nil, t.Redis),
 			}
 			// Subtract matching tier from baseline if present.
 			if before.Tiered != nil && i < len(before.Tiered.Tiers) {
@@ -720,16 +732,16 @@ func printBenchWindow(d cache.DaemonStats) {
 	if d.Tiered == nil {
 		return
 	}
-	fmt.Printf("  %-12s %-10s %10s %10s %10s %10s %8s\n",
-		"layer", "type", "hits", "misses", "fills", "errors", "hit%")
+	fmt.Printf("  %-12s %-10s %10s %10s %10s %10s %10s %8s\n",
+		"layer", "type", "hits", "misses", "fills", "end-flight", "errors", "hit%")
 	for i, t := range d.Tiered.Tiers {
 		tot := t.Hits + t.Misses
 		hr := 0.0
 		if tot > 0 {
 			hr = 100.0 * float64(t.Hits) / float64(tot)
 		}
-		fmt.Printf("  tier-%-7d %-10s %10d %10d %10d %10d %7.2f%%\n",
-			i, t.Type, t.Hits, t.Misses, t.Fills, t.Errors, hr)
+		fmt.Printf("  tier-%-7d %-10s %10d %10d %10d %10d %10d %7.2f%%\n",
+			i, t.Type, t.Hits, t.Misses, t.Fills, t.FillsInflight, t.Errors, hr)
 	}
 	o := d.Tiered.Origin
 	otot := o.Hits + o.Misses
@@ -737,8 +749,8 @@ func printBenchWindow(d cache.DaemonStats) {
 	if otot > 0 {
 		ohr = 100.0 * float64(o.Hits) / float64(otot)
 	}
-	fmt.Printf("  %-12s %-10s %10d %10d %10s %10d %7.2f%%\n",
-		"origin", o.Type, o.Hits, o.Misses, "-", o.Errors, ohr)
+	fmt.Printf("  %-12s %-10s %10d %10d %10s %10s %10d %7.2f%%\n",
+		"origin", o.Type, o.Hits, o.Misses, "-", "-", o.Errors, ohr)
 
 	for _, t := range d.Tiered.Tiers {
 		if t.Redis != nil {
