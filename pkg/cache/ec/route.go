@@ -87,6 +87,27 @@ func (r *router) LocateN(key store.ContentKey, n int) ([]string, error) {
 	return s.table.LocateN(key[:], n)
 }
 
+// LocatePeers returns the routed peer IDs and endpoints from one immutable
+// router snapshot. Callers that retain the result for asynchronous work must
+// use this method instead of resolving IDs through Endpoint later, after a
+// membership swap may have published a different peer map.
+func (r *router) LocatePeers(key store.ContentKey, n int) ([]Peer, error) {
+	s := r.state.Load()
+	ids, err := s.table.LocateN(key[:], n)
+	if err != nil {
+		return nil, err
+	}
+	peers := make([]Peer, len(ids))
+	for i, id := range ids {
+		endpoint, ok := s.peerMap[id]
+		if !ok || endpoint == "" {
+			return nil, fmt.Errorf("ec: routed peer %q has no endpoint", id)
+		}
+		peers[i] = Peer{ID: id, Endpoint: endpoint}
+	}
+	return peers, nil
+}
+
 // Endpoint returns the gRPC endpoint for the given peer ID, or empty
 // string if the peer is not in the current membership.
 func (r *router) Endpoint(peerID string) string {

@@ -166,6 +166,11 @@ func TestGetRepairsConfirmedMissHiddenByEarlyReturn(t *testing.T) {
 	}
 	tier := tierHandle.(*impl)
 	defer tier.Close()
+	var scratchGets atomic.Int32
+	tier.shardScratchPool.New = func() any {
+		scratchGets.Add(1)
+		return make([]byte, 0, 256<<10)
+	}
 
 	data := bytes.Repeat([]byte("late-confirmed-miss"), 1024)
 	shards := make([][]byte, len(peers))
@@ -197,12 +202,9 @@ func TestGetRepairsConfirmedMissHiddenByEarlyReturn(t *testing.T) {
 		tier.pool.clients[tier.router.Endpoint(peerIDs[pos])] = shard
 	}
 
-	repairDone := make(chan struct{})
+	repairFn := make(chan func(), 1)
 	tier.EnableRepair(func(fn func()) {
-		go func() {
-			fn()
-			close(repairDone)
-		}()
+		repairFn <- fn
 	})
 
 	result, blob, err := tier.Get(context.Background(), store.PartitionManifest, key)
@@ -213,11 +215,27 @@ func TestGetRepairsConfirmedMissHiddenByEarlyReturn(t *testing.T) {
 		t.Fatal("Get returned corrupt data")
 	}
 	blob.Release()
+	if got := scratchGets.Load(); got != 0 {
+		t.Fatalf("foreground Get reconstructed unconfirmed parity: scratch gets=%d", got)
+	}
+	if fill := late.lastFill(); fill != nil {
+		t.Fatalf("repair ran before the deferred probe: %x", fill)
+	}
 
 	select {
 	case <-late.cancelled:
 	case <-time.After(time.Second):
 		t.Fatal("foreground late peer did not observe cancellation")
+	}
+	repairDone := make(chan struct{})
+	select {
+	case fn := <-repairFn:
+		go func() {
+			fn()
+			close(repairDone)
+		}()
+	case <-time.After(time.Second):
+		t.Fatal("background repair probe was not scheduled")
 	}
 	select {
 	case <-repairDone:
@@ -297,12 +315,17 @@ func TestRepairProbeDoesNotWriteOnTransportError(t *testing.T) {
 	for i := range shards {
 		shards[i] = []byte{byte(i + 1)}
 	}
+	blobs := make([]cache.Blob, len(peers))
 	seen := []bool{true, true, true, true, false}
 	tier.EnableRepair(func(fn func()) { fn() })
 	if !tier.tryReserveRepairProbe() {
 		t.Fatal("repair probe reservation was rejected")
 	}
-	if !tier.scheduleProbeRepair(shards, seen, nil, []int{0}, store.PartitionManifest, key) {
+	routedPeers, err := tier.router.LocatePeers(key, len(peers))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tier.scheduleProbeRepair(shards, blobs, seen, nil, []int{0}, routedPeers, store.PartitionManifest, key) {
 		t.Fatal("repair probe was not scheduled")
 	}
 	if fill := failed.lastFill(); fill != nil {
@@ -346,12 +369,17 @@ func TestRepairProbeCombinesConfirmedAndLateMisses(t *testing.T) {
 	for i := range shards {
 		shards[i] = []byte{byte(i + 1)}
 	}
+	blobs := make([]cache.Blob, len(peers))
 	seen := []bool{true, true, true, true, false, false}
 	tier.EnableRepair(func(fn func()) { fn() })
 	if !tier.tryReserveRepairProbe() {
 		t.Fatal("repair probe reservation was rejected")
 	}
-	if !tier.scheduleProbeRepair(shards, seen, []int{0}, []int{1}, store.PartitionManifest, key) {
+	routedPeers, err := tier.router.LocatePeers(key, len(peers))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tier.scheduleProbeRepair(shards, blobs, seen, []int{0}, []int{1}, routedPeers, store.PartitionManifest, key) {
 		t.Fatal("repair probe was not scheduled")
 	}
 
@@ -367,6 +395,66 @@ func TestRepairProbeCombinesConfirmedAndLateMisses(t *testing.T) {
 		t.Fatal("combined repair probe did not release its reservation")
 	}
 	tier.releaseRepairProbe()
+}
+
+func TestRepairProbeUsesForegroundPeerSnapshot(t *testing.T) {
+	peers := []Peer{
+		{ID: "p0", Endpoint: "old-p0"},
+		{ID: "p1", Endpoint: "old-p1"},
+		{ID: "p2", Endpoint: "old-p2"},
+		{ID: "p3", Endpoint: "old-p3"},
+		{ID: "p4", Endpoint: "old-p4"},
+	}
+	tierHandle, err := New(Config{Cluster: ClusterConfig{
+		DataShards: 4, ParityShards: 1, Peers: peers,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tier := tierHandle.(*impl)
+	defer tier.Close()
+
+	key := store.ContentKey{3, 1, 4}
+	foregroundPeers, err := tier.router.LocatePeers(key, len(peers))
+	if err != nil {
+		t.Fatal(err)
+	}
+	probePos := 0
+	oldPeer := &repairTestShard{result: cache.CacheMiss}
+	newPeer := &repairTestShard{result: cache.CacheMiss}
+	tier.pool.clients[foregroundPeers[probePos].Endpoint] = oldPeer
+
+	updated := make([]Peer, len(peers))
+	for i, peer := range peers {
+		updated[i] = Peer{ID: peer.ID, Endpoint: "new-" + peer.ID}
+		tier.pool.clients[updated[i].Endpoint] = newPeer
+	}
+
+	var repair func()
+	tier.EnableRepair(func(fn func()) { repair = fn })
+	if !tier.tryReserveRepairProbe() {
+		t.Fatal("repair probe reservation was rejected")
+	}
+	shards := [][]byte{{1}, {2}, {3}, {4}, nil}
+	blobs := make([]cache.Blob, len(peers))
+	seen := []bool{true, true, true, true, false}
+	if !tier.scheduleProbeRepair(shards, blobs, seen, nil, []int{probePos}, foregroundPeers, store.PartitionChunk, key) {
+		t.Fatal("repair probe was not scheduled")
+	}
+	if repair == nil {
+		t.Fatal("repair runner did not capture the probe")
+	}
+	if _, _, err := tier.router.ApplyMembership(2, updated); err != nil {
+		t.Fatal(err)
+	}
+
+	repair()
+	if fill := oldPeer.lastFill(); fill == nil {
+		t.Fatal("foreground peer did not receive the repair")
+	}
+	if fill := newPeer.lastFill(); fill != nil {
+		t.Fatalf("replacement peer received repair from stale positions: %x", fill)
+	}
 }
 
 func TestValidShardIndexRejectsPrefixOnlyValue(t *testing.T) {

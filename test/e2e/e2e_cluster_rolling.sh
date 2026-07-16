@@ -101,10 +101,10 @@ load_hash_via_tiered() {
 }
 
 wait_shard_present() {
-    local endpoint=$1 key=$2 attempts=${3:-100}
+    local endpoint=$1 namespace=$2 key=$3 attempts=${4:-100}
     for _ in $(seq 1 "$attempts"); do
         if "$BIN/cache-ctl" shard get --endpoint "$endpoint" \
-            --namespace manifest --hash "$key" >/dev/null 2>&1; then
+            --namespace "$namespace" --hash "$key" >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.05
@@ -269,6 +269,9 @@ for i in $(seq 1 $N); do
     ORIG_HASHES+=("$(payload_hash "$TMPDIR/val-$i.bin")")
 done
 echo "  $N manifest keys stored."
+mapfile -t CKEYS < <(find "$TMPDIR/store-data/chunk/G1" -type f -printf '%f\n' | sort -u)
+[ "${#CKEYS[@]}" -gt 0 ] || { echo "  FAIL: no chunk keys found in test origin"; exit 1; }
+echo "  ${#CKEYS[@]} distinct chunk keys stored."
 
 # Pre-warm the EC tier: read all N through tiered client so each key
 # gets its 5 shards distributed and filled on {p1..p5}.
@@ -278,8 +281,16 @@ for i in $(seq 1 $N); do
 done
 for i in $(seq 1 $N); do
     for peer in 1 2 3 4 5; do
-        wait_shard_present "127.0.0.1:${SHARD_PORTS[$((peer-1))]}" "${MKEYS[$((i-1))]}" || {
+        wait_shard_present "127.0.0.1:${SHARD_PORTS[$((peer-1))]}" manifest "${MKEYS[$((i-1))]}" || {
             fail "prewarm key $i was not readable from shard s$peer"
+            exit 1
+        }
+    done
+done
+for chunk_key in "${CKEYS[@]}"; do
+    for peer in 1 2 3 4 5; do
+        wait_shard_present "127.0.0.1:${SHARD_PORTS[$((peer-1))]}" chunk "$chunk_key" || {
+            fail "prewarm chunk $chunk_key was not readable from shard s$peer"
             exit 1
         }
     done
@@ -319,7 +330,7 @@ assert_eq "$origin_hits_before" "$origin_hits_after" "rolling-swap reads did not
 for i in $(seq 1 $N); do
     repaired=0
     for _ in $(seq 1 100); do
-        if wait_shard_present "127.0.0.1:${SHARD_PORTS[5]}" "${MKEYS[$((i-1))]}" 1; then
+        if wait_shard_present "127.0.0.1:${SHARD_PORTS[5]}" manifest "${MKEYS[$((i-1))]}" 1; then
             repaired=1
             break
         fi

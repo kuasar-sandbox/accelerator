@@ -181,7 +181,7 @@ func (t *impl) Get(ctx context.Context, p store.Partition, key store.ContentKey)
 	data := t.enc.data
 	parity := t.enc.parity
 
-	peerIDs, err := t.router.LocateN(key, total)
+	peers, err := t.router.LocatePeers(key, total)
 	if err != nil {
 		return cache.CacheMiss, nil, err
 	}
@@ -212,7 +212,7 @@ func (t *impl) Get(ctx context.Context, p store.Partition, key store.ContentKey)
 		wg.Add(1)
 		go func(peerPos int) {
 			defer wg.Done()
-			endpoint := t.router.Endpoint(peerIDs[peerPos])
+			endpoint := peers[peerPos].Endpoint
 			sc, poolErr := t.pool.Get(endpoint)
 			if poolErr != nil {
 				res := shardResult{peerPos: peerPos, shardIdx: -1}
@@ -379,7 +379,7 @@ func (t *impl) Get(ctx context.Context, p store.Partition, key store.ContentKey)
 		}
 	}
 	repairNeedsParity := false
-	if t.repairRunner != nil && (len(missPeerPos) > 0 || probeReserved) {
+	if t.repairRunner != nil && len(unknownPeerPos) == 0 && len(missPeerPos) > 0 {
 		for i := data; i < total; i++ {
 			if !seenIdx[i] {
 				repairNeedsParity = true
@@ -462,12 +462,12 @@ func (t *impl) Get(ctx context.Context, p store.Partition, key store.ContentKey)
 	// If the foreground left unknown peers, combine their probe results with
 	// already-confirmed misses before mapping missing indices to destinations.
 	// WrapShard copies every payload before the scratch buffers are released.
-	probeScheduled := probeReserved && t.scheduleProbeRepair(shards, seenIdx, missPeerPos, unknownPeerPos, p, key)
+	probeScheduled := probeReserved && t.scheduleProbeRepair(shards, blobs, seenIdx, missPeerPos, unknownPeerPos, peers, p, key)
 	if probeScheduled {
 		// The scheduled thunk owns the reservation and releases it on exit.
 		probeReserved = false
 	} else if len(unknownPeerPos) == 0 {
-		t.scheduleRepair(shards, seenIdx, missPeerPos, p, key)
+		t.scheduleRepair(shards, seenIdx, missPeerPos, peers, p, key)
 	}
 
 	// Build the segmented blob's release closure. It:
@@ -512,7 +512,7 @@ func (t *impl) releaseRepairProbe() {
 // scheduleRepair wraps each missing-idx shard with [idx][total]
 // prefix (single alloc per shard) and fires one async FillShard per
 // (missPeer, missingIdx) pair.
-func (t *impl) scheduleRepair(shards [][]byte, seenIdx []bool, missPeerPos []int, p store.Partition, key store.ContentKey) {
+func (t *impl) scheduleRepair(shards [][]byte, seenIdx []bool, missPeerPos []int, peers []Peer, p store.Partition, key store.ContentKey) {
 	runner := t.repairRunner
 	if runner == nil || len(missPeerPos) == 0 {
 		return
@@ -560,15 +560,16 @@ func (t *impl) scheduleRepair(shards [][]byte, seenIdx []bool, missPeerPos []int
 		return
 	}
 
-	// Snapshot router/peer state for the goroutine.
-	peerIDs, err := t.router.LocateN(key, total)
-	if err != nil {
+	if len(peers) != total {
 		return
 	}
 
 	runner(func() {
 		for _, j := range jobs {
-			endpoint := t.router.Endpoint(peerIDs[j.peerPos])
+			if j.peerPos < 0 || j.peerPos >= len(peers) {
+				continue
+			}
+			endpoint := peers[j.peerPos].Endpoint
 			sc, err := t.pool.Get(endpoint)
 			if err != nil {
 				continue
@@ -585,43 +586,61 @@ func (t *impl) scheduleRepair(shards [][]byte, seenIdx []bool, missPeerPos []int
 // and the resulting confirmed misses map exactly to the still-missing shard
 // indices. Transport errors, invalid values, and ambiguous mappings never
 // trigger a write.
-func (t *impl) scheduleProbeRepair(shards [][]byte, seenIdx []bool, confirmedPeerPositions, probePeerPositions []int, p store.Partition, key store.ContentKey) bool {
+func (t *impl) scheduleProbeRepair(shards [][]byte, blobs []cache.Blob, seenIdx []bool, confirmedPeerPositions, probePeerPositions []int, peers []Peer, p store.Partition, key store.ContentKey) bool {
 	runner := t.repairRunner
 	if runner == nil || len(probePeerPositions) == 0 {
 		return false
 	}
 	total := t.enc.TotalShards()
-	payloads := make(map[int][]byte, total)
-	for idx, seen := range seenIdx {
-		if seen {
-			continue
-		}
-		if len(shards[idx]) == 0 {
-			return false
-		}
-		payloads[idx] = WrapShard(shards[idx], idx, total)
-	}
-	if len(payloads) == 0 {
+	data := t.enc.data
+	if len(peers) != total || len(shards) != total || len(blobs) != total || len(seenIdx) != total {
 		return false
 	}
 
-	peerIDs, err := t.router.LocateN(key, total)
-	if err != nil {
-		return false
-	}
 	allPeerPositions := make([]int, 0, len(confirmedPeerPositions)+len(probePeerPositions))
 	allPeerPositions = append(allPeerPositions, confirmedPeerPositions...)
 	allPeerPositions = append(allPeerPositions, probePeerPositions...)
 	endpoints := make(map[int]string, len(allPeerPositions))
 	for _, peerPos := range allPeerPositions {
-		if peerPos < 0 || peerPos >= len(peerIDs) {
+		if peerPos < 0 || peerPos >= len(peers) {
 			return false
 		}
-		endpoint := t.router.Endpoint(peerIDs[peerPos])
+		endpoint := peers[peerPos].Endpoint
 		if endpoint == "" {
 			return false
 		}
 		endpoints[peerPos] = endpoint
+	}
+
+	// Keep the K data shards alive for the detached probe. Wire-backed hits are
+	// retained with cheap Blob clones; only data reconstructed into scratch on
+	// the foreground path is copied. Parity remains unconstructed until a probe
+	// confirms that a parity peer is actually missing.
+	dataShards := make([][]byte, data)
+	retained := make([]cache.Blob, 0, data)
+	releaseData := func() {
+		for _, blob := range retained {
+			blob.Release()
+		}
+	}
+	for idx := 0; idx < data; idx++ {
+		if blobs[idx] != nil {
+			clone := blobs[idx].Clone()
+			value := clone.Bytes()
+			if len(value) <= cache.ShardPrefixSize {
+				clone.Release()
+				releaseData()
+				return false
+			}
+			retained = append(retained, clone)
+			dataShards[idx] = value[cache.ShardPrefixSize:]
+			continue
+		}
+		if len(shards[idx]) == 0 {
+			releaseData()
+			return false
+		}
+		dataShards[idx] = append([]byte(nil), shards[idx]...)
 	}
 	knownIdx := append([]bool(nil), seenIdx...)
 	confirmed := append([]int(nil), confirmedPeerPositions...)
@@ -629,6 +648,7 @@ func (t *impl) scheduleProbeRepair(shards [][]byte, seenIdx []bool, confirmedPee
 
 	runner(func() {
 		defer t.releaseRepairProbe()
+		defer releaseData()
 		complete := true
 		for _, peerPos := range positions {
 			sc, getErr := t.pool.Get(endpoints[peerPos])
@@ -684,11 +704,23 @@ func (t *impl) scheduleProbeRepair(shards [][]byte, seenIdx []bool, confirmedPee
 		if len(missingIdx) != len(confirmed) {
 			return
 		}
+
+		repairShards := make([][]byte, total)
+		copy(repairShards, dataShards)
+		for _, idx := range missingIdx {
+			if idx >= data {
+				if err := t.enc.enc.Reconstruct(repairShards); err != nil {
+					return
+				}
+				break
+			}
+		}
 		for i, peerPos := range confirmed {
-			value := payloads[missingIdx[i]]
-			if len(value) == 0 {
+			idx := missingIdx[i]
+			if len(repairShards[idx]) == 0 {
 				return
 			}
+			value := WrapShard(repairShards[idx], idx, total)
 			sc, getErr := t.pool.Get(endpoints[peerPos])
 			if getErr != nil {
 				continue
@@ -753,7 +785,7 @@ func (t *impl) Fill(ctx context.Context, p store.Partition, key store.ContentKey
 		return err
 	}
 
-	peerIDs, err := t.router.LocateN(key, total)
+	peers, err := t.router.LocatePeers(key, total)
 	if err != nil {
 		return err
 	}
@@ -771,7 +803,7 @@ func (t *impl) Fill(ctx context.Context, p store.Partition, key store.ContentKey
 		wg.Add(1)
 		go func(pos int) {
 			defer wg.Done()
-			endpoint := t.router.Endpoint(peerIDs[pos])
+			endpoint := peers[pos].Endpoint
 			sc, err := t.pool.Get(endpoint)
 			if err == nil {
 				err = sc.FillShard(fillCtx, p, key, bufs[pos])
