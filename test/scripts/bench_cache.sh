@@ -10,10 +10,21 @@ set -euo pipefail
 # Scenarios (BENCH_SCENARIO env var, default "local"):
 #
 #   local            1 local cache-ctl (today's default behaviour)
-#   tiered-l1        1 local (store role) + 1 tiered (L1 embedded rocks,
+#   tiered-l1        1 local (store role) + 1 tiered (L1 selected backend,
 #                    origin: upstream → local)
 #   tiered-shard-l2  1 local (store role) + 5 shard (L2 EC cluster) +
 #                    1 tiered (no L1, tiers=[ec], origin: upstream → local)
+#
+# BENCH_BACKEND selects the physical store used by the measured cache-ctl
+# daemon(s):
+#
+#   embedded          in-process RocksDB (default)
+#   redis             external Redis-compatible server over UDS or TCP
+#
+# Redis server lifecycle is deliberately external to this protocol-neutral
+# harness. local/tiered-l1 require REDIS_ENDPOINT; tiered-shard-l2 requires
+# five whitespace-separated REDIS_SHARD_ENDPOINTS, one independent storage
+# namespace per physical shard peer.
 #
 # External mode (skip spin-up, bench a pre-started instance):
 #
@@ -24,6 +35,11 @@ set -euo pipefail
 #   bash test/scripts/bench_cache.sh
 #   BENCH_SCENARIO=tiered-l1 bash test/scripts/bench_cache.sh
 #   BENCH_SCENARIO=tiered-shard-l2 bash test/scripts/bench_cache.sh
+#   BENCH_BACKEND=redis REDIS_ENDPOINT=unix:///run/dragonfly/redis.sock \
+#     bash test/scripts/bench_cache.sh
+#   BENCH_BACKEND=redis BENCH_SCENARIO=tiered-shard-l2 \
+#     REDIS_SHARD_ENDPOINTS='unix:///run/df1.sock ... unix:///run/df5.sock' \
+#     bash test/scripts/bench_cache.sh
 #   BENCH_EXTERNAL_ENDPOINT=127.0.0.1:7700 bash test/scripts/bench_cache.sh
 #
 #   SERVER_CORES=0   CLIENT_CORES=1       bash test/scripts/bench_cache.sh
@@ -33,8 +49,15 @@ set -euo pipefail
 #   GET_CONCS="" PUT_CONCS="1 4 8"        bash test/scripts/bench_cache.sh  # PUT only
 
 BENCH_SCENARIO="${BENCH_SCENARIO:-local}"
+BENCH_BACKEND="${BENCH_BACKEND:-embedded}"
 BENCH_EXTERNAL_ENDPOINT="${BENCH_EXTERNAL_ENDPOINT:-}"
 BENCH_EXTERNAL_PREFILL_ENDPOINT="${BENCH_EXTERNAL_PREFILL_ENDPOINT:-}"
+REDIS_ENDPOINT="${REDIS_ENDPOINT:-}"
+REDIS_SHARD_ENDPOINTS="${REDIS_SHARD_ENDPOINTS:-}"
+REDIS_GET_POOL="${REDIS_GET_POOL:-32}"
+REDIS_SET_POOL="${REDIS_SET_POOL:-8}"
+REDIS_TIMEOUT="${REDIS_TIMEOUT:-5s}"
+BACKEND_CORES="${BACKEND_CORES:-}"
 
 SERVER_CORES="${SERVER_CORES:-0-1}"
 CLIENT_CORES="${CLIENT_CORES:-2-3}"
@@ -45,6 +68,12 @@ PREFILL="${PREFILL:-2000}"
 # e.g. GET_CONCS="" to run PUT only.
 GET_CONCS="${CONCS:-${GET_CONCS-1 2 4 8}}"
 PUT_CONCS="${CONCS:-${PUT_CONCS-1}}"
+MIXED_CONCS="${MIXED_CONCS-}"
+ACCESS="${ACCESS:-seq}"
+ZIPF_S="${ZIPF_S:-1.1}"
+COLD_PREFILL="${COLD_PREFILL:-0}"
+MISS_RATIO="${MISS_RATIO:-0}"
+TIMEOUT="${TIMEOUT:-10s}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -122,6 +151,39 @@ count_cores() {
     echo "$total"
 }
 
+case "$BENCH_BACKEND" in
+    embedded|redis) ;;
+    *)
+        echo "ERROR: BENCH_BACKEND must be embedded or redis" >&2
+        exit 1
+        ;;
+esac
+
+if [ -z "$BENCH_EXTERNAL_ENDPOINT" ] && [ "$BENCH_BACKEND" = redis ]; then
+    case "$BENCH_SCENARIO" in
+        local|tiered-l1)
+            if [ -z "$REDIS_ENDPOINT" ]; then
+                echo "ERROR: BENCH_BACKEND=redis with $BENCH_SCENARIO requires REDIS_ENDPOINT" >&2
+                exit 1
+            fi
+            ;;
+        tiered-shard-l2)
+            read -r -a REDIS_SHARD_ENDPOINT_ARRAY <<< "$REDIS_SHARD_ENDPOINTS"
+            if [ "${#REDIS_SHARD_ENDPOINT_ARRAY[@]}" -ne 5 ]; then
+                echo "ERROR: redis tiered-shard-l2 requires exactly 5 REDIS_SHARD_ENDPOINTS" >&2
+                exit 1
+            fi
+            ;;
+    esac
+fi
+
+if [ "$COLD_PREFILL" -ne 0 ] || [ "$MISS_RATIO" != 0 ]; then
+    if [ "$BENCH_SCENARIO" = local ] && [ -z "$BENCH_EXTERNAL_PREFILL_ENDPOINT" ]; then
+        echo "ERROR: COLD_PREFILL/MISS_RATIO require a split prefill endpoint" >&2
+        exit 1
+    fi
+fi
+
 free_port() {
     python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
 }
@@ -172,10 +234,13 @@ start_local_only() {
     config="$WORKDIR/local.yaml"
     cat > "$config" <<EOF
 mode: local
-type: embedded
+type: $BENCH_BACKEND
 listen: 127.0.0.1:$data
 health_listen: 127.0.0.1:$health
 rpc_timeout: 5s
+EOF
+    if [ "$BENCH_BACKEND" = embedded ]; then
+        cat >> "$config" <<EOF
 freq:
   counters: 1M
   reset_after: 100K
@@ -187,6 +252,15 @@ rocks:
   direct_reads: false
   bloom_bits: 10
 EOF
+    else
+        cat >> "$config" <<EOF
+redis:
+  endpoint: $REDIS_ENDPOINT
+  get_pool: $REDIS_GET_POOL
+  set_pool: $REDIS_SET_POOL
+  timeout: $REDIS_TIMEOUT
+EOF
+    fi
     spawn_daemon "$config" "$health" "local"
     BENCH_ENDPOINT="127.0.0.1:$data"
     PREFILL_ENDPOINT="127.0.0.1:$data"
@@ -245,13 +319,27 @@ freq:
   reset_after: 100K
   disable_eviction: true
 tiers:
-  - type: embedded
+  - type: $BENCH_BACKEND
+EOF
+    if [ "$BENCH_BACKEND" = embedded ]; then
+        cat >> "$config" <<EOF
     rocks:
       path: $rocks
       disk_bytes: 4GiB
       mem_ratio: 0.1
       direct_reads: false
       bloom_bits: 10
+EOF
+    else
+        cat >> "$config" <<EOF
+    redis:
+      endpoint: $REDIS_ENDPOINT
+      get_pool: $REDIS_GET_POOL
+      set_pool: $REDIS_SET_POOL
+      timeout: $REDIS_TIMEOUT
+EOF
+    fi
+    cat >> "$config" <<EOF
 origin:
   type: upstream
   upstream:
@@ -280,10 +368,13 @@ start_tiered_shard_l2() {
         sconfig="$WORKDIR/shard-$i.yaml"
         cat > "$sconfig" <<EOF
 mode: shard
-type: embedded
+type: $BENCH_BACKEND
 listen: 127.0.0.1:$sdata
 health_listen: 127.0.0.1:$shealth
 rpc_timeout: 5s
+EOF
+        if [ "$BENCH_BACKEND" = embedded ]; then
+            cat >> "$sconfig" <<EOF
 freq:
   counters: 1M
   reset_after: 100K
@@ -295,6 +386,15 @@ rocks:
   direct_reads: false
   bloom_bits: 10
 EOF
+        else
+            cat >> "$sconfig" <<EOF
+redis:
+  endpoint: ${REDIS_SHARD_ENDPOINT_ARRAY[$((i - 1))]}
+  get_pool: $REDIS_GET_POOL
+  set_pool: $REDIS_SET_POOL
+  timeout: $REDIS_TIMEOUT
+EOF
+        fi
         spawn_daemon "$sconfig" "$shealth" "shard-$i"
         shard_peers+=("  - id: s$i")
         shard_peers+=("    endpoint: 127.0.0.1:$sdata")
@@ -418,12 +518,17 @@ run_bench() {
     fi
 
     local rc=0
+    local workload_flags=(--access "$ACCESS" --zipf-s "$ZIPF_S" --timeout "$TIMEOUT")
+    if [ "$COLD_PREFILL" -gt 0 ]; then
+        workload_flags+=(--cold-prefill "$COLD_PREFILL" --miss-ratio "$MISS_RATIO")
+    fi
     if [ -n "$CLIENT_CORES" ]; then
         taskset -c "$CLIENT_CORES" "$BIN/cache-ctl" bench \
             --endpoint "$BENCH_ENDPOINT" \
             "${prefill_flag[@]}" \
             "${info_flag[@]}" \
             "${profile_flags[@]}" \
+            "${workload_flags[@]}" \
             --concurrency "$conc" --duration "$DURATION" \
             --value-size "$VALUE_SIZE" --mode "$mode" "$@" >"$out" 2>&1 || rc=$?
     else
@@ -432,6 +537,7 @@ run_bench() {
             "${prefill_flag[@]}" \
             "${info_flag[@]}" \
             "${profile_flags[@]}" \
+            "${workload_flags[@]}" \
             --concurrency "$conc" --duration "$DURATION" \
             --value-size "$VALUE_SIZE" --mode "$mode" "$@" >"$out" 2>&1 || rc=$?
     fi
@@ -486,6 +592,9 @@ else
     for c in $PUT_CONCS; do
         run_bench put "$c"
     done
+    for c in $MIXED_CONCS; do
+        run_bench mixed "$c" --prefill "$PREFILL"
+    done
 fi
 
 # ── Report ────────────────────────────────────────────────────────────────
@@ -496,6 +605,8 @@ SCOUNT=$(count_cores "$SERVER_CORES")
 CCOUNT=$(count_cores "$CLIENT_CORES")
 
 awk -v scores="${SERVER_CORES:-unbound}" -v ccores="${CLIENT_CORES:-unbound}" \
+    -v backend="$BENCH_BACKEND" -v backend_ep="${REDIS_ENDPOINT:-$REDIS_SHARD_ENDPOINTS}" \
+    -v bcores="${BACKEND_CORES:-external/unbound}" \
     -v scount="$SCOUNT" -v ccount="$CCOUNT" \
     -v valsz="$VALUE_SIZE" -v duration="$DURATION" \
     -v scenario="$BENCH_SCENARIO" -v bench_ep="$BENCH_ENDPOINT" -v prefill_ep="$PREFILL_ENDPOINT" '
@@ -536,16 +647,19 @@ function emit_section(label, n,   i, HDR, ROW) {
         if (label == "GET") {
             printf ROW, g_conc[i], commify(g_thrpt[i]), g_bw[i]+0,
                    fmt_lat(g_p50[i]), fmt_lat(g_p99[i]), fmt_lat(g_p999[i])
-        } else {
+        } else if (label == "PUT") {
             printf ROW, p_conc[i], commify(p_thrpt[i]), p_bw[i]+0,
                    fmt_lat(p_p50[i]), fmt_lat(p_p99[i]), fmt_lat(p_p999[i])
+        } else {
+            printf ROW, m_conc[i], commify(m_thrpt[i]), m_bw[i]+0,
+                   fmt_lat(m_p50[i]), fmt_lat(m_p99[i]), fmt_lat(m_p999[i])
         }
     }
     print ""
 }
 BEGIN {
     FS = "\t"
-    ng = 0; np = 0
+    ng = 0; np = 0; nm = 0
 }
 {
     mode = $1; conc = $2; ops = $3; thrpt = $4; bw = $5
@@ -558,6 +672,10 @@ BEGIN {
         p_conc[np] = conc; p_thrpt[np] = thrpt; p_bw[np] = bw
         p_p50[np] = p50; p_p99[np] = p99; p_p999[np] = p999
         np++
+    } else if (mode == "mixed") {
+        m_conc[nm] = conc; m_thrpt[nm] = thrpt; m_bw[nm] = bw
+        m_p50[nm] = p50; m_p99[nm] = p99; m_p999[nm] = p999
+        nm++
     }
 }
 END {
@@ -566,16 +684,20 @@ END {
     print "                          Cache Bench Report"
     print "═══════════════════════════════════════════════════════════════════════════"
     printf "  Scenario     : %s\n", scenario
+    printf "  Backend      : %s\n", backend
+    if (backend == "redis" && backend_ep != "") printf "  Redis EP(s)  : %s\n", backend_ep
     printf "  Bench EP     : %s\n", bench_ep
     if (prefill_ep != bench_ep) {
         printf "  Prefill EP   : %s\n", prefill_ep
     }
     printf "  Server cores : %s\n", fmt_cores(scores, scount)
+    if (backend == "redis") printf "  Backend cores: %s\n", bcores
     printf "  Client cores : %s\n", fmt_cores(ccores, ccount)
     printf "  Value size   : %s\n", fmt_size(valsz+0)
     printf "  Duration     : %s per run\n", duration
     print ""
     if (ng > 0) emit_section("GET", ng)
     if (np > 0) emit_section("PUT", np)
+    if (nm > 0) emit_section("MIXED", nm)
 }
 ' "$RAW"

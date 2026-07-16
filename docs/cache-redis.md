@@ -167,6 +167,55 @@ Dragonfly's SSD tier is cache capacity, not authoritative persistence. A local
 or tiered instance can refill after restart. For RS(4+1), restart at most one
 shard peer at a time and rate-limit repair while that peer is cold.
 
+## Backend A/B benchmark
+
+The repository's existing cache wire benchmark can select the physical store
+without changing its client workload:
+
+```bash
+# Embedded RocksDB baseline.
+SERVER_CORES=0-3 CLIENT_CORES=8-11 \
+  ACCESS=uniform GET_CONCS='1 4 16 32' MIXED_CONCS=8 \
+  bash test/scripts/bench_cache.sh
+
+# Redis-compatible local backend. Start a disposable, empty server first.
+BENCH_BACKEND=redis \
+  REDIS_ENDPOINT=unix:///run/kuasar-bench/redis.sock \
+  SERVER_CORES=0-3 BACKEND_CORES=4-7 CLIENT_CORES=8-11 \
+  ACCESS=uniform GET_CONCS='1 4 16 32' MIXED_CONCS=8 \
+  bash test/scripts/bench_cache.sh
+```
+
+`bench_cache.sh` manages only cache-ctl processes. The Redis-compatible server
+is an external deployment component, so the operator must pin its process to
+`BACKEND_CORES`, start it with an empty namespace, and stop it after the run.
+`BACKEND_CORES` is recorded in the report but is not applied by the script.
+Report both cache-ctl and backend CPU allocations; comparing an unbounded
+Dragonfly process with a bounded embedded process is not a valid A/B.
+
+For the EC path, provide exactly five independent Redis endpoints:
+
+```bash
+BENCH_SCENARIO=tiered-shard-l2 BENCH_BACKEND=redis \
+  REDIS_SHARD_ENDPOINTS='unix:///run/df1.sock unix:///run/df2.sock unix:///run/df3.sock unix:///run/df4.sock unix:///run/df5.sock' \
+  SERVER_CORES=0-3 BACKEND_CORES=4-7 CLIENT_CORES=8-11 \
+  ACCESS=uniform GET_CONCS='1 4 16 32' \
+  bash test/scripts/bench_cache.sh
+```
+
+Each shard peer owns a physical storage namespace. Pointing multiple shard
+peers at the same Redis namespace is invalid because their values for one
+content key represent different EC shard indexes and would overwrite each
+other. In production those endpoints normally reside on different nodes; a
+single-host benchmark must use separate server instances or otherwise
+isolated namespaces.
+
+Hot-hit acceptance requires a working set that fits the configured memory.
+SSD-tier acceptance requires a uniform working set larger than the server's
+RAM budget, observed offloaded-entry and pending-I/O metrics, and storage that
+matches the production NVMe class. Results from a virtual block device may be
+used for functional tiering tests but not for the production latency claim.
+
 [Dragonfly SSD tiering](https://www.dragonflydb.io/docs/managing-dragonfly/tiering)
 currently requires Linux 5.19 or newer with `io_uring`. Capacity and latency
 acceptance must include active offload/defragmentation and near-full disk
