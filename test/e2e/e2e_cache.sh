@@ -99,27 +99,35 @@ wait_manifest_load() {
     return 1
 }
 
-wait_origin_free_load() {
-    local config=$1 output=$2 key=$3 expected_hash=$4 health_endpoint=$5
-    local origin_before origin_after
-    for _ in $(seq 1 100); do
-        origin_before=$(origin_hits "$health_endpoint")
-        if "$BIN/manifest-ctl" load --manifest-config "$config" \
-            --output "$output" --no-progress "$key" >/dev/null 2>&1 &&
-            [ "$(payload_hash "$output" 2>/dev/null)" = "$expected_hash" ]; then
-            origin_after=$(origin_hits "$health_endpoint")
-            if [ "$origin_before" = "$origin_after" ]; then
-                return 0
-            fi
-        fi
-        sleep 0.05
-    done
-    return 1
-}
-
 # Allocate a free port.
 free_port() {
     python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
+}
+
+# Start a disposable origin over the already initialized FS store. Tests use
+# this process only for reads, then stop it without disrupting the main origin.
+start_store_reader() {
+    local name=$1
+    STORE_READER_PORT=$(free_port)
+    cat > "$TMPDIR/$name.yaml" <<EOF
+listen: 127.0.0.1:$STORE_READER_PORT
+backend: fs
+fs:
+  root: $STORE_ROOT
+  verify_content_key: true
+EOF
+    "$BIN/store-ctl" serve --config "$TMPDIR/$name.yaml" >"$TMPDIR/$name.log" 2>&1 &
+    STORE_READER_PID=$!
+    PIDS+=("$STORE_READER_PID")
+    for _ in $(seq 1 50); do
+        if (echo >/dev/tcp/127.0.0.1/"$STORE_READER_PORT") 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "ERROR: store reader $name did not listen on 127.0.0.1:$STORE_READER_PORT" >&2
+    cat "$TMPDIR/$name.log" >&2 || true
+    return 1
 }
 
 # Start an isolated Redis protocol test server with both loopback TCP and UDS.
@@ -356,6 +364,9 @@ assert_eq "obj-on-shard" "$GOT" "object put/get on shard mode (unified handler)"
 # ============================================================
 echo ""
 echo "=== Test 5: tiered mode (embedded only) — manifest-ctl load through cache ==="
+start_store_reader embedded-origin
+TIERED_ORIGIN_PORT=$STORE_READER_PORT
+TIERED_ORIGIN_PID=$STORE_READER_PID
 TIERED_PORT=$(free_port)
 TIERED_HEALTH_PORT=$(free_port)
 cat > "$TMPDIR/tiered.yaml" <<EOF
@@ -377,7 +388,7 @@ tiers:
 origin:
   type: store
   store:
-    endpoint: 127.0.0.1:$STORE_PORT
+    endpoint: 127.0.0.1:$TIERED_ORIGIN_PORT
     pool: 2
     timeout: 2s
   max_inflight: 16
@@ -394,25 +405,23 @@ TIERED_MANIFEST_CONFIG=$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")
     --output "$TMPDIR/test-cached.bin" --no-progress "$MKEY" 2>&1
 CACHED_HASH=$(payload_hash "$TMPDIR/test-cached.bin")
 assert_eq "$ORIG_HASH" "$CACHED_HASH" "tiered load roundtrip (cold)"
-if wait_origin_free_load "$TIERED_MANIFEST_CONFIG" "$TMPDIR/test-embedded-probe.bin" \
-    "$MKEY" "$ORIG_HASH" "127.0.0.1:$TIERED_HEALTH_PORT"; then
-    ok "tiered embedded complete artifact became warm without origin"
+kill "$TIERED_ORIGIN_PID" 2>/dev/null || true
+wait "$TIERED_ORIGIN_PID" 2>/dev/null || true
+if wait_manifest_load "$TIERED_MANIFEST_CONFIG" "$TMPDIR/test-embedded-probe.bin" \
+    "$MKEY" "$ORIG_HASH"; then
+    ok "tiered embedded cold fill became readable with origin stopped"
 else
-    fail "tiered embedded complete artifact did not become warm without origin"
+    fail "tiered embedded cold fill did not become readable with origin stopped"
     exit 1
 fi
 
 # ============================================================
 echo ""
 echo "=== Test 6: tiered mode — warm read (second load hits embedded cache) ==="
-TIERED_ORIGIN_BEFORE=$(origin_hits "127.0.0.1:$TIERED_HEALTH_PORT")
 "$BIN/manifest-ctl" load --manifest-config "$TIERED_MANIFEST_CONFIG" \
     --output "$TMPDIR/test-warm.bin" --no-progress "$MKEY" 2>&1
 WARM_HASH=$(payload_hash "$TMPDIR/test-warm.bin")
-assert_eq "$ORIG_HASH" "$WARM_HASH" "tiered load roundtrip (warm)"
-TIERED_ORIGIN_AFTER=$(origin_hits "127.0.0.1:$TIERED_HEALTH_PORT")
-assert_eq "$TIERED_ORIGIN_BEFORE" "$TIERED_ORIGIN_AFTER" \
-    "tiered embedded warm load did not fall through to origin"
+assert_eq "$ORIG_HASH" "$WARM_HASH" "tiered embedded warm load without origin"
 
 # ============================================================
 echo ""
@@ -521,6 +530,9 @@ for peer_port in "${SHARD_PORTS[@]}"; do
     done
 done
 assert_eq "1" "$ALL_SHARDS_PRESENT" "EC cold fill populated every embedded shard peer"
+if [ "$ALL_SHARDS_PRESENT" != "1" ]; then
+    exit 1
+fi
 EC_ORIGIN_HITS_BEFORE=$(origin_hits "127.0.0.1:$EC_TIERED_HEALTH_PORT")
 
 # ============================================================
@@ -711,6 +723,9 @@ echo ""
 echo "=== Test 13: tiered type=redis — cold fill and warm hit ==="
 start_redis redis-tiered
 REDIS_TIER_ENDPOINT="127.0.0.1:$REDIS_TCP_PORT"
+start_store_reader redis-tier-origin
+REDIS_TIER_ORIGIN_PORT=$STORE_READER_PORT
+REDIS_TIER_ORIGIN_PID=$STORE_READER_PID
 REDIS_TIER_PORT=$(free_port)
 REDIS_TIER_HEALTH_PORT=$(free_port)
 cat > "$TMPDIR/redis-tiered.yaml" <<EOF
@@ -728,7 +743,7 @@ tiers:
 origin:
   type: store
   store:
-    endpoint: 127.0.0.1:$STORE_PORT
+    endpoint: 127.0.0.1:$REDIS_TIER_ORIGIN_PORT
     pool: 2
     timeout: 2s
   max_inflight: 16
@@ -739,21 +754,19 @@ wait_ready "127.0.0.1:$REDIS_TIER_HEALTH_PORT"
 REDIS_TIER_MANIFEST_CONFIG=$(accel_cfg_for_cache "127.0.0.1:$REDIS_TIER_PORT")
 "$BIN/manifest-ctl" load --manifest-config "$REDIS_TIER_MANIFEST_CONFIG" \
     --output "$TMPDIR/test-redis-tier-cold.bin" --no-progress "$MKEY" 2>&1
-if wait_origin_free_load "$REDIS_TIER_MANIFEST_CONFIG" "$TMPDIR/test-redis-tier-probe.bin" \
-    "$MKEY" "$ORIG_HASH" "127.0.0.1:$REDIS_TIER_HEALTH_PORT"; then
-    ok "tiered Redis complete artifact became warm without origin"
+kill "$REDIS_TIER_ORIGIN_PID" 2>/dev/null || true
+wait "$REDIS_TIER_ORIGIN_PID" 2>/dev/null || true
+if wait_manifest_load "$REDIS_TIER_MANIFEST_CONFIG" "$TMPDIR/test-redis-tier-probe.bin" \
+    "$MKEY" "$ORIG_HASH"; then
+    ok "tiered Redis cold fill became readable with origin stopped"
 else
-    fail "tiered Redis complete artifact did not become warm without origin"
+    fail "tiered Redis cold fill did not become readable with origin stopped"
     exit 1
 fi
-REDIS_TIER_ORIGIN_BEFORE=$(origin_hits "127.0.0.1:$REDIS_TIER_HEALTH_PORT")
 "$BIN/manifest-ctl" load --manifest-config "$REDIS_TIER_MANIFEST_CONFIG" \
     --output "$TMPDIR/test-redis-tier-warm.bin" --no-progress "$MKEY" 2>&1
 REDIS_TIER_HASH=$(payload_hash "$TMPDIR/test-redis-tier-warm.bin")
-assert_eq "$ORIG_HASH" "$REDIS_TIER_HASH" "tiered Redis warm load roundtrip"
-REDIS_TIER_ORIGIN_AFTER=$(origin_hits "127.0.0.1:$REDIS_TIER_HEALTH_PORT")
-assert_eq "$REDIS_TIER_ORIGIN_BEFORE" "$REDIS_TIER_ORIGIN_AFTER" \
-    "tiered Redis warm load did not fall through to origin"
+assert_eq "$ORIG_HASH" "$REDIS_TIER_HASH" "tiered Redis warm load without origin"
 if "$BIN/cache-ctl" info --endpoint "127.0.0.1:$REDIS_TIER_HEALTH_PORT" --json | \
     EXPECTED_REDIS_ENDPOINT="$REDIS_TIER_ENDPOINT" python3 -c 'import json,os,sys; d=json.load(sys.stdin); r=d["tiered"]["tiers"][0]; assert r["type"] == "redis" and r["hits"] > 0; assert r["redis"]["endpoint"] == os.environ["EXPECTED_REDIS_ENDPOINT"]; assert r["redis"]["transport"] == "tcp"'; then
     ok "tiered Redis over TCP reports warm hits and transport"
@@ -849,6 +862,9 @@ for peer_port in "${REDIS_SHARD_PORTS[@]}"; do
     done
 done
 assert_eq "1" "$ALL_SHARDS_PRESENT" "EC cold fill populated every Redis shard peer"
+if [ "$ALL_SHARDS_PRESENT" != "1" ]; then
+    exit 1
+fi
 
 # Stop one Redis process without closing its sockets. The corresponding shard
 # cache enters Redis drain after the EC coordinator obtains four fast shards
