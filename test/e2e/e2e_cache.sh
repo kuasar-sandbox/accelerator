@@ -80,6 +80,12 @@ wait_shard_present() {
     return 1
 }
 
+origin_hits() {
+    local endpoint=$1
+    "$BIN/cache-ctl" info --endpoint "$endpoint" --json | \
+        python3 -c 'import json,sys; print(json.load(sys.stdin)["tiered"]["origin"]["hits"])'
+}
+
 wait_manifest_load() {
     local config=$1 output=$2 key=$3 expected_hash=$4
     for _ in $(seq 1 100); do
@@ -428,13 +434,6 @@ freq:
   counters: 1M
   reset_after: 100K
 tiers:
-  - type: embedded
-    rocks:
-      path: $TMPDIR/rocks-tiered-ec
-      disk_bytes: 1GiB
-      mem_ratio: 0.05
-      direct_reads: false
-      bloom_bits: 10
   - type: ec
     cluster:
       data_shards: 4
@@ -466,6 +465,27 @@ wait_ready "127.0.0.1:$EC_TIERED_HEALTH_PORT"
 EC_HASH=$(payload_hash "$TMPDIR/test-ec.bin")
 assert_eq "$ORIG_HASH" "$EC_HASH" "tiered+EC load roundtrip"
 
+# The main artifact has one 512 KiB content object. Select it rather than the
+# 64 KiB standalone Test 0 object, then observe both EC fills through every
+# shard peer's public data plane before injecting a failure.
+MAIN_CHUNK_KEY=$(find "$STORE_ROOT/chunk/G1" -type f -printf '%s %f\n' | sort -nr | head -1 | awk '{print $2}')
+if [ -z "$MAIN_CHUNK_KEY" ]; then
+    echo "ERROR: main test artifact chunk key was not found" >&2
+    exit 1
+fi
+ALL_SHARDS_PRESENT=1
+for peer_port in "${SHARD_PORTS[@]}"; do
+    for pair in "manifest:$MKEY" "chunk:$MAIN_CHUNK_KEY"; do
+        namespace=${pair%%:*}
+        object_key=${pair#*:}
+        if ! wait_shard_present "127.0.0.1:$peer_port" "$namespace" "$object_key"; then
+            ALL_SHARDS_PRESENT=0
+        fi
+    done
+done
+assert_eq "1" "$ALL_SHARDS_PRESENT" "EC cold fill populated every embedded shard peer"
+EC_ORIGIN_HITS_BEFORE=$(origin_hits "127.0.0.1:$EC_TIERED_HEALTH_PORT")
+
 # ============================================================
 echo ""
 echo "=== Test 9: EC failure injection — kill 1 shard node ==="
@@ -473,11 +493,14 @@ echo "=== Test 9: EC failure injection — kill 1 shard node ==="
 kill "${SHARD_PIDS[0]}" 2>/dev/null || true
 wait "${SHARD_PIDS[0]}" 2>/dev/null || true
 
-# Second load (warm from embedded + EC with 1 node down — should still work).
+# Second load must reconstruct from four EC shards without falling through.
 "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$EC_TIERED_PORT")" \
     --output "$TMPDIR/test-ec-1down.bin" --no-progress "$MKEY" 2>&1
 DOWN1_HASH=$(payload_hash "$TMPDIR/test-ec-1down.bin")
 assert_eq "$ORIG_HASH" "$DOWN1_HASH" "tiered+EC load with 1 shard down"
+EC_ORIGIN_HITS_AFTER=$(origin_hits "127.0.0.1:$EC_TIERED_HEALTH_PORT")
+assert_eq "$EC_ORIGIN_HITS_BEFORE" "$EC_ORIGIN_HITS_AFTER" \
+    "EC load with 1 shard down did not fall through to origin"
 
 # ============================================================
 echo ""
@@ -776,10 +799,8 @@ wait_ready "127.0.0.1:$REDIS_EC_HEALTH_PORT"
 "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$REDIS_EC_PORT")" \
     --output "$TMPDIR/test-redis-ec-cold.bin" --no-progress "$MKEY" 2>&1
 
-# The main test artifact has one chunk (asserted by the ingest output above).
-# Select its larger content object rather than the 64 KiB standalone Test 0
-# object, then prove EC fill wrote both namespaces to every Redis shard peer.
-MAIN_CHUNK_KEY=$(find "$STORE_ROOT/chunk/G1" -type f -printf '%s %f\n' | sort -nr | head -1 | awk '{print $2}')
+# Reuse the main artifact chunk key selected in Test 8, then prove EC fill
+# wrote both namespaces to every Redis shard peer.
 ALL_SHARDS_PRESENT=1
 for peer_port in "${REDIS_SHARD_PORTS[@]}"; do
     for pair in "manifest:$MKEY" "chunk:$MAIN_CHUNK_KEY"; do
