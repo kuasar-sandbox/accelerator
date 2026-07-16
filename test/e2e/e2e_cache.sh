@@ -99,6 +99,24 @@ wait_manifest_load() {
     return 1
 }
 
+wait_origin_free_load() {
+    local config=$1 output=$2 key=$3 expected_hash=$4 health_endpoint=$5
+    local origin_before origin_after
+    for _ in $(seq 1 100); do
+        origin_before=$(origin_hits "$health_endpoint")
+        if "$BIN/manifest-ctl" load --manifest-config "$config" \
+            --output "$output" --no-progress "$key" >/dev/null 2>&1 &&
+            [ "$(payload_hash "$output" 2>/dev/null)" = "$expected_hash" ]; then
+            origin_after=$(origin_hits "$health_endpoint")
+            if [ "$origin_before" = "$origin_after" ]; then
+                return 0
+            fi
+        fi
+        sleep 0.05
+    done
+    return 1
+}
+
 # Allocate a free port.
 free_port() {
     python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
@@ -369,20 +387,32 @@ EOF
 TIERED_PID=$!
 PIDS+=($TIERED_PID)
 wait_ready "127.0.0.1:$TIERED_HEALTH_PORT"
+TIERED_MANIFEST_CONFIG=$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")
 
 # Load via cache (first read — cold, fills embedded from origin).
-"$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
+"$BIN/manifest-ctl" load --manifest-config "$TIERED_MANIFEST_CONFIG" \
     --output "$TMPDIR/test-cached.bin" --no-progress "$MKEY" 2>&1
 CACHED_HASH=$(payload_hash "$TMPDIR/test-cached.bin")
 assert_eq "$ORIG_HASH" "$CACHED_HASH" "tiered load roundtrip (cold)"
+if wait_origin_free_load "$TIERED_MANIFEST_CONFIG" "$TMPDIR/test-embedded-probe.bin" \
+    "$MKEY" "$ORIG_HASH" "127.0.0.1:$TIERED_HEALTH_PORT"; then
+    ok "tiered embedded complete artifact became warm without origin"
+else
+    fail "tiered embedded complete artifact did not become warm without origin"
+    exit 1
+fi
 
 # ============================================================
 echo ""
 echo "=== Test 6: tiered mode — warm read (second load hits embedded cache) ==="
-"$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
+TIERED_ORIGIN_BEFORE=$(origin_hits "127.0.0.1:$TIERED_HEALTH_PORT")
+"$BIN/manifest-ctl" load --manifest-config "$TIERED_MANIFEST_CONFIG" \
     --output "$TMPDIR/test-warm.bin" --no-progress "$MKEY" 2>&1
 WARM_HASH=$(payload_hash "$TMPDIR/test-warm.bin")
 assert_eq "$ORIG_HASH" "$WARM_HASH" "tiered load roundtrip (warm)"
+TIERED_ORIGIN_AFTER=$(origin_hits "127.0.0.1:$TIERED_HEALTH_PORT")
+assert_eq "$TIERED_ORIGIN_BEFORE" "$TIERED_ORIGIN_AFTER" \
+    "tiered embedded warm load did not fall through to origin"
 
 # ============================================================
 echo ""
@@ -706,25 +736,18 @@ EOF
 "$BIN/cache-ctl" serve --config "$TMPDIR/redis-tiered.yaml" &
 PIDS+=($!)
 wait_ready "127.0.0.1:$REDIS_TIER_HEALTH_PORT"
-"$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$REDIS_TIER_PORT")" \
+REDIS_TIER_MANIFEST_CONFIG=$(accel_cfg_for_cache "127.0.0.1:$REDIS_TIER_PORT")
+"$BIN/manifest-ctl" load --manifest-config "$REDIS_TIER_MANIFEST_CONFIG" \
     --output "$TMPDIR/test-redis-tier-cold.bin" --no-progress "$MKEY" 2>&1
-REDIS_TIER_WARM=0
-for _ in $(seq 1 100); do
-    REDIS_TIER_PROBE_ORIGIN_BEFORE=$(origin_hits "127.0.0.1:$REDIS_TIER_HEALTH_PORT")
-    if "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$REDIS_TIER_PORT")" \
-        --output "$TMPDIR/test-redis-tier-probe.bin" --no-progress "$MKEY" >/dev/null 2>&1 &&
-        [ "$(payload_hash "$TMPDIR/test-redis-tier-probe.bin" 2>/dev/null)" = "$ORIG_HASH" ]; then
-        REDIS_TIER_PROBE_ORIGIN_AFTER=$(origin_hits "127.0.0.1:$REDIS_TIER_HEALTH_PORT")
-        if [ "$REDIS_TIER_PROBE_ORIGIN_BEFORE" = "$REDIS_TIER_PROBE_ORIGIN_AFTER" ]; then
-            REDIS_TIER_WARM=1
-            break
-        fi
-    fi
-    sleep 0.05
-done
-assert_eq "1" "$REDIS_TIER_WARM" "tiered Redis complete artifact became warm without origin"
+if wait_origin_free_load "$REDIS_TIER_MANIFEST_CONFIG" "$TMPDIR/test-redis-tier-probe.bin" \
+    "$MKEY" "$ORIG_HASH" "127.0.0.1:$REDIS_TIER_HEALTH_PORT"; then
+    ok "tiered Redis complete artifact became warm without origin"
+else
+    fail "tiered Redis complete artifact did not become warm without origin"
+    exit 1
+fi
 REDIS_TIER_ORIGIN_BEFORE=$(origin_hits "127.0.0.1:$REDIS_TIER_HEALTH_PORT")
-"$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$REDIS_TIER_PORT")" \
+"$BIN/manifest-ctl" load --manifest-config "$REDIS_TIER_MANIFEST_CONFIG" \
     --output "$TMPDIR/test-redis-tier-warm.bin" --no-progress "$MKEY" 2>&1
 REDIS_TIER_HASH=$(payload_hash "$TMPDIR/test-redis-tier-warm.bin")
 assert_eq "$ORIG_HASH" "$REDIS_TIER_HASH" "tiered Redis warm load roundtrip"
