@@ -110,18 +110,20 @@ closing a Redis connection. Dragonfly logged only its known UDS warning that
 TCP user timeout is unsupported on the socket; it logged no backend failure or
 external version-check attempt.
 
-## License gate
+## External service boundary
 
-Dragonfly v1.39.0 uses BSL 1.1. Its Additional Use Grant permits production use
-as part of another product or service only when that product is not an in-memory
-data-store product/service and the licensed work is not made available as a
-competing third-party managed service. The proposed topology keeps Dragonfly as
-an internal, non-exposed cache implementation behind cache-ctl, so the recorded
-technical deployment shape fits those conditions. An authorized organization
-owner must still record approval before production rollout; this benchmark is
-not legal approval.
+Dragonfly was a separately installed Redis-compatible server used for this A/B
+measurement. Accelerator does not download, bundle, publish, or redistribute
+it. Selection and operation of that external service, including its license
+terms, are deployment responsibilities and are not an Accelerator release or
+Redis-backend acceptance gate.
 
-## Remaining production qualification
+## Deployment-specific qualification
+
+The Redis-compatible backend is qualified by its protocol, lifecycle, UDS/TCP,
+race, integration, E2E, and reproducible hot-path A/B results. A specific
+external server and storage topology still needs its own production acceptance
+on the target hardware. For Dragonfly SSD tiering, that includes:
 
 1. Run a working set larger than the configured Dragonfly RAM budget on the
    target NVMe class with uniform cold reads.

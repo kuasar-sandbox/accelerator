@@ -34,7 +34,7 @@ Bloom Filter 全部常驻内存)。
   socket、chmod 0600)。数据面客户端 `cache.endpoint` 填同址即可;控制面经 socket
   时,`ping` / `info --endpoint` 用 `unix:///` 形式。
 - **本地存储**:进程内 RocksDB,或通过 UDS/TCP 访问 Redis-compatible server;
-  后者的配置、取消语义和 Dragonfly 部署见 [cache-redis.md](cache-redis.md)。
+  后者的配置、取消语义和外部 Dragonfly 部署示例见 [cache-redis.md](cache-redis.md)。
 - **写入语义**:强制准入,无应用层 LRU/SLRU。淘汰由 CompactionFilter 在
   后台按 CMS 频率统计驱动。
 - **填充语义**:fill-aside,读路径上隐式回填上层。
