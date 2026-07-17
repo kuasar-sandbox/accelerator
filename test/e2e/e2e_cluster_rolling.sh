@@ -26,6 +26,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BIN="${BIN:-$PROJECT_ROOT/bin}"
 TMPDIR=$(mktemp -d /tmp/acc-cluster-e2e-XXXXXX)
+E2E_PORT_LEASE_FILE="$TMPDIR/ports"
+source "$SCRIPT_DIR/lib/port_lease.sh"
 KEY=$(openssl rand -hex 32)
 
 PASS=0
@@ -64,10 +66,6 @@ wait_ready() {
     done
     echo "  ERROR: cache-ctl health at $endpoint did not become ready"
     return 1
-}
-
-free_port() {
-    python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
 }
 
 # Hash the payload inside a tarstream artifact. manifest-ctl ingests
@@ -120,7 +118,7 @@ origin_hits() {
 # ============================================================
 # store-ctl sidecar
 # ============================================================
-STORE_PORT=$(free_port)
+STORE_PORT=$(e2e_free_port)
 cat > "$TMPDIR/store-ctl.yaml" <<EOF
 listen: 127.0.0.1:$STORE_PORT
 backend: fs
@@ -182,8 +180,8 @@ EOF
 SHARD_PORTS=()
 SHARD_HEALTH_PORTS=()
 for i in $(seq 1 6); do
-    SP=$(free_port)
-    SHP=$(free_port)
+    SP=$(e2e_free_port)
+    SHP=$(e2e_free_port)
     SHARD_PORTS+=("$SP")
     SHARD_HEALTH_PORTS+=("$SHP")
     cat > "$TMPDIR/shard-$i.yaml" <<EOF
@@ -212,8 +210,8 @@ done
 # ============================================================
 # Tiered client, initial membership {p1..p5}
 # ============================================================
-TIERED_PORT=$(free_port)
-TIERED_HEALTH_PORT=$(free_port)
+TIERED_PORT=$(e2e_free_port)
+TIERED_HEALTH_PORT=$(e2e_free_port)
 render_tiered_yaml() {
     # $1 = space-separated list of 5 peer indices (1..6)
     local indices=($1)
