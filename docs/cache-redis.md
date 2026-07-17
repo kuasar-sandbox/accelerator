@@ -8,8 +8,9 @@ or a direct TCP connection for all physical cache roles:
 - `mode: tiered`, `type: redis`: a node-local complete-object tier.
 
 The Accelerator configuration and implementation refer only to the Redis
-protocol. Dragonfly is the recommended production server when the working set
-must extend to local NVMe; it is not a separate backend type.
+protocol. Dragonfly is one evaluated external server when the working set must
+extend to local NVMe; it is not a separate backend type or an Accelerator
+release component.
 
 ## Configuration
 
@@ -106,20 +107,19 @@ change EC membership or placement epochs.
 size/connectivity, in-flight and draining counts, cancellations, late bytes,
 reconnects, protocol errors, backend errors, and GET/SET latency percentiles.
 
-## Dragonfly deployment
+## External Dragonfly deployment example
 
 The sample unit is
 [`deploy/systemd/dragonfly-cache.service`](../deploy/systemd/dragonfly-cache.service).
 Its flag set is pinned to
 [Dragonfly v1.39.0](https://github.com/dragonflydb/dragonfly/releases/tag/v1.39.0).
-Release assembly must obtain the official `dragonfly-<arch>.tar.gz` once,
-verify the selected architecture against
-[`deploy/dragonfly-v1.39.0.sha256`](../deploy/dragonfly-v1.39.0.sha256), and
-publish the archive plus checksum through the internal China-accessible
-artifact service. The checked-in hashes are the SHA-256 digests published in
-the v1.39.0 GitHub Release asset metadata for both supported architectures.
-The target host must not download Dragonfly at install or service start time.
-Verify the internally distributed archive before extraction:
+Accelerator does not download, bundle, publish, or redistribute the Dragonfly
+binary. An operator choosing this external service must obtain and manage it
+separately under its own software-supply and license policy. The checked-in
+hashes are the SHA-256 digests published in the v1.39.0 GitHub Release asset
+metadata for both supported architectures, so an operator can verify its
+separately acquired archive. The target host should install an already
+verified artifact and must not download Dragonfly at service start time:
 
 ```bash
 sha256sum --check --ignore-missing deploy/dragonfly-v1.39.0.sha256
@@ -152,16 +152,14 @@ Run Dragonfly and `cache-ctl` in separate cpusets and align them with the NVMe
 NUMA node. The unit disables the TCP listener and exposes only
 `/run/kuasar-cache/redis.sock`. It also disables Dragonfly's daily release
 check, so the service performs no version-site request from the target host.
-This unit is the recommended node-local topology. A separately managed remote
-server may expose TCP, but its bind/firewall policy and network latency are
-operator responsibilities.
+This unit is a sample node-local topology. A separately managed remote server
+may expose TCP, but its bind/firewall policy and network latency are operator
+responsibilities.
 
-Dragonfly v1.39.0 is distributed under BSL 1.1. Its Additional Use Grant allows
-use as part of another product or service when that offering is not an
-in-memory data-store product/service and does not expose Dragonfly as a
-competing managed service. The platform owner must record that this deployment
-fits those conditions before production rollout; otherwise obtain a commercial
-license.
+Dragonfly v1.39.0 is distributed under BSL 1.1. Because Accelerator neither
+contains nor redistributes it, that license does not change the Accelerator
+release license or backend acceptance. Operators remain responsible for the
+terms of any external Redis-compatible server they select.
 
 Dragonfly's SSD tier is cache capacity, not authoritative persistence. A local
 or tiered instance can refill after restart. For RS(4+1), restart at most one
