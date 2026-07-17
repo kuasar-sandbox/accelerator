@@ -16,6 +16,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BIN="${BIN:-$PROJECT_ROOT/bin}"
 TMPDIR=$(mktemp -d /tmp/acc-store-cache-e2e-XXXXXX)
+E2E_PORT_LEASE_FILE="$TMPDIR/ports"
+source "$SCRIPT_DIR/lib/port_lease.sh"
 KEY=$(openssl rand -hex 32)
 
 PASS=0
@@ -37,15 +39,11 @@ assert_eq() {
     if [ "$1" = "$2" ]; then ok "$3"; else fail "$3 (expected '$1', got '$2')"; fi
 }
 
-free_port() {
-    python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
-}
-
 # ============================================================
 echo ""
 echo "=== Spin up store-ctl with cache_listen ==="
-STORE_PORT=$(free_port)
-STORE_CACHE_PORT=$(free_port)
+STORE_PORT=$(e2e_free_port)
+STORE_CACHE_PORT=$(e2e_free_port)
 STORE_ROOT="$TMPDIR/store-data"
 cat > "$TMPDIR/store-ctl.yaml" <<EOF
 listen: 127.0.0.1:$STORE_PORT

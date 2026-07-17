@@ -11,6 +11,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BIN="${BIN:-$PROJECT_ROOT/bin}"
 TMPDIR=$(mktemp -d /tmp/acc-cache-e2e-XXXXXX)
+E2E_PORT_LEASE_FILE="$TMPDIR/ports"
+source "$SCRIPT_DIR/lib/port_lease.sh"
 KEY=$(openssl rand -hex 32)
 
 PASS=0
@@ -99,16 +101,11 @@ wait_manifest_load() {
     return 1
 }
 
-# Allocate a free port.
-free_port() {
-    python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
-}
-
 # Start a disposable origin over the already initialized FS store. Tests use
 # this process only for reads, then stop it without disrupting the main origin.
 start_store_reader() {
     local name=$1
-    STORE_READER_PORT=$(free_port)
+    STORE_READER_PORT=$(e2e_free_port)
     cat > "$TMPDIR/$name.yaml" <<EOF
 listen: 127.0.0.1:$STORE_READER_PORT
 backend: fs
@@ -138,7 +135,7 @@ start_redis() {
     local dir="$TMPDIR/$name"
     mkdir -p "$dir"
     REDIS_SOCKET="$dir/redis.sock"
-    REDIS_TCP_PORT=${requested_port:-$(free_port)}
+    REDIS_TCP_PORT=${requested_port:-$(e2e_free_port)}
     rm -f "$REDIS_SOCKET"
     "$REDIS_SERVER" \
         --bind 127.0.0.1 \
@@ -181,7 +178,7 @@ tar cf "$TMPDIR/test.bin" -C "$TMPDIR" payload.bin
 # ============================================================
 echo ""
 echo "=== Spin up store-ctl sidecar ==="
-STORE_PORT=$(free_port)
+STORE_PORT=$(e2e_free_port)
 STORE_ROOT="$TMPDIR/store-data"
 cat > "$TMPDIR/store-ctl.yaml" <<EOF
 listen: 127.0.0.1:$STORE_PORT
@@ -286,8 +283,8 @@ assert_eq "$H_ORIG" "$H_RT" "store-ctl standalone store + get-manifest + load ro
 # ============================================================
 echo ""
 echo "=== Test 1: local mode — object put/get roundtrip ==="
-LOCAL_PORT=$(free_port)
-LOCAL_HEALTH_PORT=$(free_port)
+LOCAL_PORT=$(e2e_free_port)
+LOCAL_HEALTH_PORT=$(e2e_free_port)
 cat > "$TMPDIR/local.yaml" <<EOF
 mode: local
 type: embedded
@@ -327,8 +324,8 @@ assert_eq "shard-on-local" "$GOT" "shard put/get on local mode (unified handler)
 # ============================================================
 echo ""
 echo "=== Test 3: shard mode — shard put/get roundtrip ==="
-SHARD_PORT=$(free_port)
-SHARD_HEALTH_PORT=$(free_port)
+SHARD_PORT=$(e2e_free_port)
+SHARD_HEALTH_PORT=$(e2e_free_port)
 cat > "$TMPDIR/shard.yaml" <<EOF
 mode: shard
 type: embedded
@@ -367,8 +364,8 @@ echo "=== Test 5: tiered mode (embedded only) — manifest-ctl load through cach
 start_store_reader embedded-origin
 TIERED_ORIGIN_PORT=$STORE_READER_PORT
 TIERED_ORIGIN_PID=$STORE_READER_PID
-TIERED_PORT=$(free_port)
-TIERED_HEALTH_PORT=$(free_port)
+TIERED_PORT=$(e2e_free_port)
+TIERED_HEALTH_PORT=$(e2e_free_port)
 cat > "$TMPDIR/tiered.yaml" <<EOF
 mode: tiered
 listen: 127.0.0.1:$TIERED_PORT
@@ -443,8 +440,8 @@ SHARD_PORTS=()
 SHARD_HEALTH_PORTS=()
 SHARD_PIDS=()
 for i in $(seq 1 5); do
-    SP=$(free_port)
-    SHP=$(free_port)
+    SP=$(e2e_free_port)
+    SHP=$(e2e_free_port)
     SHARD_PORTS+=("$SP")
     SHARD_HEALTH_PORTS+=("$SHP")
     cat > "$TMPDIR/shard-$i.yaml" <<EOF
@@ -475,8 +472,8 @@ for SHP in "${SHARD_HEALTH_PORTS[@]}"; do
 done
 
 # Tiered with EC.
-EC_TIERED_PORT=$(free_port)
-EC_TIERED_HEALTH_PORT=$(free_port)
+EC_TIERED_PORT=$(e2e_free_port)
+EC_TIERED_HEALTH_PORT=$(e2e_free_port)
 cat > "$TMPDIR/tiered-ec.yaml" <<EOF
 mode: tiered
 listen: 127.0.0.1:$EC_TIERED_PORT
@@ -565,8 +562,8 @@ echo "=== Test 10: tiered + upstream — read-through + writeback ==="
 # Then kill front and read the same manifest directly from remote.
 # remote is local mode, no origin — it can only serve chunks that were
 # written during the writeback phase. Hash match ⇒ writeback works.
-REMOTE_PORT=$(free_port)
-REMOTE_HEALTH_PORT=$(free_port)
+REMOTE_PORT=$(e2e_free_port)
+REMOTE_HEALTH_PORT=$(e2e_free_port)
 cat > "$TMPDIR/upstream-remote.yaml" <<EOF
 mode: local
 type: embedded
@@ -588,8 +585,8 @@ REMOTE_PID=$!
 PIDS+=($REMOTE_PID)
 wait_ready "127.0.0.1:$REMOTE_HEALTH_PORT"
 
-FRONT_PORT=$(free_port)
-FRONT_HEALTH_PORT=$(free_port)
+FRONT_PORT=$(e2e_free_port)
+FRONT_HEALTH_PORT=$(e2e_free_port)
 cat > "$TMPDIR/upstream-front.yaml" <<EOF
 mode: tiered
 listen: 127.0.0.1:$FRONT_PORT
@@ -648,8 +645,8 @@ echo "=== Test 11: upstream dial failure rejects cache-ctl startup ==="
 # DialConnPool fails at the first dial and buildTieredChain rolls back.
 # serve then calls fatal → os.Exit(1). Verify the process exits non-zero
 # and the error message names the failure site.
-BAD_PORT=$(free_port)
-BAD_HEALTH_PORT=$(free_port)
+BAD_PORT=$(e2e_free_port)
+BAD_HEALTH_PORT=$(e2e_free_port)
 cat > "$TMPDIR/upstream-bad.yaml" <<EOF
 mode: tiered
 listen: 127.0.0.1:$BAD_PORT
@@ -686,8 +683,8 @@ echo "=== Test 12: Redis local mode — object and shard interfaces ==="
 start_redis redis-local
 REDIS_LOCAL_SOCKET=$REDIS_SOCKET
 REDIS_LOCAL_ENDPOINT="unix://$REDIS_LOCAL_SOCKET"
-REDIS_LOCAL_PORT=$(free_port)
-REDIS_LOCAL_HEALTH_PORT=$(free_port)
+REDIS_LOCAL_PORT=$(e2e_free_port)
+REDIS_LOCAL_HEALTH_PORT=$(e2e_free_port)
 cat > "$TMPDIR/redis-local.yaml" <<EOF
 mode: local
 type: redis
@@ -726,8 +723,8 @@ REDIS_TIER_ENDPOINT="127.0.0.1:$REDIS_TCP_PORT"
 start_store_reader redis-tier-origin
 REDIS_TIER_ORIGIN_PORT=$STORE_READER_PORT
 REDIS_TIER_ORIGIN_PID=$STORE_READER_PID
-REDIS_TIER_PORT=$(free_port)
-REDIS_TIER_HEALTH_PORT=$(free_port)
+REDIS_TIER_PORT=$(e2e_free_port)
+REDIS_TIER_HEALTH_PORT=$(e2e_free_port)
 cat > "$TMPDIR/redis-tiered.yaml" <<EOF
 mode: tiered
 listen: 127.0.0.1:$REDIS_TIER_PORT
@@ -791,8 +788,8 @@ for i in $(seq 1 5); do
     fi
     REDIS_SHARD_PIDS+=("$REDIS_PID")
     REDIS_SHARD_TCP_PORTS+=("$redis_tcp_port")
-    data_port=$(free_port)
-    health_port=$(free_port)
+    data_port=$(e2e_free_port)
+    health_port=$(e2e_free_port)
     REDIS_SHARD_PORTS+=("$data_port")
     REDIS_SHARD_HEALTH_PORTS+=("$health_port")
     cat > "$TMPDIR/redis-shard-$i.yaml" <<EOF
@@ -815,8 +812,8 @@ for health_port in "${REDIS_SHARD_HEALTH_PORTS[@]}"; do
     wait_ready "127.0.0.1:$health_port"
 done
 
-REDIS_EC_PORT=$(free_port)
-REDIS_EC_HEALTH_PORT=$(free_port)
+REDIS_EC_PORT=$(e2e_free_port)
+REDIS_EC_HEALTH_PORT=$(e2e_free_port)
 cat > "$TMPDIR/redis-ec-tiered.yaml" <<EOF
 mode: tiered
 listen: 127.0.0.1:$REDIS_EC_PORT

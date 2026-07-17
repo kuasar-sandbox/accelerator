@@ -10,7 +10,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all build manifest-ctl store-ctl cache-ctl deps-rocksdb test vet bench test-e2e test-e2e-cache test-e2e-store-cache test-e2e-cluster perf-cache perf-cache-remote dedup-report clean help
+.PHONY: all build manifest-ctl store-ctl cache-ctl deps-rocksdb test vet bench test-e2e test-e2e-port-lease test-e2e-cache test-e2e-store-cache test-e2e-cluster perf-cache perf-cache-remote dedup-report clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -114,7 +114,10 @@ bench: deps-rocksdb
 	CGO_LDFLAGS="-L$(ROCKS_PREFIX)/lib -lrocksdb -lstdc++ -lm -lpthread -ldl" \
 		$(GO) test -bench=. -benchmem -run=^$$ ./...
 
-test-e2e: test-e2e-cache test-e2e-store-cache test-e2e-cluster
+test-e2e: test-e2e-port-lease test-e2e-cache test-e2e-store-cache test-e2e-cluster
+
+test-e2e-port-lease:
+	bash test/e2e/port_lease_test.sh
 
 test-e2e-cache:
 	BIN=$(SBIN) bash test/e2e/e2e_cache.sh
