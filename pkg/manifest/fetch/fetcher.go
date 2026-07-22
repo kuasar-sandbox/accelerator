@@ -33,12 +33,12 @@ type Fetcher interface {
 // caller controls the key's lifetime; pass a closure if you want it
 // resolved once per process.
 func NewFetcher(keyFn CustomerKeyFunc, cg cache.Getter, dec crypto.Decryptor) Fetcher {
-	return &fetcher{keyFn: keyFn, cache: cg, dec: dec}
+	return &fetcher{keyFn: keyFn, cache: newScheduledCacheClient(cg), dec: dec}
 }
 
 type fetcher struct {
 	keyFn CustomerKeyFunc
-	cache cache.Getter
+	cache *scheduledCacheClient
 	dec   crypto.Decryptor
 }
 
@@ -48,8 +48,9 @@ type fetcher struct {
 // through to lower layers, and Size is the maximum over all layers. All layers
 // are unsealed with this Fetcher's customer key.
 //
-// Each call is independent — Streams returned by repeated Fetch calls share
-// no state and may be used concurrently.
+// Stream data and lifetime remain independent across calls. Streams returned by
+// the same Fetcher share only the underlying Getter and its on-demand/prefetch
+// admission state; they may otherwise be used concurrently.
 func (f *fetcher) Fetch(ctx context.Context, keys ...store.ContentKey) (Stream, error) {
 	if len(keys) == 0 {
 		return nil, fmt.Errorf("fetch: no manifest key")
@@ -73,7 +74,7 @@ func (f *fetcher) fetchOne(ctx context.Context, manifestKey store.ContentKey) (S
 		return nil, fmt.Errorf("fetch: customer key: %w", err)
 	}
 
-	result, blob, err := f.cache.Get(ctx, store.PartitionManifest, manifestKey)
+	result, blob, err := f.cache.OnDemandGetter().Get(ctx, store.PartitionManifest, manifestKey)
 	if err != nil {
 		return nil, fmt.Errorf("fetch: manifest blob: %w", err)
 	}
@@ -94,12 +95,15 @@ func (f *fetcher) fetchOne(ctx context.Context, manifestKey store.ContentKey) (S
 	// manifestStream takes a ChunkEncryptor (legacy interface); the same codec
 	// impl satisfies both it and Decryptor. Adapt so the call site doesn't reach
 	// into pkg/manifest/crypto internals.
-	return &manifestStream{
-		m:         m,
-		cache:     f.cache,
-		encryptor: decryptorAsChunkEncryptor{dec: f.dec},
-		keys:      keys,
-	}, nil
+	return newManifestStream(
+		m,
+		keys,
+		f.cache.OnDemandGetter(),
+		f.cache.PrefetchGetter(),
+		decryptorAsChunkEncryptor{dec: f.dec},
+		manifestKey,
+		true,
+	), nil
 }
 
 // decryptorAsChunkEncryptor bridges crypto.Decryptor (DecryptChunk /
