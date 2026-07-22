@@ -21,15 +21,20 @@
 // (which threads a serving layer's chunk index from resolve to read). External
 // consumers use the plain Stream methods.
 //
-// All methods are safe for concurrent use.
+// Prefetcher is a separate optional enhancement. Keeping prefetch out of Stream
+// and ChunkStream lets non-cache-backed streams implement either contract
+// without acquiring a meaningless background-I/O method.
+//
+// RunAt, ReadAt, and Prefetch are safe for concurrent use. Close is a lifetime
+// boundary: callers cancel and wait for active operations before closing.
 package fetch
 
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
-	"sync"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
@@ -39,14 +44,16 @@ import (
 )
 
 // Stream is a sparse.Source with a lifetime, and a stronger contract: RunAt
-// and ReadAt are safe for concurrent use at arbitrary offsets, and ReadAt MAY
-// fetch the data chunks in a range concurrently (internal goroutines); see
-// ChunkStream.ReadChunkAt for the synchronous counterpart.
+// and ReadAt are safe for concurrent use at arbitrary offsets, RunAt requires
+// a non-zero limit, and ReadAt MAY fetch the data chunks in a range concurrently
+// (internal goroutines); see ChunkStream.ReadChunkAt for the synchronous
+// counterpart.
 type Stream interface {
 	sparse.Source
 
 	// Close releases resources owned by this stream (e.g. a file descriptor).
 	// manifest streams own none (no-op); a layered stream closes its layers.
+	// It must not run concurrently with RunAt, ReadAt, or Prefetch.
 	Close() error
 }
 
@@ -59,7 +66,7 @@ type Stream interface {
 type ChunkStream interface {
 	// RunChunkAt is RunAt that additionally returns the serving chunk index
 	// (valid for Data and Zero; meaningless for Hole). It returns a single
-	// region (no Hole/Zero extension).
+	// region (no Hole/Zero extension) and requires a non-zero limit.
 	RunChunkAt(offset, limit uint64) (kind sparse.RunKind, end, chunkIdx uint64, err error)
 	// ReadChunkAt synchronously fetches+decrypts chunk chunkIdx and copies its
 	// [offset, end) sub-range into buf. Used for Data (and Zero, which yields
@@ -67,20 +74,71 @@ type ChunkStream interface {
 	ReadChunkAt(ctx context.Context, buf []byte, chunkIdx, offset, end uint64) (int, error)
 }
 
-// manifestStream is the single-manifest implementation (Stream + ChunkStream).
-type manifestStream struct {
-	m         *codec.Manifest
-	cache     cache.Getter
-	encryptor crypto.ChunkEncryptor
-	keys      [][32]byte // decrypted per-chunk keys, parallel to m.Entries
+// Prefetcher optionally warms the cache for the visible Data runs of an entire
+// logical Stream. With no keys it selects every keyed and unkeyed leaf. With
+// keys it selects only visible leaves carrying one of those manifest keys.
+type Prefetcher interface {
+	Prefetch(ctx context.Context, keys ...store.ContentKey) error
 }
 
-// NewStream constructs a single-manifest Stream. keys holds one decrypted
-// convergent key per chunk entry, in m.Entries order (zero entries hold the
-// zero key, never read). Callers holding a hex key but not a Manifest should use
-// a Fetcher (NewFetcher).
+// PrefetchChunkStream is the optional physical-chunk prefetch capability.
+// PrefetchChunkAt is synchronous and only waits for the existing cache Get/fill
+// path; it does not verify, decrypt, materialize, pin, or retain the chunk.
+type PrefetchChunkStream interface {
+	ChunkStream
+	PrefetchChunkAt(ctx context.Context, chunkIdx uint64) error
+}
+
+// ErrUnknownPrefetchLayer reports a selector key that is not structurally
+// present in the Stream, including when the Stream has only unkeyed leaves.
+var ErrUnknownPrefetchLayer = errors.New("fetch: unknown prefetch layer")
+
+var errInvalidRun = errors.New("fetch: invalid run")
+
+// manifestStream is the single-manifest implementation (Stream +
+// PrefetchChunkStream + Prefetcher).
+type manifestStream struct {
+	m              *codec.Manifest
+	onDemandGetter cache.Getter
+	prefetchGetter cache.Getter
+	encryptor      crypto.ChunkEncryptor
+	keys           [][32]byte // decrypted per-chunk keys, parallel to m.Entries
+	ownKey         store.ContentKey
+	hasKey         bool
+}
+
+// NewStream constructs an unkeyed single-manifest Stream with its own request
+// scheduler. keys holds one decrypted convergent key per chunk entry, in
+// m.Entries order (zero entries hold the zero key, never read). Prefetch with no
+// selector is supported; any non-empty selector is unknown because NewStream
+// has no manifest content key. Callers holding such a key should use a Fetcher.
 func NewStream(m *codec.Manifest, keys [][32]byte, c cache.Getter, enc crypto.ChunkEncryptor) Stream {
-	return &manifestStream{m: m, cache: c, encryptor: enc, keys: keys}
+	var onDemand, prefetch cache.Getter
+	if c != nil {
+		client := newScheduledCacheClient(c)
+		onDemand = client.OnDemandGetter()
+		prefetch = client.PrefetchGetter()
+	}
+	return newManifestStream(m, keys, onDemand, prefetch, enc, store.ContentKey{}, false)
+}
+
+func newManifestStream(
+	m *codec.Manifest,
+	keys [][32]byte,
+	onDemand, prefetch cache.Getter,
+	enc crypto.ChunkEncryptor,
+	ownKey store.ContentKey,
+	hasKey bool,
+) *manifestStream {
+	return &manifestStream{
+		m:              m,
+		onDemandGetter: onDemand,
+		prefetchGetter: prefetch,
+		encryptor:      enc,
+		keys:           keys,
+		ownKey:         ownKey,
+		hasKey:         hasKey,
+	}
 }
 
 func (s *manifestStream) Size() uint64 { return s.m.ImageSize }
@@ -90,15 +148,15 @@ func (s *manifestStream) Close() error { return nil }
 // (entries + holes cover [0, ImageSize) with no overlap or gap) a data/zero
 // chunk ends exactly where the next hole begins.
 func (s *manifestStream) RunChunkAt(offset, limit uint64) (sparse.RunKind, uint64, uint64, error) {
-	if offset >= s.m.ImageSize {
-		return 0, 0, 0, io.EOF
-	}
-	limEnd := offset + limit
-	if limEnd < offset || limEnd > s.m.ImageSize { // overflow or past EOF
-		limEnd = s.m.ImageSize
+	limEnd, err := boundedRunEnd(s.m.ImageSize, offset, limit)
+	if err != nil {
+		return 0, 0, 0, err
 	}
 	if h, in := findHoleAt(s.m.Holes, offset); in {
 		end := h.Offset + h.Size
+		if end <= offset {
+			return 0, 0, 0, fmt.Errorf("%w: hole at %d ends at %d", errInvalidRun, offset, end)
+		}
 		if end > limEnd {
 			end = limEnd
 		}
@@ -110,6 +168,9 @@ func (s *manifestStream) RunChunkAt(offset, limit uint64) (sparse.RunKind, uint6
 	}
 	e := s.m.Entries[i]
 	end := e.Offset + uint64(e.Size)
+	if end <= offset {
+		return 0, 0, 0, fmt.Errorf("%w: entry %d at %d ends at %d", errInvalidRun, i, offset, end)
+	}
 	if end > limEnd {
 		end = limEnd
 	}
@@ -126,13 +187,16 @@ func (s *manifestStream) RunAt(offset, limit uint64) (sparse.RunKind, uint64, er
 	if err != nil || kind == sparse.Data {
 		return kind, end, err
 	}
-	limEnd := offset + limit
-	if limEnd < offset || limEnd > s.m.ImageSize {
-		limEnd = s.m.ImageSize
+	limEnd, err := boundedRunEnd(s.m.ImageSize, offset, limit)
+	if err != nil {
+		return 0, 0, err
 	}
 	for end < limEnd {
 		k2, e2, _, err2 := s.RunChunkAt(end, limEnd-end)
-		if err2 != nil || k2 != kind {
+		if err2 != nil {
+			return 0, 0, err2
+		}
+		if k2 != kind {
 			break
 		}
 		end = e2
@@ -140,96 +204,152 @@ func (s *manifestStream) RunAt(offset, limit uint64) (sparse.RunKind, uint64, er
 	return kind, end, nil
 }
 
-// readChunkInto is the single synchronous fetch path: fetch chunk chunkIdx,
-// decrypt in place, copy its [offset, end) sub-range into dst. It spawns no
-// goroutines; ReadChunkAt calls it directly, ReadAt calls it from workers.
-func (s *manifestStream) readChunkInto(ctx context.Context, dst []byte, chunkIdx, offset, end uint64) error {
+type loadKind uint8
+
+const (
+	loadOnDemand loadKind = iota
+	loadPrefetch
+)
+
+// loadChunkAt owns all cache-result validation. A successful non-nil Blob is
+// transferred to the caller, which must Release it exactly once. Every Blob
+// returned on an error or non-hit path is released here.
+func (s *manifestStream) loadChunkAt(ctx context.Context, chunkIdx uint64, kind loadKind) (cache.Blob, error) {
+	if chunkIdx >= uint64(len(s.m.Entries)) {
+		return nil, fmt.Errorf("fetch: chunk index %d out of range", chunkIdx)
+	}
 	e := s.m.Entries[chunkIdx]
 	if e.IsZero {
-		clearSlice(dst)
-		return nil
+		return nil, nil
 	}
-	result, blob, err := s.cache.Get(ctx, store.PartitionChunk, store.ContentKey(e.CiphertextHash))
+	var getter cache.Getter
+	switch kind {
+	case loadOnDemand:
+		getter = s.onDemandGetter
+	case loadPrefetch:
+		getter = s.prefetchGetter
+	default:
+		return nil, fmt.Errorf("fetch: chunk %d: invalid load kind %d", chunkIdx, kind)
+	}
+	if getter == nil {
+		return nil, fmt.Errorf("fetch: chunk %d: cache getter is nil", chunkIdx)
+	}
+	result, blob, err := getter.Get(ctx, store.PartitionChunk, store.ContentKey(e.CiphertextHash))
 	if err != nil {
-		return fmt.Errorf("chunk %d: %w", chunkIdx, err)
+		if blob != nil {
+			blob.Release()
+		}
+		return nil, fmt.Errorf("chunk %d: %w", chunkIdx, err)
 	}
 	if result != cache.CacheHit {
-		return fmt.Errorf("chunk %d: not found", chunkIdx)
+		if blob != nil {
+			blob.Release()
+		}
+		return nil, fmt.Errorf("chunk %d: not found", chunkIdx)
 	}
+	if blob == nil {
+		return nil, fmt.Errorf("chunk %d: cache hit returned nil blob", chunkIdx)
+	}
+	return blob, nil
+}
+
+// ReadChunkAt implements ChunkStream — synchronous single-chunk read.
+func (s *manifestStream) ReadChunkAt(ctx context.Context, buf []byte, chunkIdx, offset, end uint64) (int, error) {
+	if chunkIdx >= uint64(len(s.m.Entries)) {
+		return 0, fmt.Errorf("fetch: chunk index %d out of range", chunkIdx)
+	}
+	e := s.m.Entries[chunkIdx]
+	entryEnd := e.Offset + uint64(e.Size)
+	if entryEnd < e.Offset {
+		return 0, fmt.Errorf("fetch: chunk %d range overflows", chunkIdx)
+	}
+	if end < offset {
+		return 0, fmt.Errorf("fetch: chunk %d: end %d before offset %d", chunkIdx, end, offset)
+	}
+	if offset < e.Offset || end > entryEnd {
+		return 0, fmt.Errorf("fetch: chunk %d: range [%d,%d) outside entry [%d,%d)", chunkIdx, offset, end, e.Offset, entryEnd)
+	}
+	want := end - offset
+	if uint64(len(buf)) < want {
+		return 0, fmt.Errorf("fetch: chunk %d: buffer has %d bytes, need %d", chunkIdx, len(buf), want)
+	}
+	if want == 0 {
+		return 0, nil
+	}
+	if e.IsZero {
+		clearSlice(buf[:int(want)])
+		return int(want), nil
+	}
+	if chunkIdx >= uint64(len(s.keys)) {
+		return 0, fmt.Errorf("fetch: chunk %d: missing decryption key", chunkIdx)
+	}
+	if s.encryptor == nil {
+		return 0, fmt.Errorf("fetch: chunk %d: decryptor is nil", chunkIdx)
+	}
+
+	blob, err := s.loadChunkAt(ctx, chunkIdx, loadOnDemand)
+	if err != nil {
+		return 0, err
+	}
+	defer blob.Release()
+	ciphertext := blob.Bytes()
 	// The content key is SHA256(ciphertext) and is authenticated by the key
 	// table's AAD, so verifying the returned bytes against it rejects a corrupt
 	// or tampered chunk before the unauthenticated AES-CTR decrypt would turn
 	// attacker-chosen ciphertext into attacker-chosen plaintext. Hash the bytes
 	// as received — DecryptInPlace mutates the buffer in place.
-	if sha256.Sum256(blob.Bytes()) != e.CiphertextHash {
-		blob.Release()
-		return fmt.Errorf("chunk %d: ciphertext hash mismatch (corrupt or tampered store/cache)", chunkIdx)
+	if sha256.Sum256(ciphertext) != e.CiphertextHash {
+		return 0, fmt.Errorf("chunk %d: ciphertext hash mismatch (corrupt or tampered store/cache)", chunkIdx)
 	}
-	plain, err := s.encryptor.DecryptInPlace(s.keys[chunkIdx], blob.Bytes())
+	plain, err := s.encryptor.DecryptInPlace(s.keys[chunkIdx], ciphertext)
 	if err != nil {
-		blob.Release()
-		return fmt.Errorf("chunk %d: decrypt: %w", chunkIdx, err)
+		return 0, fmt.Errorf("chunk %d: decrypt: %w", chunkIdx, err)
 	}
-	copy(dst, plain[offset-e.Offset:end-e.Offset])
-	blob.Release()
+	if uint64(len(plain)) < uint64(e.Size) {
+		return 0, fmt.Errorf("chunk %d: decrypted data has %d bytes, need %d", chunkIdx, len(plain), e.Size)
+	}
+	lo := int(offset - e.Offset)
+	hi := int(end - e.Offset)
+	copy(buf[:int(want)], plain[lo:hi])
+	return int(want), nil
+}
+
+// PrefetchChunkAt implements PrefetchChunkStream. It intentionally does no
+// Blob inspection: a successful Get followed by exactly one Release is the
+// complete physical prefetch operation.
+func (s *manifestStream) PrefetchChunkAt(ctx context.Context, chunkIdx uint64) error {
+	blob, err := s.loadChunkAt(ctx, chunkIdx, loadPrefetch)
+	if err != nil {
+		return err
+	}
+	if blob != nil {
+		blob.Release()
+	}
 	return nil
 }
 
-// ReadChunkAt implements ChunkStream — synchronous single-chunk read.
-func (s *manifestStream) ReadChunkAt(ctx context.Context, buf []byte, chunkIdx, offset, end uint64) (int, error) {
-	if err := s.readChunkInto(ctx, buf, chunkIdx, offset, end); err != nil {
-		return 0, err
-	}
-	return int(end - offset), nil
+func (s *manifestStream) Prefetch(ctx context.Context, keys ...store.ContentKey) error {
+	return prefetchStream(ctx, s, keys)
 }
 
 // ReadAt walks the runs and fetches data chunks concurrently — one goroutine
 // per Data run, each writing directly into its buf slice; Hole/Zero are
 // zero-filled in place. ctx cancel on early return releases in-flight blobs.
 func (s *manifestStream) ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error) {
-	if offset >= s.m.ImageSize {
+	return readResolvedAt(ctx, s, buf, offset)
+}
+
+func boundedRunEnd(size, offset, limit uint64) (uint64, error) {
+	if offset >= size {
 		return 0, io.EOF
 	}
-	if len(buf) == 0 {
-		return 0, nil
+	if limit == 0 {
+		return 0, fmt.Errorf("%w: zero limit at offset %d", errInvalidRun, offset)
 	}
-	end := offset + uint64(len(buf))
-	var eof error
-	if end > s.m.ImageSize {
-		end = s.m.ImageSize
-		eof = io.EOF
+	if limit >= size-offset {
+		return size, nil
 	}
-
-	cctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	var wg sync.WaitGroup
-	errCh := make(chan error, 1)
-	var once sync.Once
-
-	for cur := offset; cur < end; {
-		kind, runEnd, idx, _ := s.RunChunkAt(cur, end-cur)
-		dst := buf[cur-offset : runEnd-offset]
-		if kind == sparse.Data {
-			wg.Add(1)
-			go func(idx, lo, hi uint64, dst []byte) {
-				defer wg.Done()
-				if err := s.readChunkInto(cctx, dst, idx, lo, hi); err != nil {
-					once.Do(func() { errCh <- err; cancel() })
-				}
-			}(idx, cur, runEnd, dst)
-		} else { // Hole | Zero
-			clearSlice(dst)
-		}
-		cur = runEnd
-	}
-
-	wg.Wait()
-	select {
-	case err := <-errCh:
-		return 0, err
-	default:
-	}
-	return int(end - offset), eof
+	return offset + limit, nil
 }
 
 // findHoleAt returns the hole extent containing offset, or ok=false. The hole

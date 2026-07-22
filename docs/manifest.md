@@ -475,31 +475,48 @@ ingest 用一个有界 worker pool,并发度取 store 客户端连接池大小(`
 ### 4.8 读路径(细节)
 
 ```
-Manifest
+manifest key(s)
+   │
+   ├─ on-demand Getter: Get(partition=manifest)
+   ▼
+parse index + unseal key table
    │
    ▼
-parse(header, index, sealed_key_table)
+Stream (single manifest or top-to-bottom overlay)
    │
-   ▼
-unseal(manifest.key, sealed_key_table)
-   │  → key[i]
-   ▼
-fetch.Range(offset, length) → ChunkIDs
+   ├─ RunAt: resolve visible Hole / Zero / Data
+   ├─ ReadAt: fetch visible Data chunks concurrently
+   │     └─ on-demand Getter → cache/store → verify → decrypt
    │
-   ▼
-for each ChunkID:
-   ├─ cache.Get(ContentKey) ──→ store.Get fallback
-   │  → ciphertext
-   ▼
-crypto.decrypt(key[i], nonce, ciphertext) → plaintext
-   │
-   ▼
-io.Writer
+   └─ optional Prefetcher.Prefetch
+         └─ prefetch Getter → cache/store → Release
 ```
 
-`fetch.Range` 在 Manifest 的 chunk 索引上做二分查找,定位需要的 chunk 子
-集 —— 部分读(`--offset` / `--length`)只触发涉及到的 chunk 拉取,稀疏访
-问下不会读全镜像。
+`Stream.ReadAt` 先按 manifest 索引和权威 hole 元数据解析请求窗口,再只拉取
+最终可见的 Data chunks。Hole 和 IsZero 在本地填零,不访问 cache/store。多层
+Stream 采用 top-to-bottom 可见性:Data 和 Zero 遮挡下层,只有 Hole 或超出层
+大小才继续向下;嵌套 overlay 递归解析到最终叶子,且下层 run 不能越过任一上
+层 Hole 的结束边界。部分读(`--offset` / `--length`)因此只触发涉及窗口的物理
+chunks,不会扫描或物化完整镜像。
+
+支持预取的 Stream 额外实现 `fetch.Prefetcher`。`Prefetch(ctx)` 遍历整个逻辑
+Stream,只对最终可见且实现 `PrefetchChunkStream` 的 Data run 调用完整物理
+chunk 的 cache Get;成功命中后立即 Release,不读取 Blob、不校验、不解密、不
+pin。`Prefetch(ctx, keys...)` 用 manifest content key 选择最终 serving 叶子;
+所有 key 在首个 Get 前按组合树结构完成校验,完全被遮挡的 keyed 叶子仍属于该
+Stream。未绑定 manifest key 的本地文件或直接 `NewStream` 只在无参数预取时
+入选,但始终参与可见性遮挡。
+
+同一 Fetcher 的 manifest metadata、普通 ReadAt 和所有 Stream 共用一个底层
+Getter 与请求调度器。on-demand 请求从不等待已开始的 prefetch;存在任意
+on-demand 时不再准入新的 prefetch,且每个 Fetcher 最多一个 prefetch Get 在
+途。已开始的 prefetch 不抢占,可与后来到达的 on-demand 短暂重叠。不同
+Fetcher 相互独立,调度器不创建后台 goroutine,也不拥有底层 Getter 生命周期。
+
+Stream 层不维护 chunk seen set 或 singleflight。同一物理 chunk 经多个真实可
+见区间暴露、并发调用 Prefetch,或同时被 Prefetch 和 ReadAt 访问时,允许产生
+独立 Get;缓存层负责把后续请求转化为命中。这保持了读取与预取路径一致的对象
+所有权和失败语义。
 
 ## 5. 性能特征
 
