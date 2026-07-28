@@ -262,7 +262,8 @@ declare -a ORIG_HASHES=()
 echo "=== Populating $N keys into EC cluster {s1..s5} ==="
 for i in $(seq 1 $N); do
     dd if=/dev/urandom of="$TMPDIR/val-$i.payload" bs=1024 count=32 2>/dev/null
-    tar cf "$TMPDIR/val-$i.bin" -C "$TMPDIR" "val-$i.payload"
+    "$BIN/flatten-ctl" tar stream -f "$TMPDIR/val-$i.bin" \
+        "val-$i.payload:$TMPDIR/val-$i.payload"
     MKEYS+=("$("$BIN/manifest-ctl" store $COMMON --no-progress "$TMPDIR/val-$i.bin" 2>/dev/null)")
     ORIG_HASHES+=("$(payload_hash "$TMPDIR/val-$i.bin")")
 done

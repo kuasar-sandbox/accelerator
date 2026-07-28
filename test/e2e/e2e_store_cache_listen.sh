@@ -6,8 +6,9 @@ set -euo pipefail
 # chunk / manifest / blob — straight over its backend, read-only, so cache
 # clients reach store content without a separate cache-ctl.
 #
-# Self-contained: store-ctl + manifest-ctl + cache-ctl, fs backend. Does
-# not exercise the tiered/EC chain (see e2e_cache.sh for that).
+# Self-contained: store-ctl + manifest-ctl + cache-ctl, with flatten-ctl used
+# only to write strict tarstream fixtures. Does not exercise the tiered/EC
+# chain (see e2e_cache.sh for that).
 #
 # Usage:
 #   bash test/e2e/e2e_store_cache_listen.sh
@@ -85,7 +86,8 @@ CFG="--manifest-config $TMPDIR/accelerator.yaml"
 
 # Ingest a tarstream payload → chunks + a manifest land in the store.
 dd if=/dev/urandom of="$TMPDIR/payload.bin" bs=1024 count=128 2>/dev/null
-tar cf "$TMPDIR/artifact.tar" -C "$TMPDIR" payload.bin
+"$BIN/flatten-ctl" tar stream -f "$TMPDIR/artifact.tar" \
+    "payload.bin:$TMPDIR/payload.bin"
 MKEY=$("$BIN/manifest-ctl" store $CFG --no-progress "$TMPDIR/artifact.tar")
 echo "  ingested manifest-key=$MKEY"
 

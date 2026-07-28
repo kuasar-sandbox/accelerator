@@ -170,7 +170,8 @@ payload_hash() {
 # Prepare a 2 MiB payload wrapped in a tarstream artifact. The default CDC max
 # is 1 MiB, so the readiness checks below always exercise multiple chunks.
 dd if=/dev/urandom of="$TMPDIR/payload.bin" bs=1024 count=2048 2>/dev/null
-tar cf "$TMPDIR/test.bin" -C "$TMPDIR" payload.bin
+"$BIN/flatten-ctl" tar stream -f "$TMPDIR/test.bin" \
+    "payload.bin:$TMPDIR/payload.bin"
 
 # ============================================================
 # Spin up store-ctl sidecar. All subsequent manifest-ctl / cache-ctl
@@ -272,7 +273,8 @@ echo "=== Test 0: store-ctl standalone roundtrip ==="
 # tests run. Uses a fresh 64 KiB payload so it doesn't collide with
 # the main artifact's chunks.
 dd if=/dev/urandom of="$TMPDIR/store0-payload.bin" bs=1024 count=64 2>/dev/null
-tar cf "$TMPDIR/store0.bin" -C "$TMPDIR" store0-payload.bin
+"$BIN/flatten-ctl" tar stream -f "$TMPDIR/store0.bin" \
+    "store0-payload.bin:$TMPDIR/store0-payload.bin"
 MKEY0=$("$BIN/manifest-ctl" store $COMMON --no-progress "$TMPDIR/store0.bin")
 "$BIN/manifest-ctl" get-manifest $COMMON --output "$TMPDIR/store0.manifest.rt" "$MKEY0" 2>&1
 "$BIN/manifest-ctl" load $COMMON --output "$TMPDIR/store0.rt" --no-progress "$MKEY0" 2>&1
