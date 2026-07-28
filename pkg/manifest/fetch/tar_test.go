@@ -1,6 +1,7 @@
 package fetch
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"io"
@@ -31,7 +32,8 @@ func TestOpenTarStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tarstream.WriteTo(context.Background(), f, "image", src); err != nil {
+	wantDigest, err := tarstream.WriteTo(context.Background(), f, "image", src)
+	if err != nil {
 		t.Fatal(err)
 	}
 	f.Close()
@@ -41,6 +43,13 @@ func TestOpenTarStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	d, ok := st.(tarstream.Digester)
+	if !ok {
+		t.Fatal("OpenTarStream result does not implement tarstream.Digester")
+	}
+	if d.Digest() != wantDigest {
+		t.Fatalf("digest = %q; want %q", d.Digest(), wantDigest)
+	}
 	if st.Size() != size {
 		t.Fatalf("size = %d", st.Size())
 	}
@@ -77,5 +86,29 @@ func TestOpenTarStream(t *testing.T) {
 	os.WriteFile(raw, []byte("not a tar at all"), 0o644)
 	if _, err := OpenTarStream(raw); err == nil {
 		t.Fatal("raw file accepted as tar artifact")
+	}
+
+	// A generic tar remains readable through tarstream.SourceAt, but platform
+	// artifact consumers require the digest capability.
+	plain := filepath.Join(t.TempDir(), "plain.tar")
+	pf, err := os.Create(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tw := tar.NewWriter(pf)
+	if err := tw.WriteHeader(&tar.Header{Name: "image", Mode: 0o644, Size: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := pf.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenTarStream(plain); err == nil {
+		t.Fatal("markerless tar accepted as platform artifact")
 	}
 }
