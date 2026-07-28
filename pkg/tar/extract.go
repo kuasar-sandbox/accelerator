@@ -2,6 +2,7 @@ package tar
 
 import (
 	stdtar "archive/tar"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 )
 
 // Extract materializes the entries selected by rules from the tar
@@ -123,6 +126,9 @@ func (x *extractor) entry(hdr *stdtar.Header) error {
 	if name == "" {
 		return nil // the "./" root entry
 	}
+	if reservedDigestMarker(hdr, name) {
+		return nil
+	}
 	rl, rel, ok := x.matchRule(name)
 	if !ok {
 		return nil
@@ -231,6 +237,18 @@ func (x *extractor) entry(hdr *stdtar.Header) error {
 		x.o.warnf("tar: skipping unsupported entry type %q: %s", hdr.Typeflag, name)
 		return nil
 	}
+}
+
+func reservedDigestMarker(hdr *stdtar.Header, name string) bool {
+	if hdr.Typeflag != stdtar.TypeReg || hdr.Size != 0 || !strings.HasPrefix(name, tarstream.SHA256MarkerPrefix) {
+		return false
+	}
+	hexDigest := strings.TrimPrefix(name, tarstream.SHA256MarkerPrefix)
+	if len(hexDigest) != 64 || strings.ToLower(hexDigest) != hexDigest {
+		return false
+	}
+	_, err := hex.DecodeString(hexDigest)
+	return err == nil
 }
 
 // destPath maps a matched entry to its filesystem destination and, for

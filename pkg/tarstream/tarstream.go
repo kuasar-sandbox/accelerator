@@ -1,12 +1,13 @@
-// Package tarstream packages one sparse-capable byte source as a tar
-// stream and reads it back without materializing anything: WriteTo
-// emits a sparse.Source's logical view with its hole map as a GNU PAX
-// sparse 1.0 entry (byte-mirroring GNU tar's encoding, including its
-// trailing (size,0) sentinel extent); ReadFrom / ReadSeekFrom return
-// the logical view together with the exact hole map recovered from
-// the encoding; SourceFrom opens the entry directly as a sparse.Source
-// for pipeline consumers. Only data bytes flow on the wire — holes
-// cost nothing.
+// Package tarstream packages one sparse-capable byte source as a tar artifact
+// and reads it back without materializing anything. WriteTo emits a
+// sparse.Source's logical view with its hole map as a GNU PAX sparse 1.0 entry
+// (including its trailing (size,0) sentinel extent), then appends an empty
+// .kuasar.sha256.<hex> marker naming the SHA256 of all physical tar bytes before
+// its own header. ReadFrom / ReadSeekFrom return the logical view with the exact
+// hole map; SourceFrom opens it as a sparse.Source for pipelines. A size-bounded
+// SourceAt exposes the marker through the optional Digester capability without
+// rereading payload bytes. Only data bytes flow on the wire — holes cost
+// nothing.
 //
 // Zero-valued data is data: a source's Zero runs are written as
 // literal zero bytes (synthesized, never read), never as holes — the
@@ -26,11 +27,39 @@
 package tarstream
 
 import (
+	"encoding/hex"
 	"errors"
 	"io"
+	"strings"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
+
+// SHA256MarkerPrefix is the reserved name prefix of the empty metadata entry
+// that terminates a Kuasar tarstream artifact. The suffix is exactly 64
+// lowercase hexadecimal characters.
+const SHA256MarkerPrefix = ".kuasar.sha256."
+
+// Digester is an optional capability implemented by sources opened from a
+// complete Kuasar artifact. Digest is the identity declared by the artifact's
+// marker; it performs no I/O and does not recompute payload bytes.
+type Digester interface {
+	Digest() string // "sha256:<64-lowercase-hex>"
+}
+
+func parseDigestMarker(name string) (string, bool) {
+	if !strings.HasPrefix(name, SHA256MarkerPrefix) {
+		return "", false
+	}
+	hexDigest := strings.TrimPrefix(name, SHA256MarkerPrefix)
+	if len(hexDigest) != 64 || strings.ToLower(hexDigest) != hexDigest {
+		return "", false
+	}
+	if _, err := hex.DecodeString(hexDigest); err != nil {
+		return "", false
+	}
+	return "sha256:" + hexDigest, true
+}
 
 // Reader is the sequential logical view of the file inside a tar
 // stream: Read yields the logical bytes, holes reading as zeros.

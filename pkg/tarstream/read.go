@@ -99,13 +99,17 @@ func ReadSeekFromIndex(rs io.ReadSeeker, index int) (ReadSeeker, error) {
 	return seekViewFrom(rs, m)
 }
 
-// SourceAt locates the entry called name (empty: first regular file
-// entry) and opens it as a CONCURRENT random-access sparse.Source
-// over ra: RunAt serves the envelope's hole map, ReadAt is pure
-// offset arithmetic plus ra.ReadAt — as safe for concurrent use as ra
-// itself (an *os.File is). The entry's name is returned alongside.
-func SourceAt(ra io.ReaderAt, name string) (sparse.Source, string, error) {
-	sr := io.NewSectionReader(ra, 0, 1<<62)
+// SourceAt locates the entry called name (empty: first regular file entry) in
+// the size-bounded archive and opens it as a CONCURRENT random-access
+// sparse.Source over ra. RunAt serves the envelope's hole map; ReadAt is pure
+// offset arithmetic plus ra.ReadAt. When the archive has the strict Kuasar
+// payload + empty digest-marker shape, the returned source also implements
+// Digester. Ordinary tar members remain valid sources without that capability.
+func SourceAt(ra io.ReaderAt, size int64, name string) (sparse.Source, string, error) {
+	if size < 0 || size > 1<<62 {
+		return nil, "", fmt.Errorf("tarstream: invalid artifact size %d", size)
+	}
+	sr := io.NewSectionReader(ra, 0, size)
 	m, err := locate(sr, name, seekSkip(sr))
 	if err != nil {
 		return nil, "", err
@@ -114,12 +118,71 @@ func SourceAt(ra io.ReaderAt, name string) (sparse.Source, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	return &readerAtSource{
+	src := sparse.Source(&readerAtSource{
 		meta:         *m,
 		ra:           ra,
 		dataStart:    dataStart,
 		packedPrefix: packedPrefix(m.extents),
-	}, m.name, nil
+	})
+	digest, ok, err := discoverDigest(ra, size, m.name)
+	if err != nil {
+		return nil, "", err
+	}
+	if ok {
+		src = &digestedSource{Source: src, digest: digest}
+	}
+	return src, m.name, nil
+}
+
+// digestedSource adds the optional, already-parsed artifact identity without
+// changing sparse.Source or performing I/O from Digest.
+type digestedSource struct {
+	sparse.Source
+	digest string
+}
+
+func (s *digestedSource) Digest() string { return s.digest }
+
+// discoverDigest recognizes the strict two-entry artifact shape. A normal tar
+// without a marker is not an error; a reserved marker that is present but
+// malformed is. All scans skip stored payload bytes with Seek.
+func discoverDigest(ra io.ReaderAt, size int64, payloadName string) (string, bool, error) {
+	firstReader := io.NewSectionReader(ra, 0, size)
+	first, err := locateAt(firstReader, 0, seekSkip(firstReader))
+	if err != nil || first.name != payloadName {
+		return "", false, nil
+	}
+
+	markerReader := io.NewSectionReader(ra, 0, size)
+	marker, err := locateAt(markerReader, 1, seekSkip(markerReader))
+	if err != nil {
+		return "", false, nil
+	}
+	if !strings.HasPrefix(marker.name, SHA256MarkerPrefix) {
+		return "", false, nil
+	}
+	digest, ok := parseDigestMarker(marker.name)
+	if !ok {
+		return "", false, fmt.Errorf("tarstream: invalid digest marker %q", marker.name)
+	}
+	if marker.logical != 0 || marker.stored != 0 || marker.mapLen != 0 {
+		return "", false, fmt.Errorf("tarstream: digest marker %q is not empty", marker.name)
+	}
+	markerEnd, err := markerReader.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return "", false, err
+	}
+	if markerEnd+int64(len(zeroBlock2)) != size {
+		return "", false, fmt.Errorf("tarstream: digest marker must be the final entry")
+	}
+	var trailer [1024]byte
+	if _, err := ra.ReadAt(trailer[:], markerEnd); err != nil {
+		return "", false, fmt.Errorf("tarstream: read end-of-archive: %w", err)
+	}
+	if !isZeroBlock(trailer[:512]) || !isZeroBlock(trailer[512:]) {
+		return "", false, fmt.Errorf("tarstream: invalid end-of-archive after digest marker")
+	}
+	return digest, true, nil
 }
 
 func newSeqView(r io.Reader, name string) (*seqView, error) {

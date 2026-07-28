@@ -16,7 +16,7 @@ RocksDB / AWS SDK / Reed-Solomon 等重依赖:
 | `pkg/manifest` (+ `codec`/`crypto`/`chunker`/`fetch`/`ingest`) | 分块 + 收敛加密 + 内容寻址的读写 SDK;`fetch.Stream` = `sparse.Source` + Close,`fetch.OpenTarStream` 把本地 tarstream 工件零解包开成 Stream,`ingest.Ingest` 单趟消费任意 `sparse.Source` |
 | `pkg/store` + `pkg/store/client` | 远端内容寻址存储代理的接口与客户端 |
 | `pkg/cache` + `pkg/cache/client` | 分层缓存的接口与客户端 |
-| `pkg/tarstream` | 单文件稀疏流的 tar 信封:`WriteTo`(任意 `sparse.Source` → GNU PAX sparse 1.0,仅数据字节上线)/ `ReadFrom` / `ReadSeekFrom`(tar 内零拷贝随机)/ `SourceFrom`·`SourceAt` / `ReadSeekFromIndex`,洞图精确往返;互操作 GNU tar 与 archive/tar |
+| `pkg/tarstream` | 单 payload 稀疏 tar 工件:`WriteTo` 写 GNU PAX sparse 1.0 + 空的 `.kuasar.sha256.<hex>` marker,边写边生成摘要;`SourceAt` 通过可选 `Digester` 零 payload 扫描读取身份;`ReadFrom` / `ReadSeekFrom` / `SourceFrom` 保持洞图精确往返与 GNU tar/archive-tar 互操作 |
 | `pkg/{flatten,image,remote,tar}` | OCI/目录 → EROFS 展平的公共实现:`flatten` 负责源模型与导出,`image` 负责 RuntimeConfig 投影,`remote` 负责 OCI registry 拉取/referrer/cache,`tar` 负责展平结果解包 |
 
 重后端(`*/server`、`pkg/cache/{rocks,redisstore,ec}`、`pkg/store/{obs,fs}`)只在 `cmd/` 与守护进程内

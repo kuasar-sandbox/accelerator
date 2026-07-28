@@ -232,7 +232,7 @@ func mkTarstream(t *testing.T, name string, logical []byte, holes []sparse.Exten
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	if err := tarstream.WriteTo(context.Background(), &buf, name, src); err != nil {
+	if _, err := tarstream.WriteTo(context.Background(), &buf, name, src); err != nil {
 		t.Fatal(err)
 	}
 	return buf.Bytes()

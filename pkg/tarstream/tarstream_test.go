@@ -4,6 +4,7 @@ import (
 	stdtar "archive/tar"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -41,7 +42,7 @@ func mustWrite(t *testing.T, name string, logical []byte, holes []sparse.Extent)
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	if err := WriteTo(context.Background(), &buf, name, src); err != nil {
+	if _, err := WriteTo(context.Background(), &buf, name, src); err != nil {
 		t.Fatal(err)
 	}
 	return buf.Bytes()
@@ -183,8 +184,15 @@ func TestStdlibOracle(t *testing.T) {
 	if !bytes.Equal(got, logical) {
 		t.Error("stdlib logical content mismatch")
 	}
+	marker, err := tr.Next()
+	if err != nil {
+		t.Fatalf("digest marker: %v", err)
+	}
+	if marker.Size != 0 || !strings.HasPrefix(marker.Name, SHA256MarkerPrefix) {
+		t.Fatalf("digest marker = %q/%d", marker.Name, marker.Size)
+	}
 	if _, err := tr.Next(); err != io.EOF {
-		t.Errorf("expected single-entry archive, next = %v", err)
+		t.Errorf("expected payload + marker archive, next = %v", err)
 	}
 }
 
@@ -446,7 +454,7 @@ func TestLookupAndNotFound(t *testing.T) {
 
 func TestWriteToValidation(t *testing.T) {
 	var buf bytes.Buffer
-	if err := WriteTo(context.Background(), &buf, "", sparse.Dense(bytes.NewReader(nil), 0)); err == nil {
+	if _, err := WriteTo(context.Background(), &buf, "", sparse.Dense(bytes.NewReader(nil), 0)); err == nil {
 		t.Error("empty name must fail")
 	}
 }
@@ -489,7 +497,7 @@ func (zeroRunSource) ReadAt(_ context.Context, buf []byte, off uint64) (int, err
 // sparse map.
 func TestWriteToZeroRuns(t *testing.T) {
 	var buf bytes.Buffer
-	if err := WriteTo(context.Background(), &buf, "z", zeroRunSource{}); err != nil {
+	if _, err := WriteTo(context.Background(), &buf, "z", zeroRunSource{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -681,7 +689,7 @@ func TestFileRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	if err := WriteTo(context.Background(), &buf, "img.raw", src); err != nil {
+	if _, err := WriteTo(context.Background(), &buf, "img.raw", src); err != nil {
 		t.Fatal(err)
 	}
 	ts, err := ReadSeekFrom(bytes.NewReader(buf.Bytes()), "")
@@ -705,7 +713,7 @@ func TestSourceAt(t *testing.T) {
 	archive := mustWrite(t, "img", logical, holes)
 	ctx := context.Background()
 
-	src, name, err := SourceAt(bytes.NewReader(archive), "")
+	src, name, err := SourceAt(bytes.NewReader(archive), int64(len(archive)), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -772,6 +780,111 @@ func TestSourceAt(t *testing.T) {
 	}
 }
 
+type countingReaderAt struct {
+	io.ReaderAt
+	read int64
+}
+
+func (r *countingReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	n, err := r.ReaderAt.ReadAt(p, off)
+	r.read += int64(n)
+	return n, err
+}
+
+func TestArtifactDigestIsPrefixHashAndMetadataOnly(t *testing.T) {
+	logical := bytes.Repeat([]byte("payload-"), 1<<20)
+	var buf bytes.Buffer
+	digest, err := WriteTo(context.Background(), &buf, "image", sparse.Dense(bytes.NewReader(logical), uint64(len(logical))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := buf.Bytes()
+	markerOffset := len(archive) - 512 - len(zeroBlock2)
+	sum := sha256.Sum256(archive[:markerOffset])
+	if want := fmt.Sprintf("sha256:%x", sum[:]); digest != want {
+		t.Fatalf("digest = %q, want %q", digest, want)
+	}
+
+	cr := &countingReaderAt{ReaderAt: bytes.NewReader(archive)}
+	src, _, err := SourceAt(cr, int64(len(archive)), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, ok := src.(Digester)
+	if !ok {
+		t.Fatal("artifact source does not implement Digester")
+	}
+	if d.Digest() != digest {
+		t.Fatalf("source digest = %q, want %q", d.Digest(), digest)
+	}
+	if cr.read >= int64(len(logical))/100 {
+		t.Fatalf("SourceAt read %d payload-adjacent bytes for a %d-byte artifact", cr.read, len(logical))
+	}
+}
+
+func TestSourceAtDigestCapabilityIsOptional(t *testing.T) {
+	var buf bytes.Buffer
+	tw := stdtar.NewWriter(&buf)
+	if err := tw.WriteHeader(&stdtar.Header{Name: "plain", Mode: 0o644, Size: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	src, _, err := SourceAt(bytes.NewReader(buf.Bytes()), int64(buf.Len()), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := src.(Digester); ok {
+		t.Fatal("plain tar source unexpectedly implements Digester")
+	}
+}
+
+func TestSourceAtRejectsInvalidDigestMarker(t *testing.T) {
+	valid := SHA256MarkerPrefix + strings.Repeat("a", 64)
+	tests := []struct {
+		name    string
+		markers []stdtar.Header
+		bodies  []string
+	}{
+		{name: "invalid-name", markers: []stdtar.Header{{Name: SHA256MarkerPrefix + "bad", Mode: 0o444}}},
+		{name: "nonempty", markers: []stdtar.Header{{Name: valid, Mode: 0o444, Size: 1}}, bodies: []string{"x"}},
+		{name: "duplicate", markers: []stdtar.Header{{Name: valid, Mode: 0o444}, {Name: SHA256MarkerPrefix + strings.Repeat("b", 64), Mode: 0o444}}},
+		{name: "nonfinal", markers: []stdtar.Header{{Name: valid, Mode: 0o444}, {Name: "extra", Mode: 0o644}}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			tw := stdtar.NewWriter(&buf)
+			if err := tw.WriteHeader(&stdtar.Header{Name: "payload", Mode: 0o644, Size: 4}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tw.Write([]byte("data")); err != nil {
+				t.Fatal(err)
+			}
+			for i := range tc.markers {
+				if err := tw.WriteHeader(&tc.markers[i]); err != nil {
+					t.Fatal(err)
+				}
+				if i < len(tc.bodies) && tc.bodies[i] != "" {
+					if _, err := tw.Write([]byte(tc.bodies[i])); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if err := tw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := SourceAt(bytes.NewReader(buf.Bytes()), int64(buf.Len()), ""); err == nil {
+				t.Fatal("invalid digest marker accepted")
+			}
+		})
+	}
+}
+
 // TestReadSeekFromIndex: ordinal addressing matches archive/tar's
 // entry sequence, recovering the hole map the stdlib reader hides.
 func TestReadSeekFromIndex(t *testing.T) {
@@ -789,7 +902,8 @@ func TestReadSeekFromIndex(t *testing.T) {
 	buf.Write(mustWrite(t, "img", logical, holes))
 	archive := buf.Bytes()
 
-	// Ordinal alignment oracle: archive/tar sees 4 entries.
+	// Ordinal alignment oracle: archive/tar sees the four data entries plus
+	// WriteTo's digest marker.
 	tr := stdtar.NewReader(bytes.NewReader(archive))
 	count := 0
 	var names []string
@@ -804,8 +918,8 @@ func TestReadSeekFromIndex(t *testing.T) {
 		names = append(names, hdr.Name)
 		count++
 	}
-	if count != 4 {
-		t.Fatalf("stdlib sees %d entries (%v), want 4", count, names)
+	if count != 5 {
+		t.Fatalf("stdlib sees %d entries (%v), want 5", count, names)
 	}
 
 	ts, err := ReadSeekFromIndex(bytes.NewReader(archive), 3)
