@@ -7,15 +7,12 @@ import (
 	"sync"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
 // resolvedRun is the package-private visibility result shared by RunAt,
 // ReadAt, and Prefetch. leaf is always the final non-layered serving Stream.
 type resolvedRun struct {
 	leaf       Stream
-	leafKey    store.ContentKey
-	hasKey     bool
 	kind       sparse.RunKind
 	end        uint64
 	chunkIndex uint64
@@ -50,11 +47,7 @@ func resolveStream(stream Stream, offset, requestedEnd uint64) (resolvedRun, err
 		run, err = layered.resolveRun(offset, localEnd)
 	} else {
 		run.leaf = stream
-		if manifest, ok := stream.(*manifestStream); ok {
-			run.leafKey = manifest.ownKey
-			run.hasKey = manifest.hasKey
-		}
-		if chunked, ok := stream.(ChunkStream); ok {
+		if chunked, ok := stream.(chunkStream); ok {
 			run.kind, run.end, run.chunkIndex, err = chunked.RunChunkAt(offset, localEnd-offset)
 			run.hasChunk = err == nil && run.kind != sparse.Hole
 		} else {
@@ -70,8 +63,6 @@ func resolveStream(stream Stream, offset, requestedEnd uint64) (resolvedRun, err
 
 	if run.kind == sparse.Hole {
 		run.leaf = nil
-		run.leafKey = store.ContentKey{}
-		run.hasKey = false
 		run.chunkIndex = 0
 		run.hasChunk = false
 		// Once a child Hole reaches that child's EOF, the child remains
@@ -197,9 +188,9 @@ func readResolvedAt(ctx context.Context, stream Stream, buf []byte, offset uint6
 				err error
 			)
 			if item.run.hasChunk {
-				chunked, ok := item.run.leaf.(ChunkStream)
+				chunked, ok := item.run.leaf.(chunkStream)
 				if !ok {
-					report(fmt.Errorf("%w: serving leaf lost ChunkStream", errInvalidRun))
+					report(fmt.Errorf("%w: serving leaf lost chunkStream", errInvalidRun))
 					return
 				}
 				n, err = chunked.ReadChunkAt(cctx, dst, item.run.chunkIndex, item.offset, item.run.end)
@@ -225,36 +216,7 @@ func readResolvedAt(ctx context.Context, stream Stream, buf []byte, offset uint6
 	return int(readLen), eof
 }
 
-func walkLeaves(stream Stream, visit func(Stream, store.ContentKey, bool)) {
-	if layered, ok := stream.(*layeredStream); ok {
-		for _, layer := range layered.layers {
-			walkLeaves(layer, visit)
-		}
-		return
-	}
-	if manifest, ok := stream.(*manifestStream); ok {
-		visit(stream, manifest.ownKey, manifest.hasKey)
-		return
-	}
-	visit(stream, store.ContentKey{}, false)
-}
-
-func prefetchStream(ctx context.Context, stream Stream, keys []store.ContentKey) error {
-	availableKeys := make(map[store.ContentKey]struct{})
-	walkLeaves(stream, func(_ Stream, key store.ContentKey, hasKey bool) {
-		if hasKey {
-			availableKeys[key] = struct{}{}
-		}
-	})
-
-	selected := make(map[store.ContentKey]struct{}, len(keys))
-	for _, key := range keys {
-		if _, ok := availableKeys[key]; !ok {
-			return fmt.Errorf("%w: %x", ErrUnknownPrefetchLayer, key)
-		}
-		selected[key] = struct{}{}
-	}
-
+func prefetchStream(ctx context.Context, stream Stream) error {
 	for offset, end := uint64(0), stream.Size(); offset < end; {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -264,12 +226,9 @@ func prefetchStream(ctx context.Context, stream Stream, keys []store.ContentKey)
 			return err
 		}
 		if run.kind == sparse.Data {
-			_, keySelected := selected[run.leafKey]
-			if len(keys) == 0 || (run.hasKey && keySelected) {
-				if chunked, ok := run.leaf.(PrefetchChunkStream); ok && run.hasChunk {
-					if err := chunked.PrefetchChunkAt(ctx, run.chunkIndex); err != nil {
-						return err
-					}
+			if chunked, ok := run.leaf.(prefetchChunkStream); ok && run.hasChunk {
+				if err := chunked.PrefetchChunkAt(ctx, run.chunkIndex); err != nil {
+					return err
 				}
 			}
 		}

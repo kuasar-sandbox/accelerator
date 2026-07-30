@@ -6,7 +6,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
@@ -34,25 +33,6 @@ func ParseHexKey(s string) (store.ContentKey, error) {
 // validation is delegated to ParseHexKey.
 func ParseKeyRef(s string) (store.ContentKey, error) {
 	return ParseHexKey(strings.TrimPrefix(s, "manifest://"))
-}
-
-// ParseKeyRefs decodes a multi-layer manifest reference into one or more
-// content keys. The reference is an optional "manifest://" prefix followed by
-// one or more 64-char hex keys joined by ':' — "manifest://k1:k2:k3" overlays
-// k1 (top) over k2 over k3 (see fetch.Fetcher.Fetch). A single key (no ':')
-// yields a one-element slice, identical to ParseKeyRef. Hex keys never contain
-// ':', so the split is unambiguous.
-func ParseKeyRefs(s string) ([]store.ContentKey, error) {
-	parts := strings.Split(strings.TrimPrefix(s, "manifest://"), ":")
-	keys := make([]store.ContentKey, len(parts))
-	for i, p := range parts {
-		k, err := ParseHexKey(p)
-		if err != nil {
-			return nil, fmt.Errorf("manifest: layer %d: %w", i, err)
-		}
-		keys[i] = k
-	}
-	return keys, nil
 }
 
 // HexKey is the inverse of ParseHexKey — formats a ContentKey as 64
@@ -99,7 +79,3 @@ func (c *Config) CustomerKey() ([32]byte, error) {
 // lazily via CustomerKey ($MANIFEST_KEY, else the YAML's manifest.key).
 // Equivalent to passing func() ([32]byte, error) { return c.CustomerKey() }.
 func (c *Config) IngestKeyFunc() ingest.CustomerKeyFunc { return c.CustomerKey }
-
-// FetchKeyFunc returns a fetch.CustomerKeyFunc that resolves the key
-// lazily via CustomerKey ($MANIFEST_KEY, else the YAML's manifest.key).
-func (c *Config) FetchKeyFunc() fetch.CustomerKeyFunc { return c.CustomerKey }

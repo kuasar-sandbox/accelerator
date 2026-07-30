@@ -1,12 +1,12 @@
 // Package fetch implements the unified read layer for the container accelerator.
 //
 // A Stream is the read-base abstraction: it reconstructs a virtual image from
-// either a chunked + encrypted manifest, a local file, or an overlay of several
-// such streams. Stream is sparse.Source plus lifetime — it strengthens the
+// either a chunked + encrypted manifest, a local tarstream artifact, or an
+// overlay of several such streams. Stream is sparse.Source plus lifetime — it strengthens the
 // Source baseline contract (monotone single-goroutine reads) to full concurrent
 // random access, which the runtime consumers (vhost, uffd) rely on. Three
-// implementations satisfy it — manifestStream (also implements ChunkStream),
-// the file stream returned by OpenFileStream, and layeredStream — and a sandbox
+// implementations satisfy it — manifestStream (also implements chunkStream),
+// the file stream returned by OpenTarStream, and layeredStream — and a sandbox
 // disk, snapshot bundle, or manifest-ctl read all sit on the same abstraction.
 //
 // Run classification uses sparse.RunKind. Only manifest-backed streams ever
@@ -14,15 +14,15 @@
 // data that needs no fetch but does NOT fall through an overlay); file streams
 // classify allocated zeros as Data and filesystem holes as Hole.
 //
-// ChunkStream is an optional enhancement a Stream may implement so a caller can
-// thread a chunk index between classification (RunChunkAt) and read
+// chunkStream is an internal enhancement a Stream may implement so the package
+// can thread a chunk index between classification (RunChunkAt) and read
 // (ReadChunkAt), skipping a re-lookup. Its only in-tree users are manifestStream
 // itself (RunAt/ReadAt are built on the chunk primitives) and layeredStream
 // (which threads a serving layer's chunk index from resolve to read). External
 // consumers use the plain Stream methods.
 //
 // Prefetcher is a separate optional enhancement. Keeping prefetch out of Stream
-// and ChunkStream lets non-cache-backed streams implement either contract
+// and chunkStream lets non-cache-backed streams implement either contract
 // without acquiring a meaningless background-I/O method.
 //
 // RunAt, ReadAt, and Prefetch are safe for concurrent use. Close is a lifetime
@@ -46,8 +46,8 @@ import (
 // Stream is a sparse.Source with a lifetime, and a stronger contract: RunAt
 // and ReadAt are safe for concurrent use at arbitrary offsets, RunAt requires
 // a non-zero limit, and ReadAt MAY fetch the data chunks in a range concurrently
-// (internal goroutines); see ChunkStream.ReadChunkAt for the synchronous
-// counterpart.
+// (internal goroutines); see chunkStream.ReadChunkAt for the synchronous
+// counterpart used internally by layered streams.
 type Stream interface {
 	sparse.Source
 
@@ -57,13 +57,13 @@ type Stream interface {
 	Close() error
 }
 
-// ChunkStream is the optional enhancement contract: it lets a caller reuse a
+// chunkStream is the internal enhancement contract: it lets the resolver reuse a
 // chunk index between classification and read, avoiding a second offset lookup.
 //
 // Concurrency convention: ReadChunkAt is ALWAYS synchronous and runs in the
 // calling goroutine — it spawns no goroutines. Batch parallelism is Stream.ReadAt's
 // job. A caller wanting concurrency invokes ReadChunkAt from its own goroutines.
-type ChunkStream interface {
+type chunkStream interface {
 	// RunChunkAt is RunAt that additionally returns the serving chunk index
 	// (valid for Data and Zero; meaningless for Hole). It returns a single
 	// region (no Hole/Zero extension) and requires a non-zero limit.
@@ -75,51 +75,29 @@ type ChunkStream interface {
 }
 
 // Prefetcher optionally warms the cache for the visible Data runs of an entire
-// logical Stream. With no keys it selects every keyed and unkeyed leaf. With
-// keys it selects only visible leaves carrying one of those manifest keys.
+// logical Stream.
 type Prefetcher interface {
-	Prefetch(ctx context.Context, keys ...store.ContentKey) error
+	Prefetch(ctx context.Context) error
 }
 
-// PrefetchChunkStream is the optional physical-chunk prefetch capability.
+// prefetchChunkStream is the internal physical-chunk prefetch capability.
 // PrefetchChunkAt is synchronous and only waits for the existing cache Get/fill
 // path; it does not verify, decrypt, materialize, pin, or retain the chunk.
-type PrefetchChunkStream interface {
-	ChunkStream
+type prefetchChunkStream interface {
+	chunkStream
 	PrefetchChunkAt(ctx context.Context, chunkIdx uint64) error
 }
-
-// ErrUnknownPrefetchLayer reports a selector key that is not structurally
-// present in the Stream, including when the Stream has only unkeyed leaves.
-var ErrUnknownPrefetchLayer = errors.New("fetch: unknown prefetch layer")
 
 var errInvalidRun = errors.New("fetch: invalid run")
 
 // manifestStream is the single-manifest implementation (Stream +
-// PrefetchChunkStream + Prefetcher).
+// prefetchChunkStream + Prefetcher).
 type manifestStream struct {
 	m              *codec.Manifest
 	onDemandGetter cache.Getter
 	prefetchGetter cache.Getter
 	encryptor      crypto.ChunkEncryptor
 	keys           [][32]byte // decrypted per-chunk keys, parallel to m.Entries
-	ownKey         store.ContentKey
-	hasKey         bool
-}
-
-// NewStream constructs an unkeyed single-manifest Stream with its own request
-// scheduler. keys holds one decrypted convergent key per chunk entry, in
-// m.Entries order (zero entries hold the zero key, never read). Prefetch with no
-// selector is supported; any non-empty selector is unknown because NewStream
-// has no manifest content key. Callers holding such a key should use a Fetcher.
-func NewStream(m *codec.Manifest, keys [][32]byte, c cache.Getter, enc crypto.ChunkEncryptor) Stream {
-	var onDemand, prefetch cache.Getter
-	if c != nil {
-		client := newScheduledCacheClient(c)
-		onDemand = client.OnDemandGetter()
-		prefetch = client.PrefetchGetter()
-	}
-	return newManifestStream(m, keys, onDemand, prefetch, enc, store.ContentKey{}, false)
 }
 
 func newManifestStream(
@@ -127,8 +105,6 @@ func newManifestStream(
 	keys [][32]byte,
 	onDemand, prefetch cache.Getter,
 	enc crypto.ChunkEncryptor,
-	ownKey store.ContentKey,
-	hasKey bool,
 ) *manifestStream {
 	return &manifestStream{
 		m:              m,
@@ -136,8 +112,6 @@ func newManifestStream(
 		prefetchGetter: prefetch,
 		encryptor:      enc,
 		keys:           keys,
-		ownKey:         ownKey,
-		hasKey:         hasKey,
 	}
 }
 
@@ -253,7 +227,7 @@ func (s *manifestStream) loadChunkAt(ctx context.Context, chunkIdx uint64, kind 
 	return blob, nil
 }
 
-// ReadChunkAt implements ChunkStream — synchronous single-chunk read.
+// ReadChunkAt implements chunkStream — synchronous single-chunk read.
 func (s *manifestStream) ReadChunkAt(ctx context.Context, buf []byte, chunkIdx, offset, end uint64) (int, error) {
 	if chunkIdx >= uint64(len(s.m.Entries)) {
 		return 0, fmt.Errorf("fetch: chunk index %d out of range", chunkIdx)
@@ -314,7 +288,7 @@ func (s *manifestStream) ReadChunkAt(ctx context.Context, buf []byte, chunkIdx, 
 	return int(want), nil
 }
 
-// PrefetchChunkAt implements PrefetchChunkStream. It intentionally does no
+// PrefetchChunkAt implements prefetchChunkStream. It intentionally does no
 // Blob inspection: a successful Get followed by exactly one Release is the
 // complete physical prefetch operation.
 func (s *manifestStream) PrefetchChunkAt(ctx context.Context, chunkIdx uint64) error {
@@ -328,8 +302,8 @@ func (s *manifestStream) PrefetchChunkAt(ctx context.Context, chunkIdx uint64) e
 	return nil
 }
 
-func (s *manifestStream) Prefetch(ctx context.Context, keys ...store.ContentKey) error {
-	return prefetchStream(ctx, s, keys)
+func (s *manifestStream) Prefetch(ctx context.Context) error {
+	return prefetchStream(ctx, s)
 }
 
 // ReadAt walks the runs and fetches data chunks concurrently — one goroutine

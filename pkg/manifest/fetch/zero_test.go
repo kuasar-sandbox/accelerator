@@ -50,7 +50,7 @@ func TestReadAt_IsZeroNoGet(t *testing.T) {
 	m := &codec.Manifest{Version: codec.Version1, ImageSize: imageSize, Entries: entries}
 
 	getter := &recordingGetter{}
-	f := NewStream(m, make([][32]byte, numChunks), getter, nil) // encryptor nil — must never be called
+	f := newTestManifestStream(m, make([][32]byte, numChunks), getter, nil) // encryptor nil — must never be called
 	defer f.Close()
 
 	buf := make([]byte, imageSize)
@@ -89,7 +89,7 @@ func TestReadAt_AcrossZeroBoundary(t *testing.T) {
 	entries[0].CiphertextHash = hashEntry
 
 	getter := &fixedHitGetter{hash: store.ContentKey(hashEntry), value: plain}
-	f := NewStream(m, make([][32]byte, 2), getter, &passthroughEncryptor{plain: plain})
+	f := newTestManifestStream(m, make([][32]byte, 2), getter, &passthroughEncryptor{plain: plain})
 	defer f.Close()
 
 	// Read [1000, 7000): tail of chunk 0 then head of zero chunk 1.
@@ -115,7 +115,7 @@ func TestReadAt_FetchError(t *testing.T) {
 		ImageSize: 4096,
 		Entries:   []codec.ChunkEntry{{Offset: 0, Size: 4096, CiphertextHash: store.ContentKey{0x9}}},
 	}
-	f := NewStream(m, make([][32]byte, 1), errGetter{}, &passthroughEncryptor{plain: make([]byte, 4096)})
+	f := newTestManifestStream(m, make([][32]byte, 1), errGetter{}, &passthroughEncryptor{plain: make([]byte, 4096)})
 	defer f.Close()
 
 	n, err := f.ReadAt(context.Background(), make([]byte, 4096), 0)
@@ -141,7 +141,7 @@ func TestReadAt_ReleasesBlobs(t *testing.T) {
 
 	var released atomic.Int64
 	getter := blobReleaseGetter{value: plain, released: &released}
-	f := NewStream(m, make([][32]byte, numChunks), getter, &passthroughEncryptor{plain: plain})
+	f := newTestManifestStream(m, make([][32]byte, numChunks), getter, &passthroughEncryptor{plain: plain})
 	defer f.Close()
 
 	if _, err := f.ReadAt(context.Background(), make([]byte, numChunks*chunkSize), 0); err != nil {
@@ -165,7 +165,7 @@ func TestReadAt_HashMismatchRejected(t *testing.T) {
 		Entries:   []codec.ChunkEntry{{Offset: 0, Size: chunkSize, CiphertextHash: sha256.Sum256([]byte("authentic ciphertext"))}},
 	}
 	// staticGetter returns `tampered`, which does not hash to the entry's hash.
-	f := NewStream(m, make([][32]byte, 1), &staticGetter{plain: tampered}, &passthroughEncryptor{plain: tampered})
+	f := newTestManifestStream(m, make([][32]byte, 1), &staticGetter{plain: tampered}, &passthroughEncryptor{plain: tampered})
 	defer f.Close()
 
 	n, err := f.ReadAt(context.Background(), make([]byte, chunkSize), 0)

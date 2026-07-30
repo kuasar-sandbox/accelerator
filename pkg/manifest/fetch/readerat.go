@@ -15,23 +15,19 @@ import (
 //
 // Safe for concurrent ReadAt: Stream's methods are concurrency-safe.
 type readerAt struct {
-	ctx  context.Context
-	s    Stream
-	size int64
+	ctx context.Context
+	s   Stream
 }
 
-// NewReaderAt wraps s as an io.ReaderAt over [0, size). ctx is carried
+// NewReaderAt wraps s as an io.ReaderAt. ctx is carried
 // into every underlying ReadAt; cancel it to abort in-flight fetches.
-func NewReaderAt(ctx context.Context, s Stream, size int64) io.ReaderAt {
-	return &readerAt{ctx: ctx, s: s, size: size}
+func NewReaderAt(ctx context.Context, s Stream) io.ReaderAt {
+	return &readerAt{ctx: ctx, s: s}
 }
 
 func (r *readerAt) ReadAt(p []byte, off int64) (int, error) {
 	if off < 0 {
 		return 0, io.ErrUnexpectedEOF
-	}
-	if off >= r.size {
-		return 0, io.EOF
 	}
 	return r.s.ReadAt(r.ctx, p, uint64(off))
 }
