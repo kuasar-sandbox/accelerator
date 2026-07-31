@@ -165,7 +165,12 @@ func (c *Config) NewIngester(keyFn ingest.CustomerKeyFunc, extraSaltFn ingest.Ex
 //
 // Close must be called on the returned FetcherCloser to drain the
 // underlying client pools.
-func (c *Config) NewFetcher(keyFn fetch.CustomerKeyFunc) (FetcherCloser, error) {
+
+func (c *Config) NewFetcher() (FetcherCloser, error) {
+	customerKey, err := c.CustomerKey()
+	if err != nil {
+		return nil, err
+	}
 	_, dec, err := crypto.New(c.Crypto)
 	if err != nil {
 		return nil, err
@@ -183,7 +188,7 @@ func (c *Config) NewFetcher(keyFn fetch.CustomerKeyFunc) (FetcherCloser, error) 
 		if err != nil {
 			return nil, fmt.Errorf("manifest: dial cache: %w", err)
 		}
-		f := fetch.NewFetcher(keyFn, cc, dec)
+		f := fetch.NewFetcher(customerKey, cc, dec)
 		return &fetcherCloser{Fetcher: f, closers: []io.Closer{cc}}, nil
 	}
 
@@ -199,7 +204,7 @@ func (c *Config) NewFetcher(keyFn fetch.CustomerKeyFunc) (FetcherCloser, error) 
 		return nil, fmt.Errorf("manifest: dial store: %w", err)
 	}
 	getter := cache.NewStoreOrigin(sc)
-	f := fetch.NewFetcher(keyFn, getter, dec)
+	f := fetch.NewFetcher(customerKey, getter, dec)
 	return &fetcherCloser{Fetcher: f, closers: []io.Closer{sc}}, nil
 }
 

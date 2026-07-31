@@ -3,7 +3,6 @@ package fetch
 import (
 	"context"
 	"crypto/sha256"
-	"errors"
 	"testing"
 	"time"
 
@@ -12,38 +11,32 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
-func TestFetcherReturnsKeyedPrefetcher(t *testing.T) {
+func TestFetcherReturnsPrefetcher(t *testing.T) {
 	manifestKey := keyForFetcherTest(0x41)
-	unknownKey := keyForFetcherTest(0x42)
 	chunk := []byte("chunk-data")
 	getter := newFetcherRouteGetter(t, map[store.ContentKey][]byte{
 		manifestKey: marshalFetcherTestManifest(t, chunk),
 	}, chunk)
-	fetcher := NewFetcher(fetcherTestCustomerKey, getter, fetcherTestDecryptor{})
+	fetcher := NewFetcher([32]byte{}, getter, fetcherTestDecryptor{})
 
-	stream, err := fetcher.Fetch(context.Background(), manifestKey)
+	stream, err := fetcher.OpenManifest(context.Background(), manifestKey)
 	if err != nil {
-		t.Fatalf("Fetch: %v", err)
+		t.Fatalf("OpenManifest: %v", err)
 	}
 	prefetcher, ok := stream.(Prefetcher)
 	if !ok {
-		t.Fatal("Fetcher.Fetch result does not implement Prefetcher")
+		t.Fatal("Fetcher.OpenManifest result does not implement Prefetcher")
 	}
-	if _, ok := stream.(PrefetchChunkStream); !ok {
-		t.Fatal("single manifest Fetch result does not implement PrefetchChunkStream")
+	if _, ok := stream.(prefetchChunkStream); !ok {
+		t.Fatal("single manifest Stream does not implement prefetchChunkStream")
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- prefetcher.Prefetch(context.Background(), manifestKey, manifestKey) }()
+	go func() { done <- prefetcher.Prefetch(context.Background()) }()
 	call := receiveFetcherChunkCall(t, getter.chunkCalls)
 	close(call.release)
 	if err := receiveFetcherError(t, done); err != nil {
-		t.Fatalf("Prefetch(own key): %v", err)
-	}
-	assertNoFetcherChunkCall(t, getter.chunkCalls)
-
-	if err := prefetcher.Prefetch(context.Background(), manifestKey, unknownKey); !errors.Is(err, ErrUnknownPrefetchLayer) {
-		t.Fatalf("Prefetch(known, unknown) error = %v, want ErrUnknownPrefetchLayer", err)
+		t.Fatalf("Prefetch: %v", err)
 	}
 	assertNoFetcherChunkCall(t, getter.chunkCalls)
 }
@@ -54,14 +47,14 @@ func TestFetcherSharesAdmissionAcrossStreams(t *testing.T) {
 	chunk := []byte("shared-chunk")
 	manifest := marshalFetcherTestManifest(t, chunk)
 	getter := newFetcherRouteGetter(t, map[store.ContentKey][]byte{keyA: manifest, keyB: manifest}, chunk)
-	publicFetcher := NewFetcher(fetcherTestCustomerKey, getter, fetcherTestDecryptor{})
+	publicFetcher := NewFetcher([32]byte{}, getter, fetcherTestDecryptor{})
 	fetcher := publicFetcher.(*fetcher)
 
-	streamA, err := fetcher.Fetch(context.Background(), keyA)
+	streamA, err := fetcher.OpenManifest(context.Background(), keyA)
 	if err != nil {
 		t.Fatalf("Fetch(A): %v", err)
 	}
-	streamB, err := fetcher.Fetch(context.Background(), keyB)
+	streamB, err := fetcher.OpenManifest(context.Background(), keyB)
 	if err != nil {
 		t.Fatalf("Fetch(B): %v", err)
 	}
@@ -75,7 +68,7 @@ func TestFetcherSharesAdmissionAcrossStreams(t *testing.T) {
 	demand := receiveFetcherChunkCall(t, getter.chunkCalls)
 
 	prefetchDone := make(chan error, 1)
-	go func() { prefetchDone <- streamB.(Prefetcher).Prefetch(context.Background(), keyB) }()
+	go func() { prefetchDone <- streamB.(Prefetcher).Prefetch(context.Background()) }()
 	waitForChangeChannel(t, fetcher.cache.scheduler)
 	assertNoFetcherChunkCall(t, getter.chunkCalls)
 
@@ -97,21 +90,21 @@ func TestFetcherManifestLoadBypassesActivePrefetch(t *testing.T) {
 	chunk := []byte("metadata-priority")
 	manifest := marshalFetcherTestManifest(t, chunk)
 	getter := newFetcherRouteGetter(t, map[store.ContentKey][]byte{keyA: manifest, keyB: manifest}, chunk)
-	fetcher := NewFetcher(fetcherTestCustomerKey, getter, fetcherTestDecryptor{})
+	fetcher := NewFetcher([32]byte{}, getter, fetcherTestDecryptor{})
 
-	stream, err := fetcher.Fetch(context.Background(), keyA)
+	stream, err := fetcher.OpenManifest(context.Background(), keyA)
 	if err != nil {
 		t.Fatalf("Fetch(A): %v", err)
 	}
 	prefetchDone := make(chan error, 1)
-	go func() { prefetchDone <- stream.(Prefetcher).Prefetch(context.Background(), keyA) }()
+	go func() { prefetchDone <- stream.(Prefetcher).Prefetch(context.Background()) }()
 	prefetch := receiveFetcherChunkCall(t, getter.chunkCalls)
 
 	// An already-admitted prefetch must not make manifest metadata wait. The
 	// second Fetch has to finish while the prefetch Get remains blocked.
 	fetchDone := make(chan error, 1)
 	go func() {
-		_, err := fetcher.Fetch(context.Background(), keyB)
+		_, err := fetcher.OpenManifest(context.Background(), keyB)
 		fetchDone <- err
 	}()
 	if err := receiveFetcherError(t, fetchDone); err != nil {
@@ -136,16 +129,16 @@ func TestFetcherManifestLoadBlocksNewPrefetch(t *testing.T) {
 		entered: make(chan struct{}),
 		release: make(chan struct{}),
 	}
-	publicFetcher := NewFetcher(fetcherTestCustomerKey, getter, fetcherTestDecryptor{})
+	publicFetcher := NewFetcher([32]byte{}, getter, fetcherTestDecryptor{})
 	fetcher := publicFetcher.(*fetcher)
-	stream, err := fetcher.Fetch(context.Background(), keyA)
+	stream, err := fetcher.OpenManifest(context.Background(), keyA)
 	if err != nil {
 		t.Fatalf("Fetch(A): %v", err)
 	}
 
 	fetchDone := make(chan error, 1)
 	go func() {
-		_, err := fetcher.Fetch(context.Background(), keyB)
+		_, err := fetcher.OpenManifest(context.Background(), keyB)
 		fetchDone <- err
 	}()
 	select {
@@ -155,7 +148,7 @@ func TestFetcherManifestLoadBlocksNewPrefetch(t *testing.T) {
 	}
 
 	prefetchDone := make(chan error, 1)
-	go func() { prefetchDone <- stream.(Prefetcher).Prefetch(context.Background(), keyA) }()
+	go func() { prefetchDone <- stream.(Prefetcher).Prefetch(context.Background()) }()
 	waitForChangeChannel(t, fetcher.cache.scheduler)
 	assertNoFetcherChunkCall(t, route.chunkCalls)
 
@@ -182,8 +175,8 @@ func TestNewStreamsHaveIndependentAdmission(t *testing.T) {
 			CiphertextHash: sha256.Sum256(chunk),
 		}},
 	}
-	streamA := NewStream(m, make([][32]byte, 1), getter, &passthroughEncryptor{plain: chunk})
-	streamB := NewStream(m, make([][32]byte, 1), getter, &passthroughEncryptor{plain: chunk})
+	streamA := newTestManifestStream(m, make([][32]byte, 1), getter, &passthroughEncryptor{plain: chunk})
+	streamB := newTestManifestStream(m, make([][32]byte, 1), getter, &passthroughEncryptor{plain: chunk})
 
 	readDone := make(chan error, 1)
 	go func() {
@@ -194,7 +187,7 @@ func TestNewStreamsHaveIndependentAdmission(t *testing.T) {
 
 	prefetchDone := make(chan error, 1)
 	go func() { prefetchDone <- streamB.(Prefetcher).Prefetch(context.Background()) }()
-	// Independent NewStream schedulers admit B's prefetch even while A's
+	// Independent test Stream schedulers admit B's prefetch even while A's
 	// on-demand Get remains active.
 	prefetch := receiveFetcherChunkCall(t, getter.chunkCalls)
 	close(prefetch.release)
@@ -220,8 +213,6 @@ func (fetcherTestDecryptor) DecryptChunkInPlace(_ [32]byte, ciphertext []byte) (
 func (fetcherTestDecryptor) UnsealKeyTable(_ [32]byte, _, _ []byte) ([]byte, error) {
 	return make([]byte, 32), nil
 }
-
-func fetcherTestCustomerKey() ([32]byte, error) { return [32]byte{}, nil }
 
 type fetcherRouteGetter struct {
 	t          *testing.T

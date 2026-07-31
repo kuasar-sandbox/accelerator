@@ -70,6 +70,13 @@ Global Flags:
 裸 `<hex>` 等价)。位置参数须置于 flags 之后(Go stdlib flag 在首个非
 flag 实参处停止解析)。
 
+`pkg/manifest` 同时提供 canonical ref parser。`manifest://` 只允许一个 64 位
+小写十六进制 content key;多层组合必须由调用方传入显式 ref 数组并使用
+`fetch.NewLayered`,不再使用 `manifest://k1:k2`。文件引用为
+`file://<path>[@sha256:<digest>][@location:<name>]`;带 location 时 path 必须是
+basename,location 匹配 `[A-Za-z0-9][A-Za-z0-9._-]*`,只保存逻辑名称,不携带
+宿主目录。允许数字开头以直接容纳 UUIDv7 sandbox/build ID。
+
 ### 2.3 `manifest-ctl store` — 数据写入
 
 ```
@@ -475,14 +482,14 @@ ingest 用一个有界 worker pool,并发度取 store 客户端连接池大小(`
 ### 4.8 读路径(细节)
 
 ```
-manifest key(s)
+manifest key
    │
    ├─ on-demand Getter: Get(partition=manifest)
    ▼
 parse index + unseal key table
    │
    ▼
-Stream (single manifest or top-to-bottom overlay)
+Stream (single manifest; callers use NewLayered for explicit top-to-bottom arrays)
    │
    ├─ RunAt: resolve visible Hole / Zero / Data
    ├─ ReadAt: fetch visible Data chunks concurrently
@@ -500,12 +507,10 @@ Stream 采用 top-to-bottom 可见性:Data 和 Zero 遮挡下层,只有 Hole 或
 chunks,不会扫描或物化完整镜像。
 
 支持预取的 Stream 额外实现 `fetch.Prefetcher`。`Prefetch(ctx)` 遍历整个逻辑
-Stream,只对最终可见且实现 `PrefetchChunkStream` 的 Data run 调用完整物理
+Stream,只对最终可见且支持内部 chunk 预取的 Data run 调用完整物理
 chunk 的 cache Get;成功命中后立即 Release,不读取 Blob、不校验、不解密、不
-pin。`Prefetch(ctx, keys...)` 用 manifest content key 选择最终 serving 叶子;
-所有 key 在首个 Get 前按组合树结构完成校验,完全被遮挡的 keyed 叶子仍属于该
-Stream。未绑定 manifest key 的本地文件或直接 `NewStream` 只在无参数预取时
-入选,但始终参与可见性遮挡。
+pin。预取作用于当前组合 Stream 的完整可见视图,不再提供按 manifest key
+选择叶子的接口。
 
 同一 Fetcher 的 manifest metadata、普通 ReadAt 和所有 Stream 共用一个底层
 Getter 与请求调度器。on-demand 请求从不等待已开始的 prefetch;存在任意

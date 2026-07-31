@@ -51,7 +51,7 @@ func assertRegion(t *testing.T, b []byte, want byte, name string) {
 func TestRunAt_DataHoleData(t *testing.T) {
 	const dataSize, holeSize = uint64(4096), uint64(4096)
 	m := buildHoleManifest(dataSize, holeSize)
-	f := NewStream(m, make([][32]byte, 2), nil, nil)
+	f := newTestManifestStream(m, make([][32]byte, 2), nil, nil)
 	defer f.Close()
 	full := m.ImageSize
 
@@ -81,7 +81,7 @@ func TestReadAt_ZeroFillsHole(t *testing.T) {
 	m := buildHoleManifest(dataSize, holeSize)
 	plain := bytes.Repeat([]byte{0xEE}, int(dataSize))
 	stampHashes(m, plain)
-	f := NewStream(m, make([][32]byte, 2), &staticGetter{plain}, &passthroughEncryptor{plain: plain})
+	f := newTestManifestStream(m, make([][32]byte, 2), &staticGetter{plain}, &passthroughEncryptor{plain: plain})
 	defer f.Close()
 
 	buf := make([]byte, m.ImageSize)
@@ -102,7 +102,7 @@ func TestReadAt_OffsetInsideHole(t *testing.T) {
 	const dataSize, holeSize = uint64(4096), uint64(8192)
 	m := buildHoleManifest(dataSize, holeSize)
 	plain := bytes.Repeat([]byte{0xEE}, int(dataSize))
-	f := NewStream(m, make([][32]byte, 2), &staticGetter{plain}, &passthroughEncryptor{plain: plain})
+	f := newTestManifestStream(m, make([][32]byte, 2), &staticGetter{plain}, &passthroughEncryptor{plain: plain})
 	defer f.Close()
 
 	buf := bytes.Repeat([]byte{0xFF}, 1024)
@@ -126,7 +126,7 @@ func TestReadAt_PartialEOF(t *testing.T) {
 	}
 	plain := bytes.Repeat([]byte{0xCC}, int(dataSize))
 	stampHashes(m, plain)
-	f := NewStream(m, make([][32]byte, 1), &staticGetter{plain}, &passthroughEncryptor{plain: plain})
+	f := newTestManifestStream(m, make([][32]byte, 1), &staticGetter{plain}, &passthroughEncryptor{plain: plain})
 	defer f.Close()
 
 	buf := make([]byte, 1024)
@@ -153,7 +153,7 @@ func TestReadAt_FillsCompleteBuf(t *testing.T) {
 	}
 	plain := bytes.Repeat([]byte{0xDD}, int(dataSize))
 	stampHashes(m, plain)
-	f := NewStream(m, make([][32]byte, 1), &staticGetter{plain}, &passthroughEncryptor{plain: plain})
+	f := newTestManifestStream(m, make([][32]byte, 1), &staticGetter{plain}, &passthroughEncryptor{plain: plain})
 	defer f.Close()
 
 	buf := make([]byte, 1024)
@@ -174,7 +174,7 @@ func TestReadAt_ZeroLenBuf(t *testing.T) {
 		ImageSize: 4096,
 		Entries:   []codec.ChunkEntry{{Offset: 0, Size: 4096}},
 	}
-	f := NewStream(m, make([][32]byte, 1), nil, nil)
+	f := newTestManifestStream(m, make([][32]byte, 1), nil, nil)
 	defer f.Close()
 	n, err := f.ReadAt(context.Background(), nil, 100)
 	if n != 0 || err != nil {
@@ -189,11 +189,11 @@ func TestRunChunkAt_ChainLoop(t *testing.T) {
 	m := buildHoleManifest(dataSize, holeSize)
 	plain := bytes.Repeat([]byte{0xEE}, int(dataSize))
 	stampHashes(m, plain)
-	s := NewStream(m, make([][32]byte, 2), &staticGetter{plain}, &passthroughEncryptor{plain: plain})
+	s := newTestManifestStream(m, make([][32]byte, 2), &staticGetter{plain}, &passthroughEncryptor{plain: plain})
 	defer s.Close()
-	cs, ok := s.(ChunkStream)
+	cs, ok := s.(chunkStream)
 	if !ok {
-		t.Fatal("manifestStream must implement ChunkStream")
+		t.Fatal("manifestStream must implement chunkStream")
 	}
 
 	out := make([]byte, m.ImageSize)

@@ -4,7 +4,6 @@ import (
 	"context"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
-	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
 // layeredStream overlays several Streams (top → bottom) into one Stream: the
@@ -12,8 +11,8 @@ import (
 // out-of-bounds) falls through to lower layers; an IsZero chunk is opaque and
 // does not fall through. Size is the maximum over layers.
 //
-// It exposes Stream and Prefetcher, but not ChunkStream: a layer's chunk index
-// is layer-local. It consumes ChunkStream and PrefetchChunkStream internally,
+// It exposes Stream and Prefetcher, but not chunkStream: a layer's chunk index
+// is layer-local. It consumes chunkStream and prefetchChunkStream internally,
 // threading the final serving leaf's chunk index from resolve to read/prefetch.
 type layeredStream struct {
 	layers []Stream // top → bottom
@@ -66,6 +65,6 @@ func (ls *layeredStream) ReadAt(ctx context.Context, buf []byte, offset uint64) 
 	return readResolvedAt(ctx, ls, buf, offset)
 }
 
-func (ls *layeredStream) Prefetch(ctx context.Context, keys ...store.ContentKey) error {
-	return prefetchStream(ctx, ls, keys)
+func (ls *layeredStream) Prefetch(ctx context.Context) error {
+	return prefetchStream(ctx, ls)
 }

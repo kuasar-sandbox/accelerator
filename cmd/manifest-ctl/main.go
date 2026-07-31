@@ -256,19 +256,19 @@ func cmdLoad(args []string) {
 	}
 	cfg := loadCfg(*gf.configPath)
 
-	fc, err := cfg.NewFetcher(cfg.FetchKeyFunc())
+	fc, err := cfg.NewFetcher()
 	if err != nil {
 		fatal("fetcher: %v", err)
 	}
 	defer fc.Close()
 
-	keys, err := manifest.ParseKeyRefs(keyArg)
+	key, err := manifest.ParseKeyRef(keyArg)
 	if err != nil {
 		fatal("%v", err)
 	}
 
 	ctx := context.Background()
-	stream, err := fc.Fetch(ctx, keys...)
+	stream, err := fc.OpenManifest(ctx, key)
 	if err != nil {
 		fatal("fetch manifest: %v", err)
 	}
@@ -583,73 +583,67 @@ func cmdVerify(args []string) {
 	}
 	cfg := loadCfg(*gf.configPath)
 
-	fc, err := cfg.NewFetcher(cfg.FetchKeyFunc())
+	fc, err := cfg.NewFetcher()
 	if err != nil {
 		fatal("fetcher: %v", err)
 	}
 	defer fc.Close()
 
-	keys, err := manifest.ParseKeyRefs(keyArg)
+	key, err := manifest.ParseKeyRef(keyArg)
 	if err != nil {
 		fatal("%v", err)
 	}
 
 	ctx := context.Background()
 	totalFailed := 0
-	for li, key := range keys {
-		// Enumerate chunks from the raw manifest blob (as `info` does), then
-		// verify each non-zero chunk through the fetch path — fetch, decrypt,
-		// and per-chunk key validation end-to-end.
-		data, derr := cfg.GetManifestBlob(ctx, key)
-		if derr != nil {
-			fatal("layer %d: get manifest: %v", li, derr)
-		}
-		m, _, derr := codec.Unmarshal(data)
-		if derr != nil {
-			fatal("layer %d: unmarshal manifest: %v", li, derr)
-		}
-		stream, ferr := fc.Fetch(ctx, key)
-		if ferr != nil {
-			fatal("layer %d: fetch manifest: %v", li, ferr)
-		}
-		defer stream.Close()
-
-		label := ""
-		if len(keys) > 1 {
-			label = fmt.Sprintf("layer %d ", li)
-		}
-		count := int(m.ChunkCount())
-		verified, skipped, failed := 0, 0, 0
-		buf := make([]byte, m.MaxChunkSize)
-		for i, entry := range m.Entries {
-			if entry.IsZero {
-				skipped++
-				if !*noProgress {
-					fmt.Fprintf(os.Stderr, "\rverify: %s%d/%d (skip zero)", label, i+1, count)
-				}
-				continue
-			}
-			if cap(buf) < int(entry.Size) {
-				buf = make([]byte, entry.Size)
-			}
-			buf = buf[:entry.Size]
-			if _, rerr := stream.ReadAt(ctx, buf, entry.Offset); rerr != nil {
-				fmt.Fprintf(os.Stderr, "\n%schunk %d: read failed: %v\n", label, i, rerr)
-				failed++
-				continue
-			}
-			verified++
-			if !*noProgress {
-				fmt.Fprintf(os.Stderr, "\rverify: %s%d/%d", label, i+1, count)
-			}
-		}
-		if !*noProgress {
-			fmt.Fprintln(os.Stderr)
-		}
-		fmt.Fprintf(os.Stderr, "%sverified: %d  skipped(zero): %d  holes: %d  failed: %d  total chunks: %d\n",
-			label, verified, skipped, len(m.Holes), failed, count)
-		totalFailed += failed
+	// Enumerate chunks from the raw manifest blob (as `info` does), then
+	// verify each non-zero chunk through the fetch path — fetch, decrypt,
+	// and per-chunk key validation end-to-end.
+	data, derr := cfg.GetManifestBlob(ctx, key)
+	if derr != nil {
+		fatal("get manifest: %v", derr)
 	}
+	m, _, derr := codec.Unmarshal(data)
+	if derr != nil {
+		fatal("unmarshal manifest: %v", derr)
+	}
+	stream, ferr := fc.OpenManifest(ctx, key)
+	if ferr != nil {
+		fatal("open manifest: %v", ferr)
+	}
+	defer stream.Close()
+
+	count := int(m.ChunkCount())
+	verified, skipped, failed := 0, 0, 0
+	buf := make([]byte, m.MaxChunkSize)
+	for i, entry := range m.Entries {
+		if entry.IsZero {
+			skipped++
+			if !*noProgress {
+				fmt.Fprintf(os.Stderr, "\rverify: %d/%d (skip zero)", i+1, count)
+			}
+			continue
+		}
+		if cap(buf) < int(entry.Size) {
+			buf = make([]byte, entry.Size)
+		}
+		buf = buf[:entry.Size]
+		if _, rerr := stream.ReadAt(ctx, buf, entry.Offset); rerr != nil {
+			fmt.Fprintf(os.Stderr, "\nchunk %d: read failed: %v\n", i, rerr)
+			failed++
+			continue
+		}
+		verified++
+		if !*noProgress {
+			fmt.Fprintf(os.Stderr, "\rverify: %d/%d", i+1, count)
+		}
+	}
+	if !*noProgress {
+		fmt.Fprintln(os.Stderr)
+	}
+	fmt.Fprintf(os.Stderr, "verified: %d  skipped(zero): %d  holes: %d  failed: %d  total chunks: %d\n",
+		verified, skipped, len(m.Holes), failed, count)
+	totalFailed += failed
 	if totalFailed > 0 {
 		os.Exit(1)
 	}

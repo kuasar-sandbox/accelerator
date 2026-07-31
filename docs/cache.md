@@ -550,7 +550,7 @@ Go 进程内存控制在 < 200 MiB(CMS sketch + 原子计数器 + wire 连接池
 manifest-ctl load
    │
    ▼
-fetch.Fetcher.WriteTo()
+fetch.Fetcher.OpenManifest() → Stream.ReadAt()
    │
    ├─ binary-search manifest index for chunk range
    ├─ spawn N goroutines

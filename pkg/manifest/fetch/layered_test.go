@@ -10,6 +10,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 )
 
 // newTestStream builds a single-manifest Stream whose data chunks all decrypt
@@ -23,7 +24,7 @@ func newTestStream(m *codec.Manifest, fill byte) Stream {
 	}
 	plain := bytes.Repeat([]byte{fill}, int(maxSz))
 	stampHashes(m, plain)
-	return NewStream(m, make([][32]byte, len(m.Entries)), &staticGetter{plain: plain}, &passthroughEncryptor{plain: plain})
+	return newTestManifestStream(m, make([][32]byte, len(m.Entries)), &staticGetter{plain: plain}, &passthroughEncryptor{plain: plain})
 }
 
 func readAll(t *testing.T, s Stream) []byte {
@@ -150,21 +151,25 @@ func TestLayered_SingleLayerIdentity(t *testing.T) {
 func TestLayered_MixedFileAndManifest(t *testing.T) {
 	const size = uint64(12288) // 3 × 4096
 
-	// File base: data in [0,8192), sparse hole in [8192,12288).
+	// Tarstream base: data in [0,8192), sparse hole in [8192,12288).
 	dir := t.TempDir()
 	path := filepath.Join(dir, "base.img")
 	f, err := os.Create(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.WriteAt(bytes.Repeat([]byte{'B'}, 8192), 0); err != nil {
+	logical := append(bytes.Repeat([]byte{'B'}, 8192), make([]byte, 4096)...)
+	baseSource, err := sparse.NewSource(bytes.NewReader(logical), size, []sparse.Extent{{Offset: 8192, Size: 4096}})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := f.Truncate(int64(size)); err != nil { // extend with a hole
+	if _, err := tarstream.WriteTo(context.Background(), f, "base", baseSource); err != nil {
 		t.Fatal(err)
 	}
-	f.Close()
-	base, err := OpenFileStream(path)
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	base, err := OpenTarStream(path)
 	if err != nil {
 		t.Fatal(err)
 	}
