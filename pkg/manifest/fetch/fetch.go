@@ -21,9 +21,9 @@
 // (which threads a serving layer's chunk index from resolve to read). External
 // consumers use the plain Stream methods.
 //
-// Prefetcher is a separate optional enhancement. Keeping prefetch out of Stream
-// and chunkStream lets non-cache-backed streams implement either contract
-// without acquiring a meaningless background-I/O method.
+// Prefetcher is a separate optional enhancement for backend-specific warm-up.
+// Keeping prefetch out of Stream and chunkStream lets each backend expose the
+// capability only when it has a meaningful implementation.
 //
 // RunAt, ReadAt, and Prefetch are safe for concurrent use. Close is a lifetime
 // boundary: callers cancel and wait for active operations before closing.
@@ -74,8 +74,9 @@ type chunkStream interface {
 	ReadChunkAt(ctx context.Context, buf []byte, chunkIdx, offset, end uint64) (int, error)
 }
 
-// Prefetcher optionally warms the cache for the visible Data runs of an entire
-// logical Stream.
+// Prefetcher optionally warms the backend read path for an entire Stream.
+// Completion means the backend accepted or completed its own best-effort
+// operation; it is not a residency or readiness guarantee.
 type Prefetcher interface {
 	Prefetch(ctx context.Context) error
 }
