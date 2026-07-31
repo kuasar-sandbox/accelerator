@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"golang.org/x/sys/unix"
 )
 
 // TestOpenTarStream: a tarstream artifact serves as a Stream — hole
@@ -112,3 +114,111 @@ func TestOpenTarStream(t *testing.T) {
 		t.Fatal("markerless tar accepted as platform artifact")
 	}
 }
+
+func TestTarFileStreamPrefetch(t *testing.T) {
+	const logicalSize = 8 << 20
+	logical := make([]byte, logicalSize)
+	copy(logical, "HEAD")
+	copy(logical[logicalSize-4:], "TAIL")
+	src, err := sparse.NewSource(
+		bytes.NewReader(logical),
+		logicalSize,
+		[]sparse.Extent{{Offset: 4096, Size: logicalSize - 8192}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(t.TempDir(), "snapshot.snapshot")
+	out, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tarstream.WriteTo(context.Background(), out, "snapshot", src); err != nil {
+		t.Fatal(err)
+	}
+	if err := out.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() == logicalSize {
+		t.Fatalf("fixture physical size = logical size = %d; want distinct ranges", logicalSize)
+	}
+
+	type adviceCall struct {
+		fd             int
+		offset, length int64
+		advice         int
+	}
+	var calls []adviceCall
+	originalFadvise := fadvise
+	fadvise = func(fd int, offset, length int64, advice int) error {
+		calls = append(calls, adviceCall{
+			fd:     fd,
+			offset: offset,
+			length: length,
+			advice: advice,
+		})
+		return nil
+	}
+	t.Cleanup(func() { fadvise = originalFadvise })
+
+	stream, err := OpenTarStream(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("OpenTarStream submitted %d advice call(s); want none", len(calls))
+	}
+	local, ok := stream.(*tarFileStream)
+	if !ok {
+		t.Fatalf("OpenTarStream type = %T; want *tarFileStream", stream)
+	}
+	prefetcher, ok := stream.(Prefetcher)
+	if !ok {
+		t.Fatalf("OpenTarStream type %T does not implement Prefetcher", stream)
+	}
+
+	if err := prefetcher.Prefetch(context.Background()); err != nil {
+		t.Fatalf("Prefetch: %v", err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("Prefetch advice calls = %d; want 1", len(calls))
+	}
+	if got, want := calls[0].fd, int(local.f.Fd()); got != want {
+		t.Errorf("advice fd = %d; want open stream fd %d", got, want)
+	}
+	if got := calls[0].offset; got != 0 {
+		t.Errorf("advice offset = %d; want 0", got)
+	}
+	if got, want := calls[0].length, info.Size(); got != want {
+		t.Errorf("advice length = %d; want physical artifact size %d", got, want)
+	}
+	if got := calls[0].advice; got != unix.FADV_WILLNEED {
+		t.Errorf("advice = %d; want FADV_WILLNEED (%d)", got, unix.FADV_WILLNEED)
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := prefetcher.Prefetch(canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Prefetch(canceled) error = %v; want context.Canceled", err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("canceled Prefetch submitted advice; calls = %d, want 1", len(calls))
+	}
+
+	wantErr := errors.New("advice unavailable")
+	fadvise = func(int, int64, int64, int) error { return wantErr }
+	if err := prefetcher.Prefetch(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("Prefetch advice error = %v; want wrapped %v", err, wantErr)
+	}
+
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close after Prefetch: %v", err)
+	}
+}
+
+var _ Prefetcher = (*tarFileStream)(nil)
