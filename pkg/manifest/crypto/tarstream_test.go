@@ -50,6 +50,79 @@ func TestRFC5297AppendixA1(t *testing.T) {
 	}
 }
 
+func TestRFC5297AppendixA2(t *testing.T) {
+	key := decodeHex(t, "7f7e7d7c7b7a79787776757473727170404142434445464748494a4b4c4d4e4f")
+	ad1 := decodeHex(t, "00112233445566778899aabbccddeeffdeaddadadeaddadaffeeddccbbaa99887766554433221100")
+	ad2 := decodeHex(t, "102030405060708090a0")
+	nonce := decodeHex(t, "09f911029d74e35bd84156c5635688c0")
+	plaintext := decodeHex(t, "7468697320697320736f6d6520706c61696e7465787420746f20656e6372797074207573696e67205349562d414553")
+	wantSIV := decodeHex(t, "7bdb6e3b432667eb06f4d14bff2fbd0f")
+	wantCiphertext := decodeHex(t, "cb900f2fddbe404326601965c889bf17dba77ceb094fa663b7a3f748ba8af829ea64ad544a272e9c485b62a3fd5c0d")
+
+	macBlock, err := aes.NewCipher(key[:16])
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctrBlock, err := aes.NewCipher(key[16:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	siv := s2v(macBlock, ad1, ad2, nonce, plaintext)
+	if !bytes.Equal(siv[:], wantSIV) {
+		t.Fatalf("S2V = %x, want %x", siv, wantSIV)
+	}
+	iv := maskedCTRIV(siv)
+	got := make([]byte, len(plaintext))
+	cipher.NewCTR(ctrBlock, iv[:]).XORKeyStream(got, plaintext)
+	if !bytes.Equal(got, wantCiphertext) {
+		t.Fatalf("CTR ciphertext = %x, want %x", got, wantCiphertext)
+	}
+}
+
+func TestRFC4493CMACVectors(t *testing.T) {
+	key := decodeHex(t, "2b7e151628aed2a6abf7158809cf4f3c")
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := []string{
+		"",
+		"6bc1bee22e409f96e93d7e117393172a",
+		"6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e5130c81c46a35ce411",
+		"6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e5130c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710",
+	}
+	tags := []string{
+		"bb1d6929e95937287fa37d129b756746",
+		"070a16b46b4d4144f79bdd9dd04a287c",
+		"dfa66747de9ae63030ca32611497c827",
+		"51f0bebf7e3b9d92fc49741779363cfe",
+	}
+	for i := range messages {
+		got := cmacSum(block, decodeHex(t, messages[i]))
+		want := decodeHex(t, tags[i])
+		if !bytes.Equal(got[:], want) {
+			t.Fatalf("CMAC vector %d = %x, want %x", i, got, want)
+		}
+	}
+}
+
+func TestAESSIVCTRMask(t *testing.T) {
+	siv := [aes.BlockSize]byte{}
+	for i := range siv {
+		siv[i] = 0xff
+	}
+	masked := maskedCTRIV(siv)
+	for i := range masked {
+		want := byte(0xff)
+		if i == 8 || i == 12 {
+			want = 0x7f
+		}
+		if masked[i] != want {
+			t.Fatalf("masked IV byte %d = 0x%02x, want 0x%02x", i, masked[i], want)
+		}
+	}
+}
+
 func TestTarStreamCodecRoundTripAndBuffers(t *testing.T) {
 	var key [32]byte
 	for i := range key {
@@ -183,4 +256,30 @@ func TestTarStreamCodecConcurrent(t *testing.T) {
 	for err := range errs {
 		t.Error(err)
 	}
+}
+
+func FuzzTarStreamCodecRoundTrip(f *testing.F) {
+	f.Add([]byte("plaintext"), []byte("aad"))
+	f.Add([]byte(nil), []byte(nil))
+	codec, _ := NewTarStreamCodec([32]byte{0x42})
+	f.Fuzz(func(t *testing.T, plaintext, aad []byte) {
+		if len(plaintext) > 1<<16 || len(aad) > 1<<16 {
+			t.Skip()
+		}
+		original := append([]byte(nil), plaintext...)
+		sealed, err := codec.Encrypt(nil, plaintext, aad)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(plaintext, original) {
+			t.Fatal("Encrypt modified plaintext")
+		}
+		opened, err := codec.DecryptInPlace(sealed, aad)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(opened, original) {
+			t.Fatal("round-trip mismatch")
+		}
+	})
 }

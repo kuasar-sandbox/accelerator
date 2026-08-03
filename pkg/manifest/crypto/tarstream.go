@@ -28,17 +28,24 @@ var (
 // use.
 type TarStreamCodec struct {
 	customerKey [32]byte
-	macKey      [32]byte
-	ctrKey      [32]byte
+	macBlock    cipher.Block
+	ctrBlock    cipher.Block
 }
 
 // NewTarStreamCodec derives the two AES-256-SIV keys from customerKey. It does
 // not read configuration, resolve credentials, or connect to storage.
 func NewTarStreamCodec(customerKey [32]byte) (*TarStreamCodec, error) {
-	c := &TarStreamCodec{customerKey: customerKey}
-	c.macKey = keyedHMAC(customerKey, macKeyDomain)
-	c.ctrKey = keyedHMAC(customerKey, ctrKeyDomain)
-	return c, nil
+	macKey := keyedHMAC(customerKey, macKeyDomain)
+	ctrKey := keyedHMAC(customerKey, ctrKeyDomain)
+	macBlock, err := aes.NewCipher(macKey[:])
+	if err != nil {
+		return nil, fmt.Errorf("crypto: tarstream MAC cipher: %w", err)
+	}
+	ctrBlock, err := aes.NewCipher(ctrKey[:])
+	if err != nil {
+		return nil, fmt.Errorf("crypto: tarstream CTR cipher: %w", err)
+	}
+	return &TarStreamCodec{customerKey: customerKey, macBlock: macBlock, ctrBlock: ctrBlock}, nil
 }
 
 func keyedHMAC(key [32]byte, data []byte) [32]byte {
@@ -65,23 +72,18 @@ func (c *TarStreamCodec) Encrypt(dst, plaintext, associatedData []byte) ([]byte,
 	if size < 0 {
 		return nil, fmt.Errorf("crypto: tarstream: plaintext size overflow")
 	}
-	macBlock, err := aes.NewCipher(c.macKey[:])
-	if err != nil {
-		return nil, fmt.Errorf("crypto: tarstream MAC cipher: %w", err)
-	}
-	ctrBlock, err := aes.NewCipher(c.ctrKey[:])
-	if err != nil {
-		return nil, fmt.Errorf("crypto: tarstream CTR cipher: %w", err)
-	}
-
-	siv := s2v(macBlock, []byte{FlagAESSIV}, associatedData, plaintext)
+	siv := s2v(c.macBlock, []byte{FlagAESSIV}, associatedData, plaintext)
 	start := len(dst)
-	dst = append(dst, make([]byte, size)...)
+	if cap(dst)-len(dst) >= size {
+		dst = dst[:len(dst)+size]
+	} else {
+		dst = append(dst, make([]byte, size)...)
+	}
 	record := dst[start:]
 	record[0] = FlagAESSIV
 	copy(record[1:1+aes.BlockSize], siv[:])
 	iv := maskedCTRIV(siv)
-	cipher.NewCTR(ctrBlock, iv[:]).XORKeyStream(record[aesSIVOverhead:], plaintext)
+	cipher.NewCTR(c.ctrBlock, iv[:]).XORKeyStream(record[aesSIVOverhead:], plaintext)
 	return dst, nil
 }
 
@@ -92,21 +94,12 @@ func (c *TarStreamCodec) DecryptInPlace(record, associatedData []byte) ([]byte, 
 	if len(record) < aesSIVOverhead || record[0] != FlagAESSIV {
 		return nil, fmt.Errorf("%w: invalid AES-SIV record", tarstream.ErrAuthentication)
 	}
-	macBlock, err := aes.NewCipher(c.macKey[:])
-	if err != nil {
-		return nil, fmt.Errorf("crypto: tarstream MAC cipher: %w", err)
-	}
-	ctrBlock, err := aes.NewCipher(c.ctrKey[:])
-	if err != nil {
-		return nil, fmt.Errorf("crypto: tarstream CTR cipher: %w", err)
-	}
-
 	var siv [aes.BlockSize]byte
 	copy(siv[:], record[1:aesSIVOverhead])
 	plaintext := record[aesSIVOverhead:]
 	iv := maskedCTRIV(siv)
-	cipher.NewCTR(ctrBlock, iv[:]).XORKeyStream(plaintext, plaintext)
-	want := s2v(macBlock, []byte{FlagAESSIV}, associatedData, plaintext)
+	cipher.NewCTR(c.ctrBlock, iv[:]).XORKeyStream(plaintext, plaintext)
+	want := s2v(c.macBlock, []byte{FlagAESSIV}, associatedData, plaintext)
 	if subtle.ConstantTimeCompare(siv[:], want[:]) != 1 {
 		clear(plaintext)
 		return nil, tarstream.ErrAuthentication
@@ -138,12 +131,7 @@ func s2v(block cipher.Block, values ...[]byte) [aes.BlockSize]byte {
 	}
 	last := values[len(values)-1]
 	if len(last) >= aes.BlockSize {
-		input := append([]byte(nil), last...)
-		start := len(input) - aes.BlockSize
-		for i := range aes.BlockSize {
-			input[start+i] ^= d[i]
-		}
-		return cmacSum(block, input)
+		return cmacSumXORLast(block, last, d)
 	}
 	padded := doubleBlock(d)
 	for i := range last {
@@ -154,6 +142,10 @@ func s2v(block cipher.Block, values ...[]byte) [aes.BlockSize]byte {
 }
 
 func cmacSum(block cipher.Block, message []byte) [aes.BlockSize]byte {
+	return cmacSumXORLast(block, message, [aes.BlockSize]byte{})
+}
+
+func cmacSumXORLast(block cipher.Block, message []byte, lastXOR [aes.BlockSize]byte) [aes.BlockSize]byte {
 	var zero [aes.BlockSize]byte
 	var l [aes.BlockSize]byte
 	block.Encrypt(l[:], zero[:])
@@ -166,28 +158,51 @@ func cmacSum(block cipher.Block, message []byte) [aes.BlockSize]byte {
 		blocks = 1
 	}
 	var state [aes.BlockSize]byte
+	var input [aes.BlockSize]byte
 	for i := 0; i < blocks-1; i++ {
-		var input [aes.BlockSize]byte
-		copy(input[:], message[i*aes.BlockSize:(i+1)*aes.BlockSize])
-		input = xorBlock(input, state)
+		clear(input[:])
+		blockStart := i * aes.BlockSize
+		copy(input[:], message[blockStart:blockStart+aes.BlockSize])
+		applyLastXOR(&input, blockStart, len(message), lastXOR)
+		for j := range aes.BlockSize {
+			input[j] ^= state[j]
+		}
 		block.Encrypt(state[:], input[:])
 	}
 
-	var last [aes.BlockSize]byte
+	clear(input[:])
 	start := (blocks - 1) * aes.BlockSize
 	if complete {
-		copy(last[:], message[start:start+aes.BlockSize])
-		last = xorBlock(last, k1)
+		copy(input[:], message[start:start+aes.BlockSize])
+		applyLastXOR(&input, start, len(message), lastXOR)
+		input = xorBlock(input, k1)
 	} else {
 		if start < len(message) {
-			copy(last[:], message[start:])
+			copy(input[:], message[start:])
+			applyLastXOR(&input, start, len(message), lastXOR)
 		}
-		last[len(message)-start] = 0x80
-		last = xorBlock(last, k2)
+		input[len(message)-start] = 0x80
+		input = xorBlock(input, k2)
 	}
-	last = xorBlock(last, state)
-	block.Encrypt(state[:], last[:])
+	input = xorBlock(input, state)
+	block.Encrypt(state[:], input[:])
 	return state
+}
+
+func applyLastXOR(block *[aes.BlockSize]byte, blockStart, messageSize int, value [aes.BlockSize]byte) {
+	if messageSize < aes.BlockSize {
+		return
+	}
+	xorStart := messageSize - aes.BlockSize
+	for i := range aes.BlockSize {
+		position := blockStart + i
+		if position >= messageSize {
+			break
+		}
+		if position >= xorStart {
+			block[i] ^= value[position-xorStart]
+		}
+	}
 }
 
 func doubleBlock(value [aes.BlockSize]byte) [aes.BlockSize]byte {
