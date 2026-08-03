@@ -33,7 +33,13 @@ func TestParseRef(t *testing.T) {
 		{
 			name:     "digested located file",
 			raw:      "file://base.image@sha256:" + digest + "@location:build.1",
-			want:     Ref{Scheme: RefSchemeFile, Path: "base.image", Digest: digest, Location: "build.1"},
+			want:     Ref{Scheme: RefSchemeFile, Path: "base.image", DigestScheme: "sha256", Digest: digest, Location: "build.1"},
+			portable: true,
+		},
+		{
+			name:     "HMAC digested located file",
+			raw:      "file://base.image@hmac:" + digest + "@location:build.1",
+			want:     Ref{Scheme: RefSchemeFile, Path: "base.image", DigestScheme: "hmac", Digest: digest, Location: "build.1"},
 			portable: true,
 		},
 	}
@@ -71,7 +77,11 @@ func TestParseRefRejectsInvalid(t *testing.T) {
 		"file://root.snapshot@location:x@location:y",
 		"file://root.snapshot@location:",
 		"file://base.image@sha256:",
+		"file://base.image@hmac:",
 		"file://base.image@location:x@sha256:" + digest,
+		"file://base.image@location:x@hmac:" + digest,
+		"file://base.image@sha256:" + digest + "@hmac:" + digest,
+		"file://base.image@hmac:" + digest + "@hmac:" + digest,
 		"file://base.image@sha256:" + strings.Repeat("A", 64),
 	} {
 		t.Run(raw, func(t *testing.T) {
@@ -79,5 +89,18 @@ func TestParseRefRejectsInvalid(t *testing.T) {
 				t.Fatalf("ParseRef(%q) succeeded", raw)
 			}
 		})
+	}
+}
+
+func TestRefValidateDigestFieldsTogether(t *testing.T) {
+	base := Ref{Scheme: RefSchemeFile, Path: "base.image"}
+	for _, ref := range []Ref{
+		{Scheme: base.Scheme, Path: base.Path, Digest: strings.Repeat("a", 64)},
+		{Scheme: base.Scheme, Path: base.Path, DigestScheme: "sha256"},
+		{Scheme: base.Scheme, Path: base.Path, DigestScheme: "unknown", Digest: strings.Repeat("a", 64)},
+	} {
+		if err := ref.Validate(); err == nil {
+			t.Fatalf("Validate(%#v) succeeded", ref)
+		}
 	}
 }

@@ -98,4 +98,7 @@ crypto:
   # Production must use aes; fake is for performance baselining only.
   chunk: aes
   manifest: aes
+  # Local immutable-file compatibility policy (off | auto | required).
+  # This is not an algorithm selector. Omitted means off.
+  local: off
 `
