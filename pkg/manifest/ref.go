@@ -12,19 +12,20 @@ const (
 )
 
 // Ref is the canonical logical reference shared by manifest-backed and local
-// file-backed data. Digest is the lowercase hex payload of an optional
-// @sha256 qualifier; Location is the logical name from an optional @location
+// file-backed data. DigestScheme and Digest carry an optional @sha256 or @hmac
+// qualifier; Location is the logical name from an optional @location
 // qualifier. Host paths for locations are deliberately not part of Ref.
 type Ref struct {
-	Scheme   string
-	Path     string
-	Digest   string
-	Location string
+	Scheme       string
+	Path         string
+	DigestScheme string
+	Digest       string
+	Location     string
 }
 
 // ParseRef parses one manifest or file reference. A manifest reference always
 // contains exactly one content key. File qualifiers, when present, have the
-// fixed order @sha256 then @location.
+// fixed order @sha256|@hmac then @location.
 func ParseRef(raw string) (Ref, error) {
 	var ref Ref
 	switch {
@@ -43,14 +44,25 @@ func ParseRef(raw string) (Ref, error) {
 			}
 			value = value[:i]
 		}
-		if i := strings.LastIndex(value, "@sha256:"); i >= 0 {
-			ref.Digest = value[i+len("@sha256:"):]
+		sha := strings.LastIndex(value, "@sha256:")
+		hmac := strings.LastIndex(value, "@hmac:")
+		if sha >= 0 && hmac >= 0 {
+			return ref, fmt.Errorf("file ref: multiple digest qualifiers")
+		}
+		if i := max(sha, hmac); i >= 0 {
+			qualifier := "@sha256:"
+			ref.DigestScheme = "sha256"
+			if i == hmac {
+				qualifier = "@hmac:"
+				ref.DigestScheme = "hmac"
+			}
+			ref.Digest = value[i+len(qualifier):]
 			if ref.Digest == "" {
-				return ref, fmt.Errorf("file ref: sha256 digest is empty")
+				return ref, fmt.Errorf("file ref: %s digest is empty", ref.DigestScheme)
 			}
 			value = value[:i]
 		}
-		if strings.Contains(value, "@sha256:") || strings.Contains(value, "@location:") {
+		if strings.Contains(value, "@sha256:") || strings.Contains(value, "@hmac:") || strings.Contains(value, "@location:") {
 			return ref, fmt.Errorf("file ref: duplicate or out-of-order qualifier")
 		}
 		ref.Scheme = RefSchemeFile
@@ -69,7 +81,7 @@ func ParseRef(raw string) (Ref, error) {
 func (r Ref) Validate() error {
 	switch r.Scheme {
 	case RefSchemeManifest:
-		if r.Digest != "" || r.Location != "" {
+		if r.DigestScheme != "" || r.Digest != "" || r.Location != "" {
 			return fmt.Errorf("manifest ref: qualifiers are not allowed")
 		}
 		if _, err := ParseHexKey(r.Path); err != nil {
@@ -79,12 +91,18 @@ func (r Ref) Validate() error {
 		if r.Path == "" {
 			return fmt.Errorf("file ref: path is required")
 		}
+		if (r.DigestScheme == "") != (r.Digest == "") {
+			return fmt.Errorf("file ref: digest scheme and digest must be set together")
+		}
 		if r.Digest != "" {
+			if r.DigestScheme != "sha256" && r.DigestScheme != "hmac" {
+				return fmt.Errorf("file ref: unsupported digest scheme %q", r.DigestScheme)
+			}
 			if len(r.Digest) != 64 || strings.ToLower(r.Digest) != r.Digest {
-				return fmt.Errorf("file ref: sha256 digest must be 64 lowercase hex characters")
+				return fmt.Errorf("file ref: %s digest must be 64 lowercase hex characters", r.DigestScheme)
 			}
 			if _, err := ParseHexKey(r.Digest); err != nil {
-				return fmt.Errorf("file ref: sha256 digest: %w", err)
+				return fmt.Errorf("file ref: %s digest: %w", r.DigestScheme, err)
 			}
 		}
 		if r.Location != "" {
@@ -106,7 +124,7 @@ func (r Ref) Validate() error {
 func (r Ref) String() string {
 	value := r.Scheme + "://" + r.Path
 	if r.Digest != "" {
-		value += "@sha256:" + r.Digest
+		value += "@" + r.DigestScheme + ":" + r.Digest
 	}
 	if r.Location != "" {
 		value += "@location:" + r.Location
