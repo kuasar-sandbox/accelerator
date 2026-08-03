@@ -13,7 +13,10 @@ type optionTestCodec struct{}
 
 func (*optionTestCodec) CiphertextSize(size int) int { return size + recordOverhead }
 func (*optionTestCodec) Encrypt(dst, plaintext, _ []byte) ([]byte, error) {
-	return append(dst, make([]byte, len(plaintext)+recordOverhead)...), nil
+	start := len(dst)
+	dst = append(dst, make([]byte, len(plaintext)+recordOverhead)...)
+	copy(dst[start+recordOverhead:], plaintext)
+	return dst, nil
 }
 func (*optionTestCodec) DecryptInPlace(ciphertext, _ []byte) ([]byte, error) {
 	return ciphertext[recordOverhead:], nil

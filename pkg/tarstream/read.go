@@ -264,6 +264,20 @@ func discoverDigest(ra io.ReaderAt, size int64, payloadName string) ([32]byte, b
 	if first.name != payloadName {
 		return zero, false, nil
 	}
+	dataStart, err := firstReader.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return zero, false, err
+	}
+	packedSize := first.stored - first.mapLen
+	if dataStart < 0 || packedSize < 0 || dataStart > size || packedSize > size-dataStart {
+		return zero, false, fmt.Errorf("%w: invalid payload bounds", ErrInvalidCanonicalTarstream)
+	}
+	expectedMarkerStart := dataStart + packedSize
+	padding := (512 - first.stored%512) % 512
+	if padding > size-expectedMarkerStart {
+		return zero, false, fmt.Errorf("%w: invalid payload padding", ErrInvalidCanonicalTarstream)
+	}
+	expectedMarkerStart += padding
 
 	markerReader := io.NewSectionReader(ra, 0, size)
 	marker, err := locateAt(markerReader, 1, seekSkip(markerReader))
@@ -276,10 +290,6 @@ func discoverDigest(ra io.ReaderAt, size int64, payloadName string) ([32]byte, b
 	if !strings.HasPrefix(marker.name, SHA256MarkerPrefix) {
 		return zero, false, nil
 	}
-	digest, ok := parseDigestMarker(marker.name)
-	if !ok {
-		return zero, false, fmt.Errorf("%w: invalid digest marker", ErrInvalidCanonicalTarstream)
-	}
 	if marker.logical != 0 || marker.stored != 0 || marker.mapLen != 0 {
 		return zero, false, fmt.Errorf("%w: digest marker is not empty", ErrInvalidCanonicalTarstream)
 	}
@@ -287,8 +297,16 @@ func discoverDigest(ra io.ReaderAt, size int64, payloadName string) ([32]byte, b
 	if err != nil {
 		return zero, false, err
 	}
-	if markerEnd+int64(len(zeroBlock2)) != size {
+	if markerEnd < 512 || markerEnd > size || markerEnd-512 != expectedMarkerStart || size-markerEnd != int64(len(zeroBlock2)) {
 		return zero, false, fmt.Errorf("%w: digest marker must be the final entry", ErrInvalidCanonicalTarstream)
+	}
+	var markerBlock [512]byte
+	if err := readAtFull(ra, markerBlock[:], markerEnd-512); err != nil {
+		return zero, false, fmt.Errorf("%w: read digest marker", ErrInvalidCanonicalTarstream)
+	}
+	digest, err := parseCanonicalMarker(markerBlock[:])
+	if err != nil {
+		return zero, false, err
 	}
 	var trailer [1024]byte
 	if err := readAtFull(ra, trailer[:], markerEnd); err != nil {

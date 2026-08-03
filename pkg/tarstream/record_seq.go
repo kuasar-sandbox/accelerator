@@ -83,7 +83,7 @@ func (r *recordSeqReader) loadRecord() error {
 func (r *recordSeqReader) finishOuter() {
 	r.finished = true
 	var extra [1]byte
-	n, err := r.r.Read(extra[:])
+	n, err := readOneByte(r.r, extra[:])
 	if n != 0 || err == nil {
 		r.finalErr = fmt.Errorf("%w: trailing ciphertext", ErrMalformedEnvelope)
 		return

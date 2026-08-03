@@ -92,7 +92,7 @@ func (v *sequentialVerifier) finish() error {
 		return v.err
 	}
 	var extra [1]byte
-	n, err := v.reader.Read(extra[:])
+	n, err := readOneByte(v.reader, extra[:])
 	if n != 0 {
 		v.err = fmt.Errorf("%w: trailing artifact bytes", ErrInvalidCanonicalTarstream)
 		return v.err
@@ -143,15 +143,27 @@ func validHeaderChecksum(block []byte) bool {
 	if err != nil {
 		return false
 	}
-	var sum int64
+	var unsigned, signed int64
 	for i, value := range block {
 		if i >= 148 && i < 156 {
-			sum += ' '
-		} else {
-			sum += int64(value)
+			value = ' '
+		}
+		unsigned += int64(value)
+		signed += int64(int8(value))
+	}
+	return want == unsigned || want == signed
+}
+
+const maxConsecutiveEmptyReads = 100
+
+func readOneByte(reader io.Reader, buffer []byte) (int, error) {
+	for range maxConsecutiveEmptyReads {
+		n, err := reader.Read(buffer)
+		if n != 0 || err != nil {
+			return n, err
 		}
 	}
-	return sum == want
+	return 0, io.ErrNoProgress
 }
 
 func openSequentialPlaintext(r io.Reader, options readOptions) (io.Reader, *envelopeHeader, error) {
