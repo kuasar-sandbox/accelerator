@@ -270,7 +270,6 @@ chunker:
 crypto:
   chunk: aes                      # aes(唯一支持)
   manifest: aes                   # aes(唯一支持)
-  local: off                      # off | auto | required;缺省 off
 ```
 
 字段说明:
@@ -291,9 +290,6 @@ crypto:
 - `chunker.mode` — `cdc`(FastCDC,变长)或 `fixed`(固定大小)。详见 §4.1。
 - `crypto.chunk` / `crypto.manifest` — chunk 与 Manifest 的加密算法,均仅支持
   `aes`(§4.3 / §4.4);其它值在构造时即被拒绝。
-- `crypto.local` — 本地存储兼容/强制 policy,不是算法选择。`off` 不启用本地
-  codec,`auto` 同时接受历史 plaintext 与加密格式,`required` 只接受加密格式。
-  缺省为 `off`。
 
 ### 3.2 加载顺序
 
