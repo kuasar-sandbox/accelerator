@@ -163,7 +163,7 @@ func TestLayered_MixedFileAndManifest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tarstream.WriteTo(context.Background(), f, "base", baseSource); err != nil {
+	if _, _, err := tarstream.WriteTo(context.Background(), f, "base", baseSource); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.Close(); err != nil {

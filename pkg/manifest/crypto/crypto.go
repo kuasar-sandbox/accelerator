@@ -29,6 +29,9 @@ type Decryptor interface {
 // The only supported mode is "aes" (AES-256-CTR convergent chunks +
 // AES-256-GCM key table); any other value is rejected (no insecure fallback).
 func New(cfg Config) (Encryptor, Decryptor, error) {
+	if _, err := cfg.LocalPolicy(); err != nil {
+		return nil, nil, err
+	}
 	chunk, err := NewChunkEncryptor(cfg.Chunk)
 	if err != nil {
 		return nil, nil, fmt.Errorf("crypto: chunk: %w", err)

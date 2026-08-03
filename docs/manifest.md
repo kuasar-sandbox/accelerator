@@ -21,7 +21,8 @@
 ```
 
 读取方向相反:`manifest-ctl load` 从 Manifest 取 chunk 列表 → 经 cache-ctl
-(若配置)穿到 store-ctl `Get` → 解密 → 输出明文流。
+(若配置)穿到 store-ctl `Get` → 解密 → 输出由 `crypto.local` 决定编码的
+tarstream 工件。
 
 ### 1.2 设计原则
 
@@ -88,8 +89,10 @@ Flags:
 ```
 
 输入是 **tarstream 工件**(平台镜像/快照的统一容器):size 与洞图都在信封里,
-stdin 因此可单遍直通(零缓冲),文件则按需定位读;洞永远来自信封元数据,
-不做文件系统探测、更不做内容扫描。
+stdin 与文件都通过 `SourceFrom` 单遍完整验证,不物化中间文件;洞永远来自信封
+元数据,不做文件系统探测或内容零扫描。`crypto.local=off|auto|required` 分别对应
+plaintext-only、兼容 plaintext/encrypted、encrypted-only;ingest 结果发布前会验证
+inner digest、marker、trailer 和 outer EOF。
 
 stdout 输出一行 64 字符 hex —— 这是上传后的 manifest content key。stderr
 是人类可读的摘要(默认开,`--no-progress` 关):
@@ -137,7 +140,8 @@ Flags:
 
 输出是 **tarstream 工件**:manifest 空洞无损进信封洞图(没有"落洞还是填零"
 的策略问题,原 `--hole` 旗标随之取消),IsZero chunk 由写出端本地合成零字节、
-不取数。要 raw 字节用 `flatten-ctl tar extract` 解包。
+不取数。`crypto.local=off` 输出 byte-compatible plaintext,`auto|required` 输出
+encrypted v1。要 raw 字节用 `flatten-ctl tar extract` 解包。
 
 ```bash
 # 全量还原为工件(flags 在位置参数前)
@@ -270,6 +274,7 @@ chunker:
 crypto:
   chunk: aes                      # aes(唯一支持)
   manifest: aes                   # aes(唯一支持)
+  local: off                      # off | auto | required;缺省 off
 ```
 
 字段说明:
@@ -290,6 +295,9 @@ crypto:
 - `chunker.mode` — `cdc`(FastCDC,变长)或 `fixed`(固定大小)。详见 §4.1。
 - `crypto.chunk` / `crypto.manifest` — chunk 与 Manifest 的加密算法,均仅支持
   `aes`(§4.3 / §4.4);其它值在构造时即被拒绝。
+- `crypto.local` — 本地存储兼容/强制 policy,不是算法选择。`off` 不启用本地
+  codec,`auto` 同时接受历史 plaintext 与加密格式,`required` 只接受加密格式。
+  缺省为 `off`。
 
 ### 3.2 加载顺序
 
@@ -522,6 +530,42 @@ Stream 层不维护 chunk seen set 或 singleflight。同一物理 chunk 经多�
 见区间暴露、并发调用 Prefetch,或同时被 Prefetch 和 ReadAt 访问时,允许产生
 独立 Get;缓存层负责把后续请求转化为命中。这保持了读取与预取路径一致的对象
 所有权和失败语义。
+
+### 4.9 本地 immutable tarstream 加密
+
+canonical tarstream 的 plaintext 结构保持为 payload、空
+`.kuasar.sha256.<plainDigest>` marker 和两个 trailer block。未传 codec 时,
+`tarstream.WriteTo` 的输出与旧格式逐 byte 相同,对外 identity 为
+`sha256:<plainDigest>`。传入 customer-key-backed codec 时,完整结构进入
+encrypted tarstream v1,对外 identity 固定为:
+
+```text
+hmac = HMAC-SHA256(customerKey, plainDigestRaw32Bytes)
+```
+
+scheme 名为 `hmac`,不派生 identity key,不加入 domain prefix。marker 中的
+`plainDigest` 位于密文内,不得用于 key-bound 文件名、ref、日志或错误。
+`@hmac:<digest>` 只是 identity scheme,不表示输入的物理编码;`auto` 读取历史
+plaintext 时同样返回 `hmac`。
+
+v1 固定 AES-256-SIV-CMAC 和 4096-byte record,不提供算法或 record size 协商。
+文件由 16-byte clear prefix、81-byte authenticated header 和连续 authenticated
+records 组成。header 绑定完整 plaintext 大小、packed payload 起点/大小和 record
+geometry;每个 record 的 AAD 绑定 prefix、header、record index 与实际 plaintext
+长度。写入先完成 sparse metadata sweep 和布局规划,再单遍读取 Data extents;
+不会生成 plaintext staging。
+
+`SourceAt` 认证 header 及覆盖 marker/trailer 的 suffix records,随后按 record
+index O(1) 随机解密。这个 fast path 不预读全部 data records:同一 customerKey
+下,geometry 相同的另一个合法文件的同 index record 可通过局部认证,保留原
+marker 时 fast expected-digest 检查也可能通过。调用方实际读取该 record 才会
+认证它,但 fast path 不证明 data record 属于 marker 声明的完整内容。
+
+`SourceFrom` 是 full-validation path。完整消费时它解密全部 records,重算 marker
+前 plaintext tar bytes 的 SHA-256,验证空 marker、恰好两个 trailer blocks、
+expected `sha256|hmac` 和 outer EOF。因此同布局 record splice 会在终点失败。
+调用方主动停止消费时,尚未读取部分不具备完整验证结论;任何发布、上传或转换
+路径必须消费全部 Data extents并传播终点错误。
 
 ## 5. 性能特征
 

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 
+	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"golang.org/x/sys/unix"
@@ -34,7 +35,7 @@ func TestOpenTarStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantDigest, err := tarstream.WriteTo(context.Background(), f, "image", src)
+	wantScheme, wantDigest, err := tarstream.WriteTo(context.Background(), f, "image", src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,8 +50,9 @@ func TestOpenTarStream(t *testing.T) {
 	if !ok {
 		t.Fatal("OpenTarStream result does not implement tarstream.Digester")
 	}
-	if d.Digest() != wantDigest {
-		t.Fatalf("digest = %q; want %q", d.Digest(), wantDigest)
+	gotScheme, gotDigest := d.Digest()
+	if gotScheme != wantScheme || gotDigest != wantDigest {
+		t.Fatalf("digest = %q:%q; want %q:%q", gotScheme, gotDigest, wantScheme, wantDigest)
 	}
 	if st.Size() != size {
 		t.Fatalf("size = %d", st.Size())
@@ -134,7 +136,7 @@ func TestTarFileStreamPrefetch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tarstream.WriteTo(context.Background(), out, "snapshot", src); err != nil {
+	if _, _, err := tarstream.WriteTo(context.Background(), out, "snapshot", src); err != nil {
 		t.Fatal(err)
 	}
 	if err := out.Close(); err != nil {
@@ -218,6 +220,57 @@ func TestTarFileStreamPrefetch(t *testing.T) {
 
 	if err := stream.Close(); err != nil {
 		t.Fatalf("Close after Prefetch: %v", err)
+	}
+}
+
+func TestOpenEncryptedTarStream(t *testing.T) {
+	codec, err := manifestcrypto.NewTarStreamCodec([32]byte{1, 2, 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := bytes.Repeat([]byte("encrypted-local-artifact"), 1024)
+	path := filepath.Join(t.TempDir(), "image.image")
+	output, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantScheme, wantDigest, err := tarstream.WriteTo(
+		context.Background(), output, "image",
+		sparse.Dense(bytes.NewReader(body), uint64(len(body))),
+		tarstream.WithCodec(codec, false),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := output.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	stream, err := OpenTarStream(path, tarstream.WithCodec(codec, true), tarstream.WithExpectedDigest(wantScheme, wantDigest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheme, digest := stream.(tarstream.Digester).Digest()
+	if scheme != wantScheme || digest != wantDigest {
+		t.Fatalf("Digest() = %s:%s, want %s:%s", scheme, digest, wantScheme, wantDigest)
+	}
+	got := make([]byte, len(body))
+	if _, err := stream.ReadAt(context.Background(), got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatal("encrypted file stream content mismatch")
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := OpenTarStream(path); !errors.Is(err, tarstream.ErrCodecRequired) {
+		t.Fatalf("OpenTarStream without codec error = %v", err)
+	}
+	wrong, _ := manifestcrypto.NewTarStreamCodec([32]byte{9})
+	if _, err := OpenTarStream(path, tarstream.WithCodec(wrong, true)); !errors.Is(err, tarstream.ErrAuthentication) {
+		t.Fatalf("OpenTarStream wrong-key error = %v", err)
 	}
 }
 

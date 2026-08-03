@@ -6,8 +6,11 @@
 // its own header. ReadFrom / ReadSeekFrom return the logical view with the exact
 // hole map; SourceFrom opens it as a sparse.Source for pipelines. A size-bounded
 // SourceAt exposes the marker through the optional Digester capability without
-// rereading payload bytes. Only data bytes flow on the wire — holes cost
-// nothing.
+// rereading payload bytes. WithCodec places the complete canonical stream,
+// including marker and trailer, in fixed 4 KiB authenticated encrypted-v1
+// records; SourceAt decrypts records lazily and SourceFrom performs full inner
+// digest/trailer/outer-EOF validation when its Data extents are consumed. Only
+// data bytes flow on the inner tar wire — holes cost nothing.
 //
 // Zero-valued data is data: a source's Zero runs are written as
 // literal zero bytes (synthesized, never read), never as holes — the
@@ -41,24 +44,25 @@ import (
 const SHA256MarkerPrefix = ".kuasar.sha256."
 
 // Digester is an optional capability implemented by sources opened from a
-// complete Kuasar artifact. Digest is the identity declared by the artifact's
-// marker; it performs no I/O and does not recompute payload bytes.
+// complete Kuasar artifact. Digest performs no I/O and does not recompute
+// payload bytes. Digest never includes its scheme prefix.
 type Digester interface {
-	Digest() string // "sha256:<64-lowercase-hex>"
+	Digest() (scheme string, digest string)
 }
 
-func parseDigestMarker(name string) (string, bool) {
+func parseDigestMarker(name string) ([32]byte, bool) {
+	var digest [32]byte
 	if !strings.HasPrefix(name, SHA256MarkerPrefix) {
-		return "", false
+		return digest, false
 	}
 	hexDigest := strings.TrimPrefix(name, SHA256MarkerPrefix)
 	if len(hexDigest) != 64 || strings.ToLower(hexDigest) != hexDigest {
-		return "", false
+		return digest, false
 	}
-	if _, err := hex.DecodeString(hexDigest); err != nil {
-		return "", false
+	if _, err := hex.Decode(digest[:], []byte(hexDigest)); err != nil {
+		return digest, false
 	}
-	return "sha256:" + hexDigest, true
+	return digest, true
 }
 
 // Reader is the sequential logical view of the file inside a tar

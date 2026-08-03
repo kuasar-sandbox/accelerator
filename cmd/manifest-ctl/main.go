@@ -16,7 +16,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
-	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
@@ -147,6 +147,35 @@ func readManifestData(path string) ([]byte, error) {
 	return os.ReadFile(path)
 }
 
+func localTarStreamCodec(cfg *manifest.Config, customerKey [32]byte) (tarstream.Codec, bool, error) {
+	policy, err := cfg.Crypto.LocalPolicy()
+	if err != nil {
+		return nil, false, err
+	}
+	if policy == manifestcrypto.LocalOff {
+		return nil, false, nil
+	}
+	codec, err := manifestcrypto.NewTarStreamCodec(customerKey)
+	if err != nil {
+		return nil, false, err
+	}
+	return codec, policy == manifestcrypto.LocalRequired, nil
+}
+
+func localReadOptions(codec tarstream.Codec, required bool) []tarstream.ReadOption {
+	if codec == nil {
+		return nil
+	}
+	return []tarstream.ReadOption{tarstream.WithCodec(codec, required)}
+}
+
+func localWriteOptions(codec tarstream.Codec, required bool) []tarstream.WriteOption {
+	if codec == nil {
+		return nil
+	}
+	return []tarstream.WriteOption{tarstream.WithCodec(codec, required)}
+}
+
 // ---------------------------------------------------------------------------
 // store command
 // ---------------------------------------------------------------------------
@@ -163,30 +192,34 @@ func cmdStore(args []string) {
 	}
 
 	cfg := loadCfg(*gf.configPath)
+	customerKey, err := cfg.CustomerKey()
+	if err != nil {
+		fatal("customer key: %v", err)
+	}
+	localCodec, localRequired, err := localTarStreamCodec(cfg, customerKey)
+	if err != nil {
+		fatal("local tarstream policy: %v", err)
+	}
 
 	// The input is a tarstream artifact (the platform container for
 	// images and snapshots): the envelope carries size + hole map, so
-	// stdin streams straight through one-pass with nothing buffered,
-	// and files are positioned-read in place. Holes come from the
-	// envelope — never detected from the filesystem or content.
-	var (
-		src  sparse.Source
-		size uint64
-	)
-	if input == "-" {
-		s, _, err := tarstream.SourceFrom(os.Stdin, "")
+	// stdin and files stream through the same one-pass full-validation
+	// path with nothing materialized. Holes come from the envelope —
+	// never detected from the filesystem or content.
+	var inputReader io.Reader = os.Stdin
+	if input != "-" {
+		inputFile, err := os.Open(input)
 		if err != nil {
-			fatal("stdin: not a tarstream artifact: %v", err)
+			fatal("open input: %v", err)
 		}
-		src, size = s, s.Size()
-	} else {
-		stream, err := fetch.OpenTarStream(input)
-		if err != nil {
-			fatal("%v", err)
-		}
-		defer stream.Close()
-		src, size = stream, stream.Size()
+		defer inputFile.Close()
+		inputReader = inputFile
 	}
+	src, _, err := tarstream.SourceFrom(inputReader, "", localReadOptions(localCodec, localRequired)...)
+	if err != nil {
+		fatal("%s: not a tarstream artifact: %v", input, err)
+	}
+	size := src.Size()
 
 	// Optional extra-salt closure — nil when --extra-salt is empty.
 	var extraSaltFn ingest.ExtraSaltFunc
@@ -195,7 +228,8 @@ func cmdStore(args []string) {
 		extraSaltFn = func() ([]byte, error) { return bs, nil }
 	}
 
-	ing, err := cfg.NewIngester(cfg.IngestKeyFunc(), extraSaltFn)
+	fixedKeyFn := func() ([32]byte, error) { return customerKey, nil }
+	ing, err := cfg.NewIngester(fixedKeyFn, extraSaltFn)
 	if err != nil {
 		fatal("ingester: %v", err)
 	}
@@ -255,6 +289,14 @@ func cmdLoad(args []string) {
 		fatal("usage: manifest-ctl load [flags] <hex|manifest://hex>")
 	}
 	cfg := loadCfg(*gf.configPath)
+	customerKey, err := cfg.CustomerKey()
+	if err != nil {
+		fatal("customer key: %v", err)
+	}
+	localCodec, localRequired, err := localTarStreamCodec(cfg, customerKey)
+	if err != nil {
+		fatal("local tarstream policy: %v", err)
+	}
 
 	fc, err := cfg.NewFetcher()
 	if err != nil {
@@ -315,7 +357,7 @@ func cmdLoad(args []string) {
 	if !*noProgress {
 		w = &progressWriter{w: out, label: "load"}
 	}
-	if _, err := tarstream.WriteTo(ctx, w, *name, src); err != nil {
+	if _, _, err := tarstream.WriteTo(ctx, w, *name, src, localWriteOptions(localCodec, localRequired)...); err != nil {
 		fatal("%v", err)
 	}
 	if !*noProgress {
