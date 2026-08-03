@@ -3,6 +3,7 @@ package fetch
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
@@ -22,15 +23,17 @@ type tarFileStream struct {
 	sparse.Source
 	f            *os.File
 	physicalSize int64
+	sourceCloser io.Closer
+	digestScheme string
 	digest       string
 }
 
-// OpenTarStream opens the artifact at path (a tarstream envelope whose first
-// entry is the payload and whose final empty entry declares SHA256) and returns
-// it as a Stream that also implements tarstream.Digester. The caller owns the
-// returned stream and must Close it. A non-tarstream file or a tar without the
-// marker fails loudly.
-func OpenTarStream(path string) (Stream, error) {
+// OpenTarStream opens a plaintext canonical tarstream or encrypted v1 artifact
+// and returns it as a Stream that also implements tarstream.Digester. Options
+// carry the local codec, plaintext policy, and expected identity. The caller
+// owns the returned stream and must Close it. A non-tarstream file or a tar
+// without the canonical marker fails loudly.
+func OpenTarStream(path string, options ...tarstream.ReadOption) (Stream, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("fetch: open %s: %w", path, err)
@@ -40,7 +43,7 @@ func OpenTarStream(path string) (Stream, error) {
 		_ = f.Close()
 		return nil, fmt.Errorf("fetch: stat %s: %w", path, err)
 	}
-	src, _, err := tarstream.SourceAt(f, st.Size(), "")
+	src, _, err := tarstream.SourceAt(f, st.Size(), "", options...)
 	if err != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("fetch: %s: not a tarstream artifact: %w", path, err)
@@ -50,16 +53,30 @@ func OpenTarStream(path string) (Stream, error) {
 		_ = f.Close()
 		return nil, fmt.Errorf("fetch: %s: tarstream artifact missing digest marker", path)
 	}
-	return &tarFileStream{
+	digestScheme, digest := d.Digest()
+	stream := &tarFileStream{
 		Source:       src,
 		f:            f,
 		physicalSize: st.Size(),
-		digest:       d.Digest(),
-	}, nil
+		digestScheme: digestScheme,
+		digest:       digest,
+	}
+	if closer, ok := src.(io.Closer); ok {
+		stream.sourceCloser = closer
+	}
+	return stream, nil
 }
 
-func (s *tarFileStream) Digest() string { return s.digest }
-func (s *tarFileStream) Close() error   { return s.f.Close() }
+func (s *tarFileStream) Digest() (string, string) { return s.digestScheme, s.digest }
+func (s *tarFileStream) Close() error {
+	if s.sourceCloser != nil {
+		if err := s.sourceCloser.Close(); err != nil {
+			_ = s.f.Close()
+			return err
+		}
+	}
+	return s.f.Close()
+}
 
 // Prefetch submits a best-effort readahead hint for this artifact's complete
 // physical file range. It does not wait for the range to become resident.

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"path"
@@ -26,16 +27,70 @@ import (
 // filesystem snapshot. After the payload it appends one empty
 // .kuasar.sha256.<hex> entry. The returned digest covers every physical tar
 // byte before that marker header and is computed while the payload is written.
-func WriteTo(ctx context.Context, w io.Writer, name string, src sparse.Source) (string, error) {
+// With no codec the emitted bytes are the historical plaintext format. With a
+// codec the complete canonical stream, including marker and trailer, is placed
+// inside encrypted v1 records.
+func WriteTo(ctx context.Context, w io.Writer, name string, src sparse.Source, options ...WriteOption) (scheme string, digest string, err error) {
+	opts, err := parseWriteOptions(options)
+	if err != nil {
+		return "", "", err
+	}
+	plan, err := makeWritePlan(name, src)
+	if err != nil {
+		return "", "", err
+	}
+
+	var artifactWriter io.Writer = w
+	var records *recordWriter
+	if opts.codec != nil {
+		header, err := makeEnvelopeHeader(plan)
+		if err != nil {
+			return "", "", err
+		}
+		prefix, plainHeader, err := writeEncryptedHeader(w, opts.codec, header)
+		if err != nil {
+			return "", "", err
+		}
+		records = newRecordWriter(w, opts.codec, prefix, plainHeader, header)
+		artifactWriter = records
+	}
+
+	plainDigest, err := emitPlan(ctx, artifactWriter, plan, src)
+	if err != nil {
+		return "", "", err
+	}
+	if records != nil {
+		if err := records.Close(); err != nil {
+			return "", "", err
+		}
+	}
+	scheme, external := externalDigest(opts.codec, plainDigest)
+	return scheme, hex.EncodeToString(external[:]), nil
+}
+
+type writePlan struct {
+	name          string
+	logical       int64
+	stored        int64
+	sparseMap     []byte
+	extents       []extent
+	prefix        []byte
+	packedStart   int64
+	packedSize    int64
+	payloadPad    int
+	plaintextSize int64
+}
+
+func makeWritePlan(name string, src sparse.Source) (*writePlan, error) {
 	name = normalizeName(name)
 	if name == "" {
-		return "", fmt.Errorf("tarstream: empty entry name")
+		return nil, fmt.Errorf("tarstream: empty entry name")
 	}
 	if strings.HasPrefix(name, SHA256MarkerPrefix) {
-		return "", fmt.Errorf("tarstream: entry name %q uses reserved digest marker prefix", name)
+		return nil, fmt.Errorf("tarstream: entry name %q uses reserved digest marker prefix", name)
 	}
 	if src.Size() > 1<<62 {
-		return "", fmt.Errorf("tarstream: %s: size %d overflows", name, src.Size())
+		return nil, fmt.Errorf("tarstream: %s: size %d overflows", name, src.Size())
 	}
 	size := int64(src.Size())
 
@@ -46,7 +101,13 @@ func WriteTo(ctx context.Context, w io.Writer, name string, src sparse.Source) (
 	for off := uint64(0); off < uint64(size); {
 		kind, end, err := src.RunAt(off, uint64(size)-off)
 		if err != nil {
-			return "", fmt.Errorf("tarstream: %s: classify @ %d: %w", name, off, err)
+			return nil, fmt.Errorf("tarstream: %s: classify @ %d: %w", name, off, err)
+		}
+		if end <= off || end > uint64(size) {
+			return nil, fmt.Errorf("tarstream: %s: invalid run [%d,%d)", name, off, end)
+		}
+		if kind != sparse.Hole && kind != sparse.Zero && kind != sparse.Data {
+			return nil, fmt.Errorf("tarstream: %s: invalid run kind %d @ %d", name, kind, off)
 		}
 		if kind == sparse.Hole {
 			hasHole = true
@@ -57,40 +118,64 @@ func WriteTo(ctx context.Context, w io.Writer, name string, src sparse.Source) (
 		}
 		off = end
 	}
-	if !hasHole {
-		return emit(ctx, w, name, size, size, nil, extents, src)
-	}
-
-	// Sparse map: decimal extent count, then offset/size per line —
-	// the data extents plus GNU's trailing (size, 0) sentinel —
-	// NUL-padded to a 512 boundary and prepended to the stored data.
-	var mapBuf bytes.Buffer
-	mapBuf.WriteString(strconv.Itoa(len(extents) + 1))
-	mapBuf.WriteByte('\n')
 	var dataSize int64
 	for _, e := range extents {
-		mapBuf.WriteString(strconv.FormatInt(e.Offset, 10))
-		mapBuf.WriteByte('\n')
-		mapBuf.WriteString(strconv.FormatInt(e.Size, 10))
-		mapBuf.WriteByte('\n')
+		if e.Size > 0 && dataSize > 1<<62-e.Size {
+			return nil, fmt.Errorf("tarstream: %s: packed data size overflows", name)
+		}
 		dataSize += e.Size
 	}
-	mapBuf.WriteString(strconv.FormatInt(size, 10))
-	mapBuf.WriteString("\n0\n")
-	if pad := (512 - mapBuf.Len()%512) % 512; pad > 0 {
-		mapBuf.Write(zeroBlock[:pad])
+
+	var sparseMap []byte
+	stored := size
+	if hasHole {
+		// Sparse map: decimal extent count, then offset/size per line —
+		// the data extents plus GNU's trailing (size, 0) sentinel —
+		// NUL-padded to a 512 boundary and prepended to the stored data.
+		var mapBuf bytes.Buffer
+		mapBuf.WriteString(strconv.Itoa(len(extents) + 1))
+		mapBuf.WriteByte('\n')
+		for _, e := range extents {
+			mapBuf.WriteString(strconv.FormatInt(e.Offset, 10))
+			mapBuf.WriteByte('\n')
+			mapBuf.WriteString(strconv.FormatInt(e.Size, 10))
+			mapBuf.WriteByte('\n')
+		}
+		mapBuf.WriteString(strconv.FormatInt(size, 10))
+		mapBuf.WriteString("\n0\n")
+		if pad := (512 - mapBuf.Len()%512) % 512; pad > 0 {
+			mapBuf.Write(zeroBlock[:pad])
+		}
+		sparseMap = mapBuf.Bytes()
+		if dataSize > 1<<62-int64(len(sparseMap)) {
+			return nil, fmt.Errorf("tarstream: %s: stored size overflows", name)
+		}
+		stored = int64(len(sparseMap)) + dataSize
 	}
-	stored := int64(mapBuf.Len()) + dataSize
-	return emit(ctx, w, name, size, stored, mapBuf.Bytes(), extents, src)
+
+	prefix := payloadPrefix(name, size, stored, sparseMap)
+	payloadPad := int((512 - stored%512) % 512)
+	plaintextSize := int64(len(prefix)) + dataSize + int64(payloadPad) + canonicalSuffixSize
+	if plaintextSize < 0 || plaintextSize > 1<<62 {
+		return nil, fmt.Errorf("tarstream: %s: artifact size overflows", name)
+	}
+	return &writePlan{
+		name:          name,
+		logical:       size,
+		stored:        stored,
+		sparseMap:     sparseMap,
+		extents:       extents,
+		prefix:        prefix,
+		packedStart:   int64(len(prefix)),
+		packedSize:    dataSize,
+		payloadPad:    payloadPad,
+		plaintextSize: plaintextSize,
+	}, nil
 }
 
-// emit writes the PAX extended header, the data header, the optional sparse
-// map and the data extents through a SHA256 writer. It then writes the empty
-// digest marker and end-of-archive trailer outside the hash.
-// sparseMap == nil emits a plain entry of logical == stored size.
-func emit(ctx context.Context, w io.Writer, name string, logical, stored int64, sparseMap []byte, extents []extent, src sparse.Source) (string, error) {
-	h := sha256.New()
-	payloadWriter := io.MultiWriter(w, h)
+// payloadPrefix renders all canonical bytes before the packed payload. The
+// sparse map, when present, is part of this prefix.
+func payloadPrefix(name string, logical, stored int64, sparseMap []byte) []byte {
 	ustarName := name
 	recs := map[string]string{
 		"path": name,
@@ -108,6 +193,7 @@ func emit(ctx context.Context, w io.Writer, name string, logical, stored int64, 
 		recs["GNU.sparse.realsize"] = strconv.FormatInt(logical, 10)
 	}
 
+	var prefix bytes.Buffer
 	pax := encodePAX(recs)
 	xhdr := ustarBlock(rawHeader{
 		name:     "PaxHeaders.0/" + truncateStr(path.Base(name), 80),
@@ -115,16 +201,10 @@ func emit(ctx context.Context, w io.Writer, name string, logical, stored int64, 
 		size:     int64(len(pax)),
 		typeflag: 'x',
 	})
-	if _, err := payloadWriter.Write(xhdr[:]); err != nil {
-		return "", err
-	}
-	if _, err := payloadWriter.Write(pax); err != nil {
-		return "", err
-	}
+	prefix.Write(xhdr[:])
+	prefix.Write(pax)
 	if pad := (512 - len(pax)%512) % 512; pad > 0 {
-		if _, err := payloadWriter.Write(zeroBlock[:pad]); err != nil {
-			return "", err
-		}
+		prefix.Write(zeroBlock[:pad])
 	}
 
 	dhdr := ustarBlock(rawHeader{
@@ -133,42 +213,51 @@ func emit(ctx context.Context, w io.Writer, name string, logical, stored int64, 
 		size:     stored,
 		typeflag: '0',
 	})
-	if _, err := payloadWriter.Write(dhdr[:]); err != nil {
-		return "", err
-	}
+	prefix.Write(dhdr[:])
 	if sparseMap != nil {
-		if _, err := payloadWriter.Write(sparseMap); err != nil {
-			return "", err
-		}
+		prefix.Write(sparseMap)
 	}
-	if len(extents) > 0 {
+	return prefix.Bytes()
+}
+
+// emitPlan writes the planned canonical plaintext stream exactly once. The
+// destination may be the caller's plaintext writer or the encrypted record
+// writer. Data extents are read once; Zero extents are synthesized.
+func emitPlan(ctx context.Context, w io.Writer, plan *writePlan, src sparse.Source) ([32]byte, error) {
+	h := sha256.New()
+	payloadWriter := io.MultiWriter(w, h)
+	if err := writeFull(payloadWriter, plan.prefix); err != nil {
+		return [32]byte{}, err
+	}
+	if len(plan.extents) > 0 {
 		buf := make([]byte, copyBufSize)
-		for _, e := range extents {
-			if err := copyExtent(ctx, payloadWriter, src, e, name, buf); err != nil {
-				return "", err
+		for _, e := range plan.extents {
+			if err := copyExtent(ctx, payloadWriter, src, e, plan.name, buf); err != nil {
+				return [32]byte{}, err
 			}
 		}
 	}
-	if pad := int((512 - stored%512) % 512); pad > 0 {
-		if _, err := payloadWriter.Write(zeroBlock[:pad]); err != nil {
-			return "", err
+	if plan.payloadPad > 0 {
+		if err := writeFull(payloadWriter, zeroBlock[:plan.payloadPad]); err != nil {
+			return [32]byte{}, err
 		}
 	}
-	hexDigest := fmt.Sprintf("%x", h.Sum(nil))
-	digest := "sha256:" + hexDigest
+	var plainDigest [32]byte
+	copy(plainDigest[:], h.Sum(nil))
+	hexDigest := hex.EncodeToString(plainDigest[:])
 	marker := ustarBlock(rawHeader{
 		name:     SHA256MarkerPrefix + hexDigest,
 		mode:     0o444,
 		typeflag: '0',
 	})
-	if _, err := w.Write(marker[:]); err != nil {
-		return "", err
+	if err := writeFull(w, marker[:]); err != nil {
+		return [32]byte{}, err
 	}
 	// End of archive: two zero blocks.
-	if _, err := w.Write(zeroBlock2[:]); err != nil {
-		return "", err
+	if err := writeFull(w, zeroBlock2[:]); err != nil {
+		return [32]byte{}, err
 	}
-	return digest, nil
+	return plainDigest, nil
 }
 
 const copyBufSize = 256 << 10
@@ -190,6 +279,12 @@ func copyExtent(ctx context.Context, w io.Writer, src sparse.Source, e extent, n
 		if err != nil {
 			return fmt.Errorf("%s: classify @ %d: %w", name, off, err)
 		}
+		if runEnd <= off || runEnd > end {
+			return fmt.Errorf("%s: invalid run [%d,%d) inside data extent ending at %d", name, off, runEnd, end)
+		}
+		if kind != sparse.Zero && kind != sparse.Data && kind != sparse.Hole {
+			return fmt.Errorf("%s: invalid run kind %d @ %d", name, kind, off)
+		}
 		if kind == sparse.Hole {
 			return fmt.Errorf("%s: hole @ %d inside a data extent (inconsistent RunAt)", name, off)
 		}
@@ -203,10 +298,10 @@ func copyExtent(ctx context.Context, w io.Writer, src sparse.Source, e extent, n
 				clear(chunk)
 			} else if m, err := src.ReadAt(ctx, chunk, off); err != nil && err != io.EOF {
 				return fmt.Errorf("%s: read @ %d: %w", name, off, err)
-			} else if m < n {
-				return fmt.Errorf("%s: source ended early (%d of %d bytes @ %d)", name, m, n, off)
+			} else if m != n {
+				return fmt.Errorf("%s: source returned invalid length %d for %d bytes @ %d", name, m, n, off)
 			}
-			if _, err := w.Write(chunk); err != nil {
+			if err := writeFull(w, chunk); err != nil {
 				return err
 			}
 			off += uint64(n)

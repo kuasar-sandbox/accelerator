@@ -315,7 +315,7 @@ func cmdLoad(args []string) {
 	if !*noProgress {
 		w = &progressWriter{w: out, label: "load"}
 	}
-	if _, err := tarstream.WriteTo(ctx, w, *name, src); err != nil {
+	if _, _, err := tarstream.WriteTo(ctx, w, *name, src); err != nil {
 		fatal("%v", err)
 	}
 	if !*noProgress {

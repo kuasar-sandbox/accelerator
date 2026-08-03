@@ -42,7 +42,7 @@ func mustWrite(t *testing.T, name string, logical []byte, holes []sparse.Extent)
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	if _, err := WriteTo(context.Background(), &buf, name, src); err != nil {
+	if _, _, err := WriteTo(context.Background(), &buf, name, src); err != nil {
 		t.Fatal(err)
 	}
 	return buf.Bytes()
@@ -454,7 +454,7 @@ func TestLookupAndNotFound(t *testing.T) {
 
 func TestWriteToValidation(t *testing.T) {
 	var buf bytes.Buffer
-	if _, err := WriteTo(context.Background(), &buf, "", sparse.Dense(bytes.NewReader(nil), 0)); err == nil {
+	if _, _, err := WriteTo(context.Background(), &buf, "", sparse.Dense(bytes.NewReader(nil), 0)); err == nil {
 		t.Error("empty name must fail")
 	}
 }
@@ -497,7 +497,7 @@ func (zeroRunSource) ReadAt(_ context.Context, buf []byte, off uint64) (int, err
 // sparse map.
 func TestWriteToZeroRuns(t *testing.T) {
 	var buf bytes.Buffer
-	if _, err := WriteTo(context.Background(), &buf, "z", zeroRunSource{}); err != nil {
+	if _, _, err := WriteTo(context.Background(), &buf, "z", zeroRunSource{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -611,7 +611,7 @@ func TestSourceFrom(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Run("random", func(t *testing.T) { check(t, src, name, true) })
+	t.Run("seekable-is-still-one-pass", func(t *testing.T) { check(t, src, name, false) })
 }
 
 // TestReadFromUpgrade: ReadFrom over a seekable source returns a view
@@ -689,7 +689,7 @@ func TestFileRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	if _, err := WriteTo(context.Background(), &buf, "img.raw", src); err != nil {
+	if _, _, err := WriteTo(context.Background(), &buf, "img.raw", src); err != nil {
 		t.Fatal(err)
 	}
 	ts, err := ReadSeekFrom(bytes.NewReader(buf.Bytes()), "")
@@ -794,15 +794,16 @@ func (r *countingReaderAt) ReadAt(p []byte, off int64) (int, error) {
 func TestArtifactDigestIsPrefixHashAndMetadataOnly(t *testing.T) {
 	logical := bytes.Repeat([]byte("payload-"), 1<<20)
 	var buf bytes.Buffer
-	digest, err := WriteTo(context.Background(), &buf, "image", sparse.Dense(bytes.NewReader(logical), uint64(len(logical))))
+	scheme, digest, err := WriteTo(context.Background(), &buf, "image", sparse.Dense(bytes.NewReader(logical), uint64(len(logical))))
 	if err != nil {
 		t.Fatal(err)
 	}
 	archive := buf.Bytes()
 	markerOffset := len(archive) - 512 - len(zeroBlock2)
 	sum := sha256.Sum256(archive[:markerOffset])
-	if want := fmt.Sprintf("sha256:%x", sum[:]); digest != want {
-		t.Fatalf("digest = %q, want %q", digest, want)
+	tagged := scheme + ":" + digest
+	if want := fmt.Sprintf("sha256:%x", sum[:]); tagged != want {
+		t.Fatalf("digest = %q, want %q", tagged, want)
 	}
 
 	cr := &countingReaderAt{ReaderAt: bytes.NewReader(archive)}
@@ -814,8 +815,9 @@ func TestArtifactDigestIsPrefixHashAndMetadataOnly(t *testing.T) {
 	if !ok {
 		t.Fatal("artifact source does not implement Digester")
 	}
-	if d.Digest() != digest {
-		t.Fatalf("source digest = %q, want %q", d.Digest(), digest)
+	gotScheme, gotDigest := d.Digest()
+	if gotScheme+":"+gotDigest != tagged {
+		t.Fatalf("source digest = %q:%q, want %q", gotScheme, gotDigest, tagged)
 	}
 	if cr.read >= int64(len(logical))/100 {
 		t.Fatalf("SourceAt read %d payload-adjacent bytes for a %d-byte artifact", cr.read, len(logical))
