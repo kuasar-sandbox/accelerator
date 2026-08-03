@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"fmt"
+	"unsafe"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 )
@@ -76,6 +77,15 @@ func (c *TarStreamCodec) Encrypt(dst, plaintext, associatedData []byte) ([]byte,
 	start := len(dst)
 	if cap(dst)-len(dst) >= size {
 		dst = dst[:len(dst)+size]
+		// The append contract permits callers to reuse destination capacity,
+		// including capacity from the same allocation as an input. Preserve
+		// both inputs by moving the result when the appended record would
+		// overwrite either one.
+		if slicesOverlap(dst[start:], plaintext) || slicesOverlap(dst[start:], associatedData) {
+			moved := make([]byte, len(dst))
+			copy(moved, dst[:start])
+			dst = moved
+		}
 	} else {
 		dst = append(dst, make([]byte, size)...)
 	}
@@ -85,6 +95,18 @@ func (c *TarStreamCodec) Encrypt(dst, plaintext, associatedData []byte) ([]byte,
 	iv := maskedCTRIV(siv)
 	cipher.NewCTR(c.ctrBlock, iv[:]).XORKeyStream(record[aesSIVOverhead:], plaintext)
 	return dst, nil
+}
+
+func slicesOverlap(a, b []byte) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	aStart := uintptr(unsafe.Pointer(unsafe.SliceData(a)))
+	bStart := uintptr(unsafe.Pointer(unsafe.SliceData(b)))
+	if aStart < bStart {
+		return bStart-aStart < uintptr(len(a))
+	}
+	return aStart-bStart < uintptr(len(b))
 }
 
 // DecryptInPlace authenticates and decrypts one record into its ciphertext

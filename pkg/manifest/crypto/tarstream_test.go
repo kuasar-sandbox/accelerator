@@ -162,6 +162,54 @@ func TestTarStreamCodecRoundTripAndBuffers(t *testing.T) {
 	}
 }
 
+func TestTarStreamCodecEncryptPreservesAliasedInputs(t *testing.T) {
+	codec, err := NewTarStreamCodec([32]byte{0x44})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name           string
+		aliasPlaintext bool
+	}{
+		{name: "plaintext", aliasPlaintext: true},
+		{name: "associated data"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const inputSize = 64
+			backing := make([]byte, inputSize, inputSize+codec.CiphertextSize(inputSize))
+			for i := range backing {
+				backing[i] = byte(i + 1)
+			}
+			plain := []byte("independent plaintext")
+			aad := []byte("independent associated data")
+			if tc.aliasPlaintext {
+				plain = backing
+			} else {
+				aad = backing
+			}
+			wantPlain := append([]byte(nil), plain...)
+			wantAAD := append([]byte(nil), aad...)
+			sealed, err := codec.Encrypt(backing[:0], plain, aad)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(plain, wantPlain) {
+				t.Fatal("Encrypt modified aliased plaintext")
+			}
+			if !bytes.Equal(aad, wantAAD) {
+				t.Fatal("Encrypt modified aliased associated data")
+			}
+			opened, err := codec.DecryptInPlace(sealed, wantAAD)
+			if err != nil {
+				t.Fatalf("decrypt aliased result: %v", err)
+			}
+			if !bytes.Equal(opened, wantPlain) {
+				t.Fatal("aliased result plaintext mismatch")
+			}
+		})
+	}
+}
+
 func TestTarStreamCodecGolden(t *testing.T) {
 	var key [32]byte
 	for i := range key {
