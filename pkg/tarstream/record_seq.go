@@ -48,6 +48,8 @@ func (r *recordSeqReader) Read(dst []byte) (int, error) {
 				return written, nil
 			}
 			if err := r.loadRecord(); err != nil {
+				r.finished = true
+				r.finalErr = err
 				return written, err
 			}
 		}

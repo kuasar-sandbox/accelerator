@@ -493,6 +493,33 @@ func TestEncryptedTarStreamRecordSwapRejected(t *testing.T) {
 	}
 }
 
+func TestEncryptedSequentialAuthenticationFailureIsSticky(t *testing.T) {
+	codec, _ := NewTarStreamCodec([32]byte{16})
+	body := bytes.Repeat([]byte("0123456789abcdef"), 512)
+	artifact, scheme, digest := writeTarArtifact(t, codec, "image", body, nil)
+	const (
+		firstDataRecord = 1650
+		fullRecord      = 4096 + 17
+	)
+	artifact[firstDataRecord+fullRecord+17] ^= 1
+	source, _, err := tarstream.SourceFrom(
+		streamReaderOnly{bytes.NewReader(artifact)},
+		"",
+		tarstream.WithCodec(codec, true),
+		tarstream.WithExpectedDigest(scheme, digest),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, len(body))
+	if n, err := source.ReadAt(context.Background(), buffer, 0); n != 4096 || !errors.Is(err, tarstream.ErrAuthentication) {
+		t.Fatalf("cross-record read = %d, %v; want 4096, authentication failure", n, err)
+	}
+	if n, err := source.ReadAt(context.Background(), buffer[:4096], 4096); n != 0 || !errors.Is(err, tarstream.ErrAuthentication) {
+		t.Fatalf("retry after authentication failure = %d, %v", n, err)
+	}
+}
+
 func TestEncryptedTarStreamDoesNotExposePlainDigest(t *testing.T) {
 	codec, _ := NewTarStreamCodec([32]byte{12})
 	body := bytes.Repeat([]byte("identity"), 1024)

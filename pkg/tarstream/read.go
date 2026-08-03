@@ -728,6 +728,10 @@ func (v *seqView) Read(p []byte) (int, error) {
 		if read > 0 {
 			v.pos += int64(read)
 			v.packedRead += int64(read)
+			if err != nil && err != io.EOF {
+				v.finalErr = err
+				return read, err
+			}
 			if v.packedRead == v.stored-v.mapLen {
 				if finalErr := v.finishNow(); finalErr != nil {
 					return read, finalErr
