@@ -21,7 +21,8 @@
 ```
 
 读取方向相反:`manifest-ctl load` 从 Manifest 取 chunk 列表 → 经 cache-ctl
-(若配置)穿到 store-ctl `Get` → 解密 → 输出明文流。
+(若配置)穿到 store-ctl `Get` → 解密 → 输出由 `crypto.local` 决定编码的
+tarstream 工件。
 
 ### 1.2 设计原则
 
@@ -88,8 +89,10 @@ Flags:
 ```
 
 输入是 **tarstream 工件**(平台镜像/快照的统一容器):size 与洞图都在信封里,
-stdin 因此可单遍直通(零缓冲),文件则按需定位读;洞永远来自信封元数据,
-不做文件系统探测、更不做内容扫描。
+stdin 与文件都通过 `SourceFrom` 单遍完整验证,不物化中间文件;洞永远来自信封
+元数据,不做文件系统探测或内容零扫描。`crypto.local=off|auto|required` 分别对应
+plaintext-only、兼容 plaintext/encrypted、encrypted-only;ingest 结果发布前会验证
+inner digest、marker、trailer 和 outer EOF。
 
 stdout 输出一行 64 字符 hex —— 这是上传后的 manifest content key。stderr
 是人类可读的摘要(默认开,`--no-progress` 关):
@@ -137,7 +140,8 @@ Flags:
 
 输出是 **tarstream 工件**:manifest 空洞无损进信封洞图(没有"落洞还是填零"
 的策略问题,原 `--hole` 旗标随之取消),IsZero chunk 由写出端本地合成零字节、
-不取数。要 raw 字节用 `flatten-ctl tar extract` 解包。
+不取数。`crypto.local=off` 输出 byte-compatible plaintext,`auto|required` 输出
+encrypted v1。要 raw 字节用 `flatten-ctl tar extract` 解包。
 
 ```bash
 # 全量还原为工件(flags 在位置参数前)
