@@ -48,6 +48,9 @@ make test                       # 单元测试(含 rocks,需 librocksdb);e2e 见
 独立版本通过仓库的 `Release` workflow 发布为 `vX.Y.Z`;发布件
 `accelerator-vX.Y.Z-linux-<arch>.tar.gz` 包含三个服务二进制、文档和测试脚本。
 本地可用 `make release VERSION=vX.Y.Z` 生成并校验相同布局的 release bundle。
+正式版之前,workflow 每天按上海日期发布
+`v0.1.0-preview.YYYYMMDD` prerelease;手工入口也接受相同 preview 格式。
+preview 不更新 GitHub Latest,正式 `v0.1.0` 由独立构建发布。
 
 `deps/build-rocksdb.sh` 在 `build/<arch>/rocksdb/` 下编出无压缩的 `librocksdb.a`
 (约数分钟,冷启)。
