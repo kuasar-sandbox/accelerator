@@ -20,7 +20,8 @@ RocksDB / AWS SDK / Reed-Solomon 等重依赖:
 | `pkg/{flatten,image,remote,tar}` | OCI/目录 → EROFS 展平的公共实现:`flatten` 负责源模型与导出,`image` 负责 RuntimeConfig 投影,`remote` 负责 OCI registry 拉取/referrer/cache,`tar` 负责展平结果解包 |
 
 重后端(`*/server`、`pkg/cache/{rocks,redisstore,ec}`、`pkg/store/{obs,fs}`)只在 `cmd/` 与守护进程内
-编译,不进入下游闭包。`flatten-ctl` 二进制由 `guest-runtime` 发布,但其导入的
+编译,不进入下游闭包。`flatten-ctl` 二进制随 `guest-runtime` 的
+`runtime-vX.Y.Z` 发布,但其导入的
 展平公共包仍在本仓维护,供 CLI、测试和运行时读取 config 的代码复用。
 
 ## 二进制
@@ -43,6 +44,10 @@ make build TARGET_ARCH=aarch64  # 交叉编译(别名 amd64 / arm64)
 make vet                        # 校验薄客户端面(无需 librocksdb)
 make test                       # 单元测试(含 rocks,需 librocksdb);e2e 见各 docs;zot 拉取 e2e 为 make e2e
 ```
+
+独立版本通过仓库的 `Release` workflow 发布为 `vX.Y.Z`;发布件
+`accelerator-vX.Y.Z-linux-<arch>.tar.gz` 包含三个服务二进制、文档和测试脚本。
+本地可用 `make release VERSION=vX.Y.Z` 生成并校验相同布局的 release bundle。
 
 `deps/build-rocksdb.sh` 在 `build/<arch>/rocksdb/` 下编出无压缩的 `librocksdb.a`
 (约数分钟,冷启)。

@@ -10,7 +10,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all build manifest-ctl store-ctl cache-ctl deps-rocksdb test vet bench test-e2e test-e2e-port-lease test-e2e-cache test-e2e-store-cache test-e2e-cluster perf-cache perf-cache-remote dedup-report clean help
+.PHONY: all build manifest-ctl store-ctl cache-ctl deps-rocksdb test vet bench test-e2e test-e2e-port-lease test-e2e-cache test-e2e-store-cache test-e2e-cluster perf-cache perf-cache-remote dedup-report release test-release clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -137,6 +137,18 @@ perf-cache-remote:
 dedup-report:
 	BIN=$(SBIN) bash test/scripts/dedup_report.sh
 
+VERSION ?= v0.1.0
+
+release: build
+	@printf 'repository\trequested_ref\tresolved_sha\trole\n' > build/revisions.tsv
+	@printf 'kuasar-sandbox/accelerator\tHEAD\t%s\tprimary\n' "$$(git rev-parse HEAD)" >> build/revisions.tsv
+	rm -rf build/release-bundle
+	SOURCE_DATE_EPOCH="$$(git show -s --format=%ct HEAD)" \
+		bash scripts/release.sh package "$(VERSION)" "$(TARGET_ARCH)" build/revisions.tsv build/release-bundle
+
+test-release:
+	bash scripts/test-release.sh
+
 help:
 	@echo "accelerator. Targets:"
 	@echo "  build         build manifest-ctl + store-ctl + cache-ctl"
@@ -146,5 +158,7 @@ help:
 	@echo "  deps-rocksdb  build local librocksdb.a"
 	@echo "  test          unit tests (needs librocksdb for cache/rocks)"
 	@echo "  vet           vet the CGO-free client surface"
+	@echo "  release       build a validated component release bundle"
+	@echo "  test-release  test component release packaging"
 	@echo "  clean         remove bin/ + build/"
 	@echo "  TARGET_ARCH   x86_64 (default) | aarch64"
