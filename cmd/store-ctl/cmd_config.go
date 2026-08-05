@@ -56,7 +56,7 @@ func cmdConfigGenerate(args []string) {
 
 // storeConfigTemplate is a commented YAML for `store-ctl config generate`.
 // Defaults to the fs backend (simplest local deploy); operators using
-// obs swap the backend block.
+// S3-compatible object storage swap the backend block.
 const storeConfigTemplate = `# store-ctl daemon configuration.
 # Reference this file via --config or the STORE_CONFIG environment
 # variable. There is no auto-discovery; unset = error.
@@ -66,7 +66,7 @@ const storeConfigTemplate = `# store-ctl daemon configuration.
 # set store.endpoint to the same path (or its unix:/// form).
 listen: 127.0.0.1:7100
 
-# Backend: fs | obs.
+# Backend: fs | s3.
 backend: fs
 
 # Periodic adaptive stats line to stderr: each period with traffic prints one
@@ -81,12 +81,16 @@ fs:
   # bytes. Cheap insurance against client bugs; off only for benchmarks.
   verify_content_key: true
 
-# Object-storage backend (when backend: obs). Unused under backend: fs.
-# obs:
-#   endpoint: obs.example.com
-#   region: cn-north-4
-#   bucket: my-store
-#   prefix: store/
-#   access_key: AKIA...
-#   secret_key: ...
+# S3-compatible object storage backend (when backend: s3). Unused under backend: fs.
+# s3:
+#   endpoint: https://example-s3-endpoint
+#   region: us-east-1
+#   bucket: kuasar-store
+#   prefix: production
+#   access_key: ${S3_ACCESS_KEY}
+#   secret_key: ${S3_SECRET_KEY}
+#   verify_content_key: true
+#   max_inflight: 64
+#   op_timeout: 10s
+#   max_object_size_bytes: 16777216
 `

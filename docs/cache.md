@@ -1,28 +1,29 @@
 # cache — 分层内容缓存
 
 `cache-ctl` 是项目里**跨 sandbox 共享**的内容缓存层。它把客户端反复
-读取的 chunk 在节点本地与节点间集群里重复使用,把热路径延迟从远端
-OBS 的 ~50 ms 压到本地 RocksDB BlockCache 命中的 <100 µs。同一份二进
-制,通过 YAML 配置切换三种运行形态(`local` / `shard` / `tiered`),
+读取的 chunk 在节点本地与节点间集群里重复使用,把远端 S3-compatible
+object storage 的热路径收敛到本地 RocksDB BlockCache。同一份二进制,
+通过 YAML 配置切换三种运行形态(`local` / `shard` / `tiered`),
 适配不同部署场景。
 
 ## 1. 概述
 
 ### 1.1 解决的问题
 
-Agent 应用的镜像(1–5 GiB)和内存快照(~512 MiB)存储在远端 OBS,直接
-拉取的延迟和带宽不可承受——万级并发同时拉取,聚合带宽超过网络承载。
+Agent 应用的镜像(1–5 GiB)和内存快照(~512 MiB)存储在远端 S3-compatible
+object storage,直接拉取的延迟和带宽不可承受——万级并发同时拉取,聚合
+带宽超过网络承载。
 
 | 维度 | 无缓存 | 有缓存 |
 |---|---|---|
 | 镜像冷启动 | 秒级(全量拉取) | <500 ms(按需加载,缓存命中单次 IO) |
 | 快照恢复 | 数百 ms | <80 ms(L1/L2 命中) |
 | 网络带宽 | 线性增长 | 仅首次 miss 产生远端流量 |
-| OBS 成本 | 随并发线性增长 | 流量降 >99% |
+| 远端对象存储成本 | 随并发线性增长 | 流量降 >99% |
 
 99.9% 整体命中率(L1 内存 + L2 磁盘联合)意味着每 1000 次缓存查询最多 1
-次穿透到 OBS。5 TiB 磁盘容量范围内,任何请求最多 1 次随机 IO(Index 与
-Bloom Filter 全部常驻内存)。
+次穿透到远端对象存储。5 TiB 磁盘容量范围内,任何请求最多 1 次随机 IO
+(Index 与 Bloom Filter 全部常驻内存)。
 
 ### 1.2 设计原则
 
@@ -332,7 +333,7 @@ tiers:
                        │   gRPC server        │    │   wire server                │
                        │      │               │    │      │                       │
                        │      ▼               │    │      ▼                       │
-                       │   fs / obs backend   │    │   TieredCache                │
+                       │   fs / s3 backend    │    │   TieredCache                │
                        │   __meta/generations │    │     tier 0   embedded  (L1)  │
                        └──────────▲───────────┘    │     tier 1   ec ──────┐      │
                                   │                │     origin ──┐        │      │

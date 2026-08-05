@@ -15,7 +15,7 @@ import (
 // Symmetric across backends:
 //
 //	fs:  rewrites <root>/__meta/generations atomically
-//	obs: CAS-rewrites <prefix>/__meta/generations with If-Match
+//	s3:  CAS-rewrites <prefix>/__meta/generations with If-Match
 func cmdRollout(args []string) {
 	fset := flag.NewFlagSet("rollout", flag.ExitOnError)
 	configPath := fset.String("config", "", "YAML config file (overrides STORE_CONFIG env)")
@@ -52,8 +52,8 @@ func openAdminStore(cfg *Config) (adminStore, error) {
 	switch cfg.Backend {
 	case "fs":
 		return openFSStore(cfg)
-	case "obs":
-		return openOBSStore(context.Background(), cfg)
+	case "s3":
+		return openS3Store(context.Background(), cfg)
 	default:
 		return nil, fmt.Errorf("unknown backend %q", cfg.Backend)
 	}

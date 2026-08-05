@@ -15,7 +15,7 @@ import (
 //
 // Works on both backends — the per-partition walk happens through
 // the admin GenerationStats method, which fs implements with
-// filepath.WalkDir and obs implements with paginated List.
+// filepath.WalkDir and s3 implements with paginated List.
 func cmdInfo(args []string) {
 	fset := flag.NewFlagSet("info", flag.ExitOnError)
 	configPath := fset.String("config", "", "YAML config file (overrides STORE_CONFIG env)")
@@ -38,9 +38,9 @@ func cmdInfo(args []string) {
 	switch cfg.Backend {
 	case "fs":
 		fmt.Printf("Root:    %s\n", cfg.FS.Root)
-	case "obs":
-		fmt.Printf("Bucket:  %s\n", cfg.OBS.Bucket)
-		fmt.Printf("Prefix:  %s\n", cfg.OBS.Prefix)
+	case "s3":
+		fmt.Printf("Bucket:  %s\n", cfg.S3.Bucket)
+		fmt.Printf("Prefix:  %s\n", cfg.S3.Prefix)
 	}
 	fmt.Printf("Active:  %s\n", s.ActiveGeneration())
 	gens := s.Generations()

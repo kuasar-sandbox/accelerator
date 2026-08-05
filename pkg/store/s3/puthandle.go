@@ -1,4 +1,4 @@
-package obs
+package s3
 
 import (
 	"bytes"
@@ -31,7 +31,7 @@ type putHandle struct {
 
 func (h *putHandle) Write(p []byte) (int, error) {
 	if h.committed || h.aborted {
-		return 0, errors.New("obs: write after commit/abort")
+		return 0, errors.New("s3: write after commit/abort")
 	}
 	return h.buf.Write(p)
 }
@@ -50,7 +50,7 @@ func (h *putHandle) Write(p []byte) (int, error) {
 // the contract documented in store.PutHandle).
 func (h *putHandle) Commit(key store.ContentKey, verifyDigest store.ContentKey) (bool, error) {
 	if h.committed || h.aborted {
-		return false, errors.New("obs: commit on already-terminated handle")
+		return false, errors.New("s3: commit on already-terminated handle")
 	}
 	defer func() { h.committed = true; h.buf.Reset() }()
 
@@ -58,7 +58,7 @@ func (h *putHandle) Commit(key store.ContentKey, verifyDigest store.ContentKey) 
 		return false, ErrKeyMismatch
 	}
 	if int64(h.buf.Len()) > h.store.maxObjSize {
-		return false, fmt.Errorf("obs: payload size %d exceeds max %d", h.buf.Len(), h.store.maxObjSize)
+		return false, fmt.Errorf("s3: payload size %d exceeds max %d", h.buf.Len(), h.store.maxObjSize)
 	}
 
 	// Last-chance dedup. Two writers racing on the same key both
@@ -77,7 +77,7 @@ func (h *putHandle) Commit(key store.ContentKey, verifyDigest store.ContentKey) 
 	if _, err := h.store.boundedPut(context.Background(), objKey, body, PutOptions{
 		ContentType: "application/octet-stream",
 	}); err != nil {
-		return false, fmt.Errorf("obs: put %s: %w", objKey, err)
+		return false, fmt.Errorf("s3: put %s: %w", objKey, err)
 	}
 	return true, nil
 }
@@ -91,7 +91,7 @@ func (h *putHandle) Abort() error {
 	return nil
 }
 
-// computeDigest is a small helper kept here (not in obs.go) so
+// computeDigest is a small helper kept here (not in s3.go) so
 // puthandle's contract — "verifyDigest != key ⇒ reject" — stays
 // next to the reject site. fs.Store keeps the same idiom.
 func computeDigest(data []byte) store.ContentKey {

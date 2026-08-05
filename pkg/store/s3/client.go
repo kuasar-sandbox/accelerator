@@ -1,6 +1,5 @@
-// Package obs implements a store-ctl Backend backed by S3-compatible
-// object storage (used in production with OBS via its
-// S3-compatible endpoint).
+// Package s3 implements a store-ctl Backend backed by S3-compatible
+// object storage.
 //
 // The package is intentionally split across three concerns so the
 // core logic can be unit-tested without dragging in a real S3 SDK:
@@ -8,17 +7,17 @@
 //   - client.go (this file): the minimal s3Client interface that
 //     hides whichever SDK we end up using and the small data types
 //     it needs (ObjectMeta, PutOptions, sentinel errors).
-//   - obs.go:    Store implementation — generations meta load/init,
+//   - store.go: Store implementation — generations meta load/init,
 //     Get/Put/Exists/OpenPut, generation-walk on Get,
 //     defensive wrapper (timeout + semaphore + size limit).
 //   - puthandle.go: streaming-Put session that buffers in memory
 //     and uploads on Commit via s3Client.Put.
 //
-// Production code wires *s3client.Client (a thin aws-sdk-go-v2/s3
+// Production code wires *sdkclient.Client (a thin aws-sdk-go-v2/s3
 // adapter living in a sub-package so it doesn't pollute this
 // package's dependency footprint) into the s3Client interface; tests
 // inject a fake.
-package obs
+package s3
 
 import (
 	"context"
@@ -32,12 +31,12 @@ var (
 	// ErrNotFound is returned by Head/Get when the key is absent.
 	// Distinct from "transport failure" so callers can short-circuit
 	// without misclassifying genuine 5xx as miss.
-	ErrNotFound = errors.New("obs: object not found")
+	ErrNotFound = errors.New("s3: object not found")
 
 	// ErrPreconditionFailed maps to HTTP 412 — the conditional-put
 	// header (If-None-Match: *  or  If-Match: <etag>) was violated.
 	// Used for compare-and-swap on the generations meta object.
-	ErrPreconditionFailed = errors.New("obs: precondition failed")
+	ErrPreconditionFailed = errors.New("s3: precondition failed")
 )
 
 // ObjectMeta is the small subset of S3 HEAD response we use. The
@@ -64,15 +63,15 @@ type PutOptions struct {
 	ContentType string
 }
 
-// s3Client is the storage-side dependency the obs.Store relies on.
+// s3Client is the storage-side dependency the s3.Store relies on.
 // Real production wiring uses an aws-sdk-go-v2/s3-backed implementation
-// (sub-package pkg/store/obs/s3client). Tests inject a fake.
+// (sub-package pkg/store/s3/sdkclient). Tests inject a fake.
 //
 // Implementations MUST:
 //
-//   - return obs.ErrNotFound for HEAD/GET on a missing key (NOT a
+//   - return s3.ErrNotFound for HEAD/GET on a missing key (NOT a
 //     wrapped SDK error)
-//   - return obs.ErrPreconditionFailed for 412 from PUT
+//   - return s3.ErrPreconditionFailed for 412 from PUT
 //   - respect ctx cancellation/deadline (don't trust SDK auto-timeout)
 //   - close any response body before returning to caller
 type s3Client interface {

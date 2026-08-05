@@ -1,12 +1,12 @@
-// Package s3client wraps aws-sdk-go-v2/s3 in the small obs.s3Client
+// Package sdkclient wraps aws-sdk-go-v2/s3 in the small s3.s3Client
 // interface, normalising AWS SDK error types into the sentinel
-// errors the parent package expects (obs.ErrNotFound /
-// obs.ErrPreconditionFailed) and applying the per-call defenses
+// errors the parent package expects (s3.ErrNotFound /
+// s3.ErrPreconditionFailed) and applying the per-call defenses
 // (no-trust-SDK-timeout, body close, content-length verification).
 //
-// Living in a sub-package keeps the AWS SDK out of pkg/store/obs's
+// Living in a sub-package keeps the AWS SDK out of pkg/store/s3's
 // dependency tree — that package's unit tests stay SDK-free.
-package s3client
+package sdkclient
 
 import (
 	"bytes"
@@ -19,11 +19,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 
-	"github.com/kuasar-sandbox/accelerator/pkg/store/obs"
+	"github.com/kuasar-sandbox/accelerator/pkg/store/s3"
 )
 
 // Config is the dialing-side configuration. AccessKey / SecretKey
@@ -32,16 +32,14 @@ import (
 // (env vars, ECS metadata, etc.) which is the right behaviour when
 // the host is a cloud instance with an instance role attached.
 type Config struct {
-	// Endpoint is the OBS S3-compatible endpoint URL, e.g.
-	// "https://obs.cn-north-4.example.com". Required.
+	// Endpoint is the S3-compatible endpoint URL. Required.
 	Endpoint string
 
-	// Region is the OBS region name, e.g. "cn-north-4". Used for
-	// signing only — OBS validates the region on each request.
+	// Region is the signing region. Empty defaults to us-east-1.
 	Region string
 
 	// Bucket is the target bucket. Captured by Client to produce
-	// per-call S3 inputs; obs.Store talks in keys, this layer
+	// per-call S3 inputs; s3.Store talks in keys, this layer
 	// fills in the bucket.
 	Bucket string
 
@@ -51,65 +49,82 @@ type Config struct {
 }
 
 // Client is the s3Client implementation. Held in the parent package
-// via the obs.s3Client interface; no public methods other than the
+// via the s3.s3Client interface; no public methods other than the
 // interface contract.
 type Client struct {
-	api    *s3.Client
+	api    *awss3.Client
 	bucket string
 }
 
-// New dials and returns a Client. Validation is minimal — the SDK
-// itself surfaces any malformed endpoint / signature config the
-// first time a request flies.
+// New validates the required location and static-credential pairing,
+// then returns a Client. The SDK surfaces malformed endpoint or signing
+// configuration when the first request is sent.
 func New(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.Endpoint == "" {
-		return nil, errors.New("s3client: endpoint is required")
+		return nil, errors.New("s3 sdkclient: endpoint is required")
 	}
 	if cfg.Bucket == "" {
-		return nil, errors.New("s3client: bucket is required")
+		return nil, errors.New("s3 sdkclient: bucket is required")
+	}
+	if (cfg.AccessKey == "") != (cfg.SecretKey == "") {
+		return nil, errors.New("s3 sdkclient: access key and secret key must be set together")
 	}
 
-	loadOpts := []func(*awsconfig.LoadOptions) error{}
-	if cfg.Region != "" {
-		loadOpts = append(loadOpts, awsconfig.WithRegion(cfg.Region))
+	region := cfg.Region
+	if region == "" {
+		region = "us-east-1"
 	}
+	loadOpts := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(region)}
 	if cfg.AccessKey != "" {
 		loadOpts = append(loadOpts, awsconfig.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")))
 	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
 	if err != nil {
-		return nil, fmt.Errorf("s3client: load aws config: %w", err)
+		return nil, fmt.Errorf("s3 sdkclient: load aws config: %w", err)
 	}
-	api := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-		o.BaseEndpoint = aws.String(cfg.Endpoint)
-		// OBS's S3-compatible responses carry no CRC/SHA checksum
-		// header, so the SDK logs a WARN on every GET. Silence it —
-		// we verify content-length ourselves and the transport is TLS.
-		o.DisableLogOutputChecksumValidationSkipped = true
-	})
+	api := newAPI(awsCfg, cfg.Endpoint)
 	return &Client{api: api, bucket: cfg.Bucket}, nil
 }
 
-// Head implements obs.s3Client.
-func (c *Client) Head(ctx context.Context, key string) (*obs.ObjectMeta, error) {
-	out, err := c.api.HeadObject(ctx, &s3.HeadObjectInput{
+func newAPI(awsCfg aws.Config, endpoint string) *awss3.Client {
+	return awss3.NewFromConfig(awsCfg, func(o *awss3.Options) {
+		o.BaseEndpoint = aws.String(endpoint)
+
+		// Custom S3-compatible endpoints cannot be assumed to publish
+		// wildcard bucket DNS records or certificates. Keep the configured
+		// endpoint host intact and address the bucket in the request path.
+		o.UsePathStyle = true
+
+		// Prefer the broadly supported S3 request format. Some
+		// S3-compatible services do not implement AWS flexible checksum
+		// trailers or aws-chunked request encoding.
+		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
+
+		o.DisableLogOutputChecksumValidationSkipped = true
+	})
+}
+
+// Head implements s3.s3Client.
+func (c *Client) Head(ctx context.Context, key string) (*s3.ObjectMeta, error) {
+	out, err := c.api.HeadObject(ctx, &awss3.HeadObjectInput{
 		Bucket: aws.String(c.bucket),
 		Key:    aws.String(key),
 	})
 	if err != nil {
 		if isNotFound(err) {
-			return nil, obs.ErrNotFound
+			return nil, s3.ErrNotFound
 		}
 		return nil, normaliseErr("head", key, err)
 	}
-	return &obs.ObjectMeta{
+	return &s3.ObjectMeta{
 		Size: aws.ToInt64(out.ContentLength),
 		ETag: aws.ToString(out.ETag),
 	}, nil
 }
 
-// Get implements obs.s3Client. The body is fully read into memory
+// Get implements s3.s3Client. The body is fully read into memory
 // — store-ctl's chunk/manifest workload caps single-object size at
 // the chunker's max-chunk setting (typically ≤1 MiB), so a one-
 // shot ReadAll is the right tradeoff vs streaming complexity.
@@ -117,14 +132,14 @@ func (c *Client) Head(ctx context.Context, key string) (*obs.ObjectMeta, error) 
 // Defensive close: the response Body is *always* Closed before
 // return, including on read failure, to avoid leaking a connection
 // if the SDK's own cleanup path has a bug.
-func (c *Client) Get(ctx context.Context, key string) ([]byte, *obs.ObjectMeta, error) {
-	out, err := c.api.GetObject(ctx, &s3.GetObjectInput{
+func (c *Client) Get(ctx context.Context, key string) ([]byte, *s3.ObjectMeta, error) {
+	out, err := c.api.GetObject(ctx, &awss3.GetObjectInput{
 		Bucket: aws.String(c.bucket),
 		Key:    aws.String(key),
 	})
 	if err != nil {
 		if isNotFound(err) {
-			return nil, nil, obs.ErrNotFound
+			return nil, nil, s3.ErrNotFound
 		}
 		return nil, nil, normaliseErr("get", key, err)
 	}
@@ -135,21 +150,21 @@ func (c *Client) Get(ctx context.Context, key string) ([]byte, *obs.ObjectMeta, 
 	size := aws.ToInt64(out.ContentLength)
 	body, err := io.ReadAll(out.Body)
 	if err != nil {
-		return nil, nil, fmt.Errorf("s3client: read body %s: %w", key, err)
+		return nil, nil, fmt.Errorf("s3 sdkclient: read body %s: %w", key, err)
 	}
-	if size > 0 && int64(len(body)) != size {
-		return nil, nil, fmt.Errorf("s3client: body size mismatch (header=%d, read=%d)",
+	if out.ContentLength != nil && int64(len(body)) != size {
+		return nil, nil, fmt.Errorf("s3 sdkclient: body size mismatch (header=%d, read=%d)",
 			size, len(body))
 	}
-	return body, &obs.ObjectMeta{
+	return body, &s3.ObjectMeta{
 		Size: int64(len(body)),
 		ETag: aws.ToString(out.ETag),
 	}, nil
 }
 
-// Put implements obs.s3Client.
-func (c *Client) Put(ctx context.Context, key string, body []byte, opts obs.PutOptions) (string, error) {
-	in := &s3.PutObjectInput{
+// Put implements s3.s3Client.
+func (c *Client) Put(ctx context.Context, key string, body []byte, opts s3.PutOptions) (string, error) {
+	in := &awss3.PutObjectInput{
 		Bucket:        aws.String(c.bucket),
 		Key:           aws.String(key),
 		Body:          bytes.NewReader(body),
@@ -167,19 +182,19 @@ func (c *Client) Put(ctx context.Context, key string, body []byte, opts obs.PutO
 	out, err := c.api.PutObject(ctx, in)
 	if err != nil {
 		if isPreconditionFailed(err) {
-			return "", obs.ErrPreconditionFailed
+			return "", s3.ErrPreconditionFailed
 		}
 		return "", normaliseErr("put", key, err)
 	}
 	return aws.ToString(out.ETag), nil
 }
 
-// List implements obs.s3Client. Pages transparently via the SDK's
+// List implements s3.s3Client. Pages transparently via the SDK's
 // continuation-token mechanism so callers see one flat key stream.
 // visit returning false aborts the scan at the next page boundary
 // (we don't issue any S3-level cancel — paginator just stops).
 func (c *Client) List(ctx context.Context, prefix string, visit func(key string) bool) error {
-	paginator := s3.NewListObjectsV2Paginator(c.api, &s3.ListObjectsV2Input{
+	paginator := awss3.NewListObjectsV2Paginator(c.api, &awss3.ListObjectsV2Input{
 		Bucket: aws.String(c.bucket),
 		Prefix: aws.String(prefix),
 	})
@@ -198,11 +213,11 @@ func (c *Client) List(ctx context.Context, prefix string, visit func(key string)
 	return nil
 }
 
-// Delete implements obs.s3Client. S3 DeleteObject is idempotent —
+// Delete implements s3.s3Client. S3 DeleteObject is idempotent —
 // 200/204 OK whether the key existed or not — so we don't translate
 // "absent" to a sentinel; only transport errors propagate.
 func (c *Client) Delete(ctx context.Context, key string) error {
-	_, err := c.api.DeleteObject(ctx, &s3.DeleteObjectInput{
+	_, err := c.api.DeleteObject(ctx, &awss3.DeleteObjectInput{
 		Bucket: aws.String(c.bucket),
 		Key:    aws.String(key),
 	})
@@ -253,5 +268,5 @@ func isPreconditionFailed(err error) bool {
 // normaliseErr wraps an SDK error with the operation + key context
 // without losing the original chain (errors.Is / As still work).
 func normaliseErr(op, key string, err error) error {
-	return fmt.Errorf("s3client: %s %s: %w", op, key, err)
+	return fmt.Errorf("s3 sdkclient: %s %s: %w", op, key, err)
 }

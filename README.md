@@ -19,7 +19,7 @@ RocksDB / AWS SDK / Reed-Solomon 等重依赖:
 | `pkg/tarstream` | 单 payload 稀疏 tar 工件:`WriteTo` 写 GNU PAX sparse 1.0 + 空的 `.kuasar.sha256.<hex>` marker,边写边生成摘要;`SourceAt` 通过可选 `Digester` 零 payload 扫描读取身份;`ReadFrom` / `ReadSeekFrom` / `SourceFrom` 保持洞图精确往返与 GNU tar/archive-tar 互操作 |
 | `pkg/{flatten,image,remote,tar}` | OCI/目录 → EROFS 展平的公共实现:`flatten` 负责源模型与导出,`image` 负责 RuntimeConfig 投影,`remote` 负责 OCI registry 拉取/referrer/cache,`tar` 负责展平结果解包 |
 
-重后端(`*/server`、`pkg/cache/{rocks,redisstore,ec}`、`pkg/store/{obs,fs}`)只在 `cmd/` 与守护进程内
+重后端(`*/server`、`pkg/cache/{rocks,redisstore,ec}`、`pkg/store/{fs,s3}`)只在 `cmd/` 与守护进程内
 编译,不进入下游闭包。`flatten-ctl` 二进制随 `guest-runtime` 的
 `runtime-vX.Y.Z` 发布,但其导入的
 展平公共包仍在本仓维护,供 CLI、测试和运行时读取 config 的代码复用。
@@ -29,7 +29,7 @@ RocksDB / AWS SDK / Reed-Solomon 等重依赖:
 | 二进制 | 说明 | 链接 |
 |---|---|---|
 | `manifest-ctl` | 本地分块/加密/去重 + manifest 读写 CLI | 纯 Go |
-| `store-ctl` | 内容寻址存储代理(fs / obs 后端 + generation) | 纯 Go |
+| `store-ctl` | 内容寻址存储代理(fs / S3-compatible object storage backend + generation) | 纯 Go |
 | `cache-ctl` | 分层缓存守护进程(local / shard / tiered + EC) | CGO,静态链 librocksdb |
 
 **CGO 仅 `cache-ctl`**(librocksdb);其余两个二进制与全部导出面均 `CGO_ENABLED=0`。
@@ -63,7 +63,7 @@ preview 不更新 GitHub Latest,正式 `v0.1.0` 由独立构建发布。
 ## 文档
 
 - [docs/manifest.md](docs/manifest.md) — 二进制清单:分块 / 收敛加密 / 密钥表 / 读写 SDK。
-- [docs/store.md](docs/store.md) — 内容寻址存储:分代目录布局 / fs·obs 后端 / GC。
+- [docs/store.md](docs/store.md) — 内容寻址存储:分代目录布局 / fs·S3-compatible object storage backend / GC。
 - [docs/cache.md](docs/cache.md) — 三层缓存 + 纠删码:local / shard / tiered 与旁路填充。
 - [docs/cache-redis.md](docs/cache-redis.md) — Redis-compatible UDS/TCP 后端、取消语义与外部 Dragonfly 部署示例。
 OCI/目录 → EROFS 确定性展平 CLI 见 `guest-runtime/docs/flatten.md`。

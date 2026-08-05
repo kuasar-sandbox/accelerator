@@ -1,4 +1,4 @@
-package obs
+package s3
 
 import (
 	"bytes"
@@ -256,7 +256,7 @@ func TestObjectKeyLayout(t *testing.T) {
 		t.Errorf("objectKey=%q want %q", got, want)
 	}
 	// Path layout intentionally mirrors filepath.Join semantics for
-	// fs/obs symmetry: posix-style slashes either way.
+	// fs/s3 symmetry: posix-style slashes either way.
 	_ = filepath.Join
 }
 

@@ -1,4 +1,4 @@
-package obs
+package s3
 
 import (
 	"context"
