@@ -15,7 +15,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
-	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 
 	stores3 "github.com/kuasar-sandbox/accelerator/pkg/store/s3"
 )
@@ -236,13 +235,36 @@ func newRoundTripClient(rt http.RoundTripper) *Client {
 			credentials.NewStaticCredentialsProvider("test-ak", "test-sk", "")),
 		HTTPClient: &http.Client{Transport: rt},
 	}
-	api := awss3.NewFromConfig(awsCfg, func(o *awss3.Options) {
-		o.BaseEndpoint = aws.String("https://objects.example.com")
-		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
-		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
-		o.DisableLogOutputChecksumValidationSkipped = true
-	})
+	api := newAPI(awsCfg, "https://objects.example.com")
 	return &Client{api: api, bucket: "test-bucket"}
+}
+
+func TestPutUsesPathStyleForCompatibleEndpoint(t *testing.T) {
+	type observedRequest struct {
+		host string
+		path string
+	}
+	requests := make(chan observedRequest, 1)
+	client := newRoundTripClient(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests <- observedRequest{host: req.URL.Host, path: req.URL.EscapedPath()}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"ETag": []string{`"path-style-etag"`}},
+			Body:       io.NopCloser(strings.NewReader("")),
+			Request:    req,
+		}, nil
+	}))
+
+	if _, err := client.Put(context.Background(), "objects/key", []byte("payload"), stores3.PutOptions{}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	got := <-requests
+	if got.host != "objects.example.com" {
+		t.Errorf("request host=%q want configured endpoint host", got.host)
+	}
+	if got.path != "/test-bucket/objects/key" {
+		t.Errorf("request path=%q want path-style bucket and key", got.path)
+	}
 }
 
 type trackingBody struct {

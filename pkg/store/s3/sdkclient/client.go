@@ -83,8 +83,18 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("s3 sdkclient: load aws config: %w", err)
 	}
-	api := awss3.NewFromConfig(awsCfg, func(o *awss3.Options) {
-		o.BaseEndpoint = aws.String(cfg.Endpoint)
+	api := newAPI(awsCfg, cfg.Endpoint)
+	return &Client{api: api, bucket: cfg.Bucket}, nil
+}
+
+func newAPI(awsCfg aws.Config, endpoint string) *awss3.Client {
+	return awss3.NewFromConfig(awsCfg, func(o *awss3.Options) {
+		o.BaseEndpoint = aws.String(endpoint)
+
+		// Custom S3-compatible endpoints cannot be assumed to publish
+		// wildcard bucket DNS records or certificates. Keep the configured
+		// endpoint host intact and address the bucket in the request path.
+		o.UsePathStyle = true
 
 		// Prefer the broadly supported S3 request format. Some
 		// S3-compatible services do not implement AWS flexible checksum
@@ -94,7 +104,6 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 
 		o.DisableLogOutputChecksumValidationSkipped = true
 	})
-	return &Client{api: api, bucket: cfg.Bucket}, nil
 }
 
 // Head implements s3.s3Client.

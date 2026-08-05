@@ -361,7 +361,8 @@ store-ctl OOM 或队头阻塞。`op_timeout` 不设时,慢/卡调用靠 `STORE_C
 
 endpoint 与 bucket 没有自动发现来源,展开后为空会立即报错。region 也不识别
 厂商或 hostname;空值统一使用 `us-east-1`。这让私有 endpoint、代理 endpoint
-及不同 S3-compatible 服务保持同一签名和配置行为。
+及不同 S3-compatible 服务保持同一签名和配置行为。请求固定使用 path-style
+bucket addressing,不要求自定义 endpoint 提供 wildcard bucket DNS 或证书。
 
 ### 4.6 Generation 模型
 
