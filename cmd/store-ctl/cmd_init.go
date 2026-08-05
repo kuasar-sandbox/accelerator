@@ -15,7 +15,7 @@ import (
 // Symmetric across backends:
 //
 //	fs:  writes <root>/__meta/generations
-//	obs: PUTs <prefix>/__meta/generations with If-None-Match: *
+//	s3:  PUTs <prefix>/__meta/generations with If-None-Match: *
 func cmdInit(args []string) {
 	fset := flag.NewFlagSet("init", flag.ExitOnError)
 	configPath := fset.String("config", "", "YAML config file (overrides STORE_CONFIG env)")
@@ -41,12 +41,12 @@ func cmdInit(args []string) {
 		}
 		fmt.Fprintf(os.Stderr, "init OK: backend=fs root=%s generation=%s\n",
 			cfg.FS.Root, *generation)
-	case "obs":
-		if err := initOBSStore(context.Background(), cfg, *generation); err != nil {
-			fatal("init obs: %v", err)
+	case "s3":
+		if err := initS3Store(context.Background(), cfg, *generation); err != nil {
+			fatal("init s3: %v", err)
 		}
-		fmt.Fprintf(os.Stderr, "init OK: backend=obs bucket=%s prefix=%s generation=%s\n",
-			cfg.OBS.Bucket, cfg.OBS.Prefix, *generation)
+		fmt.Fprintf(os.Stderr, "init OK: backend=s3 bucket=%s prefix=%s generation=%s\n",
+			cfg.S3.Bucket, cfg.S3.Prefix, *generation)
 	default:
 		fatal("unknown backend %q", cfg.Backend)
 	}

@@ -1,10 +1,13 @@
 package main
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func writeYAML(t *testing.T, body string) string {
@@ -17,8 +20,31 @@ func writeYAML(t *testing.T, body string) string {
 	return p
 }
 
-// TestLoadConfig_FS — minimal valid fs yaml.
-func TestLoadConfig_FS(t *testing.T) {
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = old }()
+	defer r.Close()
+	defer w.Close()
+
+	fn()
+	os.Stderr = old
+	if err := w.Close(); err != nil {
+		t.Fatalf("close stderr capture: %v", err)
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read stderr capture: %v", err)
+	}
+	return string(out)
+}
+
+func TestLoadConfigFS(t *testing.T) {
 	path := writeYAML(t, `
 listen: 127.0.0.1:50051
 backend: fs
@@ -29,16 +55,15 @@ fs:
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if cfg.Backend != "fs" || cfg.FS.Root != "/var/lib/store" {
-		t.Errorf("unexpected: %+v", cfg.FS)
+	if cfg.Backend != "fs" || cfg.FS == nil || cfg.FS.Root != "/var/lib/store" {
+		t.Fatalf("unexpected config: %+v", cfg)
 	}
 	if !cfg.VerifyKey() {
-		t.Errorf("VerifyKey should default to true")
+		t.Error("VerifyKey should default to true")
 	}
 }
 
-// TestLoadConfig_FS_VerifyOff — nullable bool honoured.
-func TestLoadConfig_FS_VerifyOff(t *testing.T) {
+func TestLoadConfigFSVerifyOff(t *testing.T) {
 	path := writeYAML(t, `
 listen: 127.0.0.1:50051
 backend: fs
@@ -55,14 +80,13 @@ fs:
 	}
 }
 
-// TestLoadConfig_OBS_HappyPath — minimal valid obs yaml.
-func TestLoadConfig_OBS_HappyPath(t *testing.T) {
+func TestLoadConfigS3HappyPath(t *testing.T) {
 	path := writeYAML(t, `
 listen: 127.0.0.1:50051
-backend: obs
-obs:
-  endpoint: https://obs.cn-north-4.example.com
-  region: cn-north-4
+backend: s3
+s3:
+  endpoint: https://objects.example.com
+  region: test-region-1
   bucket: test-bucket
   prefix: store/
   access_key: ABC
@@ -73,214 +97,260 @@ obs:
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if cfg.Backend != "obs" {
-		t.Errorf("Backend=%q want obs", cfg.Backend)
+	if cfg.Backend != "s3" || cfg.S3 == nil {
+		t.Fatalf("unexpected config: %+v", cfg)
 	}
-	if cfg.OBS.Bucket != "test-bucket" || cfg.OBS.Endpoint == "" {
-		t.Errorf("obs fields unexpected: %+v", cfg.OBS)
+	if cfg.S3.Bucket != "test-bucket" || cfg.S3.Region != "test-region-1" {
+		t.Errorf("s3 fields unexpected: %+v", cfg.S3)
 	}
-	to, err := cfg.OBSOpTimeout()
+	if !cfg.VerifyKey() {
+		t.Error("VerifyKey should default to true")
+	}
+	got, err := cfg.S3OpTimeout()
 	if err != nil {
-		t.Fatalf("OBSOpTimeout: %v", err)
+		t.Fatalf("S3OpTimeout: %v", err)
 	}
-	if to.String() != "7s" {
-		t.Errorf("OpTimeout=%v want 7s", to)
+	if got.String() != "7s" {
+		t.Errorf("OpTimeout=%v want 7s", got)
 	}
 }
 
-// TestLoadConfig_OBS_EnvExpansion — ${OBS_AK} / ${OBS_SK} resolve
-// to the corresponding env vars.
-func TestLoadConfig_OBS_EnvExpansion(t *testing.T) {
-	t.Setenv("MY_TEST_AK", "from-env-AK")
-	t.Setenv("MY_TEST_SK", "from-env-SK")
+func TestLoadConfigLegacyOBSNormalizesSilently(t *testing.T) {
 	path := writeYAML(t, `
 listen: 127.0.0.1:50051
 backend: obs
 obs:
-  endpoint: https://obs.example.com
-  bucket: b
-  access_key: ${MY_TEST_AK}
-  secret_key: ${MY_TEST_SK}
+  endpoint: https://legacy-objects.example.com
+  region: legacy-region-1
+  bucket: legacy-bucket
 `)
-	cfg, err := LoadConfig(path, true)
+	var (
+		cfg     *Config
+		loadErr error
+	)
+	stderr := captureStderr(t, func() {
+		cfg, loadErr = LoadConfig(path, true)
+	})
+	if loadErr != nil {
+		t.Fatalf("LoadConfig: %v", loadErr)
+	}
+	if stderr != "" {
+		t.Fatalf("legacy config emitted stderr: %q", stderr)
+	}
+	if cfg.Backend != "s3" {
+		t.Errorf("Backend=%q want s3", cfg.Backend)
+	}
+	if cfg.S3 == nil || cfg.S3.Bucket != "legacy-bucket" {
+		t.Fatalf("S3 not normalised: %+v", cfg.S3)
+	}
+	if cfg.OBS != nil {
+		t.Fatalf("OBS must be nil after normalisation: %+v", cfg.OBS)
+	}
+
+	out, err := yaml.Marshal(cfg)
 	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
+		t.Fatalf("marshal normalised config: %v", err)
 	}
-	if cfg.OBS.AccessKey != "from-env-AK" {
-		t.Errorf("AccessKey=%q want from-env-AK", cfg.OBS.AccessKey)
-	}
-	if cfg.OBS.SecretKey != "from-env-SK" {
-		t.Errorf("SecretKey=%q want from-env-SK", cfg.OBS.SecretKey)
+	if strings.Contains(string(out), "obs:") || !strings.Contains(string(out), "s3:") {
+		t.Fatalf("normalised YAML exposed legacy section:\n%s", out)
 	}
 }
 
-// TestLoadConfig_OBS_DiscoverFromHome — yaml leaves AK/SK/endpoint
-// blank; ~/.obsconfig (HOME-redirected via t.Setenv) supplies them.
-func TestLoadConfig_OBS_DiscoverFromHome(t *testing.T) {
-	tmpHome := t.TempDir()
-	t.Setenv("HOME", tmpHome)
-	obsCfg := `{
-  "endpoint": "http://obs.cn-north-7.example.com",
-  "access-key": "DISCOVERED_AK",
-  "secret-key": "DISCOVERED_SK"
-}`
-	if err := os.WriteFile(filepath.Join(tmpHome, ".obsconfig"), []byte(obsCfg), 0o600); err != nil {
-		t.Fatalf("write .obsconfig: %v", err)
-	}
+func TestLoadConfigS3EnvExpansion(t *testing.T) {
+	t.Setenv("TEST_S3_ENDPOINT", "https://env-objects.example.com")
+	t.Setenv("TEST_S3_REGION", "env-region-1")
+	t.Setenv("TEST_S3_BUCKET", "env-bucket")
+	t.Setenv("TEST_S3_AK", "from-env-AK")
+	t.Setenv("TEST_S3_SK", "from-env-SK")
 	path := writeYAML(t, `
-listen: 127.0.0.1:50051
-backend: obs
-obs:
-  bucket: ops-dev
-`)
-	cfg, err := LoadConfig(path, true)
-	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
-	}
-	if cfg.OBS.Endpoint != "http://obs.cn-north-7.example.com" {
-		t.Errorf("Endpoint not auto-discovered: %q", cfg.OBS.Endpoint)
-	}
-	if cfg.OBS.AccessKey != "DISCOVERED_AK" {
-		t.Errorf("AccessKey not auto-discovered: %q", cfg.OBS.AccessKey)
-	}
-	if cfg.OBS.SecretKey != "DISCOVERED_SK" {
-		t.Errorf("SecretKey not auto-discovered: %q", cfg.OBS.SecretKey)
-	}
-	if cfg.OBS.Region != "cn-north-7" {
-		t.Errorf("Region not auto-derived from endpoint: %q", cfg.OBS.Region)
-	}
-}
-
-// TestLoadConfig_OBS_YAMLBeatsDiscover — yaml-explicit value wins
-// over ~/.obsconfig fallback.
-func TestLoadConfig_OBS_YAMLBeatsDiscover(t *testing.T) {
-	tmpHome := t.TempDir()
-	t.Setenv("HOME", tmpHome)
-	obsCfg := `{
-  "endpoint": "http://obs.discovered.example.com",
-  "access-key": "DISCOVERED_AK",
-  "secret-key": "DISCOVERED_SK"
-}`
-	if err := os.WriteFile(filepath.Join(tmpHome, ".obsconfig"), []byte(obsCfg), 0o600); err != nil {
-		t.Fatalf("write .obsconfig: %v", err)
-	}
-	path := writeYAML(t, `
-listen: 127.0.0.1:50051
-backend: obs
-obs:
-  endpoint: http://obs.cn-north-4.example.com
-  bucket: ops-dev
-  access_key: YAML_AK
-  secret_key: YAML_SK
-`)
-	cfg, err := LoadConfig(path, true)
-	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
-	}
-	if cfg.OBS.Endpoint != "http://obs.cn-north-4.example.com" ||
-		cfg.OBS.AccessKey != "YAML_AK" || cfg.OBS.SecretKey != "YAML_SK" {
-		t.Errorf("yaml didn't win: %+v", cfg.OBS)
-	}
-	if cfg.OBS.Region != "cn-north-4" {
-		t.Errorf("Region auto-derive should still apply when not in yaml: %q", cfg.OBS.Region)
-	}
-}
-
-// TestLoadConfig_OBS_NoDiscoverNoCreds — no ~/.obsconfig + no creds
-// in yaml: not an error at config parse time (SDK default chain
-// takes over at runtime). Endpoint still required though.
-func TestLoadConfig_OBS_NoDiscoverNoCreds(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	path := writeYAML(t, `
-listen: 127.0.0.1:50051
-backend: obs
-obs:
-  endpoint: http://obs.cn-north-4.example.com
-  bucket: ops-dev
-`)
-	cfg, err := LoadConfig(path, true)
-	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
-	}
-	if cfg.OBS.AccessKey != "" || cfg.OBS.SecretKey != "" {
-		t.Errorf("expected empty creds; got %q/%q", cfg.OBS.AccessKey, cfg.OBS.SecretKey)
-	}
-}
-
-// TestLoadConfig_AdminCommandsSkipListen — non-serve subcommands
-// pass requireListen=false; a yaml without `listen:` parses fine.
-func TestLoadConfig_AdminCommandsSkipListen(t *testing.T) {
-	path := writeYAML(t, `
-backend: fs
-fs:
-  root: /var/lib/store
+backend: s3
+s3:
+  endpoint: ${TEST_S3_ENDPOINT}
+  region: ${TEST_S3_REGION}
+  bucket: ${TEST_S3_BUCKET}
+  access_key: ${TEST_S3_AK}
+  secret_key: ${TEST_S3_SK}
 `)
 	cfg, err := LoadConfig(path, false)
 	if err != nil {
-		t.Fatalf("LoadConfig (admin mode): %v", err)
+		t.Fatalf("LoadConfig: %v", err)
 	}
-	if cfg.Listen != "" {
-		t.Errorf("Listen should be empty: %q", cfg.Listen)
+	if cfg.S3.Endpoint != "https://env-objects.example.com" ||
+		cfg.S3.Region != "env-region-1" || cfg.S3.Bucket != "env-bucket" ||
+		cfg.S3.AccessKey != "from-env-AK" || cfg.S3.SecretKey != "from-env-SK" {
+		t.Fatalf("environment expansion failed: %+v", cfg.S3)
 	}
 }
 
-// TestLoadConfig_RequiredFields — missing required fields produce
-// a clear error per backend.
-func TestLoadConfig_RequiredFields(t *testing.T) {
+func TestLoadConfigS3RegionBehavior(t *testing.T) {
+	t.Run("explicit value preserved", func(t *testing.T) {
+		path := writeYAML(t, `
+backend: s3
+s3:
+  endpoint: https://objects.internal.example
+  region: signing-region-9
+  bucket: b
+`)
+		cfg, err := LoadConfig(path, false)
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if cfg.S3.Region != "signing-region-9" {
+			t.Errorf("Region=%q", cfg.S3.Region)
+		}
+	})
+
+	t.Run("empty value defaults without endpoint inference", func(t *testing.T) {
+		path := writeYAML(t, `
+backend: s3
+s3:
+  endpoint: https://objects.vendor-region-7.example
+  bucket: b
+`)
+		cfg, err := LoadConfig(path, false)
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if cfg.S3.Region != "us-east-1" {
+			t.Errorf("Region=%q want us-east-1", cfg.S3.Region)
+		}
+	})
+}
+
+func TestLoadConfigS3EmptyCredentialsUseDefaultChain(t *testing.T) {
+	path := writeYAML(t, `
+backend: s3
+s3:
+  endpoint: https://objects.example.com
+  bucket: b
+`)
+	cfg, err := LoadConfig(path, false)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.S3.AccessKey != "" || cfg.S3.SecretKey != "" {
+		t.Fatalf("expected empty static credentials, got %q/%q", cfg.S3.AccessKey, cfg.S3.SecretKey)
+	}
+}
+
+func TestLoadConfigRejectsIncompleteStaticCredentials(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		credentials string
+	}{
+		{name: "access key only", credentials: "  access_key: AK\n"},
+		{name: "secret key only", credentials: "  secret_key: SK\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeYAML(t, "backend: s3\ns3:\n  endpoint: https://objects.example.com\n  bucket: b\n"+tc.credentials)
+			_, err := LoadConfig(path, false)
+			if err == nil || !strings.Contains(err.Error(), "must be set together") {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
+
+func TestLoadConfigRejectsMismatchedSections(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "s3 backend with obs section",
+			body: "backend: s3\nobs:\n",
+			want: `"obs" config cannot be used with backend=s3`,
+		},
+		{
+			name: "legacy backend with s3 section",
+			body: "backend: obs\ns3:\n",
+			want: `"s3" config cannot be used with backend=obs`,
+		},
+		{
+			name: "both object storage sections",
+			body: "backend: s3\ns3:\nobs:\n",
+			want: "cannot both be set",
+		},
+		{
+			name: "fs backend with s3 section",
+			body: "backend: fs\nfs:\n  root: /tmp/store\ns3:\n",
+			want: "object storage config is not valid for backend=fs",
+		},
+		{
+			name: "fs backend with legacy section",
+			body: "backend: fs\nfs:\n  root: /tmp/store\nobs:\n",
+			want: "object storage config is not valid for backend=fs",
+		},
+		{
+			name: "s3 backend with fs section",
+			body: "backend: s3\nfs:\n  root: /tmp/store\ns3:\n  endpoint: https://objects.example.com\n  bucket: b\n",
+			want: `"fs" config cannot be used with backend=s3`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadConfig(writeYAML(t, tc.body), false)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error=%v want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadConfigRequiredFields(t *testing.T) {
 	cases := []struct {
 		name          string
 		body          string
 		requireListen bool
 		want          string
 	}{
-		{
-			name:          "serve missing listen",
-			body:          "backend: fs\nfs:\n  root: /tmp/x\n",
-			requireListen: true,
-			want:          "listen is required",
-		},
-		{
-			name:          "missing backend",
-			body:          "listen: 127.0.0.1:1\n",
-			requireListen: true,
-			want:          "backend is required",
-		},
-		{
-			name:          "fs missing root",
-			body:          "listen: 127.0.0.1:1\nbackend: fs\n",
-			requireListen: true,
-			want:          "fs.root is required",
-		},
-		{
-			name:          "obs missing bucket",
-			body:          "listen: 127.0.0.1:1\nbackend: obs\nobs:\n  endpoint: x\n",
-			requireListen: true,
-			want:          "obs.bucket is required",
-		},
-		{
-			name:          "obs missing endpoint",
-			body:          "listen: 127.0.0.1:1\nbackend: obs\nobs:\n  bucket: b\n",
-			requireListen: true,
-			want:          "obs.endpoint is required",
-		},
-		{
-			name:          "unknown backend",
-			body:          "listen: 127.0.0.1:1\nbackend: alien\n",
-			requireListen: true,
-			want:          "unknown backend",
-		},
+		{name: "serve missing listen", body: "backend: fs\nfs:\n  root: /tmp/x\n", requireListen: true, want: "listen is required"},
+		{name: "missing backend", body: "listen: 127.0.0.1:1\n", requireListen: true, want: "backend is required"},
+		{name: "fs missing section", body: "backend: fs\n", want: "fs config is required"},
+		{name: "fs missing root", body: "backend: fs\nfs: {}\n", want: "fs.root is required"},
+		{name: "s3 missing section", body: "backend: s3\n", want: "s3 config is required"},
+		{name: "legacy missing section", body: "backend: obs\n", want: "obs config is required"},
+		{name: "s3 missing bucket", body: "backend: s3\ns3:\n  endpoint: https://objects.example.com\n", want: "s3.bucket is required"},
+		{name: "s3 missing endpoint", body: "backend: s3\ns3:\n  bucket: b\n", want: "s3.endpoint is required"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
-			path := writeYAML(t, tc.body)
-			_, err := LoadConfig(path, tc.requireListen)
-			if err == nil {
-				t.Fatalf("expected error containing %q, got nil", tc.want)
-			}
-			if !strings.Contains(err.Error(), tc.want) {
-				t.Errorf("error %q does not contain %q", err.Error(), tc.want)
+			_, err := LoadConfig(writeYAML(t, tc.body), tc.requireListen)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error=%v want substring %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestLoadConfigUnknownBackendAdvertisesOnlyFSAndS3(t *testing.T) {
+	_, err := LoadConfig(writeYAML(t, "backend: alien\n"), false)
+	if err == nil {
+		t.Fatal("expected unknown-backend error")
+	}
+	if !strings.Contains(err.Error(), "(want fs|s3)") || strings.Contains(err.Error(), "fs|obs") {
+		t.Fatalf("unexpected supported-backend list: %v", err)
+	}
+}
+
+func TestLoadConfigAdminCommandsSkipListen(t *testing.T) {
+	cfg, err := LoadConfig(writeYAML(t, "backend: fs\nfs:\n  root: /var/lib/store\n"), false)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Listen != "" {
+		t.Errorf("Listen=%q want empty", cfg.Listen)
+	}
+}
+
+func TestStoreConfigTemplateUsesS3(t *testing.T) {
+	if !strings.Contains(storeConfigTemplate, "# Backend: fs | s3.") ||
+		!strings.Contains(storeConfigTemplate, "# S3-compatible object storage backend") ||
+		!strings.Contains(storeConfigTemplate, "# s3:") {
+		t.Fatalf("generated template does not describe s3 backend:\n%s", storeConfigTemplate)
+	}
+	if strings.Contains(storeConfigTemplate, "backend: obs") || strings.Contains(storeConfigTemplate, "# obs:") {
+		t.Fatalf("generated template exposes legacy configuration:\n%s", storeConfigTemplate)
 	}
 }

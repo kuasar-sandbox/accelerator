@@ -102,14 +102,14 @@ func cmdServe(args []string) {
 // serveBackend dispatches on cfg.Backend. Returns the abstract
 // server.Backend so the caller doesn't need to import every backend
 // package directly. Error messages keep the per-backend context so
-// misconfiguration (missing fs.root, bad obs endpoint, etc.) lands
+// misconfiguration (missing fs.root, bad s3 endpoint, etc.) lands
 // with a clear hint.
 func serveBackend(cfg *Config) (server.Backend, error) {
 	switch cfg.Backend {
 	case "fs":
 		return openFSStore(cfg)
-	case "obs":
-		return openOBSStore(context.Background(), cfg)
+	case "s3":
+		return openS3Store(context.Background(), cfg)
 	default:
 		return nil, fmt.Errorf("unknown backend %q", cfg.Backend)
 	}

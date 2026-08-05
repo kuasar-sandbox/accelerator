@@ -1,4 +1,4 @@
-package obs
+package s3
 
 import (
 	"context"
@@ -12,17 +12,17 @@ import (
 
 // ErrGenerationNotFound is returned by Drop when the named generation
 // is not in the store's __meta/generations list.
-var ErrGenerationNotFound = errors.New("obs: generation not found")
+var ErrGenerationNotFound = errors.New("s3: generation not found")
 
 // ErrGenerationExists is returned by Rollout when the named
 // generation is already in the list (would create a duplicate).
-var ErrGenerationExists = errors.New("obs: generation already exists")
+var ErrGenerationExists = errors.New("s3: generation already exists")
 
 // ErrCannotDropActive is returned by Drop when the named generation
 // is the currently-active one. Demoting active is rejected because
 // it leaves the store with no writable generation; rotate to a new
 // gen via Rollout first.
-var ErrCannotDropActive = errors.New("obs: cannot drop the active generation")
+var ErrCannotDropActive = errors.New("s3: cannot drop the active generation")
 
 // Rollout appends `gen` to the generations list and makes it active.
 // `gen` must not already exist. The meta object is rewritten via
@@ -30,7 +30,7 @@ var ErrCannotDropActive = errors.New("obs: cannot drop the active generation")
 // retry up to MetaCASRetries times.
 func (s *Store) Rollout(ctx context.Context, gen string) error {
 	if gen == "" {
-		return errors.New("obs: generation is required")
+		return errors.New("s3: generation is required")
 	}
 	for attempt := 0; attempt < s.metaTries; attempt++ {
 		if err := s.refreshMeta(ctx); err != nil {
@@ -59,12 +59,12 @@ func (s *Store) Rollout(ctx context.Context, gen string) error {
 			continue // raced; refresh and retry
 		}
 		if err != nil {
-			return fmt.Errorf("obs: rollout meta: %w", err)
+			return fmt.Errorf("s3: rollout meta: %w", err)
 		}
 		s.setGenerations(oldestFirst, newETag)
 		return nil
 	}
-	return fmt.Errorf("obs: rollout exceeded %d CAS retries (concurrent writers?)", s.metaTries)
+	return fmt.Errorf("s3: rollout exceeded %d CAS retries (concurrent writers?)", s.metaTries)
 }
 
 // Drop removes `gen` from the generations list and deletes every
@@ -79,7 +79,7 @@ func (s *Store) Rollout(ctx context.Context, gen string) error {
 //  2. List + delete every key under <prefix>/{chunk,manifest}/<gen>/.
 func (s *Store) Drop(ctx context.Context, gen string) error {
 	if gen == "" {
-		return errors.New("obs: generation is required")
+		return errors.New("s3: generation is required")
 	}
 	for attempt := 0; attempt < s.metaTries; attempt++ {
 		if err := s.refreshMeta(ctx); err != nil {
@@ -117,7 +117,7 @@ func (s *Store) Drop(ctx context.Context, gen string) error {
 			continue
 		}
 		if err != nil {
-			return fmt.Errorf("obs: drop meta: %w", err)
+			return fmt.Errorf("s3: drop meta: %w", err)
 		}
 		s.setGenerations(oldestFirst, newETag)
 
@@ -129,12 +129,12 @@ func (s *Store) Drop(ctx context.Context, gen string) error {
 		for _, p := range []store.Partition{store.PartitionChunk, store.PartitionManifest, store.PartitionBlob} {
 			pref := path.Join(s.prefix, string(p), gen) + "/"
 			if err := s.deleteUnder(ctx, pref); err != nil {
-				return fmt.Errorf("obs: delete under %s: %w", pref, err)
+				return fmt.Errorf("s3: delete under %s: %w", pref, err)
 			}
 		}
 		return nil
 	}
-	return fmt.Errorf("obs: drop exceeded %d CAS retries (concurrent writers?)", s.metaTries)
+	return fmt.Errorf("s3: drop exceeded %d CAS retries (concurrent writers?)", s.metaTries)
 }
 
 // Wipe deletes every object under the store's prefix, including the
@@ -147,7 +147,7 @@ func (s *Store) Wipe(ctx context.Context) error {
 		pref += "/"
 	}
 	if err := s.deleteUnder(ctx, pref); err != nil {
-		return fmt.Errorf("obs: wipe: %w", err)
+		return fmt.Errorf("s3: wipe: %w", err)
 	}
 	s.mu.Lock()
 	s.gens = nil
@@ -168,7 +168,7 @@ func (s *Store) GenerationStats(ctx context.Context, gen string) (map[store.Part
 			count++
 			return true
 		}); err != nil {
-			return nil, fmt.Errorf("obs: list %s: %w", pref, err)
+			return nil, fmt.Errorf("s3: list %s: %w", pref, err)
 		}
 		out[p] = count
 	}
@@ -185,7 +185,7 @@ func (s *Store) refreshMeta(ctx context.Context) error {
 		return fmt.Errorf("%w: missing %s", ErrUninitialised, s.metaKey())
 	}
 	if err != nil {
-		return fmt.Errorf("obs: read meta: %w", err)
+		return fmt.Errorf("s3: read meta: %w", err)
 	}
 	gens := parseGenerations(body)
 	if len(gens) == 0 {

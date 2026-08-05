@@ -1,7 +1,8 @@
 # store — 持久层读写代理
 
-`store-ctl` 是项目里**唯一**对持久层后端(本地文件系统 / 远端 OBS)读写
-的进程。所有数据进出最终都汇聚到这里:`manifest-ctl` 通过 gRPC 把
+`store-ctl` 是项目里**唯一**对持久层后端(本地文件系统 / S3-compatible
+object storage backend)读写的进程。所有数据进出最终都汇聚到这里:
+`manifest-ctl` 通过 gRPC 把
 chunk 与 Manifest 推过来,`cache-ctl tiered` 在 origin miss 时通过 gRPC
 拉过来。store-ctl 负责后端抽象与数据面收发;generation 生命周期与运维(即 GC 与代管理控制平面)经其 admin 子命令承载。
 
@@ -12,10 +13,10 @@ chunk 与 Manifest 推过来,`cache-ctl tiered` 在 origin miss 时通过 gRPC
 跨 sandbox / 跨 manifest-ctl / 跨 cache-ctl 进程的物理字节,必须收敛到
 **单一进程**写入,才能同时满足:
 
-- **唯一写者**:fs / obs 后端的物理字节写入需要协调,否则 dedup 元数据
+- **唯一写者**:fs / s3 后端的物理字节写入需要协调,否则 dedup 元数据
   (`__meta/generations`)与 staged 临时文件可能被并发修改坏掉;
-- **后端可替换**:本地开发用 fs,生产用 OBS,manifest-ctl / cache-ctl 不
-  该感知差异;切换后端不能改客户端代码;
+- **后端可替换**:本地开发用 fs,远端使用 S3-compatible object storage
+  backend,manifest-ctl / cache-ctl 不该感知差异;切换后端不能改客户端代码;
 - **代次管理**:租户隔离靠 generation 划分(同代去重、跨代隔离),线上
   要支持"开新代"和"清退旧代"两个低频但关键的操作;
 - **完整性可验证**:写入路径要能在服务端重算 ContentKey,拒绝 hash 算错
@@ -32,14 +33,14 @@ chunk 与 Manifest 推过来,`cache-ctl tiered` 在 origin miss 时通过 gRPC
                 │  gRPC (Put/Get/GetSalt)
                 ▼
         ┌── store-ctl ────────┐
-        │  fs / obs backend    │
+        │  fs / s3 backend     │
         │  __meta/generations  │
         └──────────────────────┘
 ```
 
 ### 1.3 设计原则
 
-1. **后端抽象**:fs 与 obs 共享 `Backend` 接口(`Get / Put / OpenPut /
+1. **后端抽象**:fs 与 s3 共享 `Backend` 接口(`Get / Put / OpenPut /
    Exists / ActiveGeneration`),客户端代码无差别;两者的 generation 维护、
    Get 多代回退、verify 语义完全一致,差异仅限物理后端。
 2. **admin / serve 分离**:generation 生命周期(`init / rollout / purge`)
@@ -47,9 +48,9 @@ chunk 与 Manifest 推过来,`cache-ctl tiered` 在 origin miss 时通过 gRPC
    只读后端 meta 决定 active,从不修改。
 3. **fail-fast 而非自愈**:serve 遇到未初始化仓库直接报 `ErrUninitialised`
    + 提示 `run store-ctl init`,不静默创建——让运维错误立刻浮现。
-4. **客户端凭据透明传递**:obs 凭据从 yaml `${VAR}` → `~/.obsconfig` →
-   AWS SDK 默认链三档退化,生产挂 ECS instance role 时 yaml 只需 bucket。
-5. **单写者 + CAS**:obs 的 generation 元数据写入用 S3 条件头
+4. **标准配置与凭据链**:`endpoint` / `bucket` 在 yaml 中显式声明;字符串
+   字段支持 `${VAR}` 展开;静态 AK/SK 都为空时交给 AWS SDK 默认凭据链。
+5. **单写者 + CAS**:s3 的 generation 元数据写入用 S3 条件头
    (`If-None-Match` / `If-Match`)防并发覆盖,但稳态运行仍假设 per-bucket
    单 store-ctl 实例做写入。
 
@@ -125,7 +126,7 @@ store-ctl purge --config FILE --all --confirm   # 清空整个仓库
 - `--generation`:拒绝删 active(`ErrCannotDropActive`);未知名报
   `ErrGenerationNotFound`。顺序是先 CAS 改 meta,再删数据树。中途失败再次
   drop 同名因 NotFound 短路,数据残余可手动清。
-- `--all`:必须配 `--confirm`(无 dry-run,先停 serve 再操作)。obs 上是
+- `--all`:必须配 `--confirm`(无 dry-run,先停 serve 再操作)。s3 上是
   `ListObjects` + 逐个 `DeleteObject`,几十万对象级别会跑分钟级。删后仓
   库变 uninitialised。
 
@@ -137,7 +138,7 @@ store-ctl info --config FILE
 
 只读,可与运行中的 serve 共存。打印:
 
-- backend 类型(fs / obs)
+- backend 类型(fs / s3)
 - root / bucket+prefix
 - active generation
 - generations 列表
@@ -166,38 +167,41 @@ fs:
   verify_content_key: true       # 默认 true
 ```
 
-### 3.2 obs backend
+### 3.2 S3-compatible object storage backend
 
 ```yaml
 listen: 127.0.0.1:7100
-backend: obs
-obs:
-  bucket: container-accelerator-prod
-  prefix: store/                                       # 桶内可选前缀(多租户)
-  # endpoint / region / access_key / secret_key 全部可省;
-  # 缺省值依次从 yaml ${VAR} → ~/.obsconfig → AWS SDK 默认凭证链 解析
-  access_key: ${OBS_AK}                                # 显式注入(可选)
-  secret_key: ${OBS_SK}
+backend: s3
+s3:
+  endpoint: https://example-s3-endpoint
+  region: us-east-1
+  bucket: kuasar-store
+  prefix: production
+  access_key: ${S3_ACCESS_KEY}
+  secret_key: ${S3_SECRET_KEY}
   verify_content_key: true
-  max_inflight: 64                                     # 并发 OBS 调用上限
-  op_timeout: ""                                       # 单次 OBS 调用 wall-clock 上限。
-                                                       # 缺省/空 = 0 = 无 per-op deadline:
-                                                       # 一次调用只受调用方 ctx(取消 /
-                                                       # 客户端断开)约束,不强加任意值。
-                                                       # 需要硬上界时显式写一个 Go duration
-                                                       # (如 "30s")。慢/卡操作的可观测性
-                                                       # 改由 STORE_CTL_DEBUG 追踪(§5.6)
-  max_object_size_bytes: 16777216                      # Get 响应字节上限(默认 16 MiB)
+  max_inflight: 64
+  op_timeout: 10s
+  max_object_size_bytes: 16777216
 ```
 
-最小 obs 配置(凭据走 IMDS / `~/.obsconfig`):
+`endpoint` 与 `bucket` 必须在 yaml 中显式配置,`prefix` 可选。`region` 显式值
+优先;未配置时固定为 `us-east-1`,不会从 endpoint hostname 推导。所有 S3
+字符串字段都支持 `${VAR}` 展开。
+
+静态 `access_key` / `secret_key` 必须同时提供;二者都为空时使用 AWS SDK
+默认 credential provider chain。最小配置因此仍需给出存储位置:
 
 ```yaml
 listen: 127.0.0.1:7100
-backend: obs
-obs:
-  bucket: ops-dev
+backend: s3
+s3:
+  endpoint: https://example-s3-endpoint
+  bucket: kuasar-store
 ```
+
+Huawei OBS 可通过其 S3-compatible endpoint 使用;它仍然是 endpoint 服务,
+不是独立 backend 类型。
 
 ### 3.3 verify_content_key
 
@@ -239,7 +243,7 @@ store gRPC。它是**纯透传**——无 L1 缓存,每次 Get 直达后端;要�
 │                                                  │
 │  Backend                                         │
 │   ├ fs:  filepath I/O at root                   │
-│   └ obs: aws-sdk-go-v2/s3 to OBS                │
+│   └ s3: aws-sdk-go-v2/s3                    │
 │                                                  │
 │  __meta/generations  ←──── single writer        │
 └──────────────────────────────────────────────────┘
@@ -257,7 +261,7 @@ store gRPC。它是**纯透传**——无 L1 缓存,每次 Get 直达后端;要�
 
 ### 4.2 Backend 接口
 
-server 层的最小契约,fs 与 obs 都实现:
+server 层的最小契约,fs 与 s3 都实现:
 
 ```
 Get(ctx, partition, key)             → (found bool, data []byte, err error)
@@ -309,7 +313,7 @@ admin 操作(`Rollout` / `Drop` / `Wipe` / `GenerationStats`)是 Store 类型上
 **verify_content_key**:写入时若启用,服务端重算 SHA256 并与客户端 ContentKey
 比对,不一致 → `ErrKeyMismatch` + 删 staged 文件。
 
-### 4.4 obs 后端
+### 4.4 S3-compatible object storage backend
 
 布局完全对应 fs:
 
@@ -320,14 +324,20 @@ admin 操作(`Rollout` / `Drop` / `Wipe` / `GenerationStats`)是 Store 类型上
 <bucket>/<prefix>/blob/<gen>/<aa>/<bb>/<hash>
 ```
 
-**写入路径**:obs 没有"流式 Put + atomic rename"原语,改用"内存缓冲 + 单
-次 PutObject"。chunk 大小天然 ≤1 MiB,缓冲不会膨胀;每个 PutHandle 独占
+**写入路径**:S3 API 没有"流式 Put + atomic rename"原语,改用"内存缓冲 +
+单次 PutObject"。chunk 大小天然 ≤1 MiB,缓冲不会膨胀;每个 PutHandle 独占
 一个 `bytes.Buffer`,Commit 时一次 PutObject 上去。
 
 **dedup short-circuit**:Put 前先 HEAD 检查 active gen 路径;命中则跳过
 上传(对应 fs 的 stat 检查)。
 
-**meta 并发**:obs 的 `__meta/generations` 写入用 S3 条件头:
+**请求编码兼容性**:`sdkclient` 固定使用 AWS SDK 的
+`RequestChecksumCalculationWhenRequired` 与
+`ResponseChecksumValidationWhenRequired`。普通 PutObject 保持原始 body 与
+Content-Length,不注入 flexible checksum trailer 或 `aws-chunked`;TLS 与 SigV4
+仍由 SDK 正常处理。该策略是 backend 默认行为,不暴露额外配置项。
+
+**meta 并发**:s3 的 `__meta/generations` 写入用 S3 条件头:
 
 - `init`:`If-None-Match: *`(只在 key 不存在时创建)
 - `rollout / drop`:`If-Match: <etag>`(只在 etag 未变时改)
@@ -335,28 +345,23 @@ admin 操作(`Rollout` / `Drop` / `Wipe` / `GenerationStats`)是 Store 类型上
 CAS 失败 → 重读 + 重试,有界次数(默认 5)后报错。这保证多个 store-ctl
 实例并发 init 同一桶时只有一个赢,但稳态运行仍假定单写者。
 
-**defensive wrapper**:obs backend 在 SDK 之上加一层信号量
+**defensive wrapper**:s3 backend 在 SDK 之上加一层信号量
 (`max_inflight`)+ 可选 per-op 超时(`op_timeout`,缺省不设上界——只受调用方
-ctx 约束,§3.2)+ 响应大小封顶(`max_object_size_bytes`),防止 OBS 抖动导致
+ctx 约束,§3.2)+ 响应大小封顶(`max_object_size_bytes`),防止远端服务抖动导致
 store-ctl OOM 或队头阻塞。`op_timeout` 不设时,慢/卡调用靠 `STORE_CTL_DEBUG`
 追踪暴露(§5.6),而不是被一个武断的 deadline 提前杀掉。
 
-### 4.5 凭据自动发现(obs)
+### 4.5 配置与凭据解析(s3)
 
-obs 后端的 endpoint / access_key / secret_key 三档退化:
+解析顺序只有三层:
 
-| 字段 | 优先级 1 | 优先级 2 | 优先级 3 | 优先级 4 |
-|---|---|---|---|---|
-| `endpoint` | yaml 字面 | yaml `${VAR}` 展开 | `~/.obsconfig` 的 `endpoint` | (无)— 必填 |
-| `region` | yaml 字面 | (无 env 展开) | 从 endpoint 自动提取 | (无) |
-| `access_key` | yaml 字面 | yaml `${VAR}` 展开 | `~/.obsconfig` 的 `access-key` | AWS SDK 默认凭证链 |
-| `secret_key` | 同上 | 同上 | `~/.obsconfig` 的 `secret-key` | AWS SDK 默认凭证链 |
+1. yaml 显式值;
+2. yaml 字符串中的 `${VAR}` 环境变量展开;
+3. 当静态 AK/SK 都为空时,使用 AWS SDK 默认 credential provider chain。
 
-`~/.obsconfig` 是 obsutil / obs-browser 工具写的 JSON 文件。文件不存在不
-报错(走下一级);文件存在但 JSON 损坏报错。
-
-生产部署如果用 ECS instance role,留空 `access_key/secret_key` 并删
-`~/.obsconfig`,SDK 走 IMDS 拿 STS 凭证。
+endpoint 与 bucket 没有自动发现来源,展开后为空会立即报错。region 也不识别
+厂商或 hostname;空值统一使用 `us-east-1`。这让私有 endpoint、代理 endpoint
+及不同 S3-compatible 服务保持同一签名和配置行为。
 
 ### 4.6 Generation 模型
 
@@ -364,7 +369,7 @@ generation 是 store 内部的代次划分:**同代去重、跨代不共享**。
 chunk / manifest / blob 对象按 `<partition>/<gen>/...` 路径存,active generation
 是新写入的目标,旧 generation 仍可被反向 Get 找到。
 
-`__meta/generations` 是 source of truth,文本文件(fs)或对象(obs):
+`__meta/generations` 是 source of truth,文本文件(fs)或对象(s3):
 
 ```
 G1
@@ -411,7 +416,7 @@ store-ctl 默认只讲 store gRPC。设了 `cache_listen`(§3.4)后,它在该端
   shard 操作回 `writes not supported`。写入仍只经 store gRPC,单写者语义不变。
 - **三 partition**:wire Namespace `0x01/0x02/0x03` 映射 chunk / manifest / blob,
   与 store gRPC 服务的对象集一致。
-- **纯透传**:无 L1 缓存,每次 `ObjectGet` 直达后端(fs stat+read / obs GET)。
+- **纯透传**:无 L1 缓存,每次 `ObjectGet` 直达后端(fs stat+read / s3 GET)。
   要收敛延迟仍按 §5.3 部署 cache-ctl tiered 以本 store 为 origin——`cache_listen`
   解决的是"少一个进程也能讲 cache 协议",不是缓存。
 - **零额外配置**:idle / rpc 超时用固定默认(120s idle、无 per-rpc deadline),
@@ -432,43 +437,42 @@ store-ctl serve --config /etc/store-ctl.yaml
 ### 5.2 横向扩展
 
 数据面(`serve` 的 Get/Put)**完全横向扩展**,任意多 store-ctl 实例并发
-指向同一 fs root / obs bucket+prefix 都安全:
+指向同一 fs root / s3 bucket+prefix 都安全:
 
 - **Put**:客户端先算 `key = SHA256(client_bytes)` 再 PUT,两个并发写者
   写同样内容 → 同 key → 同路径 → 同字节。fs 上 `os.Rename` 是原子覆盖
-  且字节相同,obs PutObject 同 key 是幂等的。dedup 是**寻址层面**成立的,
+  且字节相同,s3 PutObject 同 key 是幂等的。dedup 是**寻址层面**成立的,
   不需要写者协调。
 - **Get**:纯读,反向扫 generation 列表,跨实例无副作用。
 
 **meta 写入有 CAS 保护**:
 
-- **obs**:`init` 用 `If-None-Match: *`,`rollout / purge --generation` 用
+- **s3**:`init` 用 `If-None-Match: *`,`rollout / purge --generation` 用
   `If-Match: <etag>`。多个实例并发改同一 bucket 的 meta,冲突触发
   `PreconditionFailed` → 重读重试或返回错误。**永不丢更新**。
 - **fs**:`writeGenerationsFile` 用 temp + rename 原子写,但**没有** CAS。
   两个 admin 进程并发 `rollout` 同一 root 可能 lost update。fs 部署典型
-  是单机本地开发,生产用 obs。
+  是单机本地开发,生产用 s3。
 
 **结论**:
 
-- 多副本 store-ctl serve 同源 fs/obs:数据路径任意并发,生产可直接横向
+- 多副本 store-ctl serve 同源 fs/s3:数据路径任意并发,生产可直接横向
   扩展;
-- admin 命令(init/rollout/purge):obs 自然 CAS-safe 多实例并发;fs 需要
+- admin 命令(init/rollout/purge):s3 自然 CAS-safe 多实例并发;fs 需要
   外部协调成单 admin(脚本编排即可);
 - 不需要 Active-Standby 选主或写者锁。
 
-### 5.3 必配 cache-ctl tiered(obs)
+### 5.3 部署 cache-ctl tiered(s3)
 
-OBS GetObject 区域内 ~10–50 ms,跨区更长。生产部署必须把 cache-ctl tiered
-装在 store-ctl 前面(rocksdb L1 + store-ctl origin)以收敛 hit 路径延迟。
-本地 fs backend 不需要 cache 也能跑,但生产 obs 没有 cache 直接跑等于把
-OBS 延迟加到每次客户端 Get 上。详见 [`cache.md`](cache.md)。
+远端 GetObject 延迟取决于具体服务与网络拓扑。生产部署应把 cache-ctl tiered
+放在 store-ctl 前面(rocksdb L1 + store-ctl origin)以收敛 hit 路径延迟;
+否则每次 miss 都直接承担远端对象存储时延。详见 [`cache.md`](cache.md)。
 
-### 5.4 容量监控(obs)
+### 5.4 容量监控(s3)
 
-OBS 不限对象数,监控 bucket 计费即可。chunk 路径下对象数 ≈ 唯一 chunk
-数(高去重场景 < 100K /节点 /月,见 `orchestrator/release-builder/docs/kuasar-sandbox.md`
-§7.3 存储与带宽推算)。
+按所选服务监控 bucket 容量、对象数量、请求配额与计费。chunk 路径下对象数
+约等于唯一 chunk 数;容量推算见
+`orchestrator/release-builder/docs/kuasar-sandbox.md` §7.3。
 
 ### 5.5 e2e 验证
 
@@ -481,8 +485,10 @@ cache-ctl(local / shard / tiered)↔ store-ctl 全链路;`e2e_store_cache_listen
 单独验证 store-ctl 的 `cache_listen` 只读 wire 服务(manifest 经 cache 协议字节级
 比对 store gRPC、blob namespace 路由、拒写);`e2e_cluster_rolling.sh`
 验证 EC 集群 SIGHUP 滚动换 peer 后读全部成功、且不穿透 store-ctl origin。
-obs 后端无独立 e2e:凭据发现 / 签名 / meta CAS 由 `pkg/store/obs` 单元测试
-(内置 fake S3)覆盖。
+s3 核心语义由 `pkg/store/s3` 的 fake S3 单元测试覆盖;`sdkclient` 使用
+`httptest.Server` 捕获真实 AWS SDK 请求,验证 SigV4、错误映射、分页以及普通
+PutObject 不使用 flexible checksum trailer / aws-chunked。真实云端 endpoint
+集成需要外部凭据,不包含在常规 CI 中。
 
 ### 5.6 慢/卡操作追踪(`STORE_CTL_DEBUG`)
 
@@ -500,9 +506,9 @@ STORE_CTL_SLOW=2s STORE_CTL_DEBUG=1 store-ctl serve ...     # 自定慢阈值
   (WARN);快 op 静默——稳态吞吐/时延看 §5.7 的周期统计行,这里只盯异常长尾
 - 后台 reporter 周期性 dump **仍在飞**且已超阈值的 op(op 名 + 已卡时长),
   这样 stall 在卡住的后端上立即可见,而不必等一个 deadline
-- 覆盖 obs 的 get / head / put 调用
+- 覆盖 s3 的 get / head / put 调用
 
-生产默认关闭;排障时临时开启,定位 OBS 抖动 / 凭据 / 网络导致的长尾。
+生产默认关闭;排障时临时开启,定位远端对象存储、凭据或网络导致的长尾。
 
 ### 5.7 周期自适应统计行(`stats_interval`)
 

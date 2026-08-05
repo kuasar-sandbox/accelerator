@@ -6,8 +6,8 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/accelerator/pkg/store/fs"
-	"github.com/kuasar-sandbox/accelerator/pkg/store/obs"
-	"github.com/kuasar-sandbox/accelerator/pkg/store/obs/s3client"
+	"github.com/kuasar-sandbox/accelerator/pkg/store/s3"
+	"github.com/kuasar-sandbox/accelerator/pkg/store/s3/sdkclient"
 )
 
 // adminStore is the common surface that init/rollout/purge/info
@@ -32,18 +32,18 @@ func openFSStore(cfg *Config) (*fs.Store, error) {
 	})
 }
 
-// openOBSStore dials OBS, opens an existing store. Returns
-// obs.ErrUninitialised on a missing meta object.
-func openOBSStore(ctx context.Context, cfg *Config) (*obs.Store, error) {
-	client, err := newOBSClient(ctx, cfg)
+// openS3Store opens an existing S3-compatible object store. Returns
+// s3.ErrUninitialised on a missing meta object.
+func openS3Store(ctx context.Context, cfg *Config) (*s3.Store, error) {
+	client, err := newS3Client(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
-	storeCfg, err := obsStoreConfig(cfg)
+	storeCfg, err := s3StoreConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
-	return obs.New(ctx, client, storeCfg)
+	return s3.New(ctx, client, storeCfg)
 }
 
 // initFSStore calls fs.Init on a fresh root.
@@ -51,50 +51,49 @@ func initFSStore(cfg *Config, generation string) error {
 	return fs.Init(fs.Config{Root: cfg.FS.Root}, generation)
 }
 
-// initOBSStore dials OBS and writes the initial meta object.
-func initOBSStore(ctx context.Context, cfg *Config, generation string) error {
-	client, err := newOBSClient(ctx, cfg)
+// initS3Store writes the initial meta object to S3-compatible storage.
+func initS3Store(ctx context.Context, cfg *Config, generation string) error {
+	client, err := newS3Client(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	storeCfg, err := obsStoreConfig(cfg)
+	storeCfg, err := s3StoreConfig(cfg)
 	if err != nil {
 		return err
 	}
-	return obs.Init(ctx, client, storeCfg, generation)
+	return s3.Init(ctx, client, storeCfg, generation)
 }
 
-// newOBSClient dials the OBS s3-compatible endpoint with the
-// resolved cfg. Centralised so every subcommand uses the same
-// dialing path (avoids drift in credential/discovery handling).
-func newOBSClient(ctx context.Context, cfg *Config) (*s3client.Client, error) {
-	client, err := s3client.New(ctx, s3client.Config{
-		Endpoint:  cfg.OBS.Endpoint,
-		Region:    cfg.OBS.Region,
-		Bucket:    cfg.OBS.Bucket,
-		AccessKey: cfg.OBS.AccessKey,
-		SecretKey: cfg.OBS.SecretKey,
+// newS3Client opens the configured endpoint. Centralising this path keeps
+// credential-provider and signing behavior consistent across subcommands.
+func newS3Client(ctx context.Context, cfg *Config) (*sdkclient.Client, error) {
+	client, err := sdkclient.New(ctx, sdkclient.Config{
+		Endpoint:  cfg.S3.Endpoint,
+		Region:    cfg.S3.Region,
+		Bucket:    cfg.S3.Bucket,
+		AccessKey: cfg.S3.AccessKey,
+		SecretKey: cfg.S3.SecretKey,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("obs s3 client: %w", err)
+		return nil, fmt.Errorf("s3 client: %w", err)
 	}
 	return client, nil
 }
 
-// obsStoreConfig builds the obs.Config used by both Init and New.
+// s3StoreConfig builds the s3.Config used by both Init and New.
 // Picks up the per-call defenses (timeouts, max-inflight) from
-// cfg.OBS so admin commands respect the same limits as serve.
-func obsStoreConfig(cfg *Config) (obs.Config, error) {
-	opTimeout, err := cfg.OBSOpTimeout()
+// cfg.S3 so admin commands respect the same limits as serve.
+func s3StoreConfig(cfg *Config) (s3.Config, error) {
+	opTimeout, err := cfg.S3OpTimeout()
 	if err != nil {
-		return obs.Config{}, fmt.Errorf("obs.op_timeout: %w", err)
+		return s3.Config{}, fmt.Errorf("s3.op_timeout: %w", err)
 	}
-	return obs.Config{
-		Bucket:        cfg.OBS.Bucket,
-		Prefix:        cfg.OBS.Prefix,
+	return s3.Config{
+		Bucket:        cfg.S3.Bucket,
+		Prefix:        cfg.S3.Prefix,
 		VerifyKey:     cfg.VerifyKey(),
-		MaxInflight:   cfg.OBS.MaxInflight,
+		MaxInflight:   cfg.S3.MaxInflight,
 		OpTimeout:     opTimeout,
-		MaxObjectSize: cfg.OBS.MaxObjectSize,
+		MaxObjectSize: cfg.S3.MaxObjectSize,
 	}, nil
 }

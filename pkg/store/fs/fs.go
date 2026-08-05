@@ -337,7 +337,7 @@ func (s *Store) objectPath(partition store.Partition, generation string, key sto
 // commands surface this as a clear "run init" hint.
 //
 // Returns the list newest-first (fs file is oldest-first; reverse
-// happens here so the in-memory representation matches obs.Store).
+// happens here so the in-memory representation matches s3.Store).
 func loadGenerations(root string) (gens []string, active string, err error) {
 	file := filepath.Join(root, metaDir, generationsFile)
 	data, readErr := os.ReadFile(file)

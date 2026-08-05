@@ -576,7 +576,7 @@ manifest:// 加载端到端时长)。
 
 - chunk 模式(cdc 命中率高于 fixed,但分块本身略慢);
 - 加密模式(aes 是 CPU 大头,~50–100% CPU 在大 chunk 上);
-- store 端点延迟(本地 fs vs 远端 OBS,详见 [`store.md`](store.md))。
+- store 端点延迟(本地 fs vs 远端 S3-compatible object storage,详见 [`store.md`](store.md))。
 
 ## 6. See Also
 

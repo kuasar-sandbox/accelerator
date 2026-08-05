@@ -24,7 +24,7 @@ const (
 type ContentKey [32]byte
 
 // PutHandle is the streaming-Put session abstraction shared by all
-// backends (fs / obs / future). Lifecycle:
+// backends (fs / s3 / future). Lifecycle:
 //
 //   - Write any number of frames
 //   - Commit (success path) or Abort (error path); both are terminal
@@ -32,7 +32,7 @@ type ContentKey [32]byte
 //     error — implementations may return error or panic
 //
 // Concrete implementations live in the backend package
-// (fs.PutHandle, obs.putHandle, …); the server depends only on
+// (fs.PutHandle, s3.putHandle, …); the server depends only on
 // this interface.
 type PutHandle interface {
 	io.Writer

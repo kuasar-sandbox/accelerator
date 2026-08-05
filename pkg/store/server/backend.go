@@ -14,7 +14,7 @@ import (
 // its underlying storage implementation. The interface stays small
 // and server-only.
 //
-// Implementations: fs.Store (local filesystem) and obs.Store
+// Implementations: fs.Store (local filesystem) and s3.Store
 // (S3-compatible object storage via the S3 API).
 type Backend interface {
 	// Get fetches an object by key under the given partition.

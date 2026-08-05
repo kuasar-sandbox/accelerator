@@ -1,4 +1,4 @@
-package obs
+package s3
 
 import (
 	"context"
@@ -27,23 +27,23 @@ const defaultMaxObjectSize = 16 << 20
 
 // ErrKeyMismatch is returned by PutHandle.Commit when the
 // caller-claimed key disagrees with the server's re-hash.
-var ErrKeyMismatch = errors.New("obs: key mismatch")
+var ErrKeyMismatch = errors.New("s3: key mismatch")
 
 // ErrUninitialised is returned by New when the bucket prefix has no
 // __meta/generations object. Recovery: run `store-ctl init`.
-var ErrUninitialised = errors.New("obs: store uninitialised (run `store-ctl init`)")
+var ErrUninitialised = errors.New("s3: store uninitialised (run `store-ctl init`)")
 
 // ErrAlreadyInitialised is returned by Init when the bucket prefix
 // already carries an __meta/generations object. Init never overwrites
 // existing meta — caller must Wipe first.
-var ErrAlreadyInitialised = errors.New("obs: store already initialised")
+var ErrAlreadyInitialised = errors.New("s3: store already initialised")
 
 // Config controls Store construction. The schema mirrors fs.Config
 // — generation lifecycle is owned by store-ctl admin commands
 // (init / rollout / purge), not by serve config — plus the
-// OBS-specific endpoint/auth and tunables for the defensive wrapper.
+// S3 location and defensive-wrapper tunables.
 type Config struct {
-	// Bucket is the OBS bucket name. Required.
+	// Bucket is the target bucket name. Required.
 	Bucket string
 
 	// Prefix is an optional in-bucket key prefix (e.g. "store/")
@@ -58,10 +58,9 @@ type Config struct {
 	// MaxInflight bounds concurrent S3 calls. 0 → 64.
 	MaxInflight int
 
-	// OpTimeout is the per-call wall-clock budget enforced by the
-	// Store on top of the caller's ctx. 0 → 10 seconds. Strictly
-	// shorter than gRPC server timeouts so OBS stalls surface as
-	// store-ctl errors rather than gRPC deadline exceeded.
+	// OpTimeout is the optional per-call wall-clock budget enforced by
+	// the Store on top of the caller's ctx. 0 leaves the caller's context
+	// as the only cancellation/deadline source.
 	OpTimeout time.Duration
 
 	// MaxObjectSize bounds Get response bytes. 0 → 16 MiB.
@@ -71,7 +70,7 @@ type Config struct {
 	MetaCASRetries int
 }
 
-// Store is an obs-backed implementation of server.Backend. Safe for
+// Store is an S3-compatible implementation of server.Backend. Safe for
 // concurrent use; sem channel + per-call ctx timeout protect against
 // runaway calls.
 type Store struct {
@@ -92,7 +91,7 @@ type Store struct {
 	metaETag string // last observed; used for If-Match on Rollout / Drop
 }
 
-// New opens an existing OBS-backed store. The bucket+prefix must
+// New opens an existing S3-compatible store. The bucket+prefix must
 // already carry a valid __meta/generations object — call Init first
 // for a fresh bucket. Returns ErrUninitialised when the meta object
 // is absent so callers can give a clear remediation hint.
@@ -105,12 +104,12 @@ func New(ctx context.Context, client s3Client, cfg Config) (*Store, error) {
 		return nil, err
 	}
 	if err := s.loadGenerations(ctx); err != nil {
-		return nil, fmt.Errorf("obs: load generations: %w", err)
+		return nil, fmt.Errorf("s3: load generations: %w", err)
 	}
 	return s, nil
 }
 
-// Init creates a fresh OBS-backed store at cfg.Bucket+cfg.Prefix,
+// Init creates a fresh S3-compatible store at cfg.Bucket+cfg.Prefix,
 // writing a single-line __meta/generations object containing
 // `generation`. Refuses to clobber an existing meta object — caller
 // must Wipe first if intentional.
@@ -118,7 +117,7 @@ func New(ctx context.Context, client s3Client, cfg Config) (*Store, error) {
 // The ctx scopes the single conditional PutObject call.
 func Init(ctx context.Context, client s3Client, cfg Config, generation string) error {
 	if generation == "" {
-		return errors.New("obs: generation is required")
+		return errors.New("s3: generation is required")
 	}
 	s, err := newStore(client, cfg)
 	if err != nil {
@@ -133,21 +132,21 @@ func Init(ctx context.Context, client s3Client, cfg Config, generation string) e
 		return fmt.Errorf("%w: %s/%s", ErrAlreadyInitialised, cfg.Bucket, s.prefix)
 	}
 	if err != nil {
-		return fmt.Errorf("obs: init meta: %w", err)
+		return fmt.Errorf("s3: init meta: %w", err)
 	}
 	return nil
 }
 
 // newStore constructs a Store with config defaults applied but does
-// not contact OBS. Used by both New (which then loads meta) and
+// not contact S3. Used by both New (which then loads meta) and
 // Init (which then writes meta). Centralises the validation /
 // defaulting so the two entry points stay symmetric.
 func newStore(client s3Client, cfg Config) (*Store, error) {
 	if client == nil {
-		return nil, errors.New("obs: nil s3 client")
+		return nil, errors.New("s3: nil s3 client")
 	}
 	if cfg.Bucket == "" {
-		return nil, errors.New("obs: bucket is required")
+		return nil, errors.New("s3: bucket is required")
 	}
 	if cfg.MaxInflight <= 0 {
 		cfg.MaxInflight = 64
@@ -155,7 +154,7 @@ func newStore(client s3Client, cfg Config) (*Store, error) {
 	// cfg.OpTimeout <= 0 means "no per-op deadline": an op is bounded
 	// only by the caller's context (cancellation / client disconnect),
 	// not an arbitrary number. An operator opts into a finite budget
-	// explicitly via obs.op_timeout. opWithTimeout() honours 0 = none.
+	// explicitly via s3.op_timeout. opWithTimeout() honours 0 = none.
 	if cfg.MaxObjectSize <= 0 {
 		cfg.MaxObjectSize = defaultMaxObjectSize
 	}
@@ -207,7 +206,7 @@ func (s *Store) Get(ctx context.Context, partition store.Partition, key store.Co
 		if errors.Is(err, ErrNotFound) {
 			continue
 		}
-		return false, nil, fmt.Errorf("obs: get gen=%s: %w", gen, err)
+		return false, nil, fmt.Errorf("s3: get gen=%s: %w", gen, err)
 	}
 	return false, nil, nil
 }
@@ -286,12 +285,12 @@ func (s *Store) bounded(parent context.Context, fn func(ctx context.Context) ([]
 		return nil, nil, parent.Err()
 	}
 	defer func() { <-s.sem }()
-	defer s.tr.Begin("obs.get")()
+	defer s.tr.Begin("s3.get")()
 	ctx, cancel := s.opCtx(parent)
 	defer cancel()
 	body, meta, err := fn(ctx)
 	if err == nil && meta != nil && meta.Size > s.maxObjSize {
-		return nil, nil, fmt.Errorf("obs: object size %d exceeds max %d", meta.Size, s.maxObjSize)
+		return nil, nil, fmt.Errorf("s3: object size %d exceeds max %d", meta.Size, s.maxObjSize)
 	}
 	return body, meta, err
 }
@@ -304,7 +303,7 @@ func (s *Store) boundedHead(parent context.Context, fn func(ctx context.Context)
 		return nil, parent.Err()
 	}
 	defer func() { <-s.sem }()
-	defer s.tr.Begin("obs.head")()
+	defer s.tr.Begin("s3.head")()
 	ctx, cancel := s.opCtx(parent)
 	defer cancel()
 	return fn(ctx)
@@ -318,7 +317,7 @@ func (s *Store) boundedPut(parent context.Context, key string, body []byte, opts
 		return "", parent.Err()
 	}
 	defer func() { <-s.sem }()
-	defer s.tr.Begin("obs.put")()
+	defer s.tr.Begin("s3.put")()
 	ctx, cancel := s.opCtx(parent)
 	defer cancel()
 	return s.client.Put(ctx, key, body, opts)
