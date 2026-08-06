@@ -37,8 +37,9 @@ func newServerClient(t *testing.T, handler http.Handler) (*Client, *httptest.Ser
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 	client, err := New(context.Background(), Config{
-		Endpoint: server.URL,
-		Bucket:   "test-bucket",
+		Endpoint:  server.URL,
+		Bucket:    "test-bucket",
+		PathStyle: true,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -229,41 +230,91 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func newRoundTripClient(rt http.RoundTripper) *Client {
+	return newRoundTripClientWithPathStyle(rt, true)
+}
+
+func newRoundTripClientWithPathStyle(rt http.RoundTripper, pathStyle bool) *Client {
 	awsCfg := aws.Config{
 		Region: "us-east-1",
 		Credentials: aws.NewCredentialsCache(
 			credentials.NewStaticCredentialsProvider("test-ak", "test-sk", "")),
 		HTTPClient: &http.Client{Transport: rt},
 	}
-	api := newAPI(awsCfg, "https://objects.example.com")
+	api := newAPI(awsCfg, "https://objects.example.com", pathStyle)
 	return &Client{api: api, bucket: "test-bucket"}
 }
 
-func TestPutUsesPathStyleForCompatibleEndpoint(t *testing.T) {
+func TestClientUsesConfiguredAddressingStyle(t *testing.T) {
 	type observedRequest struct {
-		host string
-		path string
+		method string
+		host   string
+		path   string
 	}
-	requests := make(chan observedRequest, 1)
-	client := newRoundTripClient(roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		requests <- observedRequest{host: req.URL.Host, path: req.URL.EscapedPath()}
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"ETag": []string{`"path-style-etag"`}},
-			Body:       io.NopCloser(strings.NewReader("")),
-			Request:    req,
-		}, nil
-	}))
+	for _, tc := range []struct {
+		name        string
+		pathStyle   bool
+		wantHost    string
+		wantPutPath string
+		wantGetPath string
+	}{
+		{
+			name:        "path style",
+			pathStyle:   true,
+			wantHost:    "objects.example.com",
+			wantPutPath: "/test-bucket/objects/key",
+			wantGetPath: "/test-bucket/__meta/generations",
+		},
+		{
+			name:        "virtual hosted style",
+			pathStyle:   false,
+			wantHost:    "test-bucket.objects.example.com",
+			wantPutPath: "/objects/key",
+			wantGetPath: "/__meta/generations",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requests := make(chan observedRequest, 2)
+			client := newRoundTripClientWithPathStyle(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				requests <- observedRequest{
+					method: req.Method,
+					host:   req.URL.Host,
+					path:   req.URL.EscapedPath(),
+				}
+				body := ""
+				header := http.Header{"ETag": []string{`"addressing-etag"`}}
+				if req.Method == http.MethodGet {
+					body = "generation-1\n"
+					header.Set("Content-Length", strconv.Itoa(len(body)))
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     header,
+					Body:       io.NopCloser(strings.NewReader(body)),
+					Request:    req,
+				}, nil
+			}), tc.pathStyle)
 
-	if _, err := client.Put(context.Background(), "objects/key", []byte("payload"), stores3.PutOptions{}); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-	got := <-requests
-	if got.host != "objects.example.com" {
-		t.Errorf("request host=%q want configured endpoint host", got.host)
-	}
-	if got.path != "/test-bucket/objects/key" {
-		t.Errorf("request path=%q want path-style bucket and key", got.path)
+			if _, err := client.Put(context.Background(), "objects/key", []byte("payload"), stores3.PutOptions{}); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+			if _, _, err := client.Get(context.Background(), "__meta/generations"); err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+
+			wantPaths := map[string]string{
+				http.MethodPut: tc.wantPutPath,
+				http.MethodGet: tc.wantGetPath,
+			}
+			for range 2 {
+				got := <-requests
+				if got.host != tc.wantHost {
+					t.Errorf("%s host=%q want %q", got.method, got.host, tc.wantHost)
+				}
+				if got.path != wantPaths[got.method] {
+					t.Errorf("%s path=%q want %q", got.method, got.path, wantPaths[got.method])
+				}
+			}
+		})
 	}
 }
 

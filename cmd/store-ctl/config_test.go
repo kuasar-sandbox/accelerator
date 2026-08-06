@@ -115,6 +115,29 @@ s3:
 	}
 }
 
+func TestLoadConfigS3PathStyle(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		field string
+		want  bool
+	}{
+		{name: "absent defaults on", want: true},
+		{name: "explicit on", field: "  path_style: true\n", want: true},
+		{name: "explicit off", field: "  path_style: false\n", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeYAML(t, "backend: s3\ns3:\n  endpoint: https://objects.example.com\n  bucket: b\n"+tc.field)
+			cfg, err := LoadConfig(path, false)
+			if err != nil {
+				t.Fatalf("LoadConfig: %v", err)
+			}
+			if got := cfg.S3PathStyle(); got != tc.want {
+				t.Errorf("S3PathStyle=%v want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoadConfigLegacyOBSNormalizesSilently(t *testing.T) {
 	path := writeYAML(t, `
 listen: 127.0.0.1:50051
@@ -123,6 +146,7 @@ obs:
   endpoint: https://legacy-objects.example.com
   region: legacy-region-1
   bucket: legacy-bucket
+  path_style: false
 `)
 	var (
 		cfg     *Config
@@ -142,6 +166,9 @@ obs:
 	}
 	if cfg.S3 == nil || cfg.S3.Bucket != "legacy-bucket" {
 		t.Fatalf("S3 not normalised: %+v", cfg.S3)
+	}
+	if cfg.S3PathStyle() {
+		t.Fatal("legacy path_style=false was not preserved during normalisation")
 	}
 	if cfg.OBS != nil {
 		t.Fatalf("OBS must be nil after normalisation: %+v", cfg.OBS)
@@ -347,7 +374,8 @@ func TestLoadConfigAdminCommandsSkipListen(t *testing.T) {
 func TestStoreConfigTemplateUsesS3(t *testing.T) {
 	if !strings.Contains(storeConfigTemplate, "# Backend: fs | s3.") ||
 		!strings.Contains(storeConfigTemplate, "# S3-compatible object storage backend") ||
-		!strings.Contains(storeConfigTemplate, "# s3:") {
+		!strings.Contains(storeConfigTemplate, "# s3:") ||
+		!strings.Contains(storeConfigTemplate, "#   path_style: true") {
 		t.Fatalf("generated template does not describe s3 backend:\n%s", storeConfigTemplate)
 	}
 	if strings.Contains(storeConfigTemplate, "backend: obs") || strings.Contains(storeConfigTemplate, "# obs:") {

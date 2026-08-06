@@ -71,6 +71,7 @@ func newS3Client(ctx context.Context, cfg *Config) (*sdkclient.Client, error) {
 		Endpoint:  cfg.S3.Endpoint,
 		Region:    cfg.S3.Region,
 		Bucket:    cfg.S3.Bucket,
+		PathStyle: cfg.S3PathStyle(),
 		AccessKey: cfg.S3.AccessKey,
 		SecretKey: cfg.S3.SecretKey,
 	})
