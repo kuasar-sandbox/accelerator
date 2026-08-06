@@ -876,8 +876,12 @@ func (s *sourceView) Size() uint64 { return uint64(s.m.logical) }
 // RunAt classifies offsets from the envelope's map: Data inside a
 // stored extent, Hole everywhere else. Zero is never produced — the
 // envelope has no such state.
-func (s *sourceView) RunAt(offset, limit uint64) (sparse.RunKind, uint64, error) {
-	return s.m.runAt(offset, limit)
+func (s *sourceView) RunAt(offset, limit uint64) (sparse.Run, error) {
+	kind, end, err := s.m.runAt(offset, limit)
+	if err != nil {
+		return nil, err
+	}
+	return tarSourceRun[*sourceView]{source: s, offset: offset, end: end, kind: kind}, nil
 }
 
 // runAt classifies one run of the entry's logical view from its
@@ -886,6 +890,9 @@ func (m *meta) runAt(offset, limit uint64) (sparse.RunKind, uint64, error) {
 	size := uint64(m.logical)
 	if offset >= size {
 		return 0, 0, io.EOF
+	}
+	if limit == 0 {
+		return 0, 0, fmt.Errorf("tarstream: invalid run: zero limit at offset %d", offset)
 	}
 	limEnd := offset + limit
 	if limEnd < offset || limEnd > size {
@@ -938,8 +945,57 @@ type readerAtSource struct {
 
 func (s *readerAtSource) Size() uint64 { return uint64(s.logical) }
 
-func (s *readerAtSource) RunAt(offset, limit uint64) (sparse.RunKind, uint64, error) {
-	return s.meta.runAt(offset, limit)
+func (s *readerAtSource) RunAt(offset, limit uint64) (sparse.Run, error) {
+	kind, end, err := s.meta.runAt(offset, limit)
+	if err != nil {
+		return nil, err
+	}
+	return tarSourceRun[*readerAtSource]{source: s, offset: offset, end: end, kind: kind}, nil
+}
+
+// tarSourceRun preserves the owning source's one-pass or concurrent-access
+// guarantee while enforcing the exact, in-run ReadAt contract.
+type tarRunReader interface {
+	ReadAt(context.Context, []byte, uint64) (int, error)
+}
+
+type tarSourceRun[S tarRunReader] struct {
+	source S
+	offset uint64
+	end    uint64
+	kind   sparse.RunKind
+}
+
+func (r tarSourceRun[S]) Offset() uint64       { return r.offset }
+func (r tarSourceRun[S]) End() uint64          { return r.end }
+func (r tarSourceRun[S]) Kind() sparse.RunKind { return r.kind }
+
+func (r tarSourceRun[S]) ReadAt(ctx context.Context, buf []byte, innerOffset uint64) (int, error) {
+	if r.end <= r.offset {
+		return 0, fmt.Errorf("tarstream: invalid run [%d,%d)", r.offset, r.end)
+	}
+	runLength := r.end - r.offset
+	if innerOffset > runLength || uint64(len(buf)) > runLength-innerOffset {
+		return 0, fmt.Errorf("tarstream: run read offset %d length %d outside [0,%d)", innerOffset, len(buf), runLength)
+	}
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if r.kind == sparse.Hole || r.kind == sparse.Zero {
+		clear(buf)
+		return len(buf), nil
+	}
+	n, err := r.source.ReadAt(ctx, buf, r.offset+innerOffset)
+	if n == len(buf) && (err == nil || err == io.EOF) {
+		return n, nil
+	}
+	if err != nil {
+		return n, err
+	}
+	return n, fmt.Errorf("tarstream: short run read @ %d: %d of %d bytes", r.offset+innerOffset, n, len(buf))
 }
 
 func (s *readerAtSource) ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error) {

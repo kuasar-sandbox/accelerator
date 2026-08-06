@@ -62,6 +62,25 @@ const (
 	Data
 )
 
+// Run is one already-resolved forward region [Offset(), End()) of a Source.
+// ReadAt offsets are relative to Offset(); innerOffset+len(buf) must remain
+// within the Run and an out-of-range request returns an error rather than
+// truncating or entering the next Run. A successful non-empty read returns
+// len(buf), nil. A zero-length read at or before End returns 0, nil. Hole and
+// Zero Runs clear buf without payload I/O.
+//
+// A Run is immutable and remains valid only for the lifetime of its Source.
+// Its concurrency guarantee is inherited from that Source: the baseline is
+// monotone, single-goroutine use, while manifest/fetch.Stream strengthens its
+// Runs to concurrent random access.
+type Run interface {
+	Offset() uint64
+	End() uint64
+	Kind() RunKind
+
+	ReadAt(ctx context.Context, buf []byte, innerOffset uint64) (int, error)
+}
+
 // Source is the platform's sparse byte source. limit in RunAt is a
 // length: the returned run satisfies offset < end <= min(offset+limit,
 // Size()). See the package comment for the contract laws.
@@ -69,12 +88,13 @@ type Source interface {
 	// Size is the total logical image size, holes included.
 	Size() uint64
 
-	// RunAt classifies the content at offset and returns the kind plus
-	// the end of a same-kind run. err == io.EOF iff offset >= Size();
-	// otherwise err == nil and offset < end <= min(offset+limit,
-	// Size()). Run granularity is implementation-defined (a Data run
-	// may end before any state change); callers iterate until io.EOF.
-	RunAt(offset, limit uint64) (kind RunKind, end uint64, err error)
+	// RunAt resolves the forward run beginning at offset. err == io.EOF iff
+	// offset >= Size(); limit must be non-zero; otherwise err == nil and the
+	// result satisfies Offset() == offset and
+	// offset < End() <= min(offset+limit, Size()). Run granularity is
+	// implementation-defined (a Data run may end before any state change).
+	// RunAt is a pure metadata operation and never reads payload data.
+	RunAt(offset, limit uint64) (Run, error)
 
 	// ReadAt reads len(buf) bytes from offset:
 	//
@@ -111,22 +131,19 @@ type staticSource struct {
 
 func (s *staticSource) Size() uint64 { return s.size }
 
-func (s *staticSource) RunAt(offset, limit uint64) (RunKind, uint64, error) {
-	if offset >= s.size {
-		return 0, 0, io.EOF
-	}
-	limEnd := offset + limit
-	if limEnd < offset || limEnd > s.size { // overflow or past EOF
-		limEnd = s.size
+func (s *staticSource) RunAt(offset, limit uint64) (Run, error) {
+	limEnd, err := boundedRunEnd(s.size, offset, limit)
+	if err != nil {
+		return nil, err
 	}
 	if h, in := holeAt(s.holes, offset); in {
 		end := h.Offset + h.Size
 		if end > limEnd {
 			end = limEnd
 		}
-		return Hole, end, nil
+		return sourceRun[*staticSource]{source: s, offset: offset, end: end, kind: Hole}, nil
 	}
-	return Data, nextHoleStart(s.holes, offset, limEnd), nil
+	return sourceRun[*staticSource]{source: s, offset: offset, end: nextHoleStart(s.holes, offset, limEnd), kind: Data}, nil
 }
 
 func (s *staticSource) ReadAt(_ context.Context, buf []byte, offset uint64) (int, error) {
@@ -165,15 +182,12 @@ type denseSource struct {
 
 func (s *denseSource) Size() uint64 { return s.size }
 
-func (s *denseSource) RunAt(offset, limit uint64) (RunKind, uint64, error) {
-	if offset >= s.size {
-		return 0, 0, io.EOF
+func (s *denseSource) RunAt(offset, limit uint64) (Run, error) {
+	limEnd, err := boundedRunEnd(s.size, offset, limit)
+	if err != nil {
+		return nil, err
 	}
-	limEnd := offset + limit
-	if limEnd < offset || limEnd > s.size {
-		limEnd = s.size
-	}
-	return Data, limEnd, nil
+	return sourceRun[*denseSource]{source: s, offset: offset, end: limEnd, kind: Data}, nil
 }
 
 func (s *denseSource) ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error) {
@@ -213,6 +227,75 @@ func (s *denseSource) short(err error) error {
 		return fmt.Errorf("sparse: dense source ended early (declared %d bytes): %w", s.size, io.ErrUnexpectedEOF)
 	}
 	return err
+}
+
+var errInvalidRun = errors.New("sparse: invalid run")
+
+// sourceRun is the lightweight Run used by the built-in Sources. Data reads
+// delegate to Source.ReadAt so one-pass and concurrency guarantees are
+// inherited unchanged; Hole and Zero reads never touch the payload source.
+type runReader interface {
+	ReadAt(context.Context, []byte, uint64) (int, error)
+}
+
+type sourceRun[S runReader] struct {
+	source S
+	offset uint64
+	end    uint64
+	kind   RunKind
+}
+
+func (r sourceRun[S]) Offset() uint64 { return r.offset }
+func (r sourceRun[S]) End() uint64    { return r.end }
+func (r sourceRun[S]) Kind() RunKind  { return r.kind }
+
+func (r sourceRun[S]) ReadAt(ctx context.Context, buf []byte, innerOffset uint64) (int, error) {
+	if err := validateRunRead(r.offset, r.end, innerOffset, len(buf)); err != nil {
+		return 0, err
+	}
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if r.kind == Hole || r.kind == Zero {
+		clear(buf)
+		return len(buf), nil
+	}
+
+	n, err := r.source.ReadAt(ctx, buf, r.offset+innerOffset)
+	if n == len(buf) && (err == nil || err == io.EOF) {
+		return n, nil
+	}
+	if err != nil {
+		return n, err
+	}
+	return n, fmt.Errorf("sparse: short run read @ %d: %d of %d bytes", r.offset+innerOffset, n, len(buf))
+}
+
+func boundedRunEnd(size, offset, limit uint64) (uint64, error) {
+	if offset >= size {
+		return 0, io.EOF
+	}
+	if limit == 0 {
+		return 0, fmt.Errorf("%w: zero limit at offset %d", errInvalidRun, offset)
+	}
+	if limit >= size-offset {
+		return size, nil
+	}
+	return offset + limit, nil
+}
+
+func validateRunRead(offset, end, innerOffset uint64, length int) error {
+	if end <= offset {
+		return fmt.Errorf("%w: run [%d,%d)", errInvalidRun, offset, end)
+	}
+	runLength := end - offset
+	if innerOffset > runLength || uint64(length) > runLength-innerOffset {
+		return fmt.Errorf("%w: read offset %d length %d outside [0,%d)", errInvalidRun, innerOffset, length, runLength)
+	}
+	return nil
 }
 
 // normalizeHoles validates and canonicalizes a hole map: copy, sort,

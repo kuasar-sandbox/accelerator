@@ -1,6 +1,7 @@
 package fetch
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -91,8 +92,15 @@ func TestLayeredPrefetchNonPrefetchChunkLeafIsNoOp(t *testing.T) {
 	stream := NewLayered(top, bottom)
 	prefetcher := stream.(Prefetcher)
 
-	if _, ok := any(top).(prefetchChunkStream); ok {
-		t.Fatal("test leaf unexpectedly implements prefetchChunkStream")
+	run, err := top.RunAt(0, top.Size())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := run.(ChunkRun); !ok {
+		t.Fatalf("test run type = %T, want ChunkRun", run)
+	}
+	if _, ok := run.(prefetchChunkRun); ok {
+		t.Fatal("test run unexpectedly implements prefetchChunkRun")
 	}
 	if err := prefetcher.Prefetch(context.Background()); err != nil {
 		t.Fatalf("Prefetch(all): %v", err)
@@ -100,11 +108,11 @@ func TestLayeredPrefetchNonPrefetchChunkLeafIsNoOp(t *testing.T) {
 	if bottomGetter.callCount() != 0 {
 		t.Fatalf("opaque non-prefetch leaf fell through to bottom: %d Gets", bottomGetter.callCount())
 	}
-	if top.readCalls.Load() != 0 || top.readChunkCalls.Load() != 0 {
-		t.Fatalf("Prefetch fell back to a read: ReadAt=%d ReadChunkAt=%d", top.readCalls.Load(), top.readChunkCalls.Load())
+	if top.readCalls.Load() != 0 {
+		t.Fatalf("Prefetch fell back to %d Run.ReadAt calls", top.readCalls.Load())
 	}
-	if top.runChunkCalls.Load() == 0 {
-		t.Fatal("resolver did not classify the non-prefetch chunkStream leaf")
+	if top.runCalls.Load() == 0 {
+		t.Fatal("Prefetch did not classify the non-prefetch ChunkRun leaf")
 	}
 }
 
@@ -134,9 +142,17 @@ func TestPrefetchChunkBlobOwnershipAndGetterFailures(t *testing.T) {
 			}
 			getter := &fixedPrefetchGetter{result: tt.result, blob: returned, err: tt.getterErr}
 			stream := newPrefetchManifest(densePrefetchManifest(8, 0x51), getter)
-			err := stream.PrefetchChunkAt(context.Background(), 0)
+			run, runErr := stream.RunAt(0, stream.Size())
+			if runErr != nil {
+				t.Fatal(runErr)
+			}
+			chunk, ok := run.(prefetchChunkRun)
+			if !ok {
+				t.Fatalf("run type = %T, want prefetchChunkRun", run)
+			}
+			err := chunk.prefetch(context.Background())
 			if (err != nil) != tt.wantErr {
-				t.Fatalf("PrefetchChunkAt error = %v, wantErr=%v", err, tt.wantErr)
+				t.Fatalf("ChunkRun prefetch error = %v, wantErr=%v", err, tt.wantErr)
 			}
 			if tt.wantSentinel && !errors.Is(err, sentinel) {
 				t.Fatalf("error = %v, want wrapped sentinel", err)
@@ -153,7 +169,7 @@ func TestPrefetchChunkBlobOwnershipAndGetterFailures(t *testing.T) {
 	}
 }
 
-func TestChunkOperationsValidateBeforeGet(t *testing.T) {
+func TestChunkRunOperationsValidateBeforeGet(t *testing.T) {
 	entry := codec.ChunkEntry{Offset: 4, Size: 4, CiphertextHash: prefetchTestKey(0x61)}
 	m := &codec.Manifest{
 		Version:   codec.Version1,
@@ -162,70 +178,120 @@ func TestChunkOperationsValidateBeforeGet(t *testing.T) {
 		Holes:     []sparse.Extent{{Offset: 0, Size: 4}},
 	}
 
-	t.Run("PrefetchChunkAt index and Zero", func(t *testing.T) {
+	t.Run("RunAt metadata and Zero", func(t *testing.T) {
 		getter := newPrefetchRecordingGetter()
 		stream := newManifestStream(m, make([][32]byte, 1), getter, getter, &passthroughEncryptor{plain: make([]byte, 4)})
-		if err := stream.PrefetchChunkAt(context.Background(), 1); err == nil {
-			t.Fatal("out-of-range PrefetchChunkAt succeeded")
+		run, err := stream.RunAt(4, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := run.(ChunkRun); !ok {
+			t.Fatalf("Data run type = %T, want ChunkRun", run)
 		}
 		zero := newManifestStream(&codec.Manifest{
 			Version: codec.Version1, ImageSize: 4,
 			Entries: []codec.ChunkEntry{{Offset: 0, Size: 4, IsZero: true}},
 		}, make([][32]byte, 1), getter, getter, nil)
-		if err := zero.PrefetchChunkAt(context.Background(), 0); err != nil {
-			t.Fatalf("Zero PrefetchChunkAt: %v", err)
+		zeroRun, err := zero.RunAt(0, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := zeroRun.(ChunkRun); ok {
+			t.Fatalf("Zero run type = %T, must not implement ChunkRun", zeroRun)
+		}
+		buf := []byte{1, 2, 3, 4}
+		if n, err := zeroRun.ReadAt(context.Background(), buf, 0); n != 4 || err != nil {
+			t.Fatalf("Zero Run.ReadAt = (%d,%v)", n, err)
+		}
+		if !bytes.Equal(buf, make([]byte, 4)) {
+			t.Fatalf("Zero Run.ReadAt = %v", buf)
 		}
 		if got := getter.callCount(); got != 0 {
-			t.Fatalf("invalid/Zero prefetch performed %d Gets", got)
+			t.Fatalf("RunAt/Zero read performed %d Gets", got)
 		}
 	})
 
 	invalidReads := []struct {
-		name     string
-		chunkIdx uint64
-		offset   uint64
-		end      uint64
-		dstLen   int
+		name string
+		run  manifestDataRun
+		buf  int
 	}{
-		{name: "chunk index", chunkIdx: 1, offset: 4, end: 8, dstLen: 4},
-		{name: "offset before entry", offset: 3, end: 7, dstLen: 4},
-		{name: "end after entry", offset: 4, end: 9, dstLen: 5},
-		{name: "end before offset", offset: 7, end: 6, dstLen: 1},
-		{name: "short destination", offset: 4, end: 8, dstLen: 3},
+		{name: "chunk index", run: manifestDataRun{chunkIndex: 1, offset: 4, end: 8}, buf: 4},
+		{name: "offset before entry", run: manifestDataRun{chunkIndex: 0, offset: 3, end: 7}, buf: 4},
+		{name: "end after entry", run: manifestDataRun{chunkIndex: 0, offset: 4, end: 9}, buf: 5},
 	}
 	for _, tt := range invalidReads {
 		t.Run(tt.name, func(t *testing.T) {
 			getter := newPrefetchRecordingGetter()
 			stream := newManifestStream(m, make([][32]byte, 1), getter, getter, &passthroughEncryptor{plain: make([]byte, 4)})
-			if _, err := stream.ReadChunkAt(context.Background(), make([]byte, tt.dstLen), tt.chunkIdx, tt.offset, tt.end); err == nil {
-				t.Fatal("invalid ReadChunkAt succeeded")
+			run := tt.run
+			run.stream = stream
+			if _, err := run.ReadAt(context.Background(), make([]byte, tt.buf), 0); err == nil {
+				t.Fatal("invalid ChunkRun.ReadAt succeeded")
 			}
 			if got := getter.callCount(); got != 0 {
-				t.Fatalf("invalid ReadChunkAt performed %d Gets", got)
+				t.Fatalf("invalid ChunkRun.ReadAt performed %d Gets", got)
 			}
 		})
 	}
 
+	t.Run("invalid prefetch index", func(t *testing.T) {
+		getter := newPrefetchRecordingGetter()
+		stream := newManifestStream(m, make([][32]byte, 1), getter, getter, &passthroughEncryptor{plain: make([]byte, 4)})
+		run := &manifestDataRun{stream: stream, chunkIndex: 1, offset: 4, end: 8}
+		if err := run.prefetch(context.Background()); err == nil {
+			t.Fatal("invalid ChunkRun prefetch succeeded")
+		}
+		if getter.callCount() != 0 {
+			t.Fatal("invalid ChunkRun prefetch performed Get")
+		}
+	})
+
+	t.Run("relative range", func(t *testing.T) {
+		getter := newPrefetchRecordingGetter()
+		stream := newManifestStream(m, make([][32]byte, 1), getter, getter, &passthroughEncryptor{plain: make([]byte, 4)})
+		run, err := stream.RunAt(4, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, inner := range []uint64{4, ^uint64(0)} {
+			if _, err := run.ReadAt(context.Background(), make([]byte, 1), inner); err == nil {
+				t.Fatalf("out-of-range inner offset %d succeeded", inner)
+			}
+		}
+		if getter.callCount() != 0 {
+			t.Fatal("invalid relative read performed Get")
+		}
+	})
+
 	t.Run("empty range", func(t *testing.T) {
 		getter := newPrefetchRecordingGetter()
 		stream := newManifestStream(m, make([][32]byte, 1), getter, getter, &passthroughEncryptor{plain: make([]byte, 4)})
-		n, err := stream.ReadChunkAt(context.Background(), nil, 0, 4, 4)
+		run, err := stream.RunAt(4, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, err := run.ReadAt(context.Background(), nil, 4)
 		if n != 0 || err != nil {
-			t.Fatalf("empty ReadChunkAt = (%d, %v), want (0, nil)", n, err)
+			t.Fatalf("empty ChunkRun.ReadAt = (%d, %v), want (0, nil)", n, err)
 		}
 		if getter.callCount() != 0 {
-			t.Fatal("empty ReadChunkAt performed Get")
+			t.Fatal("empty ChunkRun.ReadAt performed Get")
 		}
 	})
 
 	t.Run("missing decryption key", func(t *testing.T) {
 		getter := newPrefetchRecordingGetter()
 		stream := newManifestStream(m, nil, getter, getter, &passthroughEncryptor{plain: make([]byte, 4)})
-		if _, err := stream.ReadChunkAt(context.Background(), make([]byte, 4), 0, 4, 8); err == nil {
-			t.Fatal("ReadChunkAt without key succeeded")
+		run, err := stream.RunAt(4, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := run.ReadAt(context.Background(), make([]byte, 4), 0); err == nil {
+			t.Fatal("ChunkRun.ReadAt without key succeeded")
 		}
 		if getter.callCount() != 0 {
-			t.Fatal("missing-key ReadChunkAt performed Get")
+			t.Fatal("missing-key ChunkRun.ReadAt performed Get")
 		}
 	})
 
@@ -237,8 +303,12 @@ func TestChunkOperationsValidateBeforeGet(t *testing.T) {
 		blob := &prefetchObservedBlob{data: ciphertext}
 		getter := &fixedPrefetchGetter{result: cache.CacheHit, blob: blob}
 		stream := newManifestStream(shortManifest, make([][32]byte, 1), getter, getter, &passthroughEncryptor{plain: make([]byte, 3)})
-		if _, err := stream.ReadChunkAt(context.Background(), make([]byte, 4), 0, 4, 8); err == nil {
-			t.Fatal("ReadChunkAt accepted short plaintext")
+		run, err := stream.RunAt(4, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := run.ReadAt(context.Background(), make([]byte, 4), 0); err == nil {
+			t.Fatal("ChunkRun.ReadAt accepted short plaintext")
 		}
 		if getter.calls.Load() != 1 {
 			t.Fatalf("short-plaintext Gets = %d, want 1", getter.calls.Load())
@@ -414,35 +484,43 @@ func assertPrefetchBlobsUntouchedAndReleased(t *testing.T, blobs []*prefetchObse
 }
 
 type readOnlyChunkLeaf struct {
-	size           uint64
-	runChunkCalls  atomic.Int64
-	readCalls      atomic.Int64
-	readChunkCalls atomic.Int64
+	size      uint64
+	runCalls  atomic.Int64
+	readCalls atomic.Int64
 }
 
 func (s *readOnlyChunkLeaf) Size() uint64 { return s.size }
 func (s *readOnlyChunkLeaf) Close() error { return nil }
-func (s *readOnlyChunkLeaf) RunAt(offset, limit uint64) (sparse.RunKind, uint64, error) {
-	kind, end, _, err := s.RunChunkAt(offset, limit)
-	return kind, end, err
-}
-func (s *readOnlyChunkLeaf) RunChunkAt(offset, limit uint64) (sparse.RunKind, uint64, uint64, error) {
-	s.runChunkCalls.Add(1)
+func (s *readOnlyChunkLeaf) RunAt(offset, limit uint64) (sparse.Run, error) {
+	s.runCalls.Add(1)
 	if offset >= s.size {
-		return 0, 0, 0, fmt.Errorf("readOnlyChunkLeaf: offset out of range")
+		return nil, fmt.Errorf("readOnlyChunkLeaf: offset out of range")
+	}
+	if limit == 0 {
+		return nil, fmt.Errorf("readOnlyChunkLeaf: zero limit")
 	}
 	end := offset + limit
 	if end < offset || end > s.size {
 		end = s.size
 	}
-	return sparse.Data, end, 0, nil
+	return readOnlyChunkRun{leaf: s, offset: offset, end: end}, nil
 }
-func (s *readOnlyChunkLeaf) ReadAt(_ context.Context, buf []byte, _ uint64) (int, error) {
-	s.readCalls.Add(1)
-	return len(buf), nil
+func (s *readOnlyChunkLeaf) ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error) {
+	return readStreamAt(ctx, s, buf, offset)
 }
-func (s *readOnlyChunkLeaf) ReadChunkAt(_ context.Context, buf []byte, _ uint64, _, _ uint64) (int, error) {
-	s.readChunkCalls.Add(1)
+
+type readOnlyChunkRun struct {
+	leaf   *readOnlyChunkLeaf
+	offset uint64
+	end    uint64
+}
+
+func (r readOnlyChunkRun) Offset() uint64       { return r.offset }
+func (r readOnlyChunkRun) End() uint64          { return r.end }
+func (r readOnlyChunkRun) Kind() sparse.RunKind { return sparse.Data }
+func (r readOnlyChunkRun) chunkRun()            {}
+func (r readOnlyChunkRun) ReadAt(_ context.Context, buf []byte, _ uint64) (int, error) {
+	r.leaf.readCalls.Add(1)
 	return len(buf), nil
 }
 

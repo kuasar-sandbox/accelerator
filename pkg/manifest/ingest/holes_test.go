@@ -3,6 +3,7 @@ package ingest
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -112,16 +113,41 @@ type zeroRunIngestSource struct {
 
 func (s *zeroRunIngestSource) Size() uint64 { return 12 * 1024 }
 
-func (s *zeroRunIngestSource) RunAt(off, limit uint64) (sparse.RunKind, uint64, error) {
+func (s *zeroRunIngestSource) RunAt(off, limit uint64) (sparse.Run, error) {
 	size := s.Size()
 	if off >= size {
-		return 0, 0, io.EOF
+		return nil, io.EOF
+	}
+	if limit == 0 {
+		return nil, errors.New("zero RunAt limit")
 	}
 	limEnd := min(off+limit, size)
 	if off < 4096 {
-		return sparse.Data, min(4096, limEnd), nil
+		return zeroIngestRun{source: s, offset: off, end: min(4096, limEnd), kind: sparse.Data}, nil
 	}
-	return sparse.Zero, limEnd, nil
+	return zeroIngestRun{source: s, offset: off, end: limEnd, kind: sparse.Zero}, nil
+}
+
+type zeroIngestRun struct {
+	source *zeroRunIngestSource
+	offset uint64
+	end    uint64
+	kind   sparse.RunKind
+}
+
+func (r zeroIngestRun) Offset() uint64       { return r.offset }
+func (r zeroIngestRun) End() uint64          { return r.end }
+func (r zeroIngestRun) Kind() sparse.RunKind { return r.kind }
+func (r zeroIngestRun) ReadAt(ctx context.Context, buf []byte, inner uint64) (int, error) {
+	length := r.end - r.offset
+	if inner > length || uint64(len(buf)) > length-inner {
+		return 0, errors.New("run read out of range")
+	}
+	if r.kind == sparse.Zero {
+		clear(buf)
+		return len(buf), nil
+	}
+	return r.source.ReadAt(ctx, buf, r.offset+inner)
 }
 
 func (s *zeroRunIngestSource) ReadAt(_ context.Context, buf []byte, off uint64) (int, error) {

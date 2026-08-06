@@ -5,11 +5,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
@@ -34,6 +36,16 @@ type recordingGetter struct {
 func (g *recordingGetter) Get(_ context.Context, _ store.Partition, _ store.ContentKey) (cache.CacheResult, cache.Blob, error) {
 	g.calls.Add(1)
 	return cache.CacheMiss, nil, nil
+}
+
+type countingHitGetter struct {
+	value []byte
+	calls atomic.Int64
+}
+
+func (g *countingHitGetter) Get(_ context.Context, _ store.Partition, _ store.ContentKey) (cache.CacheResult, cache.Blob, error) {
+	g.calls.Add(1)
+	return cache.CacheHit, cache.NewMemBlob(g.value), nil
 }
 
 // TestReadAt_IsZeroNoGet — every entry is IsZero; ReadAt produces zeros without
@@ -66,6 +78,88 @@ func TestReadAt_IsZeroNoGet(t *testing.T) {
 	}
 	if got := getter.calls.Load(); got != 0 {
 		t.Errorf("cache.Get called %d times for IsZero-only manifest; want 0", got)
+	}
+	run, err := f.RunAt(0, imageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Kind() != sparse.Zero || run.End() != imageSize {
+		t.Fatalf("merged Zero run = [%d,%d) %v, want [0,%d) Zero", run.Offset(), run.End(), run.Kind(), imageSize)
+	}
+	if _, ok := run.(ChunkRun); ok {
+		t.Fatalf("Zero run type = %T, must not implement ChunkRun", run)
+	}
+	if _, err := run.ReadAt(context.Background(), make([]byte, 1), imageSize); err == nil {
+		t.Fatal("Zero Run.ReadAt crossed End")
+	}
+	if n, err := run.ReadAt(context.Background(), nil, imageSize); n != 0 || err != nil {
+		t.Fatalf("Zero empty read at End = (%d,%v)", n, err)
+	}
+}
+
+func TestManifestDataRunCapturesChunkIndexOnce(t *testing.T) {
+	const chunkSize = 8192
+	plain := make([]byte, chunkSize)
+	for i := range plain {
+		plain[i] = byte(i % 251)
+	}
+	m := &codec.Manifest{
+		Version:   codec.Version1,
+		ImageSize: chunkSize,
+		Entries: []codec.ChunkEntry{{
+			Offset:         0,
+			Size:           chunkSize,
+			CiphertextHash: sha256.Sum256(plain),
+		}},
+	}
+	getter := &countingHitGetter{value: plain}
+	stream := newManifestStream(m, make([][32]byte, 1), getter, getter, &passthroughEncryptor{plain: plain})
+	var lookups atomic.Int64
+	stream.chunkIndexLookup = func(entries []codec.ChunkEntry, offset uint64) int {
+		lookups.Add(1)
+		return codec.ChunkIndexForOffset(entries, offset)
+	}
+
+	run, err := stream.RunAt(1024, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := run.(ChunkRun); !ok {
+		t.Fatalf("Data run type = %T, want ChunkRun", run)
+	}
+	if lookups.Load() != 1 || getter.calls.Load() != 0 {
+		t.Fatalf("RunAt lookups/Gets = %d/%d, want 1/0", lookups.Load(), getter.calls.Load())
+	}
+
+	const readers = 8
+	var wg sync.WaitGroup
+	errCh := make(chan error, readers)
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			inner := uint64(i * 128)
+			buf := make([]byte, 256)
+			n, err := run.ReadAt(context.Background(), buf, inner)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if n != len(buf) || !bytes.Equal(buf, plain[1024+inner:1024+inner+uint64(len(buf))]) {
+				errCh <- errors.New("Run.ReadAt returned wrong sub-range")
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+	if lookups.Load() != 1 {
+		t.Fatalf("chunk index lookups after Run.ReadAt = %d, want 1", lookups.Load())
+	}
+	if getter.calls.Load() != readers {
+		t.Fatalf("payload Gets = %d, want %d", getter.calls.Load(), readers)
 	}
 }
 

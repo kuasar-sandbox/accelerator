@@ -7,11 +7,12 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
 
-func TestResolverCarriesAncestorBoundThroughNestedLayers(t *testing.T) {
+func TestLayeredCarriesAncestorBoundThroughNestedLayers(t *testing.T) {
 	const size = uint64(8)
 	outerUpper := &resolverTestStream{
 		size: size,
@@ -23,33 +24,24 @@ func TestResolverCarriesAncestorBoundThroughNestedLayers(t *testing.T) {
 		},
 	}
 	nestedUpper := resolverHoleStream(size)
-	bottom := &resolverTestStream{
-		size: size,
-		run: func(offset, limit uint64) (sparse.RunKind, uint64, error) {
-			return sparse.Data, offset + limit, nil
-		},
-	}
+	bottom := &resolverTestStream{size: size}
 	nested := NewLayered(nestedUpper, bottom)
 	stream := NewLayered(outerUpper, nested)
 
-	run, err := resolveStream(stream, 0, size)
+	run, err := stream.RunAt(0, size)
 	if err != nil {
-		t.Fatalf("resolveStream: %v", err)
+		t.Fatalf("RunAt: %v", err)
 	}
-	if run.kind != sparse.Data || run.end != 4 || run.leaf != bottom {
-		t.Fatalf("resolved run = {kind:%v end:%d leaf:%T}, want bottom Data through 4", run.kind, run.end, run.leaf)
+	leaf, ok := run.(resolverTestRun)
+	if !ok || leaf.stream != bottom || run.Kind() != sparse.Data || run.Offset() != 0 || run.End() != 4 {
+		t.Fatalf("resolved run = %T [%d,%d) kind %v, want bottom Data [0,4)", run, run.Offset(), run.End(), run.Kind())
 	}
 	if got := bottom.lastLimit.Load(); got != 4 {
 		t.Fatalf("deepest leaf limit = %d, want ancestor bound 4", got)
 	}
-
-	kind, end, err := stream.RunAt(0, size)
-	if err != nil || kind != sparse.Data || end != 4 {
-		t.Fatalf("RunAt = (%v, %d, %v), want (Data, 4, nil)", kind, end, err)
-	}
 }
 
-func TestResolverRejectsLeafErrorsAndInvalidRuns(t *testing.T) {
+func TestLayeredRejectsLeafErrorsAndInvalidRuns(t *testing.T) {
 	sentinel := errors.New("sentinel resolver failure")
 	tests := []struct {
 		name        string
@@ -57,54 +49,21 @@ func TestResolverRejectsLeafErrorsAndInvalidRuns(t *testing.T) {
 		want        error
 		wantInvalid bool
 	}{
-		{
-			name: "error",
-			run: func(uint64, uint64) (sparse.RunKind, uint64, error) {
-				return 0, 0, sentinel
-			},
-			want: sentinel,
-		},
-		{
-			name: "EOF below Size",
-			run: func(uint64, uint64) (sparse.RunKind, uint64, error) {
-				return 0, 0, io.EOF
-			},
-			want: io.EOF,
-		},
-		{
-			name: "unknown kind",
-			run: func(offset, _ uint64) (sparse.RunKind, uint64, error) {
-				return sparse.RunKind(0xFF), offset + 1, nil
-			},
-			wantInvalid: true,
-		},
-		{
-			name: "non advancing",
-			run: func(offset, _ uint64) (sparse.RunKind, uint64, error) {
-				return sparse.Data, offset, nil
-			},
-			wantInvalid: true,
-		},
-		{
-			name: "end before offset",
-			run: func(offset, _ uint64) (sparse.RunKind, uint64, error) {
-				return sparse.Data, offset - 1, nil
-			},
-			wantInvalid: true,
-		},
-		{
-			name: "end after requested bound",
-			run: func(offset, limit uint64) (sparse.RunKind, uint64, error) {
-				return sparse.Data, offset + limit + 1, nil
-			},
-			wantInvalid: true,
-		},
+		{name: "error", run: func(uint64, uint64) (sparse.RunKind, uint64, error) { return 0, 0, sentinel }, want: sentinel},
+		{name: "EOF below Size", run: func(uint64, uint64) (sparse.RunKind, uint64, error) { return 0, 0, io.EOF }, want: io.EOF},
+		{name: "unknown kind", run: func(offset, _ uint64) (sparse.RunKind, uint64, error) { return sparse.RunKind(0xFF), offset + 1, nil }, wantInvalid: true},
+		{name: "non advancing", run: func(offset, _ uint64) (sparse.RunKind, uint64, error) { return sparse.Data, offset, nil }, wantInvalid: true},
+		{name: "end before offset", run: func(offset, _ uint64) (sparse.RunKind, uint64, error) { return sparse.Data, offset - 1, nil }, wantInvalid: true},
+		{name: "end after requested bound", run: func(offset, limit uint64) (sparse.RunKind, uint64, error) {
+			return sparse.Data, offset + limit + 1, nil
+		}, wantInvalid: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			leaf := &resolverTestStream{size: 8, run: tt.run}
-			_, err := resolveStream(leaf, 2, 6)
+			stream := NewLayered(resolverHoleStream(8), leaf)
+			_, err := stream.RunAt(2, 4)
 			if tt.want != nil && !errors.Is(err, tt.want) {
 				t.Fatalf("error = %v, want %v", err, tt.want)
 			}
@@ -118,29 +77,6 @@ func TestResolverRejectsLeafErrorsAndInvalidRuns(t *testing.T) {
 	}
 }
 
-func TestResolverUsesChunkStreamErrors(t *testing.T) {
-	sentinel := errors.New("chunk classifier failed")
-	base := &resolverTestStream{
-		size: 8,
-		run: func(offset, limit uint64) (sparse.RunKind, uint64, error) {
-			return sparse.Data, offset + limit, nil
-		},
-	}
-	chunked := &resolverTestChunkStream{
-		resolverTestStream: base,
-		runChunk: func(uint64, uint64) (sparse.RunKind, uint64, uint64, error) {
-			return 0, 0, 0, sentinel
-		},
-	}
-
-	if _, err := resolveStream(chunked, 0, 8); !errors.Is(err, sentinel) {
-		t.Fatalf("resolveStream error = %v, want chunk sentinel", err)
-	}
-	if base.runCalls.Load() != 0 || chunked.runChunkCalls.Load() != 1 {
-		t.Fatalf("classifier calls = RunAt:%d RunChunkAt:%d, want 0/1", base.runCalls.Load(), chunked.runChunkCalls.Load())
-	}
-}
-
 func TestResolverFailuresPropagateThroughEveryOperation(t *testing.T) {
 	sentinel := errors.New("leaf metadata failed")
 	tests := []struct {
@@ -148,34 +84,10 @@ func TestResolverFailuresPropagateThroughEveryOperation(t *testing.T) {
 		run  func(offset, limit uint64) (sparse.RunKind, uint64, error)
 		want error
 	}{
-		{
-			name: "sentinel",
-			run: func(uint64, uint64) (sparse.RunKind, uint64, error) {
-				return 0, 0, sentinel
-			},
-			want: sentinel,
-		},
-		{
-			name: "unexpected EOF",
-			run: func(uint64, uint64) (sparse.RunKind, uint64, error) {
-				return 0, 0, io.EOF
-			},
-			want: io.EOF,
-		},
-		{
-			name: "invalid kind",
-			run: func(offset, _ uint64) (sparse.RunKind, uint64, error) {
-				return sparse.RunKind(99), offset + 1, nil
-			},
-			want: errInvalidRun,
-		},
-		{
-			name: "invalid end",
-			run: func(offset, _ uint64) (sparse.RunKind, uint64, error) {
-				return sparse.Data, offset, nil
-			},
-			want: errInvalidRun,
-		},
+		{name: "sentinel", run: func(uint64, uint64) (sparse.RunKind, uint64, error) { return 0, 0, sentinel }, want: sentinel},
+		{name: "unexpected EOF", run: func(uint64, uint64) (sparse.RunKind, uint64, error) { return 0, 0, io.EOF }, want: io.EOF},
+		{name: "invalid kind", run: func(offset, _ uint64) (sparse.RunKind, uint64, error) { return sparse.RunKind(99), offset + 1, nil }, want: errInvalidRun},
+		{name: "invalid end", run: func(offset, _ uint64) (sparse.RunKind, uint64, error) { return sparse.Data, offset, nil }, want: errInvalidRun},
 	}
 
 	for _, tt := range tests {
@@ -186,7 +98,7 @@ func TestResolverFailuresPropagateThroughEveryOperation(t *testing.T) {
 			}
 
 			_, stream := newStream()
-			if _, _, err := stream.RunAt(0, 8); !errors.Is(err, tt.want) {
+			if _, err := stream.RunAt(0, 8); !errors.Is(err, tt.want) {
 				t.Fatalf("RunAt error = %v, want %v", err, tt.want)
 			}
 
@@ -200,11 +112,7 @@ func TestResolverFailuresPropagateThroughEveryOperation(t *testing.T) {
 			}
 
 			bad, stream = newStream()
-			prefetcher, ok := stream.(Prefetcher)
-			if !ok {
-				t.Fatal("layered stream does not implement Prefetcher")
-			}
-			if err := prefetcher.Prefetch(context.Background()); !errors.Is(err, tt.want) {
+			if err := stream.(Prefetcher).Prefetch(context.Background()); !errors.Is(err, tt.want) {
 				t.Fatalf("Prefetch error = %v, want %v", err, tt.want)
 			}
 			if bad.readCalls.Load() != 0 {
@@ -240,7 +148,7 @@ func TestReadAtPlansAllRunsBeforeStartingIO(t *testing.T) {
 		t.Fatalf("ReadAt = (%d, %v), want (0, sentinel)", n, err)
 	}
 	if got := leaf.readCalls.Load(); got != 0 {
-		t.Fatalf("phase-two I/O started %d times before phase-one resolution completed", got)
+		t.Fatalf("phase-two I/O started %d times before planning completed", got)
 	}
 	for i := range buf {
 		if buf[i] != want[i] {
@@ -249,36 +157,19 @@ func TestReadAtPlansAllRunsBeforeStartingIO(t *testing.T) {
 	}
 }
 
-func TestReadAtRejectsNonChunkLeafShortReadAndFullEOF(t *testing.T) {
+func TestReadAtRejectsRunShortReadAndFullEOF(t *testing.T) {
 	tests := []struct {
 		name string
 		read func(context.Context, []byte, uint64) (int, error)
 		want error
 	}{
-		{
-			name: "short read",
-			read: func(_ context.Context, buf []byte, _ uint64) (int, error) {
-				return len(buf) - 1, nil
-			},
-		},
-		{
-			name: "full read with EOF",
-			read: func(_ context.Context, buf []byte, _ uint64) (int, error) {
-				return len(buf), io.EOF
-			},
-			want: io.EOF,
-		},
+		{name: "short read", read: func(_ context.Context, buf []byte, _ uint64) (int, error) { return len(buf) - 1, nil }},
+		{name: "full read with EOF", read: func(_ context.Context, buf []byte, _ uint64) (int, error) { return len(buf), io.EOF }, want: io.EOF},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			leaf := &resolverTestStream{
-				size: 8,
-				run: func(offset, limit uint64) (sparse.RunKind, uint64, error) {
-					return sparse.Data, offset + limit, nil
-				},
-				read: tt.read,
-			}
+			leaf := &resolverTestStream{size: 8, read: tt.read}
 			stream := NewLayered(leaf, resolverHoleStream(8))
 			n, err := stream.ReadAt(context.Background(), make([]byte, 8), 0)
 			if n != 0 || err == nil {
@@ -290,10 +181,57 @@ func TestReadAtRejectsNonChunkLeafShortReadAndFullEOF(t *testing.T) {
 			if tt.want == nil && !strings.Contains(err.Error(), "short read") {
 				t.Fatalf("ReadAt error = %v, want short-read diagnostic", err)
 			}
-			if got := leaf.readCalls.Load(); got != 1 {
-				t.Fatalf("leaf ReadAt calls = %d, want 1", got)
-			}
 		})
+	}
+}
+
+func TestReadAtRunsConcurrentlyAndCancelsPeers(t *testing.T) {
+	sentinel := errors.New("run failed")
+	entered := make(chan uint64, 2)
+	fail := make(chan struct{})
+	canceled := make(chan struct{})
+	leaf := &resolverTestStream{
+		size: 8,
+		run:  func(offset, _ uint64) (sparse.RunKind, uint64, error) { return sparse.Data, offset + 4, nil },
+		read: func(ctx context.Context, buf []byte, offset uint64) (int, error) {
+			entered <- offset
+			if offset == 0 {
+				<-fail
+				return 0, sentinel
+			}
+			<-ctx.Done()
+			close(canceled)
+			return 0, ctx.Err()
+		},
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := leaf.ReadAt(context.Background(), make([]byte, 8), 0)
+		done <- err
+	}()
+
+	seen := map[uint64]bool{}
+	for len(seen) < 2 {
+		select {
+		case off := <-entered:
+			seen[off] = true
+		case <-time.After(5 * time.Second):
+			t.Fatal("data runs did not start concurrently")
+		}
+	}
+	close(fail)
+	select {
+	case err := <-done:
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("ReadAt error = %v, want sentinel", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ReadAt did not return")
+	}
+	select {
+	case <-canceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("peer run did not observe cancellation")
 	}
 }
 
@@ -308,41 +246,41 @@ type resolverTestStream struct {
 
 func (s *resolverTestStream) Size() uint64 { return s.size }
 func (s *resolverTestStream) Close() error { return nil }
-func (s *resolverTestStream) RunAt(offset, limit uint64) (sparse.RunKind, uint64, error) {
+func (s *resolverTestStream) RunAt(offset, limit uint64) (sparse.Run, error) {
 	s.runCalls.Add(1)
 	s.lastLimit.Store(limit)
+	kind, end := sparse.Data, offset+limit
+	var err error
 	if s.run != nil {
-		return s.run(offset, limit)
+		kind, end, err = s.run(offset, limit)
 	}
-	return sparse.Data, offset + limit, nil
+	if err != nil {
+		return nil, err
+	}
+	return resolverTestRun{stream: s, offset: offset, end: end, kind: kind}, nil
 }
 func (s *resolverTestStream) ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error) {
-	s.readCalls.Add(1)
-	if s.read != nil {
-		return s.read(ctx, buf, offset)
-	}
-	return len(buf), nil
+	return readStreamAt(ctx, s, buf, offset)
 }
 
-type resolverTestChunkStream struct {
-	*resolverTestStream
-	runChunk       func(offset, limit uint64) (sparse.RunKind, uint64, uint64, error)
-	readChunk      func(context.Context, []byte, uint64, uint64, uint64) (int, error)
-	runChunkCalls  atomic.Int64
-	readChunkCalls atomic.Int64
+type resolverTestRun struct {
+	stream *resolverTestStream
+	offset uint64
+	end    uint64
+	kind   sparse.RunKind
 }
 
-func (s *resolverTestChunkStream) RunChunkAt(offset, limit uint64) (sparse.RunKind, uint64, uint64, error) {
-	s.runChunkCalls.Add(1)
-	if s.runChunk != nil {
-		return s.runChunk(offset, limit)
+func (r resolverTestRun) Offset() uint64       { return r.offset }
+func (r resolverTestRun) End() uint64          { return r.end }
+func (r resolverTestRun) Kind() sparse.RunKind { return r.kind }
+func (r resolverTestRun) ReadAt(ctx context.Context, buf []byte, inner uint64) (int, error) {
+	r.stream.readCalls.Add(1)
+	if r.kind != sparse.Data {
+		clear(buf)
+		return len(buf), nil
 	}
-	return sparse.Data, offset + limit, 0, nil
-}
-func (s *resolverTestChunkStream) ReadChunkAt(ctx context.Context, buf []byte, chunkIdx, offset, end uint64) (int, error) {
-	s.readChunkCalls.Add(1)
-	if s.readChunk != nil {
-		return s.readChunk(ctx, buf, chunkIdx, offset, end)
+	if r.stream.read != nil {
+		return r.stream.read(ctx, buf, r.offset+inner)
 	}
 	return len(buf), nil
 }

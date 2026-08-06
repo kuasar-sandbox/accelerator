@@ -250,11 +250,12 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 	var chunkErr error
 	cursor := uint64(0)
 	for cursor < size && chunkErr == nil {
-		kind, end, err := src.RunAt(cursor, size-cursor)
+		run, err := src.RunAt(cursor, size-cursor)
 		if err != nil {
 			chunkErr = fmt.Errorf("ingest: classify @ %d: %w", cursor, err)
 			break
 		}
+		kind, end := run.Kind(), run.End()
 		if kind == sparse.Hole {
 			if n := len(m.Holes); n > 0 && m.Holes[n-1].Offset+m.Holes[n-1].Size == cursor {
 				m.Holes[n-1].Size += end - cursor
@@ -269,15 +270,15 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 		// (pure metadata queries — no data is consumed).
 		segStart := cursor
 		for cursor < size {
-			k2, e2, err := src.RunAt(cursor, size-cursor)
+			run, err := src.RunAt(cursor, size-cursor)
 			if err != nil {
 				chunkErr = fmt.Errorf("ingest: classify @ %d: %w", cursor, err)
 				break
 			}
-			if k2 == sparse.Hole {
+			if run.Kind() == sparse.Hole {
 				break
 			}
-			cursor = e2
+			cursor = run.End()
 		}
 		if chunkErr != nil {
 			break
@@ -388,33 +389,32 @@ type segReader struct {
 	ctx      context.Context
 	src      sparse.Source
 	cur, end uint64
-	runKind  sparse.RunKind
-	runEnd   uint64
+	run      sparse.Run
 }
 
 func (r *segReader) Read(p []byte) (int, error) {
 	if r.cur >= r.end {
 		return 0, io.EOF
 	}
-	if r.cur >= r.runEnd {
-		kind, end, err := r.src.RunAt(r.cur, r.end-r.cur)
+	if r.run == nil || r.cur >= r.run.End() {
+		run, err := r.src.RunAt(r.cur, r.end-r.cur)
 		if err != nil {
 			return 0, err
 		}
-		if kind == sparse.Hole {
+		if run.Kind() == sparse.Hole {
 			return 0, fmt.Errorf("ingest: hole @ %d inside a data segment (inconsistent RunAt)", r.cur)
 		}
-		r.runKind, r.runEnd = kind, end
+		r.run = run
 	}
 	n := len(p)
-	if rest := r.runEnd - r.cur; rest < uint64(n) {
+	if rest := r.run.End() - r.cur; rest < uint64(n) {
 		n = int(rest)
 	}
-	if r.runKind == sparse.Zero {
+	if r.run.Kind() == sparse.Zero {
 		clear(p[:n])
 	} else {
-		m, err := r.src.ReadAt(r.ctx, p[:n], r.cur)
-		if err != nil && err != io.EOF {
+		m, err := r.run.ReadAt(r.ctx, p[:n], r.cur-r.run.Offset())
+		if err != nil {
 			return 0, err
 		}
 		if m < n {

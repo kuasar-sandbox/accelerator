@@ -374,19 +374,31 @@ type windowSource struct {
 
 func (w *windowSource) Size() uint64 { return w.size }
 
-func (w *windowSource) RunAt(off, limit uint64) (sparse.RunKind, uint64, error) {
+func (w *windowSource) RunAt(off, limit uint64) (sparse.Run, error) {
 	if off >= w.size {
-		return 0, 0, io.EOF
+		return nil, io.EOF
+	}
+	if limit == 0 {
+		return nil, fmt.Errorf("manifest-ctl: zero RunAt limit at offset %d", off)
 	}
 	if limit > w.size-off {
 		limit = w.size - off
 	}
-	kind, end, err := w.s.RunAt(w.base+off, limit)
+	run, err := w.s.RunAt(w.base+off, limit)
 	if err != nil {
-		return kind, 0, err
+		return nil, err
 	}
-	return kind, end - w.base, nil
+	return windowRun{Run: run, offset: off, end: run.End() - w.base}, nil
 }
+
+type windowRun struct {
+	sparse.Run
+	offset uint64
+	end    uint64
+}
+
+func (r windowRun) Offset() uint64 { return r.offset }
+func (r windowRun) End() uint64    { return r.end }
 
 func (w *windowSource) ReadAt(ctx context.Context, buf []byte, off uint64) (int, error) {
 	if off >= w.size {

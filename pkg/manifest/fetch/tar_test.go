@@ -57,8 +57,8 @@ func TestOpenTarStream(t *testing.T) {
 	if st.Size() != size {
 		t.Fatalf("size = %d", st.Size())
 	}
-	if kind, end, err := st.RunAt(4096, size); kind != sparse.Hole || end != 1<<20 || err != nil {
-		t.Fatalf("RunAt(4096) = (%v, %d, %v)", kind, end, err)
+	if run, err := st.RunAt(4096, size); err != nil || run.Kind() != sparse.Hole || run.End() != 1<<20 {
+		t.Fatalf("RunAt(4096) = (%v, %v)", run, err)
 	}
 
 	ctx := context.Background()

@@ -499,26 +499,36 @@ parse index + unseal key table
    ▼
 Stream (single manifest; callers use NewLayered for explicit top-to-bottom arrays)
    │
-   ├─ RunAt: resolve visible Hole / Zero / Data
-   ├─ ReadAt: fetch visible Data chunks concurrently
+   ├─ RunAt: resolve executable sparse.Run (Hole / Zero / Data)
+   │     └─ manifest Data additionally implements fetch.ChunkRun
+   ├─ Run.ReadAt: read one already-resolved visible run
+   ├─ Stream.ReadAt: collect runs, then fetch visible Data concurrently
    │     └─ on-demand Getter → cache/store → verify → decrypt
    │
    └─ optional Prefetcher.Prefetch
          └─ prefetch Getter → cache/store → Release
 ```
 
-`Stream.ReadAt` 先按 manifest 索引和权威 hole 元数据解析请求窗口,再只拉取
-最终可见的 Data chunks。Hole 和 IsZero 在本地填零,不访问 cache/store。多层
-Stream 采用 top-to-bottom 可见性:Data 和 Zero 遮挡下层,只有 Hole 或超出层
-大小才继续向下;嵌套 overlay 递归解析到最终叶子,且下层 run 不能越过任一上
-层 Hole 的结束边界。部分读(`--offset` / `--length`)因此只触发涉及窗口的物理
-chunks,不会扫描或物化完整镜像。
+`Stream.RunAt` 返回不可变的 `sparse.Run`,其逻辑范围为
+`[Offset(), End())`,`Run.ReadAt` 使用相对 `Offset()` 的 inner offset,且拒绝
+跨越 `End()`。`RunAt` 只查询 sparse map、manifest index 或 tar extent map,
+不读取 payload,不调用 cache/store Get,也不校验、解密或改变一次性 source 的
+读取位置。manifest Data Run 保存首次解析得到的 chunk index,并额外实现
+`fetch.ChunkRun`;Hole、Zero 和 tar/file Data Run 只实现普通 `sparse.Run`。
+
+`Stream.ReadAt` 先收集覆盖请求窗口的全部 Run,完成解析后再修改目标 buffer;
+随后只对 Data Run 并发调用 `Run.ReadAt`,Hole 和 Zero 直接填零。多层 Stream
+采用 top-to-bottom 可见性:Data 和 Zero 遮挡下层,只有 Hole 或超出层大小才继续
+向下。每个 upper Hole 会先收紧 bound,命中后直接返回最终 child Run,因此嵌套
+overlay 不丢失 `ChunkRun` 能力,下层 chunk 也不能越过任一上层重新出现内容的
+位置。部分读(`--offset` / `--length`)只触发涉及窗口的物理 chunks,不会扫描或
+物化完整镜像。
 
 支持预取的 Stream 额外实现 `fetch.Prefetcher`。`Prefetch(ctx)` 遍历整个逻辑
-Stream,只对最终可见且支持内部 chunk 预取的 Data run 调用完整物理
-chunk 的 cache Get;成功命中后立即 Release,不读取 Blob、不校验、不解密、不
-pin。预取作用于当前组合 Stream 的完整可见视图,不再提供按 manifest key
-选择叶子的接口。
+Stream,只对最终可见且实现包内 prefetch 能力的 `ChunkRun` 调用完整物理
+chunk 的 cache Get;普通 Data Run、Hole 和 Zero 都是 no-op。成功命中后立即
+Release,不读取 Blob、不校验、不解密、不 pin。预取作用于当前组合 Stream 的
+完整可见视图,不再提供按 manifest key 选择叶子的接口。
 
 同一 Fetcher 的 manifest metadata、普通 ReadAt 和所有 Stream 共用一个底层
 Getter 与请求调度器。on-demand 请求从不等待已开始的 prefetch;存在任意
