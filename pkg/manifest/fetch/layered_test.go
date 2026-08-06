@@ -55,11 +55,13 @@ func TestLayered_HoleFallsThrough(t *testing.T) {
 	ls := NewLayered(top, bottom)
 	defer ls.Close()
 
-	if k, _, err := ls.RunAt(0, ls.Size()); err != nil || k != sparse.Data {
-		t.Errorf("RunAt(0) = (%v, %v), want Data", k, err)
+	if run, err := ls.RunAt(0, ls.Size()); err != nil || run.Kind() != sparse.Data {
+		t.Errorf("RunAt(0) = (%v, %v), want Data", run, err)
 	}
-	if k, _, err := ls.RunAt(4096, ls.Size()); err != nil || k != sparse.Data {
-		t.Errorf("RunAt(4096) = (%v, %v), want Data (fall-through to bottom)", k, err)
+	if run, err := ls.RunAt(4096, ls.Size()); err != nil || run.Kind() != sparse.Data {
+		t.Errorf("RunAt(4096) = (%v, %v), want Data (fall-through to bottom)", run, err)
+	} else if _, ok := run.(ChunkRun); !ok {
+		t.Errorf("fall-through manifest run type = %T, want ChunkRun", run)
 	}
 	out := readAll(t, ls)
 	assertRegion(t, out[:4096], 'A', "top data")
@@ -83,8 +85,10 @@ func TestLayered_ZeroChunkDoesNotFallThrough(t *testing.T) {
 	ls := NewLayered(top, bottom)
 	defer ls.Close()
 
-	if k, _, err := ls.RunAt(0, ls.Size()); err != nil || k != sparse.Zero {
-		t.Errorf("RunAt(0) = (%v, %v), want Zero (no fall-through)", k, err)
+	if run, err := ls.RunAt(0, ls.Size()); err != nil || run.Kind() != sparse.Zero {
+		t.Errorf("RunAt(0) = (%v, %v), want Zero (no fall-through)", run, err)
+	} else if _, ok := run.(ChunkRun); ok {
+		t.Errorf("Zero run type = %T, must not implement ChunkRun", run)
 	}
 	out := readAll(t, ls)
 	assertRegion(t, out[:4096], 0x00, "top zero chunk (no fall-through)")
@@ -103,8 +107,10 @@ func TestLayered_MergedHole(t *testing.T) {
 	ls := NewLayered(mk('A', store.ContentKey{0x1}), mk('B', store.ContentKey{0x2}))
 	defer ls.Close()
 
-	if k, end, err := ls.RunAt(0, ls.Size()); err != nil || k != sparse.Hole || end != 4096 {
-		t.Errorf("RunAt(0) = (%v, %d, %v), want (Hole, 4096, nil)", k, end, err)
+	if run, err := ls.RunAt(0, ls.Size()); err != nil || run.Kind() != sparse.Hole || run.End() != 4096 {
+		t.Errorf("RunAt(0) = (%v, %v), want (Hole, 4096, nil)", run, err)
+	} else if _, ok := run.(ChunkRun); ok {
+		t.Errorf("Hole run type = %T, must not implement ChunkRun", run)
 	}
 	out := readAll(t, ls)
 	assertRegion(t, out[:4096], 0x00, "merged hole")
@@ -183,9 +189,55 @@ func TestLayered_MixedFileAndManifest(t *testing.T) {
 
 	ls := NewLayered(overlay, base)
 	defer ls.Close()
+	fileRun, err := ls.RunAt(4096, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fileRun.Kind() != sparse.Data {
+		t.Fatalf("file fall-through kind = %v, want Data", fileRun.Kind())
+	}
+	if _, ok := fileRun.(ChunkRun); ok {
+		t.Fatalf("tar/file run type = %T, must not implement ChunkRun", fileRun)
+	}
 
 	out := readAll(t, ls)
 	assertRegion(t, out[:4096], 'A', "overlay data")                  // overlay wins
 	assertRegion(t, out[4096:8192], 'B', "fall-through to file base") // overlay hole → file data
 	assertRegion(t, out[8192:], 0x00, "merged hole (file sparse + overlay hole)")
+}
+
+func TestLayeredChunkRunVisibilityClippingAndNestedPassthrough(t *testing.T) {
+	const size = uint64(8192)
+	outerUpper := newTestStream(&codec.Manifest{
+		Version: codec.Version1, ImageSize: size,
+		Entries: []codec.ChunkEntry{{Offset: 4096, Size: 4096, CiphertextHash: store.ContentKey{0x31}}},
+		Holes:   []sparse.Extent{{Offset: 0, Size: 4096}},
+	}, 'U')
+	nestedUpper := newTestStream(&codec.Manifest{
+		Version: codec.Version1, ImageSize: size,
+		Entries: []codec.ChunkEntry{{Offset: 6144, Size: 2048, CiphertextHash: store.ContentKey{0x32}}},
+		Holes:   []sparse.Extent{{Offset: 0, Size: 6144}},
+	}, 'N')
+	bottom := newTestStream(&codec.Manifest{
+		Version: codec.Version1, ImageSize: size,
+		Entries: []codec.ChunkEntry{{Offset: 0, Size: 8192, CiphertextHash: store.ContentKey{0x33}}},
+	}, 'B')
+	stream := NewLayered(outerUpper, NewLayered(nestedUpper, bottom))
+	defer stream.Close()
+
+	run, err := stream.RunAt(1024, size-1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Offset() != 1024 || run.End() != 4096 || run.Kind() != sparse.Data {
+		t.Fatalf("visible run = [%d,%d) %v, want [1024,4096) Data", run.Offset(), run.End(), run.Kind())
+	}
+	if _, ok := run.(ChunkRun); !ok {
+		t.Fatalf("nested lower manifest run type = %T, want ChunkRun", run)
+	}
+	buf := make([]byte, run.End()-run.Offset())
+	if n, err := run.ReadAt(context.Background(), buf, 0); err != nil || n != len(buf) {
+		t.Fatalf("Run.ReadAt = (%d,%v)", n, err)
+	}
+	assertRegion(t, buf, 'B', "clipped lower chunk")
 }

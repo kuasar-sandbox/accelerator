@@ -9,137 +9,152 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
 
-// resolvedRun is the package-private visibility result shared by RunAt,
-// ReadAt, and Prefetch. leaf is always the final non-layered serving Stream.
-type resolvedRun struct {
-	leaf       Stream
-	kind       sparse.RunKind
-	end        uint64
-	chunkIndex uint64
-	hasChunk   bool
+type holeRun struct {
+	offset uint64
+	end    uint64
 }
 
-// resolveStream resolves one visible run in [offset, requestedEnd). Nested
-// layered streams are traversed recursively so key and chunk ownership remain
-// attached to the final leaf. A child that is already out of bounds is a Hole
-// through requestedEnd and is not called.
-func resolveStream(stream Stream, offset, requestedEnd uint64) (resolvedRun, error) {
-	if stream == nil {
-		return resolvedRun{}, fmt.Errorf("%w: nil stream", errInvalidRun)
-	}
-	if requestedEnd <= offset {
-		return resolvedRun{}, fmt.Errorf("%w: [%d,%d)", errInvalidRun, offset, requestedEnd)
-	}
-	if offset >= stream.Size() {
-		return resolvedRun{kind: sparse.Hole, end: requestedEnd}, nil
-	}
-
-	localEnd := requestedEnd
-	if localEnd > stream.Size() {
-		localEnd = stream.Size()
-	}
-
-	var (
-		run resolvedRun
-		err error
-	)
-	if layered, ok := stream.(*layeredStream); ok {
-		run, err = layered.resolveRun(offset, localEnd)
-	} else {
-		run.leaf = stream
-		if chunked, ok := stream.(chunkStream); ok {
-			run.kind, run.end, run.chunkIndex, err = chunked.RunChunkAt(offset, localEnd-offset)
-			run.hasChunk = err == nil && run.kind != sparse.Hole
-		} else {
-			run.kind, run.end, err = stream.RunAt(offset, localEnd-offset)
-		}
-	}
-	if err != nil {
-		return resolvedRun{}, err
-	}
-	if err := validateResolvedRun(run, offset, localEnd); err != nil {
-		return resolvedRun{}, err
-	}
-
-	if run.kind == sparse.Hole {
-		run.leaf = nil
-		run.chunkIndex = 0
-		run.hasChunk = false
-		// Once a child Hole reaches that child's EOF, the child remains
-		// transparent. Extend the Hole through the caller's bound instead of
-		// manufacturing a boundary that can repeat the same lower chunk Get.
-		if run.end == localEnd && localEnd < requestedEnd {
-			run.end = requestedEnd
-		}
-	}
-	return run, nil
+func (r *holeRun) Offset() uint64       { return r.offset }
+func (r *holeRun) End() uint64          { return r.end }
+func (r *holeRun) Kind() sparse.RunKind { return sparse.Hole }
+func (r *holeRun) ReadAt(ctx context.Context, buf []byte, innerOffset uint64) (int, error) {
+	return readZeroRun(ctx, r.offset, r.end, buf, innerOffset)
+}
+func (r *holeRun) release() {
+	*r = holeRun{}
+	holeRunPool.Put(r)
 }
 
-func validateResolvedRun(run resolvedRun, offset, requestedEnd uint64) error {
-	switch run.kind {
+type zeroRun struct {
+	offset uint64
+	end    uint64
+}
+
+func (r *zeroRun) Offset() uint64       { return r.offset }
+func (r *zeroRun) End() uint64          { return r.end }
+func (r *zeroRun) Kind() sparse.RunKind { return sparse.Zero }
+func (r *zeroRun) ReadAt(ctx context.Context, buf []byte, innerOffset uint64) (int, error) {
+	return readZeroRun(ctx, r.offset, r.end, buf, innerOffset)
+}
+func (r *zeroRun) release() {
+	*r = zeroRun{}
+	zeroRunPool.Put(r)
+}
+
+var (
+	holeRunPool = sync.Pool{New: func() any { return new(holeRun) }}
+	zeroRunPool = sync.Pool{New: func() any { return new(zeroRun) }}
+	dataRunPool = sync.Pool{New: func() any { return new(manifestDataRun) }}
+)
+
+func newHoleRun(offset, end uint64) *holeRun {
+	r := holeRunPool.Get().(*holeRun)
+	*r = holeRun{offset: offset, end: end}
+	return r
+}
+
+func newZeroRun(offset, end uint64) *zeroRun {
+	r := zeroRunPool.Get().(*zeroRun)
+	*r = zeroRun{offset: offset, end: end}
+	return r
+}
+
+type recyclableRun interface {
+	sparse.Run
+	release()
+}
+
+// releaseRun is used only after a package-internal operation has relinquished
+// every reference to a Run. Runs returned to external callers are never
+// released here, so they remain immutable for their documented Stream
+// lifetime. sync.Pool reuse is opportunistic and does not grow with image size.
+func releaseRun(run sparse.Run) {
+	if recyclable, ok := run.(recyclableRun); ok {
+		recyclable.release()
+	}
+}
+
+func releaseRuns(runs []sparse.Run) {
+	for _, run := range runs {
+		releaseRun(run)
+	}
+}
+
+func readZeroRun(ctx context.Context, offset, end uint64, buf []byte, innerOffset uint64) (int, error) {
+	if end <= offset {
+		return 0, fmt.Errorf("%w: invalid run [%d,%d)", errInvalidRun, offset, end)
+	}
+	runLength := end - offset
+	if innerOffset > runLength || uint64(len(buf)) > runLength-innerOffset {
+		return 0, fmt.Errorf("%w: read offset %d length %d outside [0,%d)", errInvalidRun, innerOffset, len(buf), runLength)
+	}
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	clearSlice(buf)
+	return len(buf), nil
+}
+
+func validateRun(run sparse.Run, offset, requestedEnd uint64) error {
+	if run == nil {
+		return fmt.Errorf("%w: nil run at %d", errInvalidRun, offset)
+	}
+	switch run.Kind() {
 	case sparse.Hole, sparse.Zero, sparse.Data:
 	default:
-		return fmt.Errorf("%w: unknown kind %d at %d", errInvalidRun, run.kind, offset)
+		return fmt.Errorf("%w: unknown kind %d at %d", errInvalidRun, run.Kind(), offset)
 	}
-	if run.end <= offset || run.end > requestedEnd {
-		return fmt.Errorf("%w: run at %d ends at %d, bound %d", errInvalidRun, offset, run.end, requestedEnd)
+	if run.Offset() != offset {
+		return fmt.Errorf("%w: run offset %d, want %d", errInvalidRun, run.Offset(), offset)
 	}
-	if run.kind != sparse.Hole && run.leaf == nil {
-		return fmt.Errorf("%w: kind %d at %d has no serving leaf", errInvalidRun, run.kind, offset)
+	if run.End() <= offset || run.End() > requestedEnd {
+		return fmt.Errorf("%w: run at %d ends at %d, bound %d", errInvalidRun, offset, run.End(), requestedEnd)
 	}
 	return nil
 }
 
-// resolveRun overlays direct children top to bottom. Every upper Hole tightens
-// bound before a lower (possibly nested) child is queried, so a lower Data run
-// can never cross the next point where an upper child starts serving again.
-func (ls *layeredStream) resolveRun(offset, requestedEnd uint64) (resolvedRun, error) {
-	if offset >= ls.size {
-		return resolvedRun{}, io.EOF
+func validateRunRead(run sparse.Run, innerOffset uint64, length int) error {
+	if run == nil || run.End() <= run.Offset() {
+		return fmt.Errorf("%w: invalid run bounds", errInvalidRun)
 	}
-	if requestedEnd <= offset || requestedEnd > ls.size {
-		return resolvedRun{}, fmt.Errorf("%w: layered range [%d,%d), size %d", errInvalidRun, offset, requestedEnd, ls.size)
+	runLength := run.End() - run.Offset()
+	if innerOffset > runLength || uint64(length) > runLength-innerOffset {
+		return fmt.Errorf("%w: read offset %d length %d outside [0,%d)", errInvalidRun, innerOffset, length, runLength)
 	}
-
-	bound := requestedEnd
-	for _, layer := range ls.layers {
-		run, err := resolveStream(layer, offset, bound)
-		if err != nil {
-			return resolvedRun{}, err
-		}
-		if run.kind == sparse.Hole {
-			bound = run.end
-			continue
-		}
-		return run, nil
-	}
-	return resolvedRun{kind: sparse.Hole, end: bound}, nil
+	return nil
 }
 
-type plannedRun struct {
-	offset uint64
-	run    resolvedRun
-}
-
-func planResolvedRuns(ctx context.Context, stream Stream, offset, end uint64) ([]plannedRun, error) {
-	plan := make([]plannedRun, 0)
+func planRuns(ctx context.Context, stream Stream, offset, end uint64) ([]sparse.Run, error) {
+	plan := make([]sparse.Run, 0)
 	for current := offset; current < end; {
 		if err := ctx.Err(); err != nil {
+			releaseRuns(plan)
 			return nil, err
 		}
-		run, err := resolveStream(stream, current, end)
+		run, err := stream.RunAt(current, end-current)
 		if err != nil {
+			releaseRun(run)
+			releaseRuns(plan)
 			return nil, err
 		}
-		plan = append(plan, plannedRun{offset: current, run: run})
-		current = run.end
+		if err := validateRun(run, current, end); err != nil {
+			releaseRun(run)
+			releaseRuns(plan)
+			return nil, err
+		}
+		plan = append(plan, run)
+		current = run.End()
 	}
 	return plan, nil
 }
 
-// readResolvedAt first plans every run, then performs any buffer mutation or
-// data I/O. This makes a later resolver error atomic with respect to reads.
-func readResolvedAt(ctx context.Context, stream Stream, buf []byte, offset uint64) (int, error) {
+// readStreamAt resolves the complete range before performing payload I/O or
+// modifying buf. Data runs then execute concurrently; the first failure
+// cancels peers while every started operation is joined before return.
+func readStreamAt(ctx context.Context, stream Stream, buf []byte, offset uint64) (int, error) {
 	if offset >= stream.Size() {
 		return 0, io.EOF
 	}
@@ -155,8 +170,12 @@ func readResolvedAt(ctx context.Context, stream Stream, buf []byte, offset uint6
 		eof = io.EOF
 	}
 	end := offset + readLen
-	plan, err := planResolvedRuns(ctx, stream, offset, end)
+	plan, err := planRuns(ctx, stream, offset, end)
 	if err != nil {
+		return 0, err
+	}
+	defer releaseRuns(plan)
+	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
 
@@ -172,39 +191,26 @@ func readResolvedAt(ctx context.Context, stream Stream, buf []byte, offset uint6
 		})
 	}
 
-	for _, item := range plan {
-		lo, hi := item.offset, item.run.end
+	for _, run := range plan {
+		lo, hi := run.Offset(), run.End()
 		dst := buf[lo-offset : hi-offset]
-		if item.run.kind != sparse.Data {
+		if run.Kind() != sparse.Data {
 			clearSlice(dst)
 			continue
 		}
 
 		wg.Add(1)
-		go func(item plannedRun, dst []byte) {
+		go func(run sparse.Run, dst []byte) {
 			defer wg.Done()
-			var (
-				n   int
-				err error
-			)
-			if item.run.hasChunk {
-				chunked, ok := item.run.leaf.(chunkStream)
-				if !ok {
-					report(fmt.Errorf("%w: serving leaf lost chunkStream", errInvalidRun))
-					return
-				}
-				n, err = chunked.ReadChunkAt(cctx, dst, item.run.chunkIndex, item.offset, item.run.end)
-			} else {
-				n, err = item.run.leaf.ReadAt(cctx, dst, item.offset)
-			}
+			n, err := run.ReadAt(cctx, dst, 0)
 			if err != nil {
-				report(fmt.Errorf("fetch: read [%d,%d): %w", item.offset, item.run.end, err))
+				report(fmt.Errorf("fetch: read [%d,%d): %w", run.Offset(), run.End(), err))
 				return
 			}
 			if n != len(dst) {
-				report(fmt.Errorf("fetch: short read [%d,%d): got %d of %d bytes", item.offset, item.run.end, n, len(dst)))
+				report(fmt.Errorf("fetch: short read [%d,%d): got %d of %d bytes", run.Offset(), run.End(), n, len(dst)))
 			}
-		}(item, dst)
+		}(run, dst)
 	}
 
 	wg.Wait()
@@ -221,18 +227,26 @@ func prefetchStream(ctx context.Context, stream Stream) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		run, err := resolveStream(stream, offset, end)
+		run, err := stream.RunAt(offset, end-offset)
 		if err != nil {
+			releaseRun(run)
 			return err
 		}
-		if run.kind == sparse.Data {
-			if chunked, ok := run.leaf.(prefetchChunkStream); ok && run.hasChunk {
-				if err := chunked.PrefetchChunkAt(ctx, run.chunkIndex); err != nil {
+		if err := validateRun(run, offset, end); err != nil {
+			releaseRun(run)
+			return err
+		}
+		next := run.End()
+		if run.Kind() == sparse.Data {
+			if chunk, ok := run.(prefetchChunkRun); ok {
+				if err := chunk.prefetch(ctx); err != nil {
+					releaseRun(run)
 					return err
 				}
 			}
 		}
-		offset = run.end
+		releaseRun(run)
+		offset = next
 	}
 	return nil
 }

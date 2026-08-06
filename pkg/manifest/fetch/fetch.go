@@ -5,7 +5,7 @@
 // overlay of several such streams. Stream is sparse.Source plus lifetime — it strengthens the
 // Source baseline contract (monotone single-goroutine reads) to full concurrent
 // random access, which the runtime consumers (vhost, uffd) rely on. Three
-// implementations satisfy it — manifestStream (also implements chunkStream),
+// implementations satisfy it — manifestStream,
 // the file stream returned by OpenTarStream, and layeredStream — and a sandbox
 // disk, snapshot bundle, or manifest-ctl read all sit on the same abstraction.
 //
@@ -14,19 +14,17 @@
 // data that needs no fetch but does NOT fall through an overlay); file streams
 // classify allocated zeros as Data and filesystem holes as Hole.
 //
-// chunkStream is an internal enhancement a Stream may implement so the package
-// can thread a chunk index between classification (RunChunkAt) and read
-// (ReadChunkAt), skipping a re-lookup. Its only in-tree users are manifestStream
-// itself (RunAt/ReadAt are built on the chunk primitives) and layeredStream
-// (which threads a serving layer's chunk index from resolve to read). External
-// consumers use the plain Stream methods.
+// Manifest Data runs additionally implement ChunkRun, preserving their physical
+// chunk identity through layered visibility resolution without exposing chunk
+// indices or manifest internals.
 //
 // Prefetcher is a separate optional enhancement for backend-specific warm-up.
-// Keeping prefetch out of Stream and chunkStream lets each backend expose the
+// Keeping prefetch out of Stream and ChunkRun lets each backend expose the
 // capability only when it has a meaningful implementation.
 //
-// RunAt, ReadAt, and Prefetch are safe for concurrent use. Close is a lifetime
-// boundary: callers cancel and wait for active operations before closing.
+// RunAt, Run.ReadAt, ReadAt, and Prefetch are safe for concurrent use. Close is
+// a lifetime boundary: callers cancel and wait for active operations before
+// closing.
 package fetch
 
 import (
@@ -44,10 +42,9 @@ import (
 )
 
 // Stream is a sparse.Source with a lifetime, and a stronger contract: RunAt
-// and ReadAt are safe for concurrent use at arbitrary offsets, RunAt requires
-// a non-zero limit, and ReadAt MAY fetch the data chunks in a range concurrently
-// (internal goroutines); see chunkStream.ReadChunkAt for the synchronous
-// counterpart used internally by layered streams.
+// and ReadAt are safe for concurrent use at arbitrary offsets, every returned
+// Run supports concurrent random ReadAt calls, RunAt requires a non-zero limit,
+// and Stream.ReadAt MAY fetch the data chunks in a range concurrently.
 type Stream interface {
 	sparse.Source
 
@@ -57,21 +54,13 @@ type Stream interface {
 	Close() error
 }
 
-// chunkStream is the internal enhancement contract: it lets the resolver reuse a
-// chunk index between classification and read, avoiding a second offset lookup.
-//
-// Concurrency convention: ReadChunkAt is ALWAYS synchronous and runs in the
-// calling goroutine — it spawns no goroutines. Batch parallelism is Stream.ReadAt's
-// job. A caller wanting concurrency invokes ReadChunkAt from its own goroutines.
-type chunkStream interface {
-	// RunChunkAt is RunAt that additionally returns the serving chunk index
-	// (valid for Data and Zero; meaningless for Hole). It returns a single
-	// region (no Hole/Zero extension) and requires a non-zero limit.
-	RunChunkAt(offset, limit uint64) (kind sparse.RunKind, end, chunkIdx uint64, err error)
-	// ReadChunkAt synchronously fetches+decrypts chunk chunkIdx and copies its
-	// [offset, end) sub-range into buf. Used for Data (and Zero, which yields
-	// zeros); never for Hole.
-	ReadChunkAt(ctx context.Context, buf []byte, chunkIdx, offset, end uint64) (int, error)
+// ChunkRun marks a Data Run whose serving leaf is a physical manifest chunk.
+// Reading any sub-range normally pays the full fetch, verification, and decrypt
+// cost, so callers with enough bounded memory should prefer the whole visible
+// Run. The unexported method reserves implementations to this package.
+type ChunkRun interface {
+	sparse.Run
+	chunkRun()
 }
 
 // Prefetcher optionally warms the backend read path for an entire Stream.
@@ -81,24 +70,25 @@ type Prefetcher interface {
 	Prefetch(ctx context.Context) error
 }
 
-// prefetchChunkStream is the internal physical-chunk prefetch capability.
-// PrefetchChunkAt is synchronous and only waits for the existing cache Get/fill
-// path; it does not verify, decrypt, materialize, pin, or retain the chunk.
-type prefetchChunkStream interface {
-	chunkStream
-	PrefetchChunkAt(ctx context.Context, chunkIdx uint64) error
+// prefetchChunkRun is the internal physical-chunk prefetch capability. It only
+// waits for the existing cache Get/fill path and does not verify or decrypt.
+type prefetchChunkRun interface {
+	ChunkRun
+	prefetch(ctx context.Context) error
 }
 
 var errInvalidRun = errors.New("fetch: invalid run")
 
-// manifestStream is the single-manifest implementation (Stream +
-// prefetchChunkStream + Prefetcher).
+// manifestStream is the single-manifest implementation (Stream + Prefetcher).
 type manifestStream struct {
 	m              *codec.Manifest
 	onDemandGetter cache.Getter
 	prefetchGetter cache.Getter
 	encryptor      crypto.ChunkEncryptor
 	keys           [][32]byte // decrypted per-chunk keys, parallel to m.Entries
+	// Tests may replace this metadata-only lookup to verify a Run reuses its
+	// captured index. Production leaves it nil for the direct codec fast path.
+	chunkIndexLookup func([]codec.ChunkEntry, uint64) int
 }
 
 func newManifestStream(
@@ -119,65 +109,120 @@ func newManifestStream(
 func (s *manifestStream) Size() uint64 { return s.m.ImageSize }
 func (s *manifestStream) Close() error { return nil }
 
-// RunChunkAt classifies one region starting at offset. By the tiling invariant
-// (entries + holes cover [0, ImageSize) with no overlap or gap) a data/zero
-// chunk ends exactly where the next hole begins.
-func (s *manifestStream) RunChunkAt(offset, limit uint64) (sparse.RunKind, uint64, uint64, error) {
+// RunAt resolves one visible forward run. Data remains bounded to one physical
+// chunk and captures its index; adjacent Hole or Zero metadata may be merged.
+// No payload getter, verification, decrypt, or prefetch work occurs here.
+func (s *manifestStream) RunAt(offset, limit uint64) (sparse.Run, error) {
 	limEnd, err := boundedRunEnd(s.m.ImageSize, offset, limit)
 	if err != nil {
-		return 0, 0, 0, err
+		return nil, err
 	}
 	if h, in := findHoleAt(s.m.Holes, offset); in {
 		end := h.Offset + h.Size
 		if end <= offset {
-			return 0, 0, 0, fmt.Errorf("%w: hole at %d ends at %d", errInvalidRun, offset, end)
+			return nil, fmt.Errorf("%w: hole at %d ends at %d", errInvalidRun, offset, end)
 		}
 		if end > limEnd {
 			end = limEnd
 		}
-		return sparse.Hole, end, 0, nil
+		return newHoleRun(offset, end), nil
 	}
-	i := codec.ChunkIndexForOffset(s.m.Entries, offset)
+	i := s.chunkIndexForOffset(offset)
 	if i < 0 {
-		return sparse.Hole, limEnd, 0, nil // unreachable in bounds (tiling); degrade safely
+		return newHoleRun(offset, limEnd), nil // invalid tiling: degrade safely
 	}
 	e := s.m.Entries[i]
 	end := e.Offset + uint64(e.Size)
 	if end <= offset {
-		return 0, 0, 0, fmt.Errorf("%w: entry %d at %d ends at %d", errInvalidRun, i, offset, end)
+		return nil, fmt.Errorf("%w: entry %d at %d ends at %d", errInvalidRun, i, offset, end)
 	}
 	if end > limEnd {
 		end = limEnd
 	}
-	if e.IsZero {
-		return sparse.Zero, end, uint64(i), nil
+	if !e.IsZero {
+		return newManifestDataRun(s, uint64(i), offset, end), nil
 	}
-	return sparse.Data, end, uint64(i), nil
-}
 
-// RunAt extends Hole/Zero runs through contiguous same-kind regions; a Data run
-// stays a single chunk.
-func (s *manifestStream) RunAt(offset, limit uint64) (sparse.RunKind, uint64, error) {
-	kind, end, _, err := s.RunChunkAt(offset, limit)
-	if err != nil || kind == sparse.Data {
-		return kind, end, err
-	}
-	limEnd, err := boundedRunEnd(s.m.ImageSize, offset, limit)
-	if err != nil {
-		return 0, 0, err
-	}
+	// Zero runs carry no physical read capability. Merge only immediately
+	// adjacent IsZero entries; a hole or Data entry remains a hard boundary.
+	next := i + 1
 	for end < limEnd {
-		k2, e2, _, err2 := s.RunChunkAt(end, limEnd-end)
-		if err2 != nil {
-			return 0, 0, err2
-		}
-		if k2 != kind {
+		if next >= len(s.m.Entries) {
 			break
 		}
-		end = e2
+		e2 := s.m.Entries[next]
+		if !e2.IsZero || e2.Offset != end {
+			break
+		}
+		nextEnd := e2.Offset + uint64(e2.Size)
+		if nextEnd <= end {
+			return nil, fmt.Errorf("%w: entry %d at %d ends at %d", errInvalidRun, next, end, nextEnd)
+		}
+		end = nextEnd
+		if end > limEnd {
+			end = limEnd
+		}
+		next++
 	}
-	return kind, end, nil
+	return newZeroRun(offset, end), nil
 }
+
+func (s *manifestStream) chunkIndexForOffset(offset uint64) int {
+	if s.chunkIndexLookup != nil {
+		return s.chunkIndexLookup(s.m.Entries, offset)
+	}
+	return codec.ChunkIndexForOffset(s.m.Entries, offset)
+}
+
+type manifestDataRun struct {
+	stream     *manifestStream
+	chunkIndex uint64
+	offset     uint64
+	end        uint64
+}
+
+func newManifestDataRun(stream *manifestStream, chunkIndex, offset, end uint64) *manifestDataRun {
+	r := dataRunPool.Get().(*manifestDataRun)
+	*r = manifestDataRun{stream: stream, chunkIndex: chunkIndex, offset: offset, end: end}
+	return r
+}
+
+func (r *manifestDataRun) Offset() uint64       { return r.offset }
+func (r *manifestDataRun) End() uint64          { return r.end }
+func (r *manifestDataRun) Kind() sparse.RunKind { return sparse.Data }
+func (r *manifestDataRun) chunkRun()            {}
+
+func (r *manifestDataRun) ReadAt(ctx context.Context, buf []byte, innerOffset uint64) (int, error) {
+	if err := validateRunRead(r, innerOffset, len(buf)); err != nil {
+		return 0, err
+	}
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.stream.readChunkAt(ctx, buf, r.chunkIndex, r.offset+innerOffset)
+}
+
+func (r *manifestDataRun) prefetch(ctx context.Context) error {
+	blob, err := r.stream.loadChunkAt(ctx, r.chunkIndex, loadPrefetch)
+	if err != nil {
+		return err
+	}
+	if blob != nil {
+		blob.Release()
+	}
+	return nil
+}
+
+func (r *manifestDataRun) release() {
+	*r = manifestDataRun{}
+	dataRunPool.Put(r)
+}
+
+var _ ChunkRun = (*manifestDataRun)(nil)
+var _ prefetchChunkRun = (*manifestDataRun)(nil)
 
 type loadKind uint8
 
@@ -228,8 +273,9 @@ func (s *manifestStream) loadChunkAt(ctx context.Context, chunkIdx uint64, kind 
 	return blob, nil
 }
 
-// ReadChunkAt implements chunkStream — synchronous single-chunk read.
-func (s *manifestStream) ReadChunkAt(ctx context.Context, buf []byte, chunkIdx, offset, end uint64) (int, error) {
+// readChunkAt synchronously fetches, verifies, decrypts, and copies one
+// sub-range from the already-resolved chunk index.
+func (s *manifestStream) readChunkAt(ctx context.Context, buf []byte, chunkIdx, offset uint64) (int, error) {
 	if chunkIdx >= uint64(len(s.m.Entries)) {
 		return 0, fmt.Errorf("fetch: chunk index %d out of range", chunkIdx)
 	}
@@ -238,22 +284,19 @@ func (s *manifestStream) ReadChunkAt(ctx context.Context, buf []byte, chunkIdx, 
 	if entryEnd < e.Offset {
 		return 0, fmt.Errorf("fetch: chunk %d range overflows", chunkIdx)
 	}
-	if end < offset {
-		return 0, fmt.Errorf("fetch: chunk %d: end %d before offset %d", chunkIdx, end, offset)
+	if uint64(len(buf)) > ^uint64(0)-offset {
+		return 0, fmt.Errorf("fetch: chunk %d: read offset %d length %d overflows", chunkIdx, offset, len(buf))
 	}
+	end := offset + uint64(len(buf))
 	if offset < e.Offset || end > entryEnd {
 		return 0, fmt.Errorf("fetch: chunk %d: range [%d,%d) outside entry [%d,%d)", chunkIdx, offset, end, e.Offset, entryEnd)
 	}
-	want := end - offset
-	if uint64(len(buf)) < want {
-		return 0, fmt.Errorf("fetch: chunk %d: buffer has %d bytes, need %d", chunkIdx, len(buf), want)
-	}
-	if want == 0 {
+	if len(buf) == 0 {
 		return 0, nil
 	}
 	if e.IsZero {
-		clearSlice(buf[:int(want)])
-		return int(want), nil
+		clearSlice(buf)
+		return len(buf), nil
 	}
 	if chunkIdx >= uint64(len(s.keys)) {
 		return 0, fmt.Errorf("fetch: chunk %d: missing decryption key", chunkIdx)
@@ -285,22 +328,8 @@ func (s *manifestStream) ReadChunkAt(ctx context.Context, buf []byte, chunkIdx, 
 	}
 	lo := int(offset - e.Offset)
 	hi := int(end - e.Offset)
-	copy(buf[:int(want)], plain[lo:hi])
-	return int(want), nil
-}
-
-// PrefetchChunkAt implements prefetchChunkStream. It intentionally does no
-// Blob inspection: a successful Get followed by exactly one Release is the
-// complete physical prefetch operation.
-func (s *manifestStream) PrefetchChunkAt(ctx context.Context, chunkIdx uint64) error {
-	blob, err := s.loadChunkAt(ctx, chunkIdx, loadPrefetch)
-	if err != nil {
-		return err
-	}
-	if blob != nil {
-		blob.Release()
-	}
-	return nil
+	copy(buf, plain[lo:hi])
+	return len(buf), nil
 }
 
 func (s *manifestStream) Prefetch(ctx context.Context) error {
@@ -311,7 +340,7 @@ func (s *manifestStream) Prefetch(ctx context.Context) error {
 // per Data run, each writing directly into its buf slice; Hole/Zero are
 // zero-filled in place. ctx cancel on early return releases in-flight blobs.
 func (s *manifestStream) ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error) {
-	return readResolvedAt(ctx, s, buf, offset)
+	return readStreamAt(ctx, s, buf, offset)
 }
 
 func boundedRunEnd(size, offset, limit uint64) (uint64, error) {

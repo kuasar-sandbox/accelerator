@@ -27,8 +27,12 @@ func TestFetcherReturnsPrefetcher(t *testing.T) {
 	if !ok {
 		t.Fatal("Fetcher.OpenManifest result does not implement Prefetcher")
 	}
-	if _, ok := stream.(prefetchChunkStream); !ok {
-		t.Fatal("single manifest Stream does not implement prefetchChunkStream")
+	run, err := stream.RunAt(0, stream.Size())
+	if err != nil {
+		t.Fatalf("RunAt: %v", err)
+	}
+	if _, ok := run.(prefetchChunkRun); !ok {
+		t.Fatalf("single manifest Data run type = %T, want prefetchChunkRun", run)
 	}
 
 	done := make(chan error, 1)

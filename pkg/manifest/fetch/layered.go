@@ -11,9 +11,8 @@ import (
 // out-of-bounds) falls through to lower layers; an IsZero chunk is opaque and
 // does not fall through. Size is the maximum over layers.
 //
-// It exposes Stream and Prefetcher, but not chunkStream: a layer's chunk index
-// is layer-local. It consumes chunkStream and prefetchChunkStream internally,
-// threading the final serving leaf's chunk index from resolve to read/prefetch.
+// RunAt returns the final serving child's Run directly, preserving optional
+// capabilities such as ChunkRun through arbitrary nested overlays.
 type layeredStream struct {
 	layers []Stream // top → bottom
 	size   uint64   // max Size over layers
@@ -46,23 +45,51 @@ func (ls *layeredStream) Close() error {
 	return firstErr
 }
 
-func (ls *layeredStream) RunAt(offset, limit uint64) (sparse.RunKind, uint64, error) {
+func (ls *layeredStream) RunAt(offset, limit uint64) (sparse.Run, error) {
 	requestedEnd, err := boundedRunEnd(ls.size, offset, limit)
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
-	run, err := ls.resolveRun(offset, requestedEnd)
-	if err != nil {
-		return 0, 0, err
+
+	bound := requestedEnd
+	for _, layer := range ls.layers {
+		if offset >= layer.Size() {
+			continue
+		}
+		localEnd := bound
+		if localEnd > layer.Size() {
+			localEnd = layer.Size()
+		}
+		run, err := layer.RunAt(offset, localEnd-offset)
+		if err != nil {
+			releaseRun(run)
+			return nil, err
+		}
+		if err := validateRun(run, offset, localEnd); err != nil {
+			releaseRun(run)
+			return nil, err
+		}
+		if run.Kind() != sparse.Hole {
+			return run, nil
+		}
+		runEnd := run.End()
+		releaseRun(run)
+
+		// A child that remains Hole through its own EOF is transparent
+		// through the caller's bound; otherwise its next visible boundary
+		// tightens every lower-layer query.
+		if runEnd == localEnd && localEnd < bound {
+			continue
+		}
+		bound = runEnd
 	}
-	return run.kind, run.end, nil
+	return newHoleRun(offset, bound), nil
 }
 
-// ReadAt walks the resolved runs and delegates each Data run to its serving
-// layer (ReadChunkAt for ChunkStream layers, ReadAt otherwise) concurrently;
-// merged holes and serving zeros are zero-filled in place.
+// ReadAt walks final visible runs and reads Data runs concurrently; Hole and
+// Zero runs are zero-filled in place.
 func (ls *layeredStream) ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error) {
-	return readResolvedAt(ctx, ls, buf, offset)
+	return readStreamAt(ctx, ls, buf, offset)
 }
 
 func (ls *layeredStream) Prefetch(ctx context.Context) error {

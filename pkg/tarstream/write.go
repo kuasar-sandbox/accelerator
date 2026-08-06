@@ -99,10 +99,11 @@ func makeWritePlan(name string, src sparse.Source) (*writePlan, error) {
 	var extents []extent
 	hasHole := false
 	for off := uint64(0); off < uint64(size); {
-		kind, end, err := src.RunAt(off, uint64(size)-off)
+		run, err := src.RunAt(off, uint64(size)-off)
 		if err != nil {
 			return nil, fmt.Errorf("tarstream: %s: classify @ %d: %w", name, off, err)
 		}
+		kind, end := run.Kind(), run.End()
 		if end <= off || end > uint64(size) {
 			return nil, fmt.Errorf("tarstream: %s: invalid run [%d,%d)", name, off, end)
 		}
@@ -275,10 +276,11 @@ var (
 func copyExtent(ctx context.Context, w io.Writer, src sparse.Source, e extent, name string, buf []byte) error {
 	off, end := uint64(e.Offset), uint64(e.Offset+e.Size)
 	for off < end {
-		kind, runEnd, err := src.RunAt(off, end-off)
+		run, err := src.RunAt(off, end-off)
 		if err != nil {
 			return fmt.Errorf("%s: classify @ %d: %w", name, off, err)
 		}
+		kind, runEnd := run.Kind(), run.End()
 		if runEnd <= off || runEnd > end {
 			return fmt.Errorf("%s: invalid run [%d,%d) inside data extent ending at %d", name, off, runEnd, end)
 		}
@@ -296,7 +298,7 @@ func copyExtent(ctx context.Context, w io.Writer, src sparse.Source, e extent, n
 			chunk := buf[:n]
 			if kind == sparse.Zero {
 				clear(chunk)
-			} else if m, err := src.ReadAt(ctx, chunk, off); err != nil && err != io.EOF {
+			} else if m, err := run.ReadAt(ctx, chunk, off-run.Offset()); err != nil {
 				return fmt.Errorf("%s: read @ %d: %w", name, off, err)
 			} else if m != n {
 				return fmt.Errorf("%s: source returned invalid length %d for %d bytes @ %d", name, m, n, off)

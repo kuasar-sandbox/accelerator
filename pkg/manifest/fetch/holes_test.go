@@ -55,22 +55,29 @@ func TestRunAt_DataHoleData(t *testing.T) {
 	defer f.Close()
 	full := m.ImageSize
 
-	if k, end, err := f.RunAt(0, full); err != nil || k != sparse.Data || end != dataSize {
-		t.Errorf("RunAt(0) = (%v, %d, %v), want (Data, %d, nil)", k, end, err, dataSize)
+	if run, err := f.RunAt(0, full); err != nil || run.Kind() != sparse.Data || run.Offset() != 0 || run.End() != dataSize {
+		t.Errorf("RunAt(0) = (%v, %v), want (Data, %d, nil)", run, err, dataSize)
+	} else if _, ok := run.(ChunkRun); !ok {
+		t.Errorf("manifest Data run type = %T, want ChunkRun", run)
 	}
-	if k, end, err := f.RunAt(dataSize, full); err != nil || k != sparse.Hole || end != dataSize+holeSize {
-		t.Errorf("RunAt(hole) = (%v, %d, %v), want (Hole, %d, nil)", k, end, err, dataSize+holeSize)
+	if run, err := f.RunAt(dataSize, full); err != nil || run.Kind() != sparse.Hole || run.Offset() != dataSize || run.End() != dataSize+holeSize {
+		t.Errorf("RunAt(hole) = (%v, %v), want (Hole, %d, nil)", run, err, dataSize+holeSize)
+	} else if _, ok := run.(ChunkRun); ok {
+		t.Errorf("manifest Hole run type = %T, must not implement ChunkRun", run)
 	}
-	if k, end, err := f.RunAt(dataSize+holeSize, full); err != nil || k != sparse.Data || end != full {
-		t.Errorf("RunAt(data2) = (%v, %d, %v), want (Data, %d, nil)", k, end, err, full)
+	if run, err := f.RunAt(dataSize+holeSize, full); err != nil || run.Kind() != sparse.Data || run.End() != full {
+		t.Errorf("RunAt(data2) = (%v, %v), want (Data, %d, nil)", run, err, full)
 	}
 	// limit is a length: end <= offset+limit.
-	if k, end, err := f.RunAt(0, 1024); err != nil || k != sparse.Data || end != 1024 {
-		t.Errorf("RunAt(0, 1024) = (%v, %d, %v), want (Data, 1024, nil)", k, end, err)
+	if run, err := f.RunAt(0, 1024); err != nil || run.Kind() != sparse.Data || run.End() != 1024 {
+		t.Errorf("RunAt(0, 1024) = (%v, %v), want (Data, 1024, nil)", run, err)
 	}
 	// offset >= Size → io.EOF.
-	if _, _, err := f.RunAt(full, 1); !errors.Is(err, io.EOF) {
+	if _, err := f.RunAt(full, 1); !errors.Is(err, io.EOF) {
 		t.Errorf("RunAt(Size) err = %v, want io.EOF", err)
+	}
+	if _, err := f.RunAt(0, 0); err == nil {
+		t.Error("RunAt with zero limit succeeded")
 	}
 }
 
@@ -182,35 +189,29 @@ func TestReadAt_ZeroLenBuf(t *testing.T) {
 	}
 }
 
-// TestRunChunkAt_ChainLoop — drive the whole image via the ChunkStream
-// while-loop (RunChunkAt + ReadChunkAt), skipping (zero) Hole runs.
-func TestRunChunkAt_ChainLoop(t *testing.T) {
+// TestRunAt_ChainLoop drives the whole image through executable Runs.
+func TestRunAt_ChainLoop(t *testing.T) {
 	const dataSize, holeSize = uint64(4096), uint64(4096)
 	m := buildHoleManifest(dataSize, holeSize)
 	plain := bytes.Repeat([]byte{0xEE}, int(dataSize))
 	stampHashes(m, plain)
 	s := newTestManifestStream(m, make([][32]byte, 2), &staticGetter{plain}, &passthroughEncryptor{plain: plain})
 	defer s.Close()
-	cs, ok := s.(chunkStream)
-	if !ok {
-		t.Fatal("manifestStream must implement chunkStream")
-	}
-
 	out := make([]byte, m.ImageSize)
 	for off := uint64(0); off < m.ImageSize; {
-		kind, end, idx, err := cs.RunChunkAt(off, m.ImageSize-off)
+		run, err := s.RunAt(off, m.ImageSize-off)
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			t.Fatalf("RunChunkAt @ %d: %v", off, err)
+			t.Fatalf("RunAt @ %d: %v", off, err)
 		}
-		if kind == sparse.Data {
-			if _, rerr := cs.ReadChunkAt(context.Background(), out[off:end], idx, off, end); rerr != nil {
-				t.Fatalf("ReadChunkAt @ %d: %v", off, rerr)
+		if run.Kind() == sparse.Data {
+			if _, rerr := run.ReadAt(context.Background(), out[off:run.End()], 0); rerr != nil {
+				t.Fatalf("Run.ReadAt @ %d: %v", off, rerr)
 			}
 		} // Hole/Zero: leave zeros
-		off = end
+		off = run.End()
 	}
 	assertRegion(t, out[:dataSize], 0xEE, "first data")
 	assertRegion(t, out[dataSize:dataSize+holeSize], 0x00, "hole")

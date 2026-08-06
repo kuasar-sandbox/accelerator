@@ -466,20 +466,45 @@ type zeroRunSource struct{}
 
 func (zeroRunSource) Size() uint64 { return 2 << 20 }
 
-func (zeroRunSource) RunAt(off, limit uint64) (sparse.RunKind, uint64, error) {
+func (s zeroRunSource) RunAt(off, limit uint64) (sparse.Run, error) {
 	const size = 2 << 20
 	if off >= size {
-		return 0, 0, io.EOF
+		return nil, io.EOF
+	}
+	if limit == 0 {
+		return nil, errors.New("zero RunAt limit")
 	}
 	limEnd := min(off+limit, uint64(size))
 	switch {
 	case off < 4096:
-		return sparse.Data, min(4096, limEnd), nil
+		return zeroSourceRun{source: s, offset: off, end: min(4096, limEnd), kind: sparse.Data}, nil
 	case off < 1<<20:
-		return sparse.Zero, min(1<<20, limEnd), nil
+		return zeroSourceRun{source: s, offset: off, end: min(1<<20, limEnd), kind: sparse.Zero}, nil
 	default:
-		return sparse.Hole, limEnd, nil
+		return zeroSourceRun{source: s, offset: off, end: limEnd, kind: sparse.Hole}, nil
 	}
+}
+
+type zeroSourceRun struct {
+	source zeroRunSource
+	offset uint64
+	end    uint64
+	kind   sparse.RunKind
+}
+
+func (r zeroSourceRun) Offset() uint64       { return r.offset }
+func (r zeroSourceRun) End() uint64          { return r.end }
+func (r zeroSourceRun) Kind() sparse.RunKind { return r.kind }
+func (r zeroSourceRun) ReadAt(ctx context.Context, buf []byte, inner uint64) (int, error) {
+	length := r.end - r.offset
+	if inner > length || uint64(len(buf)) > length-inner {
+		return 0, errors.New("run read out of range")
+	}
+	if r.kind != sparse.Data {
+		clear(buf)
+		return len(buf), nil
+	}
+	return r.source.ReadAt(ctx, buf, r.offset+inner)
 }
 
 func (zeroRunSource) ReadAt(_ context.Context, buf []byte, off uint64) (int, error) {
@@ -548,18 +573,18 @@ func TestSourceFrom(t *testing.T) {
 		}
 		var runs []run
 		for off := uint64(0); ; {
-			kind, end, err := src.RunAt(off, src.Size())
+			resolved, err := src.RunAt(off, src.Size())
 			if err == io.EOF {
 				break
 			}
 			if err != nil {
 				t.Fatalf("RunAt(%d): %v", off, err)
 			}
-			if kind == sparse.Zero {
+			if resolved.Kind() == sparse.Zero {
 				t.Fatalf("tar source returned Zero at %d", off)
 			}
-			runs = append(runs, run{kind, end})
-			off = end
+			runs = append(runs, run{resolved.Kind(), resolved.End()})
+			off = resolved.End()
 		}
 		want := []run{
 			{sparse.Data, 8192},
@@ -612,6 +637,56 @@ func TestSourceFrom(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Run("seekable-is-still-one-pass", func(t *testing.T) { check(t, src, name, false) })
+}
+
+func TestSourceFromRunAtDoesNotAdvanceOnePassPayload(t *testing.T) {
+	logical, holes := fixture()
+	archive := mustWrite(t, "img", logical, holes)
+	src, _, err := SourceFrom(bytes.NewReader(archive), "img")
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, ok := src.(*sourceView)
+	if !ok {
+		t.Fatalf("SourceFrom type = %T, want *sourceView", src)
+	}
+	start := view.seq.pos
+
+	if _, err := src.RunAt(0, 0); err == nil {
+		t.Fatal("zero RunAt limit succeeded")
+	}
+	if _, err := src.RunAt(src.Size(), 1); !errors.Is(err, io.EOF) {
+		t.Fatalf("RunAt at EOF = %v, want io.EOF", err)
+	}
+	if _, err := src.RunAt(1<<20, 4096); err != nil {
+		t.Fatalf("future Data RunAt: %v", err)
+	}
+	hole, err := src.RunAt(8192, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.seq.pos != start {
+		t.Fatalf("metadata RunAt advanced logical position from %d to %d", start, view.seq.pos)
+	}
+	holeBuf := bytes.Repeat([]byte{0xFF}, 4096)
+	if n, err := hole.ReadAt(context.Background(), holeBuf, 0); err != nil || n != len(holeBuf) {
+		t.Fatalf("Hole Run.ReadAt = (%d,%v)", n, err)
+	}
+	if !bytes.Equal(holeBuf, make([]byte, len(holeBuf))) || view.seq.pos != start {
+		t.Fatal("Hole Run.ReadAt touched the one-pass payload")
+	}
+
+	data, err := src.RunAt(0, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4096)
+	if n, err := data.ReadAt(context.Background(), buf, 0); err != nil || n != len(buf) {
+		t.Fatalf("Data Run.ReadAt = (%d,%v)", n, err)
+	}
+	if !bytes.Equal(buf, logical[:len(buf)]) || view.seq.pos != int64(len(buf)) {
+		t.Fatalf("Data Run.ReadAt position/data mismatch: pos=%d", view.seq.pos)
+	}
 }
 
 // TestReadFromUpgrade: ReadFrom over a seekable source returns a view
@@ -723,17 +798,17 @@ func TestSourceAt(t *testing.T) {
 	// Run sweep mirrors the hole map.
 	var runs []sparse.Extent
 	for off := uint64(0); ; {
-		kind, end, err := src.RunAt(off, src.Size())
+		run, err := src.RunAt(off, src.Size())
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			t.Fatal(err)
 		}
-		if kind == sparse.Hole {
-			runs = append(runs, sparse.Extent{Offset: off, Size: end - off})
+		if run.Kind() == sparse.Hole {
+			runs = append(runs, sparse.Extent{Offset: off, Size: run.End() - off})
 		}
-		off = end
+		off = run.End()
 	}
 	if len(runs) != len(holes) {
 		t.Fatalf("hole runs = %v, want %v", runs, holes)

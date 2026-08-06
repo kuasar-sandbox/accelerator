@@ -116,22 +116,22 @@ func writeTarArtifact(t testing.TB, codec tarstream.Codec, name string, body []b
 func readSparseSource(ctx context.Context, source sparse.Source) ([]byte, error) {
 	result := make([]byte, source.Size())
 	for offset := uint64(0); offset < source.Size(); {
-		kind, end, err := source.RunAt(offset, source.Size()-offset)
+		run, err := source.RunAt(offset, source.Size()-offset)
 		if err != nil {
 			return nil, err
 		}
-		if end <= offset || end > source.Size() {
-			return nil, fmt.Errorf("invalid run [%d,%d)", offset, end)
+		if run.End() <= offset || run.End() > source.Size() {
+			return nil, fmt.Errorf("invalid run [%d,%d)", offset, run.End())
 		}
-		if kind == sparse.Hole {
-			offset = end
+		if run.Kind() == sparse.Hole {
+			offset = run.End()
 			continue
 		}
-		for offset < end {
-			length := min(uint64(4096), end-offset)
-			n, err := source.ReadAt(ctx, result[offset:offset+length], offset)
+		for offset < run.End() {
+			length := min(uint64(4096), run.End()-offset)
+			n, err := run.ReadAt(ctx, result[offset:offset+length], offset-run.Offset())
 			offset += uint64(n)
-			if err != nil && !(err == io.EOF && offset == source.Size()) {
+			if err != nil {
 				return nil, err
 			}
 			if n == 0 {

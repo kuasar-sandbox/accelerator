@@ -195,19 +195,19 @@ func (value fillReaderAt) ReadAt(buffer []byte, _ int64) (int, error) {
 func consumeData(source sparse.Source) error {
 	buffer := make([]byte, 256<<10)
 	for offset := uint64(0); offset < source.Size(); {
-		kind, end, err := source.RunAt(offset, source.Size()-offset)
+		run, err := source.RunAt(offset, source.Size()-offset)
 		if err != nil {
 			return err
 		}
-		if kind == sparse.Hole {
-			offset = end
+		if run.Kind() == sparse.Hole {
+			offset = run.End()
 			continue
 		}
-		for offset < end {
-			length := min(uint64(len(buffer)), end-offset)
-			n, err := source.ReadAt(context.Background(), buffer[:length], offset)
+		for offset < run.End() {
+			length := min(uint64(len(buffer)), run.End()-offset)
+			n, err := run.ReadAt(context.Background(), buffer[:length], offset-run.Offset())
 			offset += uint64(n)
-			if err != nil && !(err == io.EOF && offset == source.Size()) {
+			if err != nil {
 				return err
 			}
 			if n == 0 {
