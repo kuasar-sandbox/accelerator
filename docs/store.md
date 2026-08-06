@@ -176,6 +176,7 @@ s3:
   endpoint: https://example-s3-endpoint
   region: us-east-1
   bucket: kuasar-store
+  path_style: true
   prefix: production
   access_key: ${S3_ACCESS_KEY}
   secret_key: ${S3_SECRET_KEY}
@@ -189,6 +190,11 @@ s3:
 优先;未配置时固定为 `us-east-1`,不会从 endpoint hostname 推导。所有 S3
 字符串字段都支持 `${VAR}` 展开。
 
+`path_style` 控制 bucket 寻址方式,未配置时默认 `true`。`true` 使用
+`endpoint/bucket/key`,不要求 endpoint 提供 wildcard bucket DNS 与证书;
+`false` 允许 AWS SDK 在 bucket 名称满足 DNS 规则时使用
+`bucket.endpoint/key`,用于只接受 virtual-host 请求的服务。
+
 静态 `access_key` / `secret_key` 必须同时提供;二者都为空时使用 AWS SDK
 默认 credential provider chain。最小配置因此仍需给出存储位置:
 
@@ -200,8 +206,8 @@ s3:
   bucket: kuasar-store
 ```
 
-Huawei OBS 可通过其 S3-compatible endpoint 使用;它仍然是 endpoint 服务,
-不是独立 backend 类型。
+Huawei OBS 可通过其 S3-compatible endpoint 使用,并要求设置
+`path_style: false`;它仍然是 endpoint 服务,不是独立 backend 类型。
 
 ### 3.3 verify_content_key
 
@@ -361,8 +367,9 @@ store-ctl OOM 或队头阻塞。`op_timeout` 不设时,慢/卡调用靠 `STORE_C
 
 endpoint 与 bucket 没有自动发现来源,展开后为空会立即报错。region 也不识别
 厂商或 hostname;空值统一使用 `us-east-1`。这让私有 endpoint、代理 endpoint
-及不同 S3-compatible 服务保持同一签名和配置行为。请求固定使用 path-style
-bucket addressing,不要求自定义 endpoint 提供 wildcard bucket DNS 或证书。
+及不同 S3-compatible 服务保持同一签名和配置行为。`path_style` 缺省为
+`true`,保持 endpoint host 不变并把 bucket 放入请求路径;设为 `false` 时允许
+AWS SDK 在可用时使用 virtual-host bucket addressing。
 
 ### 4.6 Generation 模型
 

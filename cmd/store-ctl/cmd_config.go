@@ -86,6 +86,7 @@ fs:
 #   endpoint: https://example-s3-endpoint
 #   region: us-east-1
 #   bucket: kuasar-store
+#   path_style: true # Default; false for virtual-host-only services.
 #   prefix: production
 #   access_key: ${S3_ACCESS_KEY}
 #   secret_key: ${S3_SECRET_KEY}

@@ -127,6 +127,10 @@ type S3Config struct {
 	// Bucket is the target bucket name. Required.
 	Bucket string `yaml:"bucket"`
 
+	// PathStyle selects endpoint/bucket/key addressing. Empty defaults
+	// to true; set false for virtual-host-only services.
+	PathStyle *bool `yaml:"path_style"`
+
 	// Prefix is an optional in-bucket key prefix (multi-tenant
 	// namespacing). Trailing slash optional; normalised internally.
 	Prefix string `yaml:"prefix"`
@@ -284,6 +288,16 @@ func (c *Config) VerifyKey() bool {
 		}
 		return *c.FS.VerifyContentKey
 	}
+}
+
+// S3PathStyle returns the resolved S3 bucket-addressing mode. Custom
+// endpoints default to path-style because they cannot be assumed to
+// provide wildcard bucket DNS records and matching certificates.
+func (c *Config) S3PathStyle() bool {
+	if c.S3.PathStyle == nil {
+		return true
+	}
+	return *c.S3.PathStyle
 }
 
 // S3OpTimeout returns the parsed S3 op-timeout. Empty/absent = 0 =
