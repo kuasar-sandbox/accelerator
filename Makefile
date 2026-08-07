@@ -140,11 +140,9 @@ dedup-report:
 VERSION ?= v0.1.0
 
 release: build
-	@printf 'repository\trequested_ref\tresolved_sha\trole\n' > build/revisions.tsv
-	@printf 'kuasar-sandbox/accelerator\tHEAD\t%s\tprimary\n' "$$(git rev-parse HEAD)" >> build/revisions.tsv
 	rm -rf build/release-bundle
 	SOURCE_DATE_EPOCH="$$(git show -s --format=%ct HEAD)" \
-		bash scripts/release.sh package "$(VERSION)" "$(TARGET_ARCH)" build/revisions.tsv build/release-bundle
+		bash scripts/release.sh package "$(VERSION)" "$(TARGET_ARCH)" build/release-bundle
 
 test-release:
 	bash scripts/test-release.sh
