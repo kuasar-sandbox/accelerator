@@ -4,7 +4,7 @@ import (
 	archivetar "archive/tar"
 	"bytes"
 	"context"
-	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -73,25 +73,37 @@ func (r *countedReaderAt) reset() {
 	r.bytes.Store(0)
 }
 
-func TestEncryptedTarStreamWireGolden(t *testing.T) {
+func TestEncryptedTarStreamWireStructureAndRandomization(t *testing.T) {
 	var key [32]byte
 	for i := range key {
 		key[i] = byte(i)
 	}
 	codec, _ := NewTarStreamCodec(key)
 	artifact, scheme, digest := writeTarArtifact(t, codec, "golden", []byte("hello"), nil)
-	if len(artifact) != 3715 {
-		t.Fatalf("artifact length = %d, want 3715", len(artifact))
+	again, againScheme, againDigest := writeTarArtifact(t, codec, "golden", []byte("hello"), nil)
+	if len(artifact) != 3747 {
+		t.Fatalf("artifact length = %d, want 3747", len(artifact))
 	}
-	if got := fmt.Sprintf("%x", sha256.Sum256(artifact)); got != "cd161da53fe56d9825cc0cb24436d8100a4f20ceebb3c31c45ccf0e9a6e3db5d" {
-		t.Fatalf("artifact SHA-256 = %s", got)
+	if !bytes.Equal(artifact[:8], []byte{0x89, 'K', 'T', 'S', 'E', 'N', 'C', '\n'}) ||
+		binary.BigEndian.Uint16(artifact[8:10]) != 1 || binary.BigEndian.Uint16(artifact[10:12]) != 48 ||
+		binary.BigEndian.Uint32(artifact[12:16]) != 0 {
+		t.Fatalf("invalid clear prefix: %x", artifact[:48])
 	}
-	wantHeader := decodeHex(t, "894b5453454e430a000100100000000001d522dda02ce41cdba391336ed3beb57f983806c156a277a605d38249b60599cb5d21be4a9b806d2848ca2dabe73b6d58601e03c5cc52f1a31665a64cdd46d9df9d0f702989304659d33fb6c2bcb59fcf")
-	if !bytes.Equal(artifact[:len(wantHeader)], wantHeader) {
-		t.Fatalf("clear/encrypted header = %x, want %x", artifact[:len(wantHeader)], wantHeader)
+	if bytes.Equal(artifact[16:48], make([]byte, 32)) || bytes.Equal(artifact[16:48], again[16:48]) || bytes.Equal(artifact, again) {
+		t.Fatal("artifact salt and physical ciphertext must be randomized")
 	}
-	if scheme != tarstream.DigestSchemeHMAC || digest != "f0e878d5da63ce8ad0cdba9d31aecc64c0e50d3d3c9ee59c1cb80c219cd56b4c" {
-		t.Fatalf("digest = %s:%s", scheme, digest)
+	if scheme != tarstream.DigestSchemeHMAC || againScheme != scheme || againDigest != digest {
+		t.Fatalf("logical identities = %s:%s and %s:%s", scheme, digest, againScheme, againDigest)
+	}
+	for _, value := range [][]byte{artifact, again} {
+		source, _, err := tarstream.SourceAt(bytes.NewReader(value), int64(len(value)), "", tarstream.WithCodec(codec, true), tarstream.WithExpectedDigest(scheme, digest))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, 5)
+		if _, err := source.ReadAt(context.Background(), got, 0); err != nil || string(got) != "hello" {
+			t.Fatalf("randomized artifact read = %q, %v", got, err)
+		}
 	}
 }
 
@@ -158,8 +170,8 @@ func TestEncryptedTarStreamRoundTripAndIdentity(t *testing.T) {
 	if scheme != tarstream.DigestSchemeHMAC || againScheme != scheme || againDigest != digest {
 		t.Fatalf("encrypted digests = %s:%s and %s:%s", scheme, digest, againScheme, againDigest)
 	}
-	if !bytes.Equal(encrypted, again) {
-		t.Fatal("same key and plaintext produced different encrypted bytes")
+	if bytes.Equal(encrypted, again) {
+		t.Fatal("same key and plaintext produced identical encrypted bytes")
 	}
 	requiredSource, err := sparse.NewSource(bytes.NewReader(body), uint64(len(body)), holes)
 	if err != nil {
@@ -170,8 +182,8 @@ func TestEncryptedTarStreamRoundTripAndIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if requiredScheme != scheme || requiredDigest != digest || !bytes.Equal(requiredOutput.Bytes(), encrypted) {
-		t.Fatal("write output changed when only the read-time required flag changed")
+	if requiredScheme != scheme || requiredDigest != digest || bytes.Equal(requiredOutput.Bytes(), encrypted) {
+		t.Fatal("required mode changed identity or failed to randomize physical output")
 	}
 
 	plaintext, plainScheme, _ := writeTarArtifact(t, nil, "image", body, holes)
@@ -281,8 +293,18 @@ func TestEncryptedTarStreamTamperAndBounds(t *testing.T) {
 	if _, err := open(flags, codec); !errors.Is(err, tarstream.ErrMalformedEnvelope) {
 		t.Fatalf("flags error = %v", err)
 	}
+	oldPrefixGeometry := append([]byte(nil), artifact...)
+	binary.BigEndian.PutUint16(oldPrefixGeometry[10:12], 16)
+	if _, err := open(oldPrefixGeometry, codec); !errors.Is(err, tarstream.ErrMalformedEnvelope) {
+		t.Fatalf("old prefix geometry error = %v", err)
+	}
+	salt := append([]byte(nil), artifact...)
+	salt[20] ^= 0x01
+	if _, err := open(salt, codec); !errors.Is(err, tarstream.ErrAuthentication) {
+		t.Fatalf("salt tamper error = %v", err)
+	}
 	header := append([]byte(nil), artifact...)
-	header[20] ^= 0x01
+	header[49] ^= 0x01
 	if _, err := open(header, codec); !errors.Is(err, tarstream.ErrAuthentication) {
 		t.Fatalf("header tamper error = %v", err)
 	}
@@ -300,10 +322,10 @@ func TestEncryptedTarStreamTamperAndBounds(t *testing.T) {
 
 	// For a dense canonical artifact, packed data begins at plaintext offset
 	// 1536. The fixed first record therefore has 1536 bytes and record 1 starts
-	// at physical offset 16+81+(1536+17) = 1650.
+	// at physical offset 48+81+(1536+17) = 1682.
 	data := append([]byte(nil), artifact...)
-	const firstDataRecord = 1650
-	data[firstDataRecord+17] ^= 0x01
+	const firstDataRecord = 1682
+	data[firstDataRecord+1] ^= 0x01
 	source, err := open(data, codec)
 	if err != nil {
 		t.Fatalf("fast open authenticated an untouched suffix: %v", err)
@@ -311,6 +333,25 @@ func TestEncryptedTarStreamTamperAndBounds(t *testing.T) {
 	buffer := make([]byte, 4096)
 	if _, err := source.ReadAt(context.Background(), buffer, 0); !errors.Is(err, tarstream.ErrAuthentication) {
 		t.Fatalf("data tamper read error = %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		offset int
+	}{
+		{"record-flag", firstDataRecord},
+		{"record-tag", firstDataRecord + 4096 + 16},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tampered := append([]byte(nil), artifact...)
+			tampered[tc.offset] ^= 1
+			source, err := open(tampered, codec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := source.ReadAt(context.Background(), buffer, 0); !errors.Is(err, tarstream.ErrAuthentication) {
+				t.Fatalf("read error = %v", err)
+			}
+		})
 	}
 }
 
@@ -322,7 +363,7 @@ func TestEncryptedTarStreamSplicingBoundary(t *testing.T) {
 	b, _, _ := writeTarArtifact(t, codec, "image", bBody, nil)
 
 	const (
-		firstDataRecord = 1650
+		firstDataRecord = 1682
 		fullRecord      = 4096 + 17
 	)
 	spliced := append([]byte(nil), a...)
@@ -332,18 +373,15 @@ func TestEncryptedTarStreamSplicingBoundary(t *testing.T) {
 		t.Fatalf("fast validation rejected same-layout splice before access: %v", err)
 	}
 	buffer := make([]byte, 4096)
-	if _, err := random.ReadAt(context.Background(), buffer, 0); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(buffer, bBody[:4096]) {
-		t.Fatal("spliced authenticated record did not expose donor content")
+	if _, err := random.ReadAt(context.Background(), buffer, 0); !errors.Is(err, tarstream.ErrAuthentication) {
+		t.Fatalf("spliced record read error = %v", err)
 	}
 
 	sequential, _, err := tarstream.SourceFrom(streamReaderOnly{bytes.NewReader(spliced)}, "", tarstream.WithCodec(codec, true), tarstream.WithExpectedDigest(scheme, digest))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readSparseSource(context.Background(), sequential); !errors.Is(err, tarstream.ErrDigestMismatch) {
+	if _, err := readSparseSource(context.Background(), sequential); !errors.Is(err, tarstream.ErrAuthentication) {
 		t.Fatalf("full validation splice error = %v", err)
 	}
 }
@@ -476,7 +514,7 @@ func TestEncryptedTarStreamRecordSwapRejected(t *testing.T) {
 	body := bytes.Repeat([]byte("0123456789abcdef"), 1024)
 	artifact, _, _ := writeTarArtifact(t, codec, "image", body, nil)
 	const (
-		firstDataRecord = 1650
+		firstDataRecord = 1682
 		fullRecord      = 4096 + 17
 	)
 	swapped := append([]byte(nil), artifact...)
@@ -498,10 +536,10 @@ func TestEncryptedSequentialAuthenticationFailureIsSticky(t *testing.T) {
 	body := bytes.Repeat([]byte("0123456789abcdef"), 512)
 	artifact, scheme, digest := writeTarArtifact(t, codec, "image", body, nil)
 	const (
-		firstDataRecord = 1650
+		firstDataRecord = 1682
 		fullRecord      = 4096 + 17
 	)
-	artifact[firstDataRecord+fullRecord+17] ^= 1
+	artifact[firstDataRecord+fullRecord+1] ^= 1
 	source, _, err := tarstream.SourceFrom(
 		streamReaderOnly{bytes.NewReader(artifact)},
 		"",

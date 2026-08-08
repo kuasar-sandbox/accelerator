@@ -11,32 +11,35 @@ import (
 
 type optionTestCodec struct{}
 
-func (*optionTestCodec) CiphertextSize(size int) int { return size + recordOverhead }
-func (*optionTestCodec) Encrypt(dst, plaintext, _ []byte) ([]byte, error) {
+func (c *optionTestCodec) BindArtifact([32]byte) (RecordCodec, error) { return c, nil }
+func (*optionTestCodec) CiphertextSize(size int) int                  { return size + recordOverhead }
+func (*optionTestCodec) Encrypt(dst, plaintext, _ []byte, _ uint64) ([]byte, error) {
 	start := len(dst)
 	dst = append(dst, make([]byte, len(plaintext)+recordOverhead)...)
-	copy(dst[start+recordOverhead:], plaintext)
+	copy(dst[start+1:], plaintext)
 	return dst, nil
 }
-func (*optionTestCodec) DecryptInPlace(ciphertext, _ []byte) ([]byte, error) {
-	return ciphertext[recordOverhead:], nil
+func (*optionTestCodec) DecryptInPlace(ciphertext, _ []byte, _ uint64) ([]byte, error) {
+	return ciphertext[1 : len(ciphertext)-recordOverhead+1], nil
 }
 func (*optionTestCodec) KeyedDigest(digest [32]byte) [32]byte { return digest }
 
 type shortCodec struct{ optionTestCodec }
 
-func (*shortCodec) CiphertextSize(size int) int { return size + recordOverhead - 1 }
+func (c *shortCodec) BindArtifact([32]byte) (RecordCodec, error) { return c, nil }
+func (*shortCodec) CiphertextSize(size int) int                  { return size + recordOverhead - 1 }
 
 type nonInPlaceCodec struct{ optionTestCodec }
 
-func (*nonInPlaceCodec) Encrypt(dst, plaintext, _ []byte) ([]byte, error) {
+func (c *nonInPlaceCodec) BindArtifact([32]byte) (RecordCodec, error) { return c, nil }
+func (*nonInPlaceCodec) Encrypt(dst, plaintext, _ []byte, _ uint64) ([]byte, error) {
 	start := len(dst)
 	dst = append(dst, make([]byte, len(plaintext)+recordOverhead)...)
 	copy(dst[start+recordOverhead:], plaintext)
 	return dst, nil
 }
 
-func (*nonInPlaceCodec) DecryptInPlace(ciphertext, _ []byte) ([]byte, error) {
+func (*nonInPlaceCodec) DecryptInPlace(ciphertext, _ []byte, _ uint64) ([]byte, error) {
 	return append([]byte(nil), ciphertext[recordOverhead:]...), nil
 }
 

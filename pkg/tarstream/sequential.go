@@ -195,18 +195,22 @@ func openSequentialPlaintext(r io.Reader, options readOptions) (io.Reader, *enve
 	if err := validatePrefix(prefix); err != nil {
 		return nil, nil, err
 	}
-	if options.codec.CiphertextSize(envelopeHeaderSize) != envelopeHeaderSealed {
+	recordCodec, err := options.codec.BindArtifact(prefixSalt(prefix))
+	if err != nil {
+		return nil, nil, err
+	}
+	if recordCodec.CiphertextSize(envelopeHeaderSize) != envelopeHeaderSealed {
 		return nil, nil, fmt.Errorf("%w: codec header size", ErrMalformedEnvelope)
 	}
 	sealed := make([]byte, envelopeHeaderSealed)
 	if _, err := io.ReadFull(r, sealed); err != nil {
 		return nil, nil, fmt.Errorf("%w: truncated encrypted header", ErrMalformedEnvelope)
 	}
-	plaintext, err := options.codec.DecryptInPlace(sealed, headerAAD(prefix))
+	plaintext, err := recordCodec.DecryptInPlace(sealed, headerAAD(prefix), 0)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: encrypted header", ErrAuthentication)
 	}
-	if len(plaintext) != envelopeHeaderSize || &plaintext[0] != &sealed[recordOverhead] {
+	if len(plaintext) != envelopeHeaderSize || &plaintext[0] != &sealed[1] {
 		return nil, nil, fmt.Errorf("%w: codec violated in-place header contract", ErrMalformedEnvelope)
 	}
 	var plainHeader [envelopeHeaderSize]byte
@@ -215,10 +219,10 @@ func openSequentialPlaintext(r io.Reader, options readOptions) (io.Reader, *enve
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := validateCodecGeometry(options.codec, geometry); err != nil {
+	if err := validateCodecGeometry(recordCodec, geometry); err != nil {
 		return nil, nil, err
 	}
-	return newRecordSeqReader(r, options.codec, prefix, plainHeader, geometry), &geometry, nil
+	return newRecordSeqReader(r, recordCodec, prefix, plainHeader, geometry), &geometry, nil
 }
 
 func sourceFromSequential(r io.Reader, name string, options readOptions) (sparse.Source, string, error) {

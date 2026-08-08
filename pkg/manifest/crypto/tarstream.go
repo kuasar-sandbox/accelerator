@@ -5,7 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/sha256"
-	"crypto/subtle"
+	"encoding/binary"
 	"fmt"
 	"unsafe"
 
@@ -13,40 +13,49 @@ import (
 )
 
 const (
-	// FlagAESSIV is the fixed encrypted tarstream v1 record encoding flag.
-	FlagAESSIV byte = 0x01
+	// FlagAESGCM is the fixed encrypted tarstream v1 record encoding flag.
+	FlagAESGCM byte = 0x01
 
-	aesSIVOverhead = 1 + aes.BlockSize
+	aesGCMOverhead = 1 + 16
 )
 
-var (
-	macKeyDomain = []byte("kuasar/tarstream/aes-siv/mac-key/v1")
-	ctrKeyDomain = []byte("kuasar/tarstream/aes-siv/ctr-key/v1")
-)
+const artifactKeyDomain = "kuasar/tarstream/aes-gcm/artifact-key/v1\x00"
 
-// TarStreamCodec is the fixed customer-key-backed AES-256-SIV-CMAC record
-// codec for encrypted tarstream v1. It is immutable and safe for concurrent
-// use.
+// TarStreamCodec holds the customer key used to bind encrypted tarstream v1
+// artifacts. It is immutable and safe for concurrent use.
 type TarStreamCodec struct {
 	customerKey [32]byte
-	macBlock    cipher.Block
-	ctrBlock    cipher.Block
 }
 
-// NewTarStreamCodec derives the two AES-256-SIV keys from customerKey. It does
-// not read configuration, resolve credentials, or connect to storage.
+// recordCodec is bound to one artifact salt. Its AES-256-GCM instance is
+// constructed once and is safe for concurrent use.
+type recordCodec struct {
+	aead cipher.AEAD
+}
+
+// NewTarStreamCodec retains customerKey for artifact binding and logical
+// identity. It does not read configuration, resolve credentials, or connect to
+// storage.
 func NewTarStreamCodec(customerKey [32]byte) (*TarStreamCodec, error) {
-	macKey := keyedHMAC(customerKey, macKeyDomain)
-	ctrKey := keyedHMAC(customerKey, ctrKeyDomain)
-	macBlock, err := aes.NewCipher(macKey[:])
+	return &TarStreamCodec{customerKey: customerKey}, nil
+}
+
+// BindArtifact derives an artifact-specific AES-256 key and constructs the GCM
+// primitive once. Per-record operations only synthesize a counter nonce.
+func (c *TarStreamCodec) BindArtifact(salt [32]byte) (tarstream.RecordCodec, error) {
+	mac := hmac.New(sha256.New, c.customerKey[:])
+	_, _ = mac.Write([]byte(artifactKeyDomain))
+	_, _ = mac.Write(salt[:])
+	key := mac.Sum(nil)
+	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, fmt.Errorf("crypto: tarstream MAC cipher: %w", err)
+		return nil, fmt.Errorf("crypto: tarstream artifact cipher: %w", err)
 	}
-	ctrBlock, err := aes.NewCipher(ctrKey[:])
+	aead, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, fmt.Errorf("crypto: tarstream CTR cipher: %w", err)
+		return nil, fmt.Errorf("crypto: tarstream artifact GCM: %w", err)
 	}
-	return &TarStreamCodec{customerKey: customerKey, macBlock: macBlock, ctrBlock: ctrBlock}, nil
+	return &recordCodec{aead: aead}, nil
 }
 
 func keyedHMAC(key [32]byte, data []byte) [32]byte {
@@ -57,30 +66,25 @@ func keyedHMAC(key [32]byte, data []byte) [32]byte {
 	return result
 }
 
-// CiphertextSize returns flag + synthetic IV + CTR ciphertext length. A
-// negative result marks invalid or overflowing input for the framing layer.
-func (*TarStreamCodec) CiphertextSize(plaintextSize int) int {
-	if plaintextSize < 0 || plaintextSize > int(^uint(0)>>1)-aesSIVOverhead {
+// CiphertextSize returns flag + GCM ciphertext and tag length.
+func (*recordCodec) CiphertextSize(plaintextSize int) int {
+	if plaintextSize < 0 || plaintextSize > int(^uint(0)>>1)-aesGCMOverhead {
 		return -1
 	}
-	return plaintextSize + aesSIVOverhead
+	return plaintextSize + aesGCMOverhead
 }
 
-// Encrypt appends one deterministic AES-SIV record to dst. S2V's vector is
-// exactly {FlagAESSIV, associatedData, plaintext}.
-func (c *TarStreamCodec) Encrypt(dst, plaintext, associatedData []byte) ([]byte, error) {
+// Encrypt appends one AES-256-GCM record to dst. The caller guarantees that
+// sequence is unique within the bound artifact. Inputs are preserved even when
+// dst capacity aliases plaintext or associatedData.
+func (c *recordCodec) Encrypt(dst, plaintext, associatedData []byte, sequence uint64) ([]byte, error) {
 	size := c.CiphertextSize(len(plaintext))
 	if size < 0 {
 		return nil, fmt.Errorf("crypto: tarstream: plaintext size overflow")
 	}
-	siv := s2v(c.macBlock, []byte{FlagAESSIV}, associatedData, plaintext)
 	start := len(dst)
 	if cap(dst)-len(dst) >= size {
 		dst = dst[:len(dst)+size]
-		// The append contract permits callers to reuse destination capacity,
-		// including capacity from the same allocation as an input. Preserve
-		// both inputs by moving the result when the appended record would
-		// overwrite either one.
 		if slicesOverlap(dst[start:], plaintext) || slicesOverlap(dst[start:], associatedData) {
 			moved := make([]byte, len(dst))
 			copy(moved, dst[:start])
@@ -90,10 +94,12 @@ func (c *TarStreamCodec) Encrypt(dst, plaintext, associatedData []byte) ([]byte,
 		dst = append(dst, make([]byte, size)...)
 	}
 	record := dst[start:]
-	record[0] = FlagAESSIV
-	copy(record[1:1+aes.BlockSize], siv[:])
-	iv := maskedCTRIV(siv)
-	cipher.NewCTR(c.ctrBlock, iv[:]).XORKeyStream(record[aesSIVOverhead:], plaintext)
+	record[0] = FlagAESGCM
+	nonce := recordNonce(sequence)
+	sealed := c.aead.Seal(record[1:1], nonce[:], plaintext, associatedData)
+	if len(sealed) != len(record)-1 {
+		panic("crypto: tarstream GCM returned unexpected ciphertext size")
+	}
 	return dst, nil
 }
 
@@ -109,24 +115,27 @@ func slicesOverlap(a, b []byte) bool {
 	return aStart-bStart < uintptr(len(b))
 }
 
-// DecryptInPlace authenticates and decrypts one record into its ciphertext
-// backing array. Authentication failure clears the tentative plaintext before
-// returning and never exposes it to the caller.
-func (c *TarStreamCodec) DecryptInPlace(record, associatedData []byte) ([]byte, error) {
-	if len(record) < aesSIVOverhead || record[0] != FlagAESSIV {
-		return nil, fmt.Errorf("%w: invalid AES-SIV record", tarstream.ErrAuthentication)
+// DecryptInPlace authenticates and decrypts one record into record[1:]'s
+// backing storage. Authentication failure clears any tentative plaintext and
+// never returns it.
+func (c *recordCodec) DecryptInPlace(record, associatedData []byte, sequence uint64) ([]byte, error) {
+	if len(record) < aesGCMOverhead || record[0] != FlagAESGCM {
+		return nil, fmt.Errorf("%w: invalid AES-GCM record", tarstream.ErrAuthentication)
 	}
-	var siv [aes.BlockSize]byte
-	copy(siv[:], record[1:aesSIVOverhead])
-	plaintext := record[aesSIVOverhead:]
-	iv := maskedCTRIV(siv)
-	cipher.NewCTR(c.ctrBlock, iv[:]).XORKeyStream(plaintext, plaintext)
-	want := s2v(c.macBlock, []byte{FlagAESSIV}, associatedData, plaintext)
-	if subtle.ConstantTimeCompare(siv[:], want[:]) != 1 {
-		clear(plaintext)
+	nonce := recordNonce(sequence)
+	plaintextSize := len(record) - aesGCMOverhead
+	plaintext, err := c.aead.Open(record[1:1], nonce[:], record[1:], associatedData)
+	if err != nil {
+		clear(record[1 : 1+plaintextSize])
 		return nil, tarstream.ErrAuthentication
 	}
 	return plaintext, nil
+}
+
+func recordNonce(sequence uint64) [12]byte {
+	var nonce [12]byte
+	binary.BigEndian.PutUint64(nonce[4:], sequence)
+	return nonce
 }
 
 // KeyedDigest computes HMAC-SHA256(customerKey, plainDigestRaw32Bytes).
@@ -134,114 +143,7 @@ func (c *TarStreamCodec) KeyedDigest(plainDigest [32]byte) [32]byte {
 	return keyedHMAC(c.customerKey, plainDigest[:])
 }
 
-func maskedCTRIV(siv [aes.BlockSize]byte) [aes.BlockSize]byte {
-	iv := siv
-	iv[8] &= 0x7f
-	iv[12] &= 0x7f
-	return iv
-}
-
-func s2v(block cipher.Block, values ...[]byte) [aes.BlockSize]byte {
-	var zero [aes.BlockSize]byte
-	if len(values) == 0 {
-		zero[aes.BlockSize-1] = 1
-		return cmacSum(block, zero[:])
-	}
-	d := cmacSum(block, zero[:])
-	for _, value := range values[:len(values)-1] {
-		d = xorBlock(doubleBlock(d), cmacSum(block, value))
-	}
-	last := values[len(values)-1]
-	if len(last) >= aes.BlockSize {
-		return cmacSumXORLast(block, last, d)
-	}
-	padded := doubleBlock(d)
-	for i := range last {
-		padded[i] ^= last[i]
-	}
-	padded[len(last)] ^= 0x80
-	return cmacSum(block, padded[:])
-}
-
-func cmacSum(block cipher.Block, message []byte) [aes.BlockSize]byte {
-	return cmacSumXORLast(block, message, [aes.BlockSize]byte{})
-}
-
-func cmacSumXORLast(block cipher.Block, message []byte, lastXOR [aes.BlockSize]byte) [aes.BlockSize]byte {
-	var zero [aes.BlockSize]byte
-	var l [aes.BlockSize]byte
-	block.Encrypt(l[:], zero[:])
-	k1 := doubleBlock(l)
-	k2 := doubleBlock(k1)
-
-	blocks := (len(message) + aes.BlockSize - 1) / aes.BlockSize
-	complete := len(message) > 0 && len(message)%aes.BlockSize == 0
-	if blocks == 0 {
-		blocks = 1
-	}
-	var state [aes.BlockSize]byte
-	var input [aes.BlockSize]byte
-	for i := 0; i < blocks-1; i++ {
-		clear(input[:])
-		blockStart := i * aes.BlockSize
-		copy(input[:], message[blockStart:blockStart+aes.BlockSize])
-		applyLastXOR(&input, blockStart, len(message), lastXOR)
-		for j := range aes.BlockSize {
-			input[j] ^= state[j]
-		}
-		block.Encrypt(state[:], input[:])
-	}
-
-	clear(input[:])
-	start := (blocks - 1) * aes.BlockSize
-	if complete {
-		copy(input[:], message[start:start+aes.BlockSize])
-		applyLastXOR(&input, start, len(message), lastXOR)
-		input = xorBlock(input, k1)
-	} else {
-		if start < len(message) {
-			copy(input[:], message[start:])
-			applyLastXOR(&input, start, len(message), lastXOR)
-		}
-		input[len(message)-start] = 0x80
-		input = xorBlock(input, k2)
-	}
-	input = xorBlock(input, state)
-	block.Encrypt(state[:], input[:])
-	return state
-}
-
-func applyLastXOR(block *[aes.BlockSize]byte, blockStart, messageSize int, value [aes.BlockSize]byte) {
-	if messageSize < aes.BlockSize {
-		return
-	}
-	xorStart := messageSize - aes.BlockSize
-	for i := range aes.BlockSize {
-		position := blockStart + i
-		if position >= messageSize {
-			break
-		}
-		if position >= xorStart {
-			block[i] ^= value[position-xorStart]
-		}
-	}
-}
-
-func doubleBlock(value [aes.BlockSize]byte) [aes.BlockSize]byte {
-	carry := value[0] >> 7
-	for i := 0; i < aes.BlockSize-1; i++ {
-		value[i] = value[i]<<1 | value[i+1]>>7
-	}
-	value[aes.BlockSize-1] <<= 1
-	value[aes.BlockSize-1] ^= byte(0x87 * carry)
-	return value
-}
-
-func xorBlock(a, b [aes.BlockSize]byte) [aes.BlockSize]byte {
-	for i := range aes.BlockSize {
-		a[i] ^= b[i]
-	}
-	return a
-}
-
-var _ tarstream.Codec = (*TarStreamCodec)(nil)
+var (
+	_ tarstream.Codec       = (*TarStreamCodec)(nil)
+	_ tarstream.RecordCodec = (*recordCodec)(nil)
+)

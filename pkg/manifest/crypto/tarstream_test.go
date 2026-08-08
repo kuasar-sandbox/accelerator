@@ -2,8 +2,6 @@ package crypto
 
 import (
 	"bytes"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -23,139 +21,64 @@ func decodeHex(t *testing.T, value string) []byte {
 	return decoded
 }
 
-func TestRFC5297AppendixA1(t *testing.T) {
-	key := decodeHex(t, "fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff")
-	ad := decodeHex(t, "101112131415161718191a1b1c1d1e1f2021222324252627")
-	plaintext := decodeHex(t, "112233445566778899aabbccddee")
-	wantSIV := decodeHex(t, "85632d07c6e8f37f950acd320a2ecc93")
-	wantCiphertext := decodeHex(t, "40c02b9690c4dc04daef7f6afe5c")
-
-	macBlock, err := aes.NewCipher(key[:16])
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctrBlock, err := aes.NewCipher(key[16:])
-	if err != nil {
-		t.Fatal(err)
-	}
-	siv := s2v(macBlock, ad, plaintext)
-	if !bytes.Equal(siv[:], wantSIV) {
-		t.Fatalf("S2V = %x, want %x", siv, wantSIV)
-	}
-	iv := maskedCTRIV(siv)
-	got := make([]byte, len(plaintext))
-	cipher.NewCTR(ctrBlock, iv[:]).XORKeyStream(got, plaintext)
-	if !bytes.Equal(got, wantCiphertext) {
-		t.Fatalf("CTR ciphertext = %x, want %x", got, wantCiphertext)
-	}
-}
-
-func TestRFC5297AppendixA2(t *testing.T) {
-	key := decodeHex(t, "7f7e7d7c7b7a79787776757473727170404142434445464748494a4b4c4d4e4f")
-	ad1 := decodeHex(t, "00112233445566778899aabbccddeeffdeaddadadeaddadaffeeddccbbaa99887766554433221100")
-	ad2 := decodeHex(t, "102030405060708090a0")
-	nonce := decodeHex(t, "09f911029d74e35bd84156c5635688c0")
-	plaintext := decodeHex(t, "7468697320697320736f6d6520706c61696e7465787420746f20656e6372797074207573696e67205349562d414553")
-	wantSIV := decodeHex(t, "7bdb6e3b432667eb06f4d14bff2fbd0f")
-	wantCiphertext := decodeHex(t, "cb900f2fddbe404326601965c889bf17dba77ceb094fa663b7a3f748ba8af829ea64ad544a272e9c485b62a3fd5c0d")
-
-	macBlock, err := aes.NewCipher(key[:16])
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctrBlock, err := aes.NewCipher(key[16:])
-	if err != nil {
-		t.Fatal(err)
-	}
-	siv := s2v(macBlock, ad1, ad2, nonce, plaintext)
-	if !bytes.Equal(siv[:], wantSIV) {
-		t.Fatalf("S2V = %x, want %x", siv, wantSIV)
-	}
-	iv := maskedCTRIV(siv)
-	got := make([]byte, len(plaintext))
-	cipher.NewCTR(ctrBlock, iv[:]).XORKeyStream(got, plaintext)
-	if !bytes.Equal(got, wantCiphertext) {
-		t.Fatalf("CTR ciphertext = %x, want %x", got, wantCiphertext)
-	}
-}
-
-func TestRFC4493CMACVectors(t *testing.T) {
-	key := decodeHex(t, "2b7e151628aed2a6abf7158809cf4f3c")
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	messages := []string{
-		"",
-		"6bc1bee22e409f96e93d7e117393172a",
-		"6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e5130c81c46a35ce411",
-		"6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e5130c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710",
-	}
-	tags := []string{
-		"bb1d6929e95937287fa37d129b756746",
-		"070a16b46b4d4144f79bdd9dd04a287c",
-		"dfa66747de9ae63030ca32611497c827",
-		"51f0bebf7e3b9d92fc49741779363cfe",
-	}
-	for i := range messages {
-		got := cmacSum(block, decodeHex(t, messages[i]))
-		want := decodeHex(t, tags[i])
-		if !bytes.Equal(got[:], want) {
-			t.Fatalf("CMAC vector %d = %x, want %x", i, got, want)
-		}
-	}
-}
-
-func TestAESSIVCTRMask(t *testing.T) {
-	siv := [aes.BlockSize]byte{}
-	for i := range siv {
-		siv[i] = 0xff
-	}
-	masked := maskedCTRIV(siv)
-	for i := range masked {
-		want := byte(0xff)
-		if i == 8 || i == 12 {
-			want = 0x7f
-		}
-		if masked[i] != want {
-			t.Fatalf("masked IV byte %d = 0x%02x, want 0x%02x", i, masked[i], want)
-		}
-	}
-}
-
-func TestTarStreamCodecRoundTripAndBuffers(t *testing.T) {
-	var key [32]byte
-	for i := range key {
-		key[i] = byte(i)
-	}
+func fixedRecordCodec(t *testing.T, key, salt [32]byte) tarstream.RecordCodec {
+	t.Helper()
 	codec, err := NewTarStreamCodec(key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	plaintext := bytes.Repeat([]byte("record"), 683)
-	aad := []byte("authenticated geometry")
-	prefix := []byte("keep:")
-	dst := make([]byte, len(prefix), len(prefix)+codec.CiphertextSize(len(plaintext)))
-	copy(dst, prefix)
-	before := &dst[0]
-	sealed, err := codec.Encrypt(dst, plaintext, aad)
+	records, err := codec.BindArtifact(salt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if &sealed[0] != before {
-		t.Fatal("Encrypt did not reuse append destination capacity")
+	return records
+}
+
+func TestTarStreamCodecGolden(t *testing.T) {
+	var key, salt [32]byte
+	for i := range key {
+		key[i] = byte(i)
+		salt[i] = byte(0xff - i)
 	}
-	if !bytes.Equal(sealed[:len(prefix)], prefix) {
-		t.Fatal("Encrypt modified destination prefix")
+	records := fixedRecordCodec(t, key, salt)
+	plaintext := decodeHex(t, "00112233445566778899aabbccddeeff1020304050607080")
+	sealed, err := records.Encrypt(nil, plaintext, []byte("kuasar-golden-aad"), 0x0102030405060708)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := decodeHex(t, "01fd39f9b96738900026cd157da1b5a43447a3803f6430153ffaa8325892f7efcc93a4e40052592a57")
+	if !bytes.Equal(sealed, want) {
+		t.Fatalf("sealed record = %x, want %x", sealed, want)
+	}
+	opened, err := records.DecryptInPlace(sealed, []byte("kuasar-golden-aad"), 0x0102030405060708)
+	if err != nil || !bytes.Equal(opened, plaintext) {
+		t.Fatalf("golden round trip = %x, %v", opened, err)
+	}
+}
+
+func TestTarStreamCodecRoundTripAndBuffers(t *testing.T) {
+	records := fixedRecordCodec(t, [32]byte{1}, [32]byte{2})
+	plaintext := bytes.Repeat([]byte("record"), 683)
+	aad := []byte("authenticated geometry")
+	prefix := []byte("keep:")
+	dst := make([]byte, len(prefix), len(prefix)+records.CiphertextSize(len(plaintext)))
+	copy(dst, prefix)
+	before := &dst[0]
+	sealed, err := records.Encrypt(dst, plaintext, aad, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if &sealed[0] != before || !bytes.Equal(sealed[:len(prefix)], prefix) {
+		t.Fatal("Encrypt did not preserve and reuse destination prefix")
 	}
 	record := sealed[len(prefix):]
-	bodyStart := &record[aesSIVOverhead]
-	opened, err := codec.DecryptInPlace(record, aad)
+	bodyStart := &record[1]
+	opened, err := records.DecryptInPlace(record, aad, 7)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(opened) > 0 && &opened[0] != bodyStart {
-		t.Fatal("DecryptInPlace did not reuse ciphertext backing array")
+		t.Fatal("DecryptInPlace did not use record[1:] backing storage")
 	}
 	if !bytes.Equal(opened, plaintext) {
 		t.Fatal("round-trip plaintext mismatch")
@@ -163,109 +86,87 @@ func TestTarStreamCodecRoundTripAndBuffers(t *testing.T) {
 }
 
 func TestTarStreamCodecEncryptPreservesAliasedInputs(t *testing.T) {
-	codec, err := NewTarStreamCodec([32]byte{0x44})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, tc := range []struct {
-		name           string
-		aliasPlaintext bool
-	}{
-		{name: "plaintext", aliasPlaintext: true},
-		{name: "associated data"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
+	records := fixedRecordCodec(t, [32]byte{0x44}, [32]byte{0x55})
+	for _, aliasPlaintext := range []bool{true, false} {
+		name := "aad"
+		if aliasPlaintext {
+			name = "plaintext"
+		}
+		t.Run(name, func(t *testing.T) {
 			const inputSize = 64
-			backing := make([]byte, inputSize, inputSize+codec.CiphertextSize(inputSize))
+			backing := make([]byte, inputSize, inputSize+records.CiphertextSize(inputSize))
 			for i := range backing {
 				backing[i] = byte(i + 1)
 			}
-			plain := []byte("independent plaintext")
-			aad := []byte("independent associated data")
-			if tc.aliasPlaintext {
+			plain, aad := []byte("independent plaintext"), []byte("independent associated data")
+			if aliasPlaintext {
 				plain = backing
 			} else {
 				aad = backing
 			}
-			wantPlain := append([]byte(nil), plain...)
-			wantAAD := append([]byte(nil), aad...)
-			sealed, err := codec.Encrypt(backing[:0], plain, aad)
+			wantPlain, wantAAD := append([]byte(nil), plain...), append([]byte(nil), aad...)
+			sealed, err := records.Encrypt(backing[:0], plain, aad, 9)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !bytes.Equal(plain, wantPlain) {
-				t.Fatal("Encrypt modified aliased plaintext")
+			if !bytes.Equal(plain, wantPlain) || !bytes.Equal(aad, wantAAD) {
+				t.Fatal("Encrypt modified an aliased input")
 			}
-			if !bytes.Equal(aad, wantAAD) {
-				t.Fatal("Encrypt modified aliased associated data")
-			}
-			opened, err := codec.DecryptInPlace(sealed, wantAAD)
-			if err != nil {
-				t.Fatalf("decrypt aliased result: %v", err)
-			}
-			if !bytes.Equal(opened, wantPlain) {
-				t.Fatal("aliased result plaintext mismatch")
+			opened, err := records.DecryptInPlace(sealed, wantAAD, 9)
+			if err != nil || !bytes.Equal(opened, wantPlain) {
+				t.Fatalf("aliased round trip = %x, %v", opened, err)
 			}
 		})
 	}
 }
 
-func TestTarStreamCodecGolden(t *testing.T) {
-	var key [32]byte
-	for i := range key {
-		key[i] = byte(i)
-	}
-	codec, err := NewTarStreamCodec(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	plaintext := decodeHex(t, "00112233445566778899aabbccddeeff1020304050607080")
-	sealed, err := codec.Encrypt(nil, plaintext, []byte("kuasar-golden-aad"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantSealed := decodeHex(t, "013b960dd1364682b2894cfa12ea95eb2b9ffeb76642214a3b2c3429ab7a99e22fcbdaafb578179492")
-	if !bytes.Equal(sealed, wantSealed) {
-		t.Fatalf("sealed record = %x, want %x", sealed, wantSealed)
-	}
-	var plainDigest [32]byte
-	for i := range plainDigest {
-		plainDigest[i] = byte(0xff - i)
-	}
-	if got, want := codec.KeyedDigest(plainDigest), decodeHex(t, "e859e9ccf8c926d30dbdd7e9f1a1256dd2ba046b67bef092a70347167be574fd"); !bytes.Equal(got[:], want) {
-		t.Fatalf("keyed digest = %x, want %x", got, want)
-	}
-}
-
 func TestTarStreamCodecAuthenticationFailureClearsPlaintext(t *testing.T) {
-	codec, err := NewTarStreamCodec([32]byte{1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	sealed, err := codec.Encrypt(nil, []byte("secret plaintext"), []byte("aad"))
+	records := fixedRecordCodec(t, [32]byte{1}, [32]byte{2})
+	sealed, err := records.Encrypt(nil, []byte("secret plaintext"), []byte("aad"), 3)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sealed[1] ^= 0x80
-	if plaintext, err := codec.DecryptInPlace(sealed, []byte("aad")); plaintext != nil || !errors.Is(err, tarstream.ErrAuthentication) {
+	if plaintext, err := records.DecryptInPlace(sealed, []byte("aad"), 3); plaintext != nil || !errors.Is(err, tarstream.ErrAuthentication) {
 		t.Fatalf("DecryptInPlace tamper = (%x, %v)", plaintext, err)
 	}
-	if !bytes.Equal(sealed[aesSIVOverhead:], make([]byte, len(sealed)-aesSIVOverhead)) {
+	plainSize := len(sealed) - aesGCMOverhead
+	if !bytes.Equal(sealed[1:1+plainSize], make([]byte, plainSize)) {
 		t.Fatal("tentative plaintext retained after authentication failure")
 	}
 }
 
-func TestTarStreamCodecWrongKeyAndKeyedDigest(t *testing.T) {
-	key := [32]byte{1, 2, 3}
-	codec, _ := NewTarStreamCodec(key)
-	other, _ := NewTarStreamCodec([32]byte{4, 5, 6})
-	sealed, err := codec.Encrypt(nil, []byte("body"), []byte("aad"))
+func TestTarStreamCodecAuthenticationInputs(t *testing.T) {
+	key, salt := [32]byte{1, 2, 3}, [32]byte{7, 8, 9}
+	records := fixedRecordCodec(t, key, salt)
+	sealed, err := records.Encrypt(nil, []byte("body"), []byte("aad"), 11)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := other.DecryptInPlace(append([]byte(nil), sealed...), []byte("aad")); !errors.Is(err, tarstream.ErrAuthentication) {
-		t.Fatalf("wrong-key error = %v", err)
+	tests := []struct {
+		name string
+		rc   tarstream.RecordCodec
+		aad  []byte
+		seq  uint64
+	}{
+		{"wrong-key", fixedRecordCodec(t, [32]byte{4}, salt), []byte("aad"), 11},
+		{"wrong-salt", fixedRecordCodec(t, key, [32]byte{8}), []byte("aad"), 11},
+		{"wrong-aad", records, []byte("bad"), 11},
+		{"wrong-sequence", records, []byte("aad"), 12},
 	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			copyOfSealed := append([]byte(nil), sealed...)
+			if _, err := tc.rc.DecryptInPlace(copyOfSealed, tc.aad, tc.seq); !errors.Is(err, tarstream.ErrAuthentication) {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
+func TestTarStreamCodecKeyedDigestUnchanged(t *testing.T) {
+	key := [32]byte{1, 2, 3}
+	codec, _ := NewTarStreamCodec(key)
 	plainDigest := sha256.Sum256([]byte("canonical plaintext"))
 	mac := hmac.New(sha256.New, key[:])
 	_, _ = mac.Write(plainDigest[:])
@@ -275,7 +176,7 @@ func TestTarStreamCodecWrongKeyAndKeyedDigest(t *testing.T) {
 }
 
 func TestTarStreamCodecConcurrent(t *testing.T) {
-	codec, _ := NewTarStreamCodec([32]byte{9})
+	records := fixedRecordCodec(t, [32]byte{9}, [32]byte{10})
 	var wg sync.WaitGroup
 	errs := make(chan error, 32)
 	for i := 0; i < 32; i++ {
@@ -284,18 +185,16 @@ func TestTarStreamCodecConcurrent(t *testing.T) {
 			defer wg.Done()
 			plaintext := bytes.Repeat([]byte{byte(i)}, 17+i*31)
 			aad := []byte{byte(i), byte(i >> 8)}
-			sealed, err := codec.Encrypt(nil, plaintext, aad)
+			sealed, err := records.Encrypt(nil, plaintext, aad, uint64(i+1))
+			if err == nil {
+				var opened []byte
+				opened, err = records.DecryptInPlace(sealed, aad, uint64(i+1))
+				if err == nil && !bytes.Equal(opened, plaintext) {
+					err = errors.New("plaintext mismatch")
+				}
+			}
 			if err != nil {
 				errs <- err
-				return
-			}
-			opened, err := codec.DecryptInPlace(sealed, aad)
-			if err != nil {
-				errs <- err
-				return
-			}
-			if !bytes.Equal(opened, plaintext) {
-				errs <- errors.New("plaintext mismatch")
 			}
 		}(i)
 	}
@@ -307,27 +206,22 @@ func TestTarStreamCodecConcurrent(t *testing.T) {
 }
 
 func FuzzTarStreamCodecRoundTrip(f *testing.F) {
-	f.Add([]byte("plaintext"), []byte("aad"))
-	f.Add([]byte(nil), []byte(nil))
+	f.Add([]byte("plaintext"), []byte("aad"), uint64(1))
+	f.Add([]byte(nil), []byte(nil), uint64(0))
 	codec, _ := NewTarStreamCodec([32]byte{0x42})
-	f.Fuzz(func(t *testing.T, plaintext, aad []byte) {
+	records, _ := codec.BindArtifact([32]byte{0x43})
+	f.Fuzz(func(t *testing.T, plaintext, aad []byte, sequence uint64) {
 		if len(plaintext) > 1<<16 || len(aad) > 1<<16 {
 			t.Skip()
 		}
 		original := append([]byte(nil), plaintext...)
-		sealed, err := codec.Encrypt(nil, plaintext, aad)
+		sealed, err := records.Encrypt(nil, plaintext, aad, sequence)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Equal(plaintext, original) {
-			t.Fatal("Encrypt modified plaintext")
-		}
-		opened, err := codec.DecryptInPlace(sealed, aad)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(opened, original) {
-			t.Fatal("round-trip mismatch")
+		opened, err := records.DecryptInPlace(sealed, aad, sequence)
+		if err != nil || !bytes.Equal(opened, original) || !bytes.Equal(plaintext, original) {
+			t.Fatalf("round trip = %x, %v", opened, err)
 		}
 	})
 }

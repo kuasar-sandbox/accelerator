@@ -9,7 +9,7 @@ import (
 // complete canonical plaintext stream with O(recordSize) live memory.
 type recordSeqReader struct {
 	r        io.Reader
-	codec    Codec
+	codec    RecordCodec
 	prefix   [envelopePrefixSize]byte
 	header   [envelopeHeaderSize]byte
 	geometry envelopeHeader
@@ -20,7 +20,7 @@ type recordSeqReader struct {
 	finalErr error
 }
 
-func newRecordSeqReader(r io.Reader, codec Codec, prefix [envelopePrefixSize]byte, plainHeader [envelopeHeaderSize]byte, geometry envelopeHeader) *recordSeqReader {
+func newRecordSeqReader(r io.Reader, codec RecordCodec, prefix [envelopePrefixSize]byte, plainHeader [envelopeHeaderSize]byte, geometry envelopeHeader) *recordSeqReader {
 	return &recordSeqReader{r: r, codec: codec, prefix: prefix, header: plainHeader, geometry: geometry}
 }
 
@@ -67,11 +67,14 @@ func (r *recordSeqReader) loadRecord() error {
 		return fmt.Errorf("%w: truncated encrypted record", ErrMalformedEnvelope)
 	}
 	aad := recordAAD(r.prefix, r.header, r.index, uint32(plainSize))
-	plaintext, err := r.codec.DecryptInPlace(sealed, aad)
+	if r.index == ^uint64(0) {
+		return fmt.Errorf("%w: record sequence overflow", ErrMalformedEnvelope)
+	}
+	plaintext, err := r.codec.DecryptInPlace(sealed, aad, r.index+1)
 	if err != nil {
 		return fmt.Errorf("%w: encrypted data record", ErrAuthentication)
 	}
-	if len(plaintext) != plainSize || plainSize > 0 && &plaintext[0] != &sealed[recordOverhead] {
+	if len(plaintext) != plainSize || plainSize > 0 && &plaintext[0] != &sealed[1] {
 		return fmt.Errorf("%w: codec violated in-place record contract", ErrMalformedEnvelope)
 	}
 	r.current = plaintext

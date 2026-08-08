@@ -1,6 +1,7 @@
 package tarstream
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -8,7 +9,7 @@ import (
 
 const (
 	envelopeVersion       = 1
-	envelopePrefixSize    = 16
+	envelopePrefixSize    = 48
 	envelopeHeaderSize    = 64
 	envelopeHeaderSealed  = 81
 	recordSize            = 4096
@@ -122,12 +123,19 @@ func parseEnvelopeHeader(plaintext []byte) (envelopeHeader, error) {
 	return header, nil
 }
 
-func clearPrefix() [envelopePrefixSize]byte {
+func clearPrefix(salt [32]byte) [envelopePrefixSize]byte {
 	var prefix [envelopePrefixSize]byte
 	copy(prefix[:8], envelopeMagic[:])
 	binary.BigEndian.PutUint16(prefix[8:10], envelopeVersion)
 	binary.BigEndian.PutUint16(prefix[10:12], envelopePrefixSize)
+	copy(prefix[16:48], salt[:])
 	return prefix
+}
+
+func prefixSalt(prefix [envelopePrefixSize]byte) [32]byte {
+	var salt [32]byte
+	copy(salt[:], prefix[16:48])
+	return salt
 }
 
 func validatePrefix(prefix [envelopePrefixSize]byte) error {
@@ -162,26 +170,34 @@ func recordAAD(prefix [envelopePrefixSize]byte, header [envelopeHeaderSize]byte,
 	return aad
 }
 
-func writeEncryptedHeader(w io.Writer, codec Codec, header envelopeHeader) ([envelopePrefixSize]byte, [envelopeHeaderSize]byte, error) {
-	prefix := clearPrefix()
-	plainHeader := header.marshal()
-	if codec.CiphertextSize(envelopeHeaderSize) != envelopeHeaderSealed {
-		return prefix, plainHeader, fmt.Errorf("%w: codec header size", ErrMalformedEnvelope)
+func writeEncryptedHeader(w io.Writer, codec Codec, header envelopeHeader) ([envelopePrefixSize]byte, [envelopeHeaderSize]byte, RecordCodec, error) {
+	var salt [32]byte
+	if _, err := io.ReadFull(rand.Reader, salt[:]); err != nil {
+		return [envelopePrefixSize]byte{}, [envelopeHeaderSize]byte{}, nil, fmt.Errorf("tarstream: generate artifact salt: %w", err)
 	}
-	sealed, err := codec.Encrypt(nil, plainHeader[:], headerAAD(prefix))
+	prefix := clearPrefix(salt)
+	plainHeader := header.marshal()
+	recordCodec, err := codec.BindArtifact(salt)
 	if err != nil {
-		return prefix, plainHeader, err
+		return prefix, plainHeader, nil, err
+	}
+	if recordCodec.CiphertextSize(envelopeHeaderSize) != envelopeHeaderSealed {
+		return prefix, plainHeader, nil, fmt.Errorf("%w: codec header size", ErrMalformedEnvelope)
+	}
+	sealed, err := recordCodec.Encrypt(nil, plainHeader[:], headerAAD(prefix), 0)
+	if err != nil {
+		return prefix, plainHeader, nil, err
 	}
 	if len(sealed) != envelopeHeaderSealed {
-		return prefix, plainHeader, fmt.Errorf("%w: codec returned invalid header size", ErrMalformedEnvelope)
+		return prefix, plainHeader, nil, fmt.Errorf("%w: codec returned invalid header size", ErrMalformedEnvelope)
 	}
 	if err := writeFull(w, prefix[:]); err != nil {
-		return prefix, plainHeader, err
+		return prefix, plainHeader, nil, err
 	}
 	if err := writeFull(w, sealed); err != nil {
-		return prefix, plainHeader, err
+		return prefix, plainHeader, nil, err
 	}
-	return prefix, plainHeader, nil
+	return prefix, plainHeader, recordCodec, nil
 }
 
 func addUint64(a, b uint64) (uint64, bool) {
@@ -208,7 +224,7 @@ func writeFull(w io.Writer, data []byte) error {
 
 type recordWriter struct {
 	w           io.Writer
-	codec       Codec
+	codec       RecordCodec
 	prefix      [envelopePrefixSize]byte
 	header      [envelopeHeaderSize]byte
 	geometry    envelopeHeader
@@ -217,7 +233,7 @@ type recordWriter struct {
 	written     uint64
 }
 
-func newRecordWriter(w io.Writer, codec Codec, prefix [envelopePrefixSize]byte, header [envelopeHeaderSize]byte, geometry envelopeHeader) *recordWriter {
+func newRecordWriter(w io.Writer, codec RecordCodec, prefix [envelopePrefixSize]byte, header [envelopeHeaderSize]byte, geometry envelopeHeader) *recordWriter {
 	return &recordWriter{w: w, codec: codec, prefix: prefix, header: header, geometry: geometry, buffer: make([]byte, 0, recordSize)}
 }
 
@@ -270,7 +286,10 @@ func (w *recordWriter) flush() error {
 		return fmt.Errorf("%w: codec record size", ErrMalformedEnvelope)
 	}
 	aad := recordAAD(w.prefix, w.header, w.recordIndex, uint32(actual))
-	sealed, err := w.codec.Encrypt(nil, w.buffer, aad)
+	if w.recordIndex == ^uint64(0) {
+		return fmt.Errorf("%w: record sequence overflow", ErrMalformedEnvelope)
+	}
+	sealed, err := w.codec.Encrypt(nil, w.buffer, aad, w.recordIndex+1)
 	if err != nil {
 		return err
 	}

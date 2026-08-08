@@ -19,7 +19,7 @@ type cacheEntry struct {
 // bounded by bytes. Coalesced slab subslices are never retained.
 type recordReaderAt struct {
 	ra       io.ReaderAt
-	codec    Codec
+	codec    RecordCodec
 	prefix   [envelopePrefixSize]byte
 	header   [envelopeHeaderSize]byte
 	geometry envelopeHeader
@@ -46,18 +46,22 @@ func openRecordReaderAt(ra io.ReaderAt, artifactSize int64, codec Codec) (*recor
 	if err := validatePrefix(prefix); err != nil {
 		return nil, err
 	}
-	if codec.CiphertextSize(envelopeHeaderSize) != envelopeHeaderSealed {
+	recordCodec, err := codec.BindArtifact(prefixSalt(prefix))
+	if err != nil {
+		return nil, err
+	}
+	if recordCodec.CiphertextSize(envelopeHeaderSize) != envelopeHeaderSealed {
 		return nil, fmt.Errorf("%w: codec header size", ErrMalformedEnvelope)
 	}
 	sealed := make([]byte, envelopeHeaderSealed)
 	if err := readAtFull(ra, sealed, envelopePrefixSize); err != nil {
 		return nil, fmt.Errorf("%w: read encrypted header", ErrMalformedEnvelope)
 	}
-	plaintext, err := codec.DecryptInPlace(sealed, headerAAD(prefix))
+	plaintext, err := recordCodec.DecryptInPlace(sealed, headerAAD(prefix), 0)
 	if err != nil {
 		return nil, fmt.Errorf("%w: encrypted header", ErrAuthentication)
 	}
-	if len(plaintext) != envelopeHeaderSize || &plaintext[0] != &sealed[recordOverhead] {
+	if len(plaintext) != envelopeHeaderSize || &plaintext[0] != &sealed[1] {
 		return nil, fmt.Errorf("%w: codec violated in-place header contract", ErrMalformedEnvelope)
 	}
 	var plainHeader [envelopeHeaderSize]byte
@@ -66,7 +70,7 @@ func openRecordReaderAt(ra io.ReaderAt, artifactSize int64, codec Codec) (*recor
 	if err != nil {
 		return nil, err
 	}
-	if err := validateCodecGeometry(codec, geometry); err != nil {
+	if err := validateCodecGeometry(recordCodec, geometry); err != nil {
 		return nil, err
 	}
 	wantSize, err := geometry.physicalSize()
@@ -75,7 +79,7 @@ func openRecordReaderAt(ra io.ReaderAt, artifactSize int64, codec Codec) (*recor
 	}
 	return &recordReaderAt{
 		ra:       ra,
-		codec:    codec,
+		codec:    recordCodec,
 		prefix:   prefix,
 		header:   plainHeader,
 		geometry: geometry,
@@ -84,7 +88,7 @@ func openRecordReaderAt(ra io.ReaderAt, artifactSize int64, codec Codec) (*recor
 	}, nil
 }
 
-func validateCodecGeometry(codec Codec, geometry envelopeHeader) error {
+func validateCodecGeometry(codec RecordCodec, geometry envelopeHeader) error {
 	lengths := []int{envelopeHeaderSize, int(geometry.firstSize), recordSize, int(geometry.recordPlainSize(geometry.recordCount - 1))}
 	for _, length := range lengths {
 		if length < 0 || codec.CiphertextSize(length) != length+recordOverhead {
@@ -261,11 +265,14 @@ func (r *recordReaderAt) loadBatch(first, last uint64) error {
 		cipherSize := plainSize + recordOverhead
 		part := slab[position : position+cipherSize]
 		aad := recordAAD(r.prefix, r.header, index, uint32(plainSize))
-		plaintext, err := r.codec.DecryptInPlace(part, aad)
+		if index == ^uint64(0) {
+			return fmt.Errorf("%w: record sequence overflow", ErrMalformedEnvelope)
+		}
+		plaintext, err := r.codec.DecryptInPlace(part, aad, index+1)
 		if err != nil {
 			return fmt.Errorf("%w: encrypted data record", ErrAuthentication)
 		}
-		if len(plaintext) != plainSize || plainSize > 0 && &plaintext[0] != &part[recordOverhead] {
+		if len(plaintext) != plainSize || plainSize > 0 && &plaintext[0] != &part[1] {
 			return fmt.Errorf("%w: codec violated in-place record contract", ErrMalformedEnvelope)
 		}
 		owned = append(owned, cacheEntry{index: index, data: append([]byte(nil), plaintext...)})

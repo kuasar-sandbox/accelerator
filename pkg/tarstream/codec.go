@@ -2,20 +2,26 @@ package tarstream
 
 import "errors"
 
-// Codec is the customer-key-bound authenticated record primitive used by the
-// fixed encrypted tarstream v1 framing. Implementations must be safe for
-// concurrent use. Tarstream validates every reported and returned length.
+// Codec binds the customer-key-backed primitive to one encrypted tarstream v1
+// artifact and computes its stable logical identity. Implementations must be
+// safe for concurrent use.
 type Codec interface {
-	// CiphertextSize returns the exact encoded size for a plaintext record.
+	// BindArtifact derives and constructs the primitive for one artifact salt.
+	BindArtifact(salt [32]byte) (RecordCodec, error)
+	// KeyedDigest returns HMAC-SHA256(customerKey, plainDigest[:]).
+	KeyedDigest(plainDigest [32]byte) [32]byte
+}
+
+// RecordCodec is the artifact-bound authenticated record primitive used by
+// encrypted tarstream v1. Implementations must be safe for concurrent use.
+type RecordCodec interface {
 	CiphertextSize(plaintextSize int) int
 	// Encrypt appends an authenticated record to dst without retaining or
 	// modifying plaintext or associatedData.
-	Encrypt(dst, plaintext, associatedData []byte) ([]byte, error)
+	Encrypt(dst, plaintext, associatedData []byte, sequence uint64) ([]byte, error)
 	// DecryptInPlace authenticates before returning a plaintext slice backed by
 	// ciphertext. Authentication failure must not return plaintext.
-	DecryptInPlace(ciphertext, associatedData []byte) ([]byte, error)
-	// KeyedDigest returns HMAC-SHA256(customerKey, plainDigest[:]).
-	KeyedDigest(plainDigest [32]byte) [32]byte
+	DecryptInPlace(ciphertext, associatedData []byte, sequence uint64) ([]byte, error)
 }
 
 var (
