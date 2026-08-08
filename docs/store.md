@@ -480,7 +480,7 @@ store-ctl serve --config /etc/store-ctl.yaml
 
 按所选服务监控 bucket 容量、对象数量、请求配额与计费。chunk 路径下对象数
 约等于唯一 chunk 数;容量推算见
-`orchestrator/release-builder/docs/kuasar-sandbox.md` §7.3。
+`platform/docs/kuasar-sandbox.md` §7.3。
 
 ### 5.5 e2e 验证
 
@@ -548,4 +548,4 @@ store stat | get 1.2k/s 92%hit 180MiB/s p50 80µs/p99 900µs/max 4.1ms · put 34
   指向 store-ctl
 - 仓根 `README.md` / `Makefile` — 构建:store-ctl 是纯 Go 二进制,
   `make store-ctl`(或 `make build`)产出
-- `orchestrator/release-builder/docs/kuasar-sandbox.md` §7.3 — 存储模型与容量推算
+- `platform/docs/kuasar-sandbox.md` §7.3 — 存储模型与容量推算
