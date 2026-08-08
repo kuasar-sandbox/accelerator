@@ -111,7 +111,7 @@ validate_bundle() {
   done
   for file in docs/accelerator.md docs/cache.md docs/manifest.md docs/store.md \
     test/e2e/e2e_cache.sh test/e2e/e2e_cluster_rolling.sh \
-    test/e2e/e2e_store_cache_listen.sh; do
+    test/e2e/e2e_store_cache_listen.sh test/e2e/lib/port_lease.sh; do
     [ -f "$extract/$file" ] || fail "$archive is missing $file"
   done
 }
@@ -145,6 +145,7 @@ package_release() {
   copy_root_executable test/e2e/e2e_cache.sh test/e2e/e2e_cache.sh
   copy_root_executable test/e2e/e2e_cluster_rolling.sh test/e2e/e2e_cluster_rolling.sh
   copy_root_executable test/e2e/e2e_store_cache_listen.sh test/e2e/e2e_store_cache_listen.sh
+  copy_file test/e2e/lib/port_lease.sh test/e2e/lib/port_lease.sh
   copy_root_executable test/scripts/bench_cache.sh test/scripts/bench_cache.sh
   copy_root_executable test/scripts/bench_cache_remote.sh test/scripts/bench_cache_remote.sh
   copy_root_executable test/scripts/dedup_report.sh test/scripts/dedup_report.sh

@@ -26,7 +26,8 @@ SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   1111111111111111111111111111111111111111
 
 archive="$TMP/bundle/assets/accelerator-v1.2.3-linux-x86_64.tar.gz"
-for path in ./bin/manifest-ctl ./bin/store-ctl ./bin/cache-ctl ./docs/accelerator.md; do
+for path in ./bin/manifest-ctl ./bin/store-ctl ./bin/cache-ctl ./docs/accelerator.md \
+  ./test/e2e/lib/port_lease.sh; do
   tar -tzf "$archive" | grep -Fx "$path" >/dev/null || fail "archive is missing $path"
 done
 if tar -tzf "$archive" | grep -E '(^|/)release\.json$|(^|/)release/[^/]+\.json$' >/dev/null; then
