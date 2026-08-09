@@ -8,15 +8,14 @@ import (
 )
 
 const (
-	envelopeVersion       = 1
-	envelopePrefixSize    = 48
-	envelopeHeaderSize    = 64
-	envelopeHeaderSealed  = 81
-	recordSize            = 4096
-	recordOverhead        = 17
-	canonicalSuffixSize   = 3 * 512
-	maxCoalesceBytes      = 1 << 20
-	defaultRecordCacheMax = 8 << 20
+	envelopeVersion      = 1
+	envelopePrefixSize   = 48
+	envelopeHeaderSize   = 64
+	envelopeHeaderSealed = 81
+	recordSize           = 4096
+	recordOverhead       = 17
+	canonicalSuffixSize  = 3 * 512
+	maxCoalesceBytes     = 1 << 20
 )
 
 var (
@@ -158,16 +157,27 @@ func headerAAD(prefix [envelopePrefixSize]byte) []byte {
 	return aad
 }
 
-func recordAAD(prefix [envelopePrefixSize]byte, header [envelopeHeaderSize]byte, index uint64, actual uint32) []byte {
-	aad := make([]byte, 0, len(recordDomain)+len(prefix)+len(header)+8+4)
-	aad = append(aad, recordDomain...)
-	aad = append(aad, prefix[:]...)
-	aad = append(aad, header[:]...)
-	var integers [12]byte
-	binary.BigEndian.PutUint64(integers[0:8], index)
-	binary.BigEndian.PutUint32(integers[8:12], actual)
-	aad = append(aad, integers[:]...)
+func newRecordAAD(prefix [envelopePrefixSize]byte, header [envelopeHeaderSize]byte) []byte {
+	aad := make([]byte, recordAADSize())
+	initRecordAAD(aad, prefix, header)
 	return aad
+}
+
+func recordAADSize() int {
+	return len(recordDomain) + envelopePrefixSize + envelopeHeaderSize + 12
+}
+
+func initRecordAAD(aad []byte, prefix [envelopePrefixSize]byte, header [envelopeHeaderSize]byte) {
+	position := copy(aad, recordDomain)
+	position += copy(aad[position:], prefix[:])
+	position += copy(aad[position:], header[:])
+	clear(aad[position:])
+}
+
+func setRecordAAD(aad []byte, index uint64, actual uint32) {
+	geometry := aad[len(aad)-12:]
+	binary.BigEndian.PutUint64(geometry[0:8], index)
+	binary.BigEndian.PutUint32(geometry[8:12], actual)
 }
 
 func writeEncryptedHeader(w io.Writer, codec Codec, header envelopeHeader) ([envelopePrefixSize]byte, [envelopeHeaderSize]byte, RecordCodec, error) {
@@ -177,7 +187,7 @@ func writeEncryptedHeader(w io.Writer, codec Codec, header envelopeHeader) ([env
 	}
 	prefix := clearPrefix(salt)
 	plainHeader := header.marshal()
-	recordCodec, err := codec.BindArtifact(salt)
+	recordCodec, err := bindRecordCodec(codec, salt)
 	if err != nil {
 		return prefix, plainHeader, nil, err
 	}
@@ -225,16 +235,21 @@ func writeFull(w io.Writer, data []byte) error {
 type recordWriter struct {
 	w           io.Writer
 	codec       RecordCodec
-	prefix      [envelopePrefixSize]byte
-	header      [envelopeHeaderSize]byte
 	geometry    envelopeHeader
 	buffer      []byte
+	sealed      []byte
+	aad         []byte
 	recordIndex uint64
 	written     uint64
 }
 
 func newRecordWriter(w io.Writer, codec RecordCodec, prefix [envelopePrefixSize]byte, header [envelopeHeaderSize]byte, geometry envelopeHeader) *recordWriter {
-	return &recordWriter{w: w, codec: codec, prefix: prefix, header: header, geometry: geometry, buffer: make([]byte, 0, recordSize)}
+	return &recordWriter{
+		w: w, codec: codec, geometry: geometry,
+		buffer: make([]byte, 0, recordSize),
+		sealed: make([]byte, 0, recordSize+recordOverhead),
+		aad:    newRecordAAD(prefix, header),
+	}
 }
 
 func (w *recordWriter) Write(data []byte) (int, error) {
@@ -285,11 +300,11 @@ func (w *recordWriter) flush() error {
 	if wantSize != actual+recordOverhead {
 		return fmt.Errorf("%w: codec record size", ErrMalformedEnvelope)
 	}
-	aad := recordAAD(w.prefix, w.header, w.recordIndex, uint32(actual))
 	if w.recordIndex == ^uint64(0) {
 		return fmt.Errorf("%w: record sequence overflow", ErrMalformedEnvelope)
 	}
-	sealed, err := w.codec.Encrypt(nil, w.buffer, aad, w.recordIndex+1)
+	setRecordAAD(w.aad, w.recordIndex, uint32(actual))
+	sealed, err := w.codec.Encrypt(w.sealed[:0], w.buffer, w.aad, w.recordIndex+1)
 	if err != nil {
 		return err
 	}
@@ -299,6 +314,7 @@ func (w *recordWriter) flush() error {
 	if err := writeFull(w.w, sealed); err != nil {
 		return err
 	}
+	w.sealed = sealed[:0]
 	w.recordIndex++
 	w.buffer = w.buffer[:0]
 	return nil

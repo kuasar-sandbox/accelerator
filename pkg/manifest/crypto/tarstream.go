@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"sync"
 	"unsafe"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
@@ -30,7 +31,8 @@ type TarStreamCodec struct {
 // recordCodec is bound to one artifact salt. Its AES-256-GCM instance is
 // constructed once and is safe for concurrent use.
 type recordCodec struct {
-	aead cipher.AEAD
+	aead   cipher.AEAD
+	nonces sync.Pool
 }
 
 // NewTarStreamCodec retains customerKey for artifact binding and logical
@@ -55,7 +57,9 @@ func (c *TarStreamCodec) BindArtifact(salt [32]byte) (tarstream.RecordCodec, err
 	if err != nil {
 		return nil, fmt.Errorf("crypto: tarstream artifact GCM: %w", err)
 	}
-	return &recordCodec{aead: aead}, nil
+	records := &recordCodec{aead: aead}
+	records.nonces.New = func() any { return new([12]byte) }
+	return records, nil
 }
 
 func keyedHMAC(key [32]byte, data []byte) [32]byte {
@@ -95,8 +99,9 @@ func (c *recordCodec) Encrypt(dst, plaintext, associatedData []byte, sequence ui
 	}
 	record := dst[start:]
 	record[0] = FlagAESGCM
-	nonce := recordNonce(sequence)
+	nonce := c.recordNonce(sequence)
 	sealed := c.aead.Seal(record[1:1], nonce[:], plaintext, associatedData)
+	c.nonces.Put(nonce)
 	if len(sealed) != len(record)-1 {
 		panic("crypto: tarstream GCM returned unexpected ciphertext size")
 	}
@@ -122,9 +127,10 @@ func (c *recordCodec) DecryptInPlace(record, associatedData []byte, sequence uin
 	if len(record) < aesGCMOverhead || record[0] != FlagAESGCM {
 		return nil, fmt.Errorf("%w: invalid AES-GCM record", tarstream.ErrAuthentication)
 	}
-	nonce := recordNonce(sequence)
+	nonce := c.recordNonce(sequence)
 	plaintextSize := len(record) - aesGCMOverhead
 	plaintext, err := c.aead.Open(record[1:1], nonce[:], record[1:], associatedData)
+	c.nonces.Put(nonce)
 	if err != nil {
 		clear(record[1 : 1+plaintextSize])
 		return nil, tarstream.ErrAuthentication
@@ -132,8 +138,8 @@ func (c *recordCodec) DecryptInPlace(record, associatedData []byte, sequence uin
 	return plaintext, nil
 }
 
-func recordNonce(sequence uint64) [12]byte {
-	var nonce [12]byte
+func (c *recordCodec) recordNonce(sequence uint64) *[12]byte {
+	nonce := c.nonces.Get().(*[12]byte)
 	binary.BigEndian.PutUint64(nonce[4:], sequence)
 	return nonce
 }

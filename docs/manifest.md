@@ -567,7 +567,7 @@ artifact 仅执行一次以下派生并构造一个 AES-256-GCM 实例:
 ```text
 artifactKey = HMAC-SHA256(
   customerKey,
-  "kuasar/tarstream/aes-gcm/artifact-key/v1\\x00" || artifactSalt
+  "kuasar/tarstream/aes-gcm/artifact-key/v1\x00" || artifactSalt
 )
 ```
 

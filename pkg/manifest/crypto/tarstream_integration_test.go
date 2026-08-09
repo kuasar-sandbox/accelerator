@@ -334,6 +334,26 @@ func TestEncryptedTarStreamTamperAndBounds(t *testing.T) {
 	if _, err := source.ReadAt(context.Background(), buffer, 0); !errors.Is(err, tarstream.ErrAuthentication) {
 		t.Fatalf("data tamper read error = %v", err)
 	}
+
+	// A coalesced random read exposes only records that authenticated. A later
+	// record failure preserves the authenticated prefix and leaves the failing
+	// record's destination untouched.
+	const fullRecord = 4096 + 17
+	later := append([]byte(nil), artifact...)
+	later[firstDataRecord+fullRecord+1] ^= 0x01
+	source, err = open(later, codec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch := bytes.Repeat([]byte{0xa5}, 8192)
+	// sparse.Source has an exact-fill contract and reports zero for the failed
+	// logical read even though its ReaderAt filled the authenticated prefix.
+	if n, err := source.ReadAt(context.Background(), batch, 0); n != 0 || !errors.Is(err, tarstream.ErrAuthentication) {
+		t.Fatalf("later record tamper read = %d, %v", n, err)
+	}
+	if !bytes.Equal(batch[:4096], body[:4096]) || !bytes.Equal(batch[4096:], bytes.Repeat([]byte{0xa5}, 4096)) {
+		t.Fatal("coalesced authentication failure exposed unauthenticated plaintext")
+	}
 	for _, tc := range []struct {
 		name   string
 		offset int
@@ -449,6 +469,12 @@ func TestEncryptedTarStreamBoundedPhysicalIO(t *testing.T) {
 	}
 	if calls, read := reader.calls.Load(), reader.bytes.Load(); calls != 1 || read != 4096+17 {
 		t.Fatalf("aligned 4 KiB miss used %d calls/%d bytes, want 1/%d", calls, read, 4096+17)
+	}
+	if _, err := source.ReadAt(context.Background(), block, 4096); err != nil {
+		t.Fatal(err)
+	}
+	if calls, read := reader.calls.Load(), reader.bytes.Load(); calls != 2 || read != 2*(4096+17) {
+		t.Fatalf("repeated 4 KiB read used %d calls/%d bytes, want 2/%d", calls, read, 2*(4096+17))
 	}
 
 	reader = &countedReaderAt{reader: bytes.NewReader(artifact)}

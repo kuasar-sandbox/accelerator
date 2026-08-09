@@ -195,7 +195,7 @@ func openSequentialPlaintext(r io.Reader, options readOptions) (io.Reader, *enve
 	if err := validatePrefix(prefix); err != nil {
 		return nil, nil, err
 	}
-	recordCodec, err := options.codec.BindArtifact(prefixSalt(prefix))
+	recordCodec, err := bindRecordCodec(options.codec, prefixSalt(prefix))
 	if err != nil {
 		return nil, nil, err
 	}

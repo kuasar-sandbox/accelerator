@@ -29,6 +29,13 @@ type shortCodec struct{ optionTestCodec }
 func (c *shortCodec) BindArtifact([32]byte) (RecordCodec, error) { return c, nil }
 func (*shortCodec) CiphertextSize(size int) int                  { return size + recordOverhead - 1 }
 
+type nilBindingCodec struct{ optionTestCodec }
+
+func (*nilBindingCodec) BindArtifact([32]byte) (RecordCodec, error) {
+	var recordCodec *optionTestCodec
+	return recordCodec, nil
+}
+
 type nonInPlaceCodec struct{ optionTestCodec }
 
 func (c *nonInPlaceCodec) BindArtifact([32]byte) (RecordCodec, error) { return c, nil }
@@ -62,8 +69,25 @@ func TestCodecOptionValidation(t *testing.T) {
 func TestTarstreamRejectsCodecContractViolations(t *testing.T) {
 	source := sparse.Dense(bytes.NewReader(nil), 0)
 	var output bytes.Buffer
+	if _, _, err := WriteTo(context.Background(), &output, "empty", source, WithCodec(&nilBindingCodec{}, false)); !errors.Is(err, ErrMalformedEnvelope) {
+		t.Fatalf("nil bound codec write error = %v", err)
+	}
+
 	if _, _, err := WriteTo(context.Background(), &output, "empty", source, WithCodec(&shortCodec{}, false)); !errors.Is(err, ErrMalformedEnvelope) {
 		t.Fatalf("invalid CiphertextSize error = %v", err)
+	}
+
+	output.Reset()
+	validCodec := &optionTestCodec{}
+	if _, _, err := WriteTo(context.Background(), &output, "empty", source, WithCodec(validCodec, false)); err != nil {
+		t.Fatal(err)
+	}
+	artifact := append([]byte(nil), output.Bytes()...)
+	if _, _, err := SourceAt(bytes.NewReader(artifact), int64(len(artifact)), "", WithCodec(&nilBindingCodec{}, true)); !errors.Is(err, ErrMalformedEnvelope) {
+		t.Fatalf("nil bound codec random read error = %v", err)
+	}
+	if _, _, err := SourceFrom(bytes.NewBuffer(artifact), "", WithCodec(&nilBindingCodec{}, true)); !errors.Is(err, ErrMalformedEnvelope) {
+		t.Fatalf("nil bound codec sequential read error = %v", err)
 	}
 
 	output.Reset()

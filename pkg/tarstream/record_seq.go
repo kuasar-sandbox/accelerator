@@ -10,9 +10,9 @@ import (
 type recordSeqReader struct {
 	r        io.Reader
 	codec    RecordCodec
-	prefix   [envelopePrefixSize]byte
-	header   [envelopeHeaderSize]byte
 	geometry envelopeHeader
+	sealed   []byte
+	aad      []byte
 	index    uint64
 	current  []byte
 	position int
@@ -21,7 +21,11 @@ type recordSeqReader struct {
 }
 
 func newRecordSeqReader(r io.Reader, codec RecordCodec, prefix [envelopePrefixSize]byte, plainHeader [envelopeHeaderSize]byte, geometry envelopeHeader) *recordSeqReader {
-	return &recordSeqReader{r: r, codec: codec, prefix: prefix, header: plainHeader, geometry: geometry}
+	return &recordSeqReader{
+		r: r, codec: codec, geometry: geometry,
+		sealed: make([]byte, recordSize+recordOverhead),
+		aad:    newRecordAAD(prefix, plainHeader),
+	}
 }
 
 func (r *recordSeqReader) Read(dst []byte) (int, error) {
@@ -62,15 +66,15 @@ func (r *recordSeqReader) Read(dst []byte) (int, error) {
 
 func (r *recordSeqReader) loadRecord() error {
 	plainSize := int(r.geometry.recordPlainSize(r.index))
-	sealed := make([]byte, plainSize+recordOverhead)
+	sealed := r.sealed[:plainSize+recordOverhead]
 	if _, err := io.ReadFull(r.r, sealed); err != nil {
 		return fmt.Errorf("%w: truncated encrypted record", ErrMalformedEnvelope)
 	}
-	aad := recordAAD(r.prefix, r.header, r.index, uint32(plainSize))
 	if r.index == ^uint64(0) {
 		return fmt.Errorf("%w: record sequence overflow", ErrMalformedEnvelope)
 	}
-	plaintext, err := r.codec.DecryptInPlace(sealed, aad, r.index+1)
+	setRecordAAD(r.aad, r.index, uint32(plainSize))
+	plaintext, err := r.codec.DecryptInPlace(sealed, r.aad, r.index+1)
 	if err != nil {
 		return fmt.Errorf("%w: encrypted data record", ErrAuthentication)
 	}
