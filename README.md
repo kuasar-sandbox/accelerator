@@ -43,10 +43,13 @@ make build                      # 全部三个
 make build TARGET_ARCH=aarch64  # 交叉编译(别名 amd64 / arm64)
 make vet                        # 校验薄客户端面(无需 librocksdb)
 make test                       # 单元测试(含 rocks,需 librocksdb);e2e 见各 docs;zot 拉取 e2e 为 make e2e
+make test-e2e                  # 运行 test/e2e/run_all.sh;需要 platform 组装的完整 BIN
 ```
 
 独立版本通过仓库的 `Release` workflow 发布为 `vX.Y.Z`;发布件
-`accelerator-vX.Y.Z-linux-x86_64.tar.gz` 包含三个服务二进制、文档和测试脚本。
+`accelerator-vX.Y.Z-linux-x86_64.tar.gz` 包含三个服务二进制及性能/分析辅助脚本。
+本仓文档与 `test/e2e/` 不进入组件包,由 platform 聚合所选 tag 的源码并只放入
+`platform-release-vX.Y.Z.tar.gz`。
 本地可用 `make release VERSION=vX.Y.Z` 生成并校验相同布局的 release bundle。
 当前 Release 只发布已完成全量构建与 BMS 验证的 Linux x86_64 目标。正式版之前,
 `platform` 仓的每日协调器按上海日期触发
