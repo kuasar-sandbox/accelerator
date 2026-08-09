@@ -3,10 +3,28 @@ package tarstream
 import (
 	"fmt"
 	"io"
+	"math/bits"
+	"sync"
 	"sync/atomic"
 )
 
 const encryptedDataOffset = envelopePrefixSize + envelopeHeaderSealed
+
+const (
+	recordReadBufferMinShift      = 12
+	recordReadBufferMaxPowerShift = 20
+	recordReadBufferLargePool     = recordReadBufferMaxPowerShift - recordReadBufferMinShift + 1
+	recordReadBufferPoolCount     = recordReadBufferLargePool + 1
+)
+
+// The pools retain only scratch capacity. releaseRecordReadBuffer clears every
+// byte used for ciphertext, plaintext, or AAD before making a buffer reusable.
+var recordReadBufferPools [recordReadBufferPoolCount]sync.Pool
+
+type recordReadBuffer struct {
+	data      []byte
+	poolIndex int
+}
 
 // recordReaderAt exposes the authenticated envelope as a plaintext io.ReaderAt.
 // Record addressing is O(1). Reads coalesce physical I/O, authenticate every
@@ -216,7 +234,9 @@ func (r *recordReaderAt) readBatch(dst []byte, plainOffset, last uint64) (int, e
 	if err != nil {
 		return 0, err
 	}
-	buffer := make([]byte, total+recordAADSize())
+	work := acquireRecordReadBuffer(total + recordAADSize())
+	defer releaseRecordReadBuffer(work)
+	buffer := work.data
 	slab := buffer[:total:total]
 	if err := readAtFull(r.ra, slab, physical); err != nil {
 		return 0, fmt.Errorf("%w: truncated encrypted record", ErrMalformedEnvelope)
@@ -253,6 +273,53 @@ func (r *recordReaderAt) readBatch(dst []byte, plainOffset, last uint64) (int, e
 		position += cipherSize
 	}
 	return written, nil
+}
+
+func acquireRecordReadBuffer(size int) *recordReadBuffer {
+	index := recordReadBufferPoolIndex(size)
+	if index < 0 {
+		return &recordReadBuffer{data: make([]byte, size), poolIndex: -1}
+	}
+	if value := recordReadBufferPools[index].Get(); value != nil {
+		buffer := value.(*recordReadBuffer)
+		buffer.data = buffer.data[:size]
+		return buffer
+	}
+	capacity := recordReadBufferCapacity(index)
+	return &recordReadBuffer{
+		data:      make([]byte, size, capacity),
+		poolIndex: index,
+	}
+}
+
+func releaseRecordReadBuffer(buffer *recordReadBuffer) {
+	clear(buffer.data)
+	if buffer.poolIndex < 0 {
+		return
+	}
+	buffer.data = buffer.data[:cap(buffer.data)]
+	recordReadBufferPools[buffer.poolIndex].Put(buffer)
+}
+
+func recordReadBufferPoolIndex(size int) int {
+	if size <= 0 || size > maxCoalesceBytes+recordAADSize() {
+		return -1
+	}
+	shift := bits.Len(uint(size - 1))
+	if shift < recordReadBufferMinShift {
+		shift = recordReadBufferMinShift
+	}
+	if shift > recordReadBufferMaxPowerShift {
+		return recordReadBufferLargePool
+	}
+	return shift - recordReadBufferMinShift
+}
+
+func recordReadBufferCapacity(index int) int {
+	if index == recordReadBufferLargePool {
+		return maxCoalesceBytes + recordAADSize()
+	}
+	return 1 << (recordReadBufferMinShift + index)
 }
 
 func (r *recordReaderAt) Close() error {
