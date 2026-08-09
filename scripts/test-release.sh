@@ -11,6 +11,9 @@ fail() {
   exit 1
 }
 
+[ "$(git -C "$ROOT" ls-files -s -- test/e2e/run_all.sh | awk '{print $1}')" = 100755 ] \
+  || fail "test/e2e/run_all.sh is not executable in the Git index"
+
 mkdir -p "$TMP/bin" "$TMP/src"
 printf 'package main\nfunc main() {}\n' > "$TMP/src/main.go"
 GO111MODULE=off go build -o "$TMP/go-fixture" "$TMP/src/main.go"
@@ -26,10 +29,13 @@ SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   1111111111111111111111111111111111111111
 
 archive="$TMP/bundle/assets/accelerator-v1.2.3-linux-x86_64.tar.gz"
-for path in ./bin/manifest-ctl ./bin/store-ctl ./bin/cache-ctl ./docs/accelerator.md \
-  ./test/e2e/lib/port_lease.sh; do
+for path in ./bin/manifest-ctl ./bin/store-ctl ./bin/cache-ctl \
+  ./test/scripts/bench_cache.sh; do
   tar -tzf "$archive" | grep -Fx "$path" >/dev/null || fail "archive is missing $path"
 done
+if tar -tzf "$archive" | grep -E '^\./(docs|test/e2e)(/|$)' >/dev/null; then
+  fail "component archive contains documentation or E2E sources"
+fi
 if tar -tzf "$archive" | grep -E '(^|/)release\.json$|(^|/)release/[^/]+\.json$' >/dev/null; then
   fail "archive contains release metadata JSON"
 fi

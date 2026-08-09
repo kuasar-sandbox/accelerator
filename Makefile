@@ -10,7 +10,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all build manifest-ctl store-ctl cache-ctl deps-rocksdb test vet bench test-e2e test-e2e-port-lease test-e2e-cache test-e2e-store-cache test-e2e-cluster perf-cache perf-cache-remote dedup-report release test-release clean help
+.PHONY: all build manifest-ctl store-ctl cache-ctl deps-rocksdb test vet bench test-e2e perf-cache perf-cache-remote dedup-report release test-release clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -104,38 +104,27 @@ clean:
 # ---------------------------------------------------------------------------
 # Tests + benchmarks + perf
 # ---------------------------------------------------------------------------
-# e2e/perf scripts find platform binaries in $(SBIN) (the umbrella's assembled
-# bin/<arch>/). Run `make -C ../kuasar-sandbox build` first, or invoke from the
-# umbrella's `make test-e2e` which builds + drives every repo's tests.
-SBIN := $(abspath ../kuasar-sandbox/bin/$(TARGET_ARCH))
+# E2E needs the assembled platform binary set because accelerator-owned cases
+# also exercise flatten-ctl. The platform BMS sets BIN explicitly; this default
+# is convenient for the normal sibling-repository checkout.
+E2E_BIN ?= $(abspath ../platform/bin/$(TARGET_ARCH))
 
 bench: deps-rocksdb
 	CGO_CFLAGS="$(CGO_CFLAGS)" \
 	CGO_LDFLAGS="-L$(ROCKS_PREFIX)/lib -lrocksdb -lstdc++ -lm -lpthread -ldl" \
 		$(GO) test -bench=. -benchmem -run=^$$ ./...
 
-test-e2e: test-e2e-port-lease test-e2e-cache test-e2e-store-cache test-e2e-cluster
-
-test-e2e-port-lease:
-	bash test/e2e/port_lease_test.sh
-
-test-e2e-cache:
-	BIN=$(SBIN) bash test/e2e/e2e_cache.sh
-
-test-e2e-store-cache:
-	BIN=$(SBIN) bash test/e2e/e2e_store_cache_listen.sh
-
-test-e2e-cluster:
-	BIN=$(SBIN) bash test/e2e/e2e_cluster_rolling.sh
+test-e2e:
+	BIN="$(E2E_BIN)" bash test/e2e/run_all.sh
 
 perf-cache:
-	BIN=$(SBIN) bash test/scripts/bench_cache.sh
+	BIN=$(E2E_BIN) bash test/scripts/bench_cache.sh
 
 perf-cache-remote:
-	BIN=$(SBIN) bash test/scripts/bench_cache_remote.sh
+	BIN=$(E2E_BIN) bash test/scripts/bench_cache_remote.sh
 
 dedup-report:
-	BIN=$(SBIN) bash test/scripts/dedup_report.sh
+	BIN=$(E2E_BIN) bash test/scripts/dedup_report.sh
 
 VERSION ?= v0.1.0
 
@@ -156,6 +145,7 @@ help:
 	@echo "  deps-rocksdb  build local librocksdb.a"
 	@echo "  test          unit tests (needs librocksdb for cache/rocks)"
 	@echo "  vet           vet the CGO-free client surface"
+	@echo "  test-e2e      run the accelerator-owned E2E suite with E2E_BIN"
 	@echo "  release       build a validated component release bundle"
 	@echo "  test-release  test component release packaging"
 	@echo "  clean         remove bin/ + build/"

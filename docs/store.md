@@ -485,7 +485,7 @@ store-ctl serve --config /etc/store-ctl.yaml
 ### 5.5 e2e 验证
 
 ```bash
-make test-e2e        # = test-e2e-cache + test-e2e-cluster(fs 后端全链路)
+make test-e2e        # 执行 test/e2e/run_all.sh 的 accelerator 完整套件
 ```
 
 `test/e2e/e2e_cache.sh` 以 fs 后端 store-ctl 为 sidecar,覆盖 manifest-ctl ↔

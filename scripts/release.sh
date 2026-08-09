@@ -70,8 +70,8 @@ validate_archive_paths() {
   fi
   awk '
     { path=$0; sub(/^\.\//, "", path) }
-    path != "" && path !~ /\/$/ && path !~ /^(bin|docs|test)\// { exit 1 }
-  ' "$listing" || fail "$archive contains a file outside bin/, docs/, or test/"
+    path != "" && path !~ /\/$/ && path !~ /^bin\// && path !~ /^test\/scripts\// { exit 1 }
+  ' "$listing" || fail "$archive contains a file outside bin/ or test/scripts/"
 }
 
 validate_bundle() {
@@ -109,9 +109,9 @@ validate_bundle() {
     [ -x "$extract/bin/$file" ] || fail "$archive is missing executable bin/$file"
     check_go_binary "$extract/bin/$file"
   done
-  for file in docs/accelerator.md docs/cache.md docs/manifest.md docs/store.md \
-    test/e2e/e2e_cache.sh test/e2e/e2e_cluster_rolling.sh \
-    test/e2e/e2e_store_cache_listen.sh test/e2e/lib/port_lease.sh; do
+  for file in test/scripts/bench_cache.sh test/scripts/bench_cache_remote.sh \
+    test/scripts/dedup_report.sh test/scripts/procmon.sh \
+    test/scripts/proc_analyze.py; do
     [ -f "$extract/$file" ] || fail "$archive is missing $file"
   done
 }
@@ -138,14 +138,6 @@ package_release() {
   check_go_binary "$STAGE/bin/manifest-ctl"
   check_go_binary "$STAGE/bin/store-ctl"
   check_go_binary "$STAGE/bin/cache-ctl"
-  copy_file README.md docs/accelerator.md
-  copy_file docs/cache.md docs/cache.md
-  copy_file docs/manifest.md docs/manifest.md
-  copy_file docs/store.md docs/store.md
-  copy_root_executable test/e2e/e2e_cache.sh test/e2e/e2e_cache.sh
-  copy_root_executable test/e2e/e2e_cluster_rolling.sh test/e2e/e2e_cluster_rolling.sh
-  copy_root_executable test/e2e/e2e_store_cache_listen.sh test/e2e/e2e_store_cache_listen.sh
-  copy_file test/e2e/lib/port_lease.sh test/e2e/lib/port_lease.sh
   copy_root_executable test/scripts/bench_cache.sh test/scripts/bench_cache.sh
   copy_root_executable test/scripts/bench_cache_remote.sh test/scripts/bench_cache_remote.sh
   copy_root_executable test/scripts/dedup_report.sh test/scripts/dedup_report.sh
@@ -159,7 +151,7 @@ package_release() {
   cat > "$output/release-notes.md" <<EOF
 $NAME $version for Linux $arch.
 
-Extract the archive into a Kuasar Sandbox deployment root and verify it with \`SHA256SUMS\`. GitHub provides the source archives for this tag automatically.
+Extract the archive into a Kuasar Sandbox deployment root and verify it with \`SHA256SUMS\`. Documentation and E2E suites from this exact tag are collected by the aggregate platform release.
 EOF
   validate_bundle "$version" "$arch" "$output"
   echo "==> prepared $output for $version"
