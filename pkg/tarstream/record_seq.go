@@ -9,10 +9,10 @@ import (
 // complete canonical plaintext stream with O(recordSize) live memory.
 type recordSeqReader struct {
 	r        io.Reader
-	codec    Codec
-	prefix   [envelopePrefixSize]byte
-	header   [envelopeHeaderSize]byte
+	codec    RecordCodec
 	geometry envelopeHeader
+	sealed   []byte
+	aad      []byte
 	index    uint64
 	current  []byte
 	position int
@@ -20,8 +20,12 @@ type recordSeqReader struct {
 	finalErr error
 }
 
-func newRecordSeqReader(r io.Reader, codec Codec, prefix [envelopePrefixSize]byte, plainHeader [envelopeHeaderSize]byte, geometry envelopeHeader) *recordSeqReader {
-	return &recordSeqReader{r: r, codec: codec, prefix: prefix, header: plainHeader, geometry: geometry}
+func newRecordSeqReader(r io.Reader, codec RecordCodec, prefix [envelopePrefixSize]byte, plainHeader [envelopeHeaderSize]byte, geometry envelopeHeader) *recordSeqReader {
+	return &recordSeqReader{
+		r: r, codec: codec, geometry: geometry,
+		sealed: make([]byte, recordSize+recordOverhead),
+		aad:    newRecordAAD(prefix, plainHeader),
+	}
 }
 
 func (r *recordSeqReader) Read(dst []byte) (int, error) {
@@ -62,16 +66,19 @@ func (r *recordSeqReader) Read(dst []byte) (int, error) {
 
 func (r *recordSeqReader) loadRecord() error {
 	plainSize := int(r.geometry.recordPlainSize(r.index))
-	sealed := make([]byte, plainSize+recordOverhead)
+	sealed := r.sealed[:plainSize+recordOverhead]
 	if _, err := io.ReadFull(r.r, sealed); err != nil {
 		return fmt.Errorf("%w: truncated encrypted record", ErrMalformedEnvelope)
 	}
-	aad := recordAAD(r.prefix, r.header, r.index, uint32(plainSize))
-	plaintext, err := r.codec.DecryptInPlace(sealed, aad)
+	if r.index == ^uint64(0) {
+		return fmt.Errorf("%w: record sequence overflow", ErrMalformedEnvelope)
+	}
+	setRecordAAD(r.aad, r.index, uint32(plainSize))
+	plaintext, err := r.codec.DecryptInPlace(sealed, r.aad, r.index+1)
 	if err != nil {
 		return fmt.Errorf("%w: encrypted data record", ErrAuthentication)
 	}
-	if len(plaintext) != plainSize || plainSize > 0 && &plaintext[0] != &sealed[recordOverhead] {
+	if len(plaintext) != plainSize || plainSize > 0 && &plaintext[0] != &sealed[1] {
 		return fmt.Errorf("%w: codec violated in-place record contract", ErrMalformedEnvelope)
 	}
 	r.current = plaintext

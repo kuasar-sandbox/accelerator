@@ -1,35 +1,25 @@
 package tarstream
 
 import (
-	"container/list"
 	"fmt"
 	"io"
-	"sync"
+	"sync/atomic"
 )
 
 const encryptedDataOffset = envelopePrefixSize + envelopeHeaderSealed
 
-type cacheEntry struct {
-	index uint64
-	data  []byte
-}
-
 // recordReaderAt exposes the authenticated envelope as a plaintext io.ReaderAt.
-// Record addressing is O(1); the LRU owns independent record copies and is
-// bounded by bytes. Coalesced slab subslices are never retained.
+// Record addressing is O(1). Reads coalesce physical I/O, authenticate every
+// selected record, copy its requested plaintext directly to the caller, and do
+// not retain plaintext. Cache ownership belongs to consumers and lower layers.
 type recordReaderAt struct {
 	ra       io.ReaderAt
-	codec    Codec
+	codec    RecordCodec
 	prefix   [envelopePrefixSize]byte
 	header   [envelopeHeaderSize]byte
 	geometry envelopeHeader
 
-	mu         sync.Mutex
-	closed     bool
-	cacheBytes int
-	cacheMax   int
-	cache      map[uint64]*list.Element
-	lru        list.List
+	closed atomic.Bool
 }
 
 func openRecordReaderAt(ra io.ReaderAt, artifactSize int64, codec Codec) (*recordReaderAt, error) {
@@ -46,18 +36,22 @@ func openRecordReaderAt(ra io.ReaderAt, artifactSize int64, codec Codec) (*recor
 	if err := validatePrefix(prefix); err != nil {
 		return nil, err
 	}
-	if codec.CiphertextSize(envelopeHeaderSize) != envelopeHeaderSealed {
+	recordCodec, err := bindRecordCodec(codec, prefixSalt(prefix))
+	if err != nil {
+		return nil, err
+	}
+	if recordCodec.CiphertextSize(envelopeHeaderSize) != envelopeHeaderSealed {
 		return nil, fmt.Errorf("%w: codec header size", ErrMalformedEnvelope)
 	}
 	sealed := make([]byte, envelopeHeaderSealed)
 	if err := readAtFull(ra, sealed, envelopePrefixSize); err != nil {
 		return nil, fmt.Errorf("%w: read encrypted header", ErrMalformedEnvelope)
 	}
-	plaintext, err := codec.DecryptInPlace(sealed, headerAAD(prefix))
+	plaintext, err := recordCodec.DecryptInPlace(sealed, headerAAD(prefix), 0)
 	if err != nil {
 		return nil, fmt.Errorf("%w: encrypted header", ErrAuthentication)
 	}
-	if len(plaintext) != envelopeHeaderSize || &plaintext[0] != &sealed[recordOverhead] {
+	if len(plaintext) != envelopeHeaderSize || &plaintext[0] != &sealed[1] {
 		return nil, fmt.Errorf("%w: codec violated in-place header contract", ErrMalformedEnvelope)
 	}
 	var plainHeader [envelopeHeaderSize]byte
@@ -66,7 +60,7 @@ func openRecordReaderAt(ra io.ReaderAt, artifactSize int64, codec Codec) (*recor
 	if err != nil {
 		return nil, err
 	}
-	if err := validateCodecGeometry(codec, geometry); err != nil {
+	if err := validateCodecGeometry(recordCodec, geometry); err != nil {
 		return nil, err
 	}
 	wantSize, err := geometry.physicalSize()
@@ -75,16 +69,14 @@ func openRecordReaderAt(ra io.ReaderAt, artifactSize int64, codec Codec) (*recor
 	}
 	return &recordReaderAt{
 		ra:       ra,
-		codec:    codec,
+		codec:    recordCodec,
 		prefix:   prefix,
 		header:   plainHeader,
 		geometry: geometry,
-		cacheMax: defaultRecordCacheMax,
-		cache:    make(map[uint64]*list.Element),
 	}, nil
 }
 
-func validateCodecGeometry(codec Codec, geometry envelopeHeader) error {
+func validateCodecGeometry(codec RecordCodec, geometry envelopeHeader) error {
 	lengths := []int{envelopeHeaderSize, int(geometry.firstSize), recordSize, int(geometry.recordPlainSize(geometry.recordCount - 1))}
 	for _, length := range lengths {
 		if length < 0 || codec.CiphertextSize(length) != length+recordOverhead {
@@ -180,61 +172,36 @@ func (r *recordReaderAt) ReadAt(dst []byte, offset int64) (int, error) {
 	}
 	written := 0
 	for written < want {
-		index := r.geometry.recordForOffset(plainOffset)
-		record, ok, err := r.cached(index)
+		lastOffset := plainOffset + uint64(want-written) - 1
+		last := r.geometry.recordForOffset(lastOffset)
+		n, err := r.readBatch(dst[written:want], plainOffset, last)
 		if err != nil {
 			return written, err
 		}
-		if !ok {
-			lastOffset := plainOffset + uint64(want-written) - 1
-			last := r.geometry.recordForOffset(lastOffset)
-			if err := r.loadBatch(index, last); err != nil {
-				return written, err
-			}
-			record, ok, err = r.cached(index)
-			if err != nil {
-				return written, err
-			}
-			if !ok {
-				return written, fmt.Errorf("%w: authenticated record missing from cache", ErrMalformedEnvelope)
-			}
+		if n == 0 {
+			return written, io.ErrNoProgress
 		}
-		recordStart := r.geometry.recordPlainStart(index)
-		within := int(plainOffset - recordStart)
-		n := min(want-written, len(record)-within)
-		copy(dst[written:written+n], record[within:within+n])
 		written += n
 		plainOffset += uint64(n)
 	}
 	return written, eof
 }
 
-func (r *recordReaderAt) cached(index uint64) ([]byte, bool, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closed {
-		return nil, false, fmt.Errorf("tarstream: encrypted reader is closed")
+func (r *recordReaderAt) checkOpen() error {
+	if r.closed.Load() {
+		return fmt.Errorf("tarstream: encrypted reader is closed")
 	}
-	element, ok := r.cache[index]
-	if !ok {
-		return nil, false, nil
-	}
-	r.lru.MoveToFront(element)
-	return element.Value.(*cacheEntry).data, true, nil
+	return nil
 }
 
-func (r *recordReaderAt) loadBatch(first, last uint64) error {
+func (r *recordReaderAt) readBatch(dst []byte, plainOffset, last uint64) (int, error) {
+	if err := r.checkOpen(); err != nil {
+		return 0, err
+	}
+	first := r.geometry.recordForOffset(plainOffset)
 	end := first
 	total := 0
 	for end <= last {
-		if end > first {
-			if _, ok, err := r.cached(end); err != nil || ok {
-				if err != nil {
-					return err
-				}
-				break
-			}
-		}
 		cipherSize := int(r.geometry.recordPlainSize(end)) + recordOverhead
 		if total > 0 && total+cipherSize > maxCoalesceBytes {
 			break
@@ -243,70 +210,53 @@ func (r *recordReaderAt) loadBatch(first, last uint64) error {
 		end++
 	}
 	if end == first {
-		return nil
+		return 0, nil
 	}
 	physical, err := r.geometry.recordCipherOffset(first)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	slab := make([]byte, total)
+	buffer := make([]byte, total+recordAADSize())
+	slab := buffer[:total:total]
 	if err := readAtFull(r.ra, slab, physical); err != nil {
-		return fmt.Errorf("%w: truncated encrypted record", ErrMalformedEnvelope)
+		return 0, fmt.Errorf("%w: truncated encrypted record", ErrMalformedEnvelope)
 	}
 
-	owned := make([]cacheEntry, 0, end-first)
+	aad := buffer[total:]
+	initRecordAAD(aad, r.prefix, r.header)
 	position := 0
+	written := 0
 	for index := first; index < end; index++ {
 		plainSize := int(r.geometry.recordPlainSize(index))
 		cipherSize := plainSize + recordOverhead
 		part := slab[position : position+cipherSize]
-		aad := recordAAD(r.prefix, r.header, index, uint32(plainSize))
-		plaintext, err := r.codec.DecryptInPlace(part, aad)
+		if index == ^uint64(0) {
+			return written, fmt.Errorf("%w: record sequence overflow", ErrMalformedEnvelope)
+		}
+		setRecordAAD(aad, index, uint32(plainSize))
+		plaintext, err := r.codec.DecryptInPlace(part, aad, index+1)
 		if err != nil {
-			return fmt.Errorf("%w: encrypted data record", ErrAuthentication)
+			return written, fmt.Errorf("%w: encrypted data record", ErrAuthentication)
 		}
-		if len(plaintext) != plainSize || plainSize > 0 && &plaintext[0] != &part[recordOverhead] {
-			return fmt.Errorf("%w: codec violated in-place record contract", ErrMalformedEnvelope)
+		if len(plaintext) != plainSize || plainSize > 0 && &plaintext[0] != &part[1] {
+			return written, fmt.Errorf("%w: codec violated in-place record contract", ErrMalformedEnvelope)
 		}
-		owned = append(owned, cacheEntry{index: index, data: append([]byte(nil), plaintext...)})
+		recordStart := r.geometry.recordPlainStart(index)
+		within := 0
+		if plainOffset > recordStart {
+			within = int(plainOffset - recordStart)
+		}
+		n := min(len(dst)-written, len(plaintext)-within)
+		copy(dst[written:written+n], plaintext[within:within+n])
+		written += n
+		plainOffset += uint64(n)
 		position += cipherSize
 	}
-	r.insertBatch(owned)
-	return nil
-}
-
-func (r *recordReaderAt) insertBatch(entries []cacheEntry) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closed {
-		return
-	}
-	for i := range entries {
-		entry := &entries[i]
-		if existing, ok := r.cache[entry.index]; ok {
-			r.lru.MoveToFront(existing)
-			continue
-		}
-		element := r.lru.PushFront(entry)
-		r.cache[entry.index] = element
-		r.cacheBytes += len(entry.data)
-	}
-	for r.cacheBytes > r.cacheMax && r.lru.Len() > 1 {
-		element := r.lru.Back()
-		entry := element.Value.(*cacheEntry)
-		delete(r.cache, entry.index)
-		r.cacheBytes -= len(entry.data)
-		r.lru.Remove(element)
-	}
+	return written, nil
 }
 
 func (r *recordReaderAt) Close() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.closed = true
-	r.cache = nil
-	r.cacheBytes = 0
-	r.lru.Init()
+	r.closed.Store(true)
 	return nil
 }
 

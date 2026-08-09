@@ -22,7 +22,7 @@ import (
 // without calling ReadAt (zeros are data; only holes are absent). A
 // source with no holes is written as a plain entry. The metadata
 // sweep precedes any data read (sparse law 1), so one-pass sources
-// work. The envelope metadata is fixed and deterministic (mode 0644,
+// work. The plaintext envelope metadata is fixed and deterministic (mode 0644,
 // uid/gid 0, epoch mtime): the entry is a transport vessel, not a
 // filesystem snapshot. After the payload it appends one empty
 // .kuasar.sha256.<hex> entry. The returned digest covers every physical tar
@@ -47,11 +47,11 @@ func WriteTo(ctx context.Context, w io.Writer, name string, src sparse.Source, o
 		if err != nil {
 			return "", "", err
 		}
-		prefix, plainHeader, err := writeEncryptedHeader(w, opts.codec, header)
+		prefix, plainHeader, recordCodec, err := writeEncryptedHeader(w, opts.codec, header)
 		if err != nil {
 			return "", "", err
 		}
-		records = newRecordWriter(w, opts.codec, prefix, plainHeader, header)
+		records = newRecordWriter(w, recordCodec, prefix, plainHeader, header)
 		artifactWriter = records
 	}
 

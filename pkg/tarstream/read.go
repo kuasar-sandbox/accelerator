@@ -210,7 +210,7 @@ func sourceAtPlain(ra io.ReaderAt, size int64, name string) (plainAtResult, erro
 		dataStart:    dataStart,
 		packedPrefix: packedPrefix(m.extents),
 	})
-	digest, ok, err := discoverDigest(ra, size, m.name)
+	digest, ok, err := discoverDigest(ra, size, m, dataStart)
 	if err != nil {
 		return plainAtResult{}, err
 	}
@@ -251,23 +251,8 @@ func encryptedMagicAt(ra io.ReaderAt, size int64) (bool, error) {
 // discoverDigest recognizes the strict two-entry artifact shape. A normal tar
 // without a marker is not an error; a reserved marker that is present but
 // malformed is. All scans skip stored payload bytes with Seek.
-func discoverDigest(ra io.ReaderAt, size int64, payloadName string) ([32]byte, bool, error) {
+func discoverDigest(ra io.ReaderAt, size int64, first *meta, dataStart int64) ([32]byte, bool, error) {
 	var zero [32]byte
-	firstReader := io.NewSectionReader(ra, 0, size)
-	first, err := locateAt(firstReader, 0, seekSkip(firstReader))
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return zero, false, nil
-		}
-		return zero, false, err
-	}
-	if first.name != payloadName {
-		return zero, false, nil
-	}
-	dataStart, err := firstReader.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return zero, false, err
-	}
 	packedSize := first.stored - first.mapLen
 	if dataStart < 0 || packedSize < 0 || dataStart > size || packedSize > size-dataStart {
 		return zero, false, fmt.Errorf("%w: invalid payload bounds", ErrInvalidCanonicalTarstream)
@@ -279,8 +264,8 @@ func discoverDigest(ra io.ReaderAt, size int64, payloadName string) ([32]byte, b
 	}
 	expectedMarkerStart += padding
 
-	markerReader := io.NewSectionReader(ra, 0, size)
-	marker, err := locateAt(markerReader, 1, seekSkip(markerReader))
+	markerReader := io.NewSectionReader(ra, expectedMarkerStart, size-expectedMarkerStart)
+	marker, err := locateAt(markerReader, 0, seekSkip(markerReader))
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return zero, false, nil
@@ -293,11 +278,12 @@ func discoverDigest(ra io.ReaderAt, size int64, payloadName string) ([32]byte, b
 	if marker.logical != 0 || marker.stored != 0 || marker.mapLen != 0 {
 		return zero, false, fmt.Errorf("%w: digest marker is not empty", ErrInvalidCanonicalTarstream)
 	}
-	markerEnd, err := markerReader.Seek(0, io.SeekCurrent)
+	markerLength, err := markerReader.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return zero, false, err
 	}
-	if markerEnd < 512 || markerEnd > size || markerEnd-512 != expectedMarkerStart || size-markerEnd != int64(len(zeroBlock2)) {
+	markerEnd := expectedMarkerStart + markerLength
+	if markerLength != 512 || markerEnd > size || size-markerEnd != int64(len(zeroBlock2)) {
 		return zero, false, fmt.Errorf("%w: digest marker must be the final entry", ErrInvalidCanonicalTarstream)
 	}
 	var markerBlock [512]byte

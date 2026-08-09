@@ -45,8 +45,9 @@ type codecOption struct {
 	required bool
 }
 
-// WithCodec supplies the fixed v1 record codec. Required only controls whether
-// readers reject plaintext; every writer with a codec emits encrypted v1.
+// WithCodec supplies the encrypted tarstream v1 artifact codec. Required only
+// controls whether readers reject plaintext; every writer with a codec emits
+// encrypted v1.
 func WithCodec(codec Codec, required bool) CodecOption {
 	return codecOption{codec: codec, required: required}
 }

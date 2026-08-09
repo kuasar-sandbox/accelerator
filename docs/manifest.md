@@ -558,22 +558,42 @@ scheme 名为 `hmac`,不派生 identity key,不加入 domain prefix。marker 中
 `@hmac:<digest>` 只是 identity scheme,不表示输入的物理编码;`auto` 读取历史
 plaintext 时同样返回 `hmac`。
 
-v1 固定 AES-256-SIV-CMAC 和 4096-byte record,不提供算法或 record size 协商。
-文件由 16-byte clear prefix、81-byte authenticated header 和连续 authenticated
-records 组成。header 绑定完整 plaintext 大小、packed payload 起点/大小和 record
-geometry;每个 record 的 AAD 绑定 prefix、header、record index 与实际 plaintext
-长度。写入先完成 sparse metadata sweep 和布局规划,再单遍读取 Data extents;
-不会生成 plaintext staging。
+v1 固定 AES-256-GCM 和 4096-byte 独立认证 record,不提供算法或 record size 协商。
+文件由 48-byte clear prefix、81-byte authenticated header 和连续 authenticated
+records 组成。prefix 的 `[0:16]` 是 magic、version、prefix size 和 reserved 字段,
+`[16:48]` 是每次写入由 `crypto/rand` 生成的 32-byte artifact salt。codec 对每个
+artifact 仅执行一次以下派生并构造一个 AES-256-GCM 实例:
 
-`SourceAt` 认证 header 及覆盖 marker/trailer 的 suffix records,随后按 record
-index O(1) 随机解密。这个 fast path 不预读全部 data records:同一 customerKey
-下,geometry 相同的另一个合法文件的同 index record 可通过局部认证,保留原
-marker 时 fast expected-digest 检查也可能通过。调用方实际读取该 record 才会
-认证它,但 fast path 不证明 data record 属于 marker 声明的完整内容。
+```text
+artifactKey = HMAC-SHA256(
+  customerKey,
+  "kuasar/tarstream/aes-gcm/artifact-key/v1\x00" || artifactSalt
+)
+```
+
+header 使用 sequence 0;data record `i` 使用 sequence `i+1`;12-byte GCM nonce 是
+`0x00000000 || uint64BE(sequence)`。record wire 是 1-byte AES-GCM flag 后跟 GCM
+ciphertext 和 16-byte tag,因此仍保持 17-byte overhead,不存储逐 record nonce。
+header 绑定完整 plaintext 大小、packed payload 起点/大小和 record geometry;
+每个 record 的 AAD 绑定包含 salt 的完整 prefix、authenticated header、record
+index 与实际 plaintext 长度。写入先完成 sparse metadata sweep 和布局规划,再单遍
+读取 Data extents;不会生成 plaintext staging 或 spool 文件。
+
+随机 salt 使同一 customer key 和 plaintext 的两次写入具有不同物理 ciphertext,
+但 logical identity 仍严格保持
+`HMAC-SHA256(customerKey, plainDigestRaw32Bytes)`,所以 scheme、文件名和 dedup key
+不变。
+
+`SourceAt` 从 prefix 读取 salt、绑定 artifact codec,认证 header 及覆盖
+marker/trailer 的 suffix records,随后按 record index O(1) 随机解密。这个 fast
+path 不预读全部 data records,也不扫描并重算完整 plaintext digest。不同 artifact
+使用不同派生 key,所以跨 artifact splice 的 donor data record 会在该 record 被
+实际读取时认证失败;未被 fast open 读取的 donor record 不会提前触发错误。
 
 `SourceFrom` 是 full-validation path。完整消费时它解密全部 records,重算 marker
 前 plaintext tar bytes 的 SHA-256,验证空 marker、恰好两个 trailer blocks、
-expected `sha256|hmac` 和 outer EOF。因此同布局 record splice 会在终点失败。
+expected `sha256|hmac` 和 outer EOF。跨 artifact record splice 会在顺序读取到
+该 record 时以 authentication failure 失败。
 调用方主动停止消费时,尚未读取部分不具备完整验证结论;任何发布、上传或转换
 路径必须消费全部 Data extents并传播终点错误。
 
