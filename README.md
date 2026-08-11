@@ -71,3 +71,8 @@ preview 不更新 GitHub Latest,正式 `v0.1.0` 由独立构建发布。
 - [docs/cache.md](docs/cache.md) — 三层缓存 + 纠删码:local / shard / tiered 与旁路填充。
 - [docs/cache-redis.md](docs/cache-redis.md) — Redis-compatible UDS/TCP 后端、取消语义与外部 Dragonfly 部署示例。
 OCI/目录 → EROFS 确定性展平 CLI 见 `guest-runtime/docs/flatten.md`。
+
+## License
+
+本仓库的项目原创内容采用 [Apache License 2.0](LICENSE).
+贡献授权说明见 [CONTRIBUTING.md](CONTRIBUTING.md).
