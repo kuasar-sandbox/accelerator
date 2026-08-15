@@ -107,7 +107,7 @@ clean:
 # E2E needs the assembled platform binary set because accelerator-owned cases
 # also exercise flatten-ctl. The platform BMS sets BIN explicitly; this default
 # is convenient for the normal sibling-repository checkout.
-E2E_BIN ?= $(abspath ../platform/bin/$(TARGET_ARCH))
+E2E_BIN ?= $(abspath ../kuasar-sandbox/bin/$(TARGET_ARCH))
 
 bench: deps-rocksdb
 	CGO_CFLAGS="$(CGO_CFLAGS)" \
