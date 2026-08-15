@@ -76,3 +76,5 @@ OCI/目录 → EROFS 确定性展平 CLI 见 `guest-runtime/docs/flatten.md`。
 
 本仓库的项目原创内容采用 [Apache License 2.0](LICENSE).
 贡献授权说明见 [CONTRIBUTING.md](CONTRIBUTING.md).
+
+<!-- Validation-only change for the post-rename BMS gate in project issue #44; this PR will not be merged. -->
