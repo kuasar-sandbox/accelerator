@@ -485,7 +485,7 @@ ingest 用一个有界 worker pool,并发度取 store 客户端连接池大小(`
 文件顺序、manifest 索引按文件顺序组装、进度回调串行化,所以产物字节序不变;
 后端不暴露连接池信息时回退为串行。这把入库吞吐从"串行单 `Put` 往返"提升到
 "池并发往返",对多 GiB snapshot `--upload` 影响显著(实测见
-`platform/docs/perf.md` §2.4)。
+`kuasar-sandbox/docs/perf.md` §2.4)。
 
 ### 4.8 读路径(细节)
 
@@ -599,7 +599,7 @@ expected `sha256|hmac` 和 outer EOF。跨 artifact record splice 会在顺序�
 
 ## 5. 性能特征
 
-测量入口:`platform/docs/perf.md` §2.1–2.2(冷/热 L1 状态下
+测量入口:`kuasar-sandbox/docs/perf.md` §2.1–2.2(冷/热 L1 状态下
 manifest:// 加载端到端时长)。
 
 主要决定项:
@@ -617,4 +617,4 @@ manifest:// 加载端到端时长)。
   入库
 - `sandboxer/docs/sandbox.md` — 沙箱通过 `manifest://<key>` 引用磁盘
   base 与快照
-- `platform/docs/kuasar-sandbox.md` §4.1–4.4 — Manifest 抽象在系统中的位置
+- `kuasar-sandbox/docs/kuasar-sandbox.md` §4.1–4.4 — Manifest 抽象在系统中的位置
