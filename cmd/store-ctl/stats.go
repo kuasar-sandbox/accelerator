@@ -10,7 +10,7 @@ import (
 
 // storeSampler returns an obstat.RunAdaptive sample func over a store Server: it
 // diffs successive stat snapshots and renders one stats line per window,
-// reporting the window inactive (so nothing prints) when no Get/Put/GetSalt
+// reporting the window inactive (so nothing prints) when no Get/Put/AdmitWrite
 // completed and nothing is in flight. The closure keeps the previous snapshot.
 func storeSampler(srv *server.Server) func(float64) (string, bool) {
 	prev := srv.Stats()
@@ -18,9 +18,9 @@ func storeSampler(srv *server.Server) func(float64) (string, bool) {
 		cur := srv.Stats()
 		dGet := cur.GetN - prev.GetN
 		dPut := cur.PutN - prev.PutN
-		dSalt := cur.SaltN - prev.SaltN
+		dAdmit := cur.AdmitN - prev.AdmitN
 		dErr := cur.ErrN - prev.ErrN
-		if dGet == 0 && dPut == 0 && dSalt == 0 && cur.Inflight == 0 {
+		if dGet == 0 && dPut == 0 && dAdmit == 0 && cur.Inflight == 0 {
 			prev = cur
 			return "", false
 		}
@@ -42,8 +42,8 @@ func storeSampler(srv *server.Server) func(float64) (string, bool) {
 				pct(cur.PutDedup-prev.PutDedup, dPut),
 				obstat.FmtNs(pw.P50()), obstat.FmtNs(pw.P99()), obstat.FmtNs(pw.MaxNs))
 		}
-		if dSalt > 0 {
-			fmt.Fprintf(&b, " · salt %s/s", obstat.FmtCount(float64(dSalt)/elapsed))
+		if dAdmit > 0 {
+			fmt.Fprintf(&b, " · admit %s/s", obstat.FmtCount(float64(dAdmit)/elapsed))
 		}
 		fmt.Fprintf(&b, " | inflight %d", cur.Inflight)
 		if dErr > 0 {

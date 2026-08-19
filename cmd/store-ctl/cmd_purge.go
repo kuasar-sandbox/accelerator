@@ -5,26 +5,29 @@ import (
 	"flag"
 	"fmt"
 	"os"
+
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
 // cmdPurge has two modes:
 //
-//	--generation G   delete the named (non-active) generation: drop it
-//	                 from the meta list and remove every chunk +
+//	--generation G   delete a named non-write generation: remove it
+//	                 from the source list first, then remove every chunk +
 //	                 manifest object under it.
-//	--all            wipe the entire store — every object, including
-//	                 the meta. After --all the store is uninitialised;
+//	--all            wipe all object data and, when writable, remove
+//	                 the source list. Afterwards the store is uninitialised;
 //	                 a subsequent `init` is required before serve.
 //
 // Exactly one of the two flags is required. `--all` requires
-// `--confirm` because there is no recovery; `--generation` does not
-// (the underlying admin Drop refuses to remove the active generation
-// so the foot-cannon surface is much smaller).
+// `--confirm` because there is no recovery and is an offline operation:
+// every serve process and writer must be stopped first. `--generation` does
+// not require confirmation (the source mutation refuses to remove the final
+// write generation).
 func cmdPurge(args []string) {
 	fset := flag.NewFlagSet("purge", flag.ExitOnError)
 	configPath := fset.String("config", "", "YAML config file (overrides STORE_CONFIG env)")
-	generation := fset.String("generation", "", "non-active generation to drop")
-	all := fset.Bool("all", false, "wipe the entire store (requires --confirm)")
+	generation := fset.String("generation", "", "older (non-write) generation to drop")
+	all := fset.Bool("all", false, "offline wipe after stopping all serve processes (requires --confirm)")
 	confirm := fset.Bool("confirm", false, "required for --all (proves intent)")
 	fset.Parse(args)
 
@@ -45,22 +48,43 @@ func cmdPurge(args []string) {
 	if err != nil {
 		fatal("%v", err)
 	}
-	store, err := openAdminStore(cfg)
-	if err != nil {
-		fatal("%v", err)
-	}
-
 	ctx := context.Background()
+	source, err := openGenerationSource(ctx, cfg, resolved)
+	if err != nil {
+		fatal("open generation source: %v", err)
+	}
+	data, err := openAdminStore(cfg)
+	if err != nil {
+		fatal("open object backend: %v", err)
+	}
 	if *all {
-		if err := store.Wipe(ctx); err != nil {
+		if !source.readOnly() {
+			if err := source.remove(ctx); err != nil {
+				fatal("remove generation source: %v", err)
+			}
+		}
+		if err := data.Wipe(ctx); err != nil {
 			fatal("wipe: %v", err)
 		}
-		fmt.Fprintf(os.Stderr, "purge OK: backend=%s wiped (store now uninitialised)\n", cfg.Backend)
+		if source.readOnly() {
+			fmt.Fprintf(os.Stderr, "purge OK: backend=%s object data wiped; config generation source unchanged\n", cfg.Backend)
+		} else {
+			fmt.Fprintf(os.Stderr, "purge OK: backend=%s object data and generation source removed\n", cfg.Backend)
+		}
 		return
 	}
 
-	if err := store.Drop(ctx, *generation); err != nil {
+	target := store.Generation(*generation)
+	if err := store.ValidateGeneration(target); err != nil {
 		fatal("drop %s: %v", *generation, err)
+	}
+	if err := source.mutate(ctx, func(current []store.Generation) ([]store.Generation, error) {
+		return removeGeneration(current, target)
+	}); err != nil {
+		fatal("remove generation %s from source: %v", target, err)
+	}
+	if err := data.DropGeneration(ctx, target); err != nil {
+		fatal("generation %s was removed from source but object cleanup failed: %v", target, err)
 	}
 	fmt.Fprintf(os.Stderr, "purge OK: backend=%s generation=%s dropped\n",
 		cfg.Backend, *generation)

@@ -17,8 +17,8 @@ func TestStatsCounters(t *testing.T) {
 	cli, srv := startBufconnServer(t, Options{Backend: newFSStore(t, "gen-1"), VerifyKey: true})
 	base := srv.Stats()
 
-	if _, err := cli.GetSalt(context.Background(), &pb.GetSaltRequest{}); err != nil {
-		t.Fatalf("GetSalt: %v", err)
+	if _, err := cli.AdmitWrite(context.Background(), &pb.AdmitWriteRequest{}); err != nil {
+		t.Fatalf("AdmitWrite: %v", err)
 	}
 
 	data := []byte("the quick brown fox jumps over the lazy dog")
@@ -46,7 +46,7 @@ func TestStatsCounters(t *testing.T) {
 			t.Errorf("%s delta = %d, want %d", name, delta, want)
 		}
 	}
-	eq("SaltN", s.SaltN-base.SaltN, 1)
+	eq("AdmitN", s.AdmitN-base.AdmitN, 1)
 	eq("GetN", s.GetN-base.GetN, 2)
 	eq("GetHits", s.GetHits-base.GetHits, 1)
 	eq("GetBytes", s.GetBytes-base.GetBytes, uint64(len(data)))

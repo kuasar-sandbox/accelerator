@@ -31,8 +31,10 @@ type fakeS3 struct {
 	}
 	// failNext lets a test inject one transport failure to verify
 	// retry / error-propagation paths.
-	failNextGet error
-	failNextPut error
+	failNextGet  error
+	failNextHead error
+	failNextPut  error
+	headHook     func(context.Context)
 }
 
 type fakeObject struct {
@@ -44,10 +46,21 @@ func newFakeS3() *fakeS3 {
 	return &fakeS3{objects: map[string]fakeObject{}}
 }
 
-func (f *fakeS3) Head(_ context.Context, key string) (*ObjectMeta, error) {
+func (f *fakeS3) Head(ctx context.Context, key string) (*ObjectMeta, error) {
 	f.hits.head.Add(1)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.headHook != nil {
+		f.headHook(ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if f.failNextHead != nil {
+		err := f.failNextHead
+		f.failNextHead = nil
+		return nil, err
+	}
 	obj, ok := f.objects[key]
 	if !ok {
 		return nil, ErrNotFound

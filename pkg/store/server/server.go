@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"hash"
 	"io"
+	"math"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -15,17 +17,15 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/store/pb"
 )
 
-// Server implements pb.StoreServer. The streaming Put path writes
-// bytes directly into a temp file owned by the Backend's PutHandle,
-// so the server never buffers the full payload in memory. verifyKey
-// controls whether the server re-hashes data during Put to enforce
-// the client-claimed ContentKey.
+// Server implements pb.StoreServer. The generation callback returns one
+// immutable oldest-to-newest list. verifyKey controls whether the server
+// re-hashes data during Put to enforce the client-claimed ContentKey.
 type Server struct {
 	pb.UnimplementedStoreServer
 
-	backend   Backend
-	salt      [32]byte
-	verifyKey bool
+	backend     Backend
+	generations func() []store.Generation
+	verifyKey   bool
 
 	stats Stats
 }
@@ -35,6 +35,10 @@ type Options struct {
 	// Backend is the storage implementation. Must be non-nil.
 	Backend Backend
 
+	// Generations returns the current immutable oldest-to-newest list.
+	// Each request calls it exactly once.
+	Generations func() []store.Generation
+
 	// VerifyKey toggles per-Put SHA256 verification. Default true;
 	// set false in trusted-loader contexts where the extra hash pass
 	// on the server side is redundant (e.g. batch backfill from a
@@ -42,28 +46,56 @@ type Options struct {
 	VerifyKey bool
 }
 
-// New constructs a Server. The backend's active generation seeds an opaque
-// salt; generation identity never crosses the store service boundary.
+// New constructs a Server.
 func New(opts Options) (*Server, error) {
 	if opts.Backend == nil {
 		return nil, errors.New("server: backend is required")
 	}
-	gen := opts.Backend.ActiveGeneration()
+	if opts.Generations == nil {
+		return nil, errors.New("server: generations callback is required")
+	}
+	if err := store.ValidateGenerations(opts.Generations()); err != nil {
+		return nil, fmt.Errorf("server: initial generations: %w", err)
+	}
 	return &Server{
-		backend:   opts.Backend,
-		salt:      deriveSalt(gen),
-		verifyKey: opts.VerifyKey,
+		backend:     opts.Backend,
+		generations: opts.Generations,
+		verifyKey:   opts.VerifyKey,
 	}, nil
 }
 
-func deriveSalt(generation string) [32]byte {
-	return sha256.Sum256(append([]byte("accelerator-salt-v1"), generation...))
+func deriveSalt(generation store.Generation) [32]byte {
+	return sha256.Sum256(append([]byte("accelerator-salt-v1"), []byte(generation)...))
 }
 
-// GetSalt returns the store's opaque salt.
-func (s *Server) GetSalt(ctx context.Context, _ *pb.GetSaltRequest) (*pb.GetSaltResponse, error) {
-	s.stats.saltN.Add(1)
-	return &pb.GetSaltResponse{Salt: s.salt[:]}, nil
+// AdmitWrite fixes one ingest to the newest current generation.
+func (s *Server) AdmitWrite(_ context.Context, _ *pb.AdmitWriteRequest) (*pb.AdmitWriteResponse, error) {
+	s.stats.admitN.Add(1)
+	gens := s.generations()
+	if len(gens) == 0 {
+		s.stats.errN.Add(1)
+		return nil, status.Error(codes.Unavailable, "generation list is empty")
+	}
+	gen := gens[len(gens)-1]
+	salt := deriveSalt(gen)
+	return &pb.AdmitWriteResponse{Generation: string(gen), Salt: salt[:]}, nil
+}
+
+// GetObject performs the shared newest-to-oldest lookup used by both the
+// store gRPC Get and store-ctl's embedded cache wire listener.
+func (s *Server) GetObject(ctx context.Context, partition store.Partition, key store.ContentKey) (bool, []byte, error) {
+	gens := s.generations()
+	return getAcrossGenerations(ctx, s.backend, gens, partition, key)
+}
+
+func getAcrossGenerations(ctx context.Context, backend Backend, generations []store.Generation, partition store.Partition, key store.ContentKey) (bool, []byte, error) {
+	for i := len(generations) - 1; i >= 0; i-- {
+		found, data, err := backend.Get(ctx, generations[i], partition, key)
+		if err != nil || found {
+			return found, data, err
+		}
+	}
+	return false, nil, nil
 }
 
 // Get streams a stored object back to the caller. Miss → NotFound,
@@ -89,7 +121,7 @@ func (s *Server) Get(req *pb.GetRequest, stream pb.Store_GetServer) error {
 	}
 	copy(key[:], req.GetKey())
 
-	found, data, err := s.backend.Get(stream.Context(), partition, key)
+	found, data, err := s.GetObject(stream.Context(), partition, key)
 	if err != nil {
 		s.stats.errN.Add(1)
 		return status.Errorf(codes.Internal, "backend get: %v", err)
@@ -116,11 +148,10 @@ func (s *Server) Get(req *pb.GetRequest, stream pb.Store_GetServer) error {
 // Put ingests a streaming object. The first message must be a
 // PutHeader (partition + client-computed key); subsequent messages
 // carry raw byte chunks. On a dedup hit (key already exists in the
-// active generation) the server SendAndCloses immediately after the
+// admitted generation) the server SendAndCloses immediately after the
 // header, saving the full data payload's worth of bandwidth.
-// Otherwise bytes stream directly into a temp file via the
-// Backend's PutHandle, optionally re-hashed for verification, and
-// atomic-renamed at the end.
+// Otherwise bytes stream directly into the Backend's generation-bound
+// PutHandle and are optionally re-hashed for verification.
 func (s *Server) Put(stream pb.Store_PutServer) error {
 	s.stats.inflight.Add(1)
 	start := time.Now()
@@ -152,22 +183,49 @@ func (s *Server) Put(stream pb.Store_PutServer) error {
 		return status.Errorf(codes.InvalidArgument, "key must be %d bytes, got %d", len(key), len(header.GetKey()))
 	}
 	copy(key[:], header.GetKey())
+	generation := store.Generation(header.GetGeneration())
+	if err := store.ValidateGeneration(generation); err != nil {
+		s.stats.errN.Add(1)
+		return status.Errorf(codes.InvalidArgument, "put: generation: %v", err)
+	}
+	generations := s.generations()
+	if !containsGeneration(generations, generation) {
+		s.stats.errN.Add(1)
+		return status.Errorf(codes.FailedPrecondition, "put: generation %q is not current", generation)
+	}
+	var expectedSize *int64
+	if header.Size != nil {
+		if *header.Size > math.MaxInt64 {
+			s.stats.errN.Add(1)
+			return status.Errorf(codes.InvalidArgument, "put: size %d overflows int64", *header.Size)
+		}
+		n := int64(*header.Size)
+		expectedSize = &n
+	}
 
 	// 2. Dedup short-circuit — if the key already exists in the
-	// active generation, tell the client "not new" and close the
+	// admitted generation, tell the client "not new" and close the
 	// stream. The client will see io.EOF on its next Send (or it
 	// may have Sent everything already; CloseAndRecv still returns
 	// the response we emit here).
-	if s.backend.Exists(partition, key) {
+	exists, err := s.backend.Exists(stream.Context(), generation, partition, key, expectedSize)
+	if err != nil {
+		s.stats.errN.Add(1)
+		return status.Errorf(codes.Internal, "put: exists: %v", err)
+	}
+	if exists {
 		s.stats.putDedup.Add(1)
 		return stream.SendAndClose(&pb.PutResponse{IsNew: false})
 	}
 
 	// 3. Open a streaming-Put handle; bytes land directly on disk.
-	handle, err := s.backend.OpenPut(partition)
+	handle, err := s.backend.OpenPut(generation, partition, key, expectedSize)
 	if err != nil {
 		s.stats.errN.Add(1)
 		return status.Errorf(codes.Internal, "open put: %v", err)
+	}
+	if contextual, ok := handle.(interface{ SetContext(context.Context) }); ok {
+		contextual.SetContext(stream.Context())
 	}
 	var hasher hash.Hash
 	if s.verifyKey {
@@ -175,7 +233,7 @@ func (s *Server) Put(stream pb.Store_PutServer) error {
 	}
 
 	// 4. Drain data frames until stream end.
-	var nbytes uint64
+	var nbytes int64
 	for {
 		msg, err := stream.Recv()
 		if err == io.EOF {
@@ -197,15 +255,36 @@ func (s *Server) Put(stream pb.Store_PutServer) error {
 			}
 			continue
 		}
-		if _, err := handle.Write(data); err != nil {
+		if int64(len(data)) > math.MaxInt64-nbytes {
+			s.stats.errN.Add(1)
+			_ = handle.Abort()
+			return status.Error(codes.InvalidArgument, "put: payload size overflows int64")
+		}
+		if expectedSize != nil && int64(len(data)) > *expectedSize-nbytes {
+			s.stats.errN.Add(1)
+			_ = handle.Abort()
+			return status.Errorf(codes.InvalidArgument, "put: payload exceeds expected size %d", *expectedSize)
+		}
+		n, err := handle.Write(data)
+		if err != nil {
 			s.stats.errN.Add(1)
 			_ = handle.Abort()
 			return status.Errorf(codes.Internal, "put: write: %v", err)
 		}
-		nbytes += uint64(len(data))
+		if n != len(data) {
+			s.stats.errN.Add(1)
+			_ = handle.Abort()
+			return status.Errorf(codes.Internal, "put: write: %v", io.ErrShortWrite)
+		}
+		nbytes += int64(n)
 		if hasher != nil {
 			hasher.Write(data)
 		}
+	}
+	if expectedSize != nil && nbytes != *expectedSize {
+		s.stats.errN.Add(1)
+		_ = handle.Abort()
+		return status.Errorf(codes.InvalidArgument, "put: payload size %d, expected %d", nbytes, *expectedSize)
 	}
 
 	// 5. Commit (with optional verify).
@@ -218,8 +297,21 @@ func (s *Server) Put(stream pb.Store_PutServer) error {
 		s.stats.errN.Add(1)
 		return status.Errorf(codes.InvalidArgument, "put: commit: %v", err)
 	}
-	s.stats.putBytes.Add(nbytes)
+	if isNew {
+		s.stats.putBytes.Add(uint64(nbytes))
+	} else {
+		s.stats.putDedup.Add(1)
+	}
 	return stream.SendAndClose(&pb.PutResponse{IsNew: isNew})
+}
+
+func containsGeneration(generations []store.Generation, generation store.Generation) bool {
+	for _, g := range generations {
+		if g == generation {
+			return true
+		}
+	}
+	return false
 }
 
 // sendFrameSize is the target byte size for a single Get response

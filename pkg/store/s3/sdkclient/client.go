@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -134,6 +135,20 @@ func (c *Client) Head(ctx context.Context, key string) (*s3.ObjectMeta, error) {
 // return, including on read failure, to avoid leaking a connection
 // if the SDK's own cleanup path has a bug.
 func (c *Client) Get(ctx context.Context, key string) ([]byte, *s3.ObjectMeta, error) {
+	return c.get(ctx, key, nil)
+}
+
+// GetLimited is Get with a hard response-body limit. It is used for small
+// metadata objects whose size must be bounded before they are materialised in
+// memory. A missing or dishonest Content-Length is still bounded while read.
+func (c *Client) GetLimited(ctx context.Context, key string, maxBytes int64) ([]byte, *s3.ObjectMeta, error) {
+	if maxBytes < 0 {
+		return nil, nil, fmt.Errorf("s3 sdkclient: negative body limit %d", maxBytes)
+	}
+	return c.get(ctx, key, &maxBytes)
+}
+
+func (c *Client) get(ctx context.Context, key string, maxBytes *int64) ([]byte, *s3.ObjectMeta, error) {
 	out, err := c.api.GetObject(ctx, &awss3.GetObjectInput{
 		Bucket: aws.String(c.bucket),
 		Key:    aws.String(key),
@@ -146,12 +161,22 @@ func (c *Client) Get(ctx context.Context, key string) ([]byte, *s3.ObjectMeta, e
 	}
 	defer out.Body.Close()
 
-	// Trust the Content-Length header; allocate exact-fit buffer
-	// to avoid bytes.Buffer growth amplification.
 	size := aws.ToInt64(out.ContentLength)
-	body, err := io.ReadAll(out.Body)
+	if maxBytes != nil && out.ContentLength != nil && size > *maxBytes {
+		return nil, nil, fmt.Errorf("s3 sdkclient: body %s exceeds limit %d (header=%d)",
+			key, *maxBytes, size)
+	}
+
+	reader := io.Reader(out.Body)
+	if maxBytes != nil && *maxBytes < math.MaxInt64 {
+		reader = io.LimitReader(out.Body, *maxBytes+1)
+	}
+	body, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, nil, fmt.Errorf("s3 sdkclient: read body %s: %w", key, err)
+	}
+	if maxBytes != nil && int64(len(body)) > *maxBytes {
+		return nil, nil, fmt.Errorf("s3 sdkclient: body %s exceeds limit %d", key, *maxBytes)
 	}
 	if out.ContentLength != nil && int64(len(body)) != size {
 		return nil, nil, fmt.Errorf("s3 sdkclient: body size mismatch (header=%d, read=%d)",

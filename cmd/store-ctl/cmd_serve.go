@@ -21,9 +21,8 @@ import (
 // process receives SIGINT or SIGTERM, at which point it does a
 // graceful gRPC shutdown.
 //
-// The backend must already be initialised — `serve` refuses to
-// auto-init a fresh root, and the surfaced ErrUninitialised tells
-// the operator to run `store-ctl init` first.
+// The configured generation source must already contain a valid non-empty
+// oldest-to-newest list. Object backends do not own that list.
 func cmdServe(args []string) {
 	fset := flag.NewFlagSet("serve", flag.ExitOnError)
 	configPath := fset.String("config", "", "YAML config file (overrides STORE_CONFIG env)")
@@ -42,10 +41,27 @@ func cmdServe(args []string) {
 	if err != nil {
 		fatal("%v", err)
 	}
+	source, err := openGenerationSource(context.Background(), cfg, resolved)
+	if err != nil {
+		fatal("open generation source: %v", err)
+	}
+	generationManager, err := newGenerationManager(context.Background(), source)
+	if err != nil {
+		fatal("load generation source: %v", err)
+	}
+	// Register SIGHUP before publishing either listener. A reload sent during
+	// startup is then buffered rather than being lost to the default action.
+	refreshCtx, refreshCancel := context.WithCancel(context.Background())
+	defer refreshCancel()
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	defer signal.Stop(hupCh)
+	go generationManager.Run(refreshCtx, hupCh, log.Printf)
 
 	srv, err := server.New(server.Options{
-		Backend:   backend,
-		VerifyKey: cfg.VerifyKey(),
+		Backend:     backend,
+		Generations: generationManager.Current,
+		VerifyKey:   cfg.VerifyKey(),
 	})
 	if err != nil {
 		fatal("server.New: %v", err)
@@ -59,8 +75,9 @@ func cmdServe(args []string) {
 		fatal("listen %s: %v", cfg.Listen, err)
 	}
 
-	fmt.Fprintf(os.Stderr, "store-ctl serve listen=%s backend=%s generation=%s verify=%t\n",
-		cfg.Listen, cfg.Backend, backend.ActiveGeneration(), cfg.VerifyKey())
+	generations := generationManager.Current()
+	fmt.Fprintf(os.Stderr, "store-ctl serve listen=%s backend=%s generation=%s verify=%t direct_io=%t\n",
+		cfg.Listen, cfg.Backend, generations[len(generations)-1], cfg.VerifyKey(), cfg.Backend == "fs" && cfg.FS.DirectIO)
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- gs.Serve(lis) }()
@@ -70,7 +87,7 @@ func cmdServe(args []string) {
 	// reach store content without a separate cache-ctl. Disabled when empty.
 	var stopCache func()
 	if cfg.CacheListen != "" {
-		stopCache, err = startCacheWireServer(cfg, backend)
+		stopCache, err = startCacheWireServer(cfg, srv)
 		if err != nil {
 			fatal("%v", err)
 		}
@@ -84,6 +101,7 @@ func cmdServe(args []string) {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 
 	select {
 	case sig := <-sigCh:

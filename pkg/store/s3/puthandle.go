@@ -3,100 +3,87 @@ package s3
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
-// putHandle buffers the streamed bytes in memory and uploads once
-// on Commit. For our chunk sizes (≤1 MiB) and manifests (typically
-// tens of KiB) the buffer never gets large; for the rare oversized
-// payload Commit enforces the configured maxObjSize.
-//
-// The "buffer + single PutObject" approach is the right tradeoff
-// for content-addressed stores: total bytes per Put are bounded by
-// the chunker's max-chunk setting, so multipart upload's complexity
-// (extra round-trips, AbortMultipartUpload cleanup paths) buys
-// nothing here. If we ever land snapshot bytes via store-ctl
-// directly (not chunked), revisit.
 type putHandle struct {
-	store     *Store
-	partition store.Partition
-	buf       bytes.Buffer
-	committed bool
-	aborted   bool
+	store       *Store
+	generation  store.Generation
+	partition   store.Partition
+	key         store.ContentKey
+	hasExpected bool
+	expected    int64
+	ctx         context.Context
+	buf         bytes.Buffer
+	terminated  bool
+}
+
+// SetContext lets the gRPC server bind backend work to the stream context
+// without widening the shared PutHandle interface.
+func (h *putHandle) SetContext(ctx context.Context) {
+	if ctx != nil && !h.terminated {
+		h.ctx = ctx
+	}
 }
 
 func (h *putHandle) Write(p []byte) (int, error) {
-	if h.committed || h.aborted {
+	if h.terminated {
 		return 0, errors.New("s3: write after commit/abort")
+	}
+	if int64(len(p)) > h.store.maxSize-int64(h.buf.Len()) {
+		return 0, fmt.Errorf("s3: payload exceeds max object size %d", h.store.maxSize)
+	}
+	if h.hasExpected && int64(len(p)) > h.expected-int64(h.buf.Len()) {
+		return 0, fmt.Errorf("s3: payload exceeds expected size %d", h.expected)
 	}
 	return h.buf.Write(p)
 }
 
-// Commit uploads the buffered bytes via a single PutObject.
-// Order of checks:
-//
-//  1. handle state must be open
-//  2. caller-claimed key must match verifyDigest (server-verified)
-//  3. buffered size must be within maxObjSize
-//  4. dedup short-circuit: HEAD active-generation key; hit → noop
-//  5. PutObject; success → mark committed, return (true, nil)
-//
-// On any failure the handle is left in committed=true state with
-// the buffer dropped, so a subsequent Abort is a no-op (matching
-// the contract documented in store.PutHandle).
 func (h *putHandle) Commit(key store.ContentKey, verifyDigest store.ContentKey) (bool, error) {
-	if h.committed || h.aborted {
-		return false, errors.New("s3: commit on already-terminated handle")
+	if h.terminated {
+		return false, errors.New("s3: commit on terminated handle")
 	}
-	defer func() { h.committed = true; h.buf.Reset() }()
-
-	if verifyDigest != key {
+	h.terminated = true
+	defer h.buf.Reset()
+	if key != h.key {
+		return false, ErrCommitKeyMismatch
+	}
+	if h.hasExpected && int64(h.buf.Len()) != h.expected {
+		return false, fmt.Errorf("s3: payload size %d, expected %d", h.buf.Len(), h.expected)
+	}
+	if verifyDigest != h.key {
 		return false, ErrKeyMismatch
 	}
-	if int64(h.buf.Len()) > h.store.maxObjSize {
-		return false, fmt.Errorf("s3: payload size %d exceeds max %d", h.buf.Len(), h.store.maxObjSize)
-	}
 
-	// Last-chance dedup. Two writers racing on the same key both
-	// reach Commit; whichever lands first wins, the other observes
-	// the resulting object and short-circuits. (server-side Exists
-	// short-circuit before OpenPut catches the easy case; this
-	// guards the narrow "Exists missed → both opened → both
-	// streamed" window.)
-	if h.store.Exists(h.partition, key) {
+	expected := (*int64)(nil)
+	if h.hasExpected {
+		value := h.expected
+		expected = &value
+	}
+	exists, err := h.store.Exists(h.ctx, h.generation, h.partition, h.key, expected)
+	if err != nil {
+		return false, err
+	}
+	if exists {
 		return false, nil
 	}
 
-	active := h.store.ActiveGeneration()
-	objKey := h.store.objectKey(h.partition, active, key)
+	objectKey := h.store.objectKey(h.partition, h.generation, h.key)
 	body := append([]byte(nil), h.buf.Bytes()...)
-	if _, err := h.store.boundedPut(context.Background(), objKey, body, PutOptions{
-		ContentType: "application/octet-stream",
-	}); err != nil {
-		return false, fmt.Errorf("s3: put %s: %w", objKey, err)
+	if _, err := h.store.boundedPut(h.ctx, objectKey, body, PutOptions{ContentType: "application/octet-stream"}); err != nil {
+		return false, fmt.Errorf("s3: put %s: %w", objectKey, err)
 	}
 	return true, nil
 }
 
 func (h *putHandle) Abort() error {
-	if h.committed {
+	if h.terminated {
 		return nil
 	}
-	h.aborted = true
+	h.terminated = true
 	h.buf.Reset()
 	return nil
 }
-
-// computeDigest is a small helper kept here (not in s3.go) so
-// puthandle's contract — "verifyDigest != key ⇒ reject" — stays
-// next to the reject site. fs.Store keeps the same idiom.
-func computeDigest(data []byte) store.ContentKey {
-	return store.ContentKey(sha256.Sum256(data))
-}
-
-// silence — kept for future; remove with streaming Get.
-var _ = computeDigest
