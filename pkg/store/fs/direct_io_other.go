@@ -14,14 +14,27 @@ func openExclusiveNoFollow(path string, mode os.FileMode) (*os.File, error) {
 }
 
 func openReadNoFollow(path string) (*os.File, error) {
-	info, err := os.Lstat(path)
+	pathInfo, err := os.Lstat(path)
 	if err != nil {
 		return nil, err
 	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("object is not a regular file (mode %s)", info.Mode())
+	if !pathInfo.Mode().IsRegular() {
+		return nil, fmt.Errorf("object is not a regular file (mode %s)", pathInfo.Mode())
 	}
-	return os.Open(path)
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	openedInfo, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if !openedInfo.Mode().IsRegular() || !os.SameFile(pathInfo, openedInfo) {
+		_ = f.Close()
+		return nil, fmt.Errorf("object changed during no-follow open")
+	}
+	return f, nil
 }
 
 func readDirectFile(string) ([]byte, error) {

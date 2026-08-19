@@ -274,8 +274,10 @@ store-ctl serve   --config FILE
 - `init`/`rollout` 修改 file 或 S3 source；config source 明确只读，需由配置系统更新。
 - `purge --generation` 拒绝最后一项，先从可写 source 移出 generation，再删除 FS/S3
   数据。S3 source 更新使用 ETag `If-Match` CAS，冲突后重读并有界重试。
-- `purge --all` 仍要求 `--confirm`。file/S3 source 会被移除；config source 下只清理
-  对象数据，不修改主 YAML。
+- `purge --all` 是离线维护操作，仍要求 `--confirm`：执行前必须停止所有
+  `store-ctl serve` 进程并静默所有 writer。file/S3 source 会被移除；config source
+  下只清理对象数据，不修改主 YAML。source 缺失在运行中的 server 看来是刷新失败，
+  按设计会继续保留上一份有效列表，因此该命令不能用作在线写入撤销机制。
 
 典型在线 rollout：
 

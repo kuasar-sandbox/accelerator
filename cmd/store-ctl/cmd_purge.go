@@ -19,13 +19,15 @@ import (
 //	                 a subsequent `init` is required before serve.
 //
 // Exactly one of the two flags is required. `--all` requires
-// `--confirm` because there is no recovery; `--generation` does not
-// (the source mutation refuses to remove the final write generation).
+// `--confirm` because there is no recovery and is an offline operation:
+// every serve process and writer must be stopped first. `--generation` does
+// not require confirmation (the source mutation refuses to remove the final
+// write generation).
 func cmdPurge(args []string) {
 	fset := flag.NewFlagSet("purge", flag.ExitOnError)
 	configPath := fset.String("config", "", "YAML config file (overrides STORE_CONFIG env)")
 	generation := fset.String("generation", "", "older (non-write) generation to drop")
-	all := fset.Bool("all", false, "wipe the entire store (requires --confirm)")
+	all := fset.Bool("all", false, "offline wipe after stopping all serve processes (requires --confirm)")
 	confirm := fset.Bool("confirm", false, "required for --all (proves intent)")
 	fset.Parse(args)
 

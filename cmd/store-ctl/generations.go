@@ -98,7 +98,7 @@ func (s *fileGenerationSource) Load(_ context.Context) ([]store.Generation, erro
 }
 
 type generationObjectClient interface {
-	Get(context.Context, string) ([]byte, *stores3.ObjectMeta, error)
+	GetLimited(context.Context, string, int64) ([]byte, *stores3.ObjectMeta, error)
 	Put(context.Context, string, []byte, stores3.PutOptions) (string, error)
 	Delete(context.Context, string) error
 }
@@ -114,7 +114,7 @@ func (s *s3GenerationSource) Load(ctx context.Context) ([]store.Generation, erro
 }
 
 func (s *s3GenerationSource) loadWithETag(ctx context.Context) ([]store.Generation, string, error) {
-	body, meta, err := s.client.Get(ctx, s.key)
+	body, meta, err := s.client.GetLimited(ctx, s.key, maxGenerationListBytes)
 	if errors.Is(err, stores3.ErrNotFound) {
 		return nil, "", fmt.Errorf("%w: missing s3://.../%s", errGenerationSourceUninitialised, s.key)
 	}

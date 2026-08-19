@@ -376,6 +376,51 @@ func TestGetValidatesBodyLengthAndClosesBody(t *testing.T) {
 	}
 }
 
+func TestGetLimitedBoundsResponseBeforeMaterialisingIt(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		contentLength int64
+		wantRemaining int
+	}{
+		{name: "advertised oversized body", contentLength: 6, wantRemaining: 6},
+		{name: "unknown length body", contentLength: -1, wantRemaining: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := strings.NewReader("abcdef")
+			responseBody := &trackingBody{Reader: reader}
+			client := newRoundTripClient(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				header := make(http.Header)
+				header.Set("ETag", `"limited-etag"`)
+				if tc.contentLength >= 0 {
+					header.Set("Content-Length", strconv.FormatInt(tc.contentLength, 10))
+				}
+				return &http.Response{
+					StatusCode:    http.StatusOK,
+					Status:        "200 OK",
+					Proto:         "HTTP/1.1",
+					ProtoMajor:    1,
+					ProtoMinor:    1,
+					Header:        header,
+					Body:          responseBody,
+					ContentLength: tc.contentLength,
+					Request:       req,
+				}, nil
+			}))
+
+			if _, _, err := client.GetLimited(context.Background(), "generation-list", 4); err == nil ||
+				!strings.Contains(err.Error(), "exceeds limit 4") {
+				t.Fatalf("GetLimited error = %v, want body limit error", err)
+			}
+			if got := reader.Len(); got != tc.wantRemaining {
+				t.Fatalf("unread response bytes = %d, want %d", got, tc.wantRemaining)
+			}
+			if !responseBody.closed.Load() {
+				t.Error("response body was not closed")
+			}
+		})
+	}
+}
+
 func TestRequestsRespectContextCancellationAndDeadline(t *testing.T) {
 	t.Run("cancellation", func(t *testing.T) {
 		started := make(chan struct{})

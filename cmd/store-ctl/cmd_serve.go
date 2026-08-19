@@ -49,6 +49,14 @@ func cmdServe(args []string) {
 	if err != nil {
 		fatal("load generation source: %v", err)
 	}
+	// Register SIGHUP before publishing either listener. A reload sent during
+	// startup is then buffered rather than being lost to the default action.
+	refreshCtx, refreshCancel := context.WithCancel(context.Background())
+	defer refreshCancel()
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	defer signal.Stop(hupCh)
+	go generationManager.Run(refreshCtx, hupCh, log.Printf)
 
 	srv, err := server.New(server.Options{
 		Backend:     backend,
@@ -90,13 +98,6 @@ func cmdServe(args []string) {
 	statsCtx, statsCancel := context.WithCancel(context.Background())
 	defer statsCancel()
 	go obstat.RunAdaptive(statsCtx, cfg.StatsIntervalDur(), storeSampler(srv), log.Printf)
-
-	refreshCtx, refreshCancel := context.WithCancel(context.Background())
-	defer refreshCancel()
-	hupCh := make(chan os.Signal, 1)
-	signal.Notify(hupCh, syscall.SIGHUP)
-	defer signal.Stop(hupCh)
-	go generationManager.Run(refreshCtx, hupCh, log.Printf)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

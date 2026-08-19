@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -213,13 +214,18 @@ type fakeGenerationClient struct {
 	version      int
 	conflictOnce bool
 	conflictBody []byte
+	lastLimit    int64
 }
 
-func (f *fakeGenerationClient) Get(_ context.Context, _ string) ([]byte, *stores3.ObjectMeta, error) {
+func (f *fakeGenerationClient) GetLimited(_ context.Context, _ string, maxBytes int64) ([]byte, *stores3.ObjectMeta, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastLimit = maxBytes
 	if f.body == nil {
 		return nil, nil, stores3.ErrNotFound
+	}
+	if int64(len(f.body)) > maxBytes {
+		return nil, nil, fmt.Errorf("body exceeds limit %d", maxBytes)
 	}
 	return append([]byte(nil), f.body...), &stores3.ObjectMeta{Size: int64(len(f.body)), ETag: f.etag}, nil
 }
@@ -254,6 +260,22 @@ func (f *fakeGenerationClient) Delete(context.Context, string) error {
 	f.body = nil
 	f.etag = ""
 	return nil
+}
+
+func TestS3SourceBoundsObjectBeforeParsing(t *testing.T) {
+	client := &fakeGenerationClient{
+		body: make([]byte, maxGenerationListBytes+1),
+		etag: "etag-1",
+	}
+	source := &s3GenerationSource{client: client, key: "meta/generations"}
+	if _, err := source.Load(context.Background()); err == nil || !strings.Contains(err.Error(), "exceeds limit") {
+		t.Fatalf("Load error = %v, want size-limit error", err)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.lastLimit != maxGenerationListBytes {
+		t.Fatalf("GetLimited max = %d, want %d", client.lastLimit, maxGenerationListBytes)
+	}
 }
 
 func TestS3SourceCASReloadsBeforeRetry(t *testing.T) {
