@@ -21,15 +21,21 @@ type recordingStore struct {
 	chunkBytes  int
 	manifestKey store.ContentKey
 	manifest    []byte
+	admissions  []store.WriteAdmission
+	admitCalls  int
 }
 
-func (s *recordingStore) GetSalt(_ context.Context) ([32]byte, error) {
-	return [32]byte{}, nil
-}
-
-func (s *recordingStore) Put(_ context.Context, p store.Partition, key store.ContentKey, data []byte) (bool, error) {
+func (s *recordingStore) AdmitWrite(_ context.Context) (store.WriteAdmission, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.admitCalls++
+	return store.WriteAdmission{Generation: "G1"}, nil
+}
+
+func (s *recordingStore) Put(_ context.Context, admission store.WriteAdmission, p store.Partition, key store.ContentKey, data []byte) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.admissions = append(s.admissions, admission)
 	switch p {
 	case store.PartitionChunk:
 		s.chunkPuts = append(s.chunkPuts, key)
@@ -218,5 +224,27 @@ func TestIngest_AllZeroSealedTableTinyAndDeterministic(t *testing.T) {
 	const gcmOverhead = 1 + 12 + 16 // flag + synthesized nonce + GCM tag
 	if len(sealed) != gcmOverhead {
 		t.Errorf("sealed key table size %d, want %d (no keys, just AEAD overhead)", len(sealed), gcmOverhead)
+	}
+}
+
+func TestIngestUsesOneAdmissionForChunksAndManifest(t *testing.T) {
+	recorder := &recordingStore{}
+	ingester := NewIngester(testKeyFn, nil, recorder, fixedChunker(t, 4096), testEncryptor())
+	input := bytes.Repeat([]byte{1, 2, 3, 4}, 4096)
+	if _, err := ingester.Ingest(context.Background(), sparse.Dense(bytes.NewReader(input), uint64(len(input))), IngestOption{}); err != nil {
+		t.Fatal(err)
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if recorder.admitCalls != 1 {
+		t.Fatalf("AdmitWrite calls = %d, want 1", recorder.admitCalls)
+	}
+	if len(recorder.admissions) < 2 {
+		t.Fatalf("Put admissions = %d, want chunks plus manifest", len(recorder.admissions))
+	}
+	for index, admission := range recorder.admissions {
+		if admission.Generation != "G1" {
+			t.Fatalf("Put admission[%d] = %+v", index, admission)
+		}
 	}
 }

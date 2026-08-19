@@ -80,6 +80,22 @@ fs:
 	}
 }
 
+func TestLoadConfigFSDirectIO(t *testing.T) {
+	path := writeYAML(t, `
+backend: fs
+fs:
+  root: /var/lib/store
+  direct_io: true
+`)
+	cfg, err := LoadConfig(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.FS.DirectIO {
+		t.Fatal("fs.direct_io=true was not preserved")
+	}
+}
+
 func TestLoadConfigS3HappyPath(t *testing.T) {
 	path := writeYAML(t, `
 listen: 127.0.0.1:50051
@@ -380,5 +396,13 @@ func TestStoreConfigTemplateUsesS3(t *testing.T) {
 	}
 	if strings.Contains(storeConfigTemplate, "backend: obs") || strings.Contains(storeConfigTemplate, "# obs:") {
 		t.Fatalf("generated template exposes legacy configuration:\n%s", storeConfigTemplate)
+	}
+	if !strings.Contains(storeConfigTemplate, "direct_io: false") ||
+		!strings.Contains(storeConfigTemplate, "# generations:") {
+		t.Fatalf("generated template omits direct I/O or generation sources:\n%s", storeConfigTemplate)
+	}
+	path := writeYAML(t, storeConfigTemplate)
+	if _, err := LoadConfig(path, true); err != nil {
+		t.Fatalf("generated template is not valid config: %v", err)
 	}
 }

@@ -49,8 +49,7 @@ type ExtraSaltFunc func() ([]byte, error)
 // StoreWriter is the narrow write surface the ingester needs from the
 // store layer. Two methods:
 //
-//   - GetSalt returns the store's opaque 32-byte base salt;
-//     called once per Ingest before chunking starts.
+//   - AdmitWrite returns one generation-bound salt; called once per Ingest.
 //   - Put writes a single chunk or manifest blob keyed by content
 //     hash. Returns isNew=true on first write, isNew=false when the
 //     content was already present (server-side dedup).
@@ -58,8 +57,8 @@ type ExtraSaltFunc func() ([]byte, error)
 // The interface is deliberately narrow so tests can stub it without
 // pulling in pkg/store's RPC surface.
 type StoreWriter interface {
-	GetSalt(ctx context.Context) (salt [32]byte, err error)
-	Put(ctx context.Context, p store.Partition, key store.ContentKey, data []byte) (isNew bool, err error)
+	AdmitWrite(ctx context.Context) (store.WriteAdmission, error)
+	Put(ctx context.Context, admission store.WriteAdmission, p store.Partition, key store.ContentKey, data []byte) (isNew bool, err error)
 }
 
 // IngestOption holds the per-call knobs for Ingest. Zero value is
@@ -132,11 +131,11 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 		return nil, fmt.Errorf("ingest: customer key: %w", err)
 	}
 
-	baseSalt, err := i.store.GetSalt(ctx)
+	admission, err := i.store.AdmitWrite(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("ingest: get salt: %w", err)
+		return nil, fmt.Errorf("ingest: admit write: %w", err)
 	}
-	salt, err := i.mixSalt(baseSalt)
+	salt, err := i.mixSalt(admission.Salt)
 	if err != nil {
 		return nil, err
 	}
@@ -229,7 +228,7 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 				}
 				ciphertext, _, key := i.enc.EncryptChunk(salt, j.data)
 				ck := store.ContentKey(sha256.Sum256(ciphertext))
-				isNew, err := i.store.Put(wctx, store.PartitionChunk, ck, ciphertext)
+				isNew, err := i.store.Put(wctx, admission, store.PartitionChunk, ck, ciphertext)
 				if err != nil {
 					fail(fmt.Errorf("ingest: store put chunk: %w", err))
 					continue
@@ -371,7 +370,7 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 		return nil, fmt.Errorf("ingest: marshal manifest: %w", err)
 	}
 	manifestKey := store.ContentKey(sha256.Sum256(blob))
-	if _, err := i.store.Put(ctx, store.PartitionManifest, manifestKey, blob); err != nil {
+	if _, err := i.store.Put(ctx, admission, store.PartitionManifest, manifestKey, blob); err != nil {
 		return nil, fmt.Errorf("ingest: store put manifest: %w", err)
 	}
 

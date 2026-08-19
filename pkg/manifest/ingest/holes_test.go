@@ -26,11 +26,11 @@ type observingStore struct {
 	manifest    []byte
 }
 
-func (s *observingStore) GetSalt(_ context.Context) ([32]byte, error) {
-	return [32]byte{}, nil
+func (s *observingStore) AdmitWrite(_ context.Context) (store.WriteAdmission, error) {
+	return store.WriteAdmission{Generation: "G1"}, nil
 }
 
-func (s *observingStore) Put(_ context.Context, p store.Partition, key store.ContentKey, data []byte) (bool, error) {
+func (s *observingStore) Put(_ context.Context, _ store.WriteAdmission, p store.Partition, key store.ContentKey, data []byte) (bool, error) {
 	switch p {
 	case store.PartitionChunk:
 		s.chunkPuts.Add(1)

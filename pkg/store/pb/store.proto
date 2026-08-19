@@ -3,17 +3,14 @@
 // store-ctl through this interface and never touch the underlying
 // filesystem or object storage directly.
 //
-// The service is deliberately small: GetSalt to seed client-side
-// convergent encryption, Get to stream bytes out, Put to stream bytes
-// in. Generation management is an internal server concern — clients
-// do not carry generation labels in their requests.
+// The service is deliberately small: AdmitWrite fixes an ingest to one
+// generation and salt, Get streams bytes out, and Put streams bytes in.
 //
 // Put is client-streaming with a header-first convention: the first
-// PutRequest MUST carry a PutHeader (partition + client-computed key);
-// subsequent PutRequests carry raw bytes. The server streams data
-// directly into a temp file (zero-memory receive) and may SendAndClose
-// early with is_new=false if the key already exists (dedup
-// short-circuit, saves the full payload bandwidth on dedup hits).
+// PutRequest MUST carry a PutHeader (partition + client-computed key +
+// admitted generation + optional size); subsequent PutRequests carry raw
+// bytes. The server may SendAndClose early with is_new=false if a matching
+// object already exists.
 //
 // Get is server-streaming: one GetRequest produces one or more
 // GetResponse messages with byte chunks, or a NOT_FOUND status on miss.
@@ -24,9 +21,9 @@ package cac.store.v1;
 option go_package = "github.com/kuasar-sandbox/accelerator/pkg/store/pb";
 
 service Store {
-    // GetSalt returns the server's opaque 32-byte convergent-encryption
-    // salt. Its derivation and lifecycle are store-internal concerns.
-    rpc GetSalt(GetSaltRequest) returns (GetSaltResponse);
+    // AdmitWrite returns the generation and opaque salt shared by every
+    // chunk and the final manifest of one ingest.
+    rpc AdmitWrite(AdmitWriteRequest) returns (AdmitWriteResponse);
 
     // Get streams an object's bytes back to the caller. On miss,
     // the server returns NOT_FOUND (no stream payload). On hit, one
@@ -34,21 +31,22 @@ service Store {
     rpc Get(GetRequest) returns (stream GetResponse);
 
     // Put streams an object from the caller. The first message MUST
-    // be a PutHeader carrying partition + client-computed key.
+    // be a PutHeader carrying partition + client-computed key,
+    // generation, and optional payload size.
     // Subsequent messages carry raw byte chunks. The server may
     // SendAndClose early with is_new=false if the key already
-    // exists. Otherwise the server streams data directly into a
-    // temp file, optionally re-hashes to verify the key matches,
-    // and atomically renames on success.
+    // exists. Otherwise the server streams data into the backend's
+    // generation-bound handle and optionally re-hashes it.
     rpc Put(stream PutRequest) returns (PutResponse);
 }
 
-message GetSaltRequest {}
+message AdmitWriteRequest {}
 
-message GetSaltResponse {
+message AdmitWriteResponse {
+    string generation = 1;
     // Clients may combine this with their own extra salt before
     // deriving per-chunk encryption keys.
-    bytes salt = 1;
+    bytes salt = 2;
 }
 
 enum Partition {
@@ -88,6 +86,10 @@ message PutHeader {
     // optionally re-hashes the streamed bytes to verify the
     // client's claim (per-daemon config).
     bytes     key       = 2;
+    string    generation = 3;
+    // Presence matters: zero is a known empty payload, while absence means
+    // the sender did not provide an expected size.
+    optional uint64 size = 4;
 }
 
 message PutResponse {

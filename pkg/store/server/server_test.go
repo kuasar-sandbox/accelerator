@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"io"
+	"math"
 	"net"
+	"reflect"
 	"sync/atomic"
 	"testing"
 
@@ -24,6 +27,9 @@ import (
 // returns a connected gRPC client. Cleans up via t.Cleanup.
 func startBufconnServer(t *testing.T, opts Options) (pb.StoreClient, *Server) {
 	t.Helper()
+	if opts.Generations == nil {
+		opts.Generations = func() []store.Generation { return []store.Generation{"G1"} }
+	}
 	srv, err := New(opts)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
@@ -54,51 +60,87 @@ func startBufconnServer(t *testing.T, opts Options) (pb.StoreClient, *Server) {
 	return pb.NewStoreClient(conn), srv
 }
 
-func newFSStore(t *testing.T, generation string) *fs.Store {
+func newFSStore(t *testing.T, _ string) *fs.Store {
 	t.Helper()
 	root := t.TempDir()
-	if err := fs.Init(fs.Config{Root: root}, generation); err != nil {
-		t.Fatalf("fs.Init: %v", err)
-	}
-	s, err := fs.New(fs.Config{Root: root, VerifyKey: true})
+	s, err := fs.New(fs.Config{Root: root})
 	if err != nil {
 		t.Fatalf("fs.New: %v", err)
 	}
 	return s
 }
 
-// TestGetSalt — happy path: server returns an opaque 32-byte salt.
-func TestGetSalt(t *testing.T) {
+// TestAdmitWrite returns the newest generation and its opaque salt.
+func TestAdmitWrite(t *testing.T) {
 	cli, _ := startBufconnServer(t, Options{Backend: newFSStore(t, "G1"), VerifyKey: true})
 
-	resp, err := cli.GetSalt(context.Background(), &pb.GetSaltRequest{})
+	resp, err := cli.AdmitWrite(context.Background(), &pb.AdmitWriteRequest{})
 	if err != nil {
-		t.Fatalf("GetSalt: %v", err)
+		t.Fatalf("AdmitWrite: %v", err)
+	}
+	if resp.GetGeneration() != "G1" {
+		t.Errorf("Generation = %q, want G1", resp.GetGeneration())
 	}
 	if len(resp.GetSalt()) != 32 {
 		t.Errorf("Salt: got %d bytes, want 32", len(resp.GetSalt()))
 	}
 }
 
+func TestRolloutChangesNewAdmissionWhileListedOldAdmissionCanFinish(t *testing.T) {
+	current := []store.Generation{"G1"}
+	cli, _ := startBufconnServer(t, Options{
+		Backend:     newFSStore(t, "G1"),
+		Generations: func() []store.Generation { return current },
+		VerifyKey:   true,
+	})
+	oldAdmission, err := cli.AdmitWrite(context.Background(), &pb.AdmitWriteRequest{})
+	if err != nil || oldAdmission.GetGeneration() != "G1" {
+		t.Fatalf("old admission = %v, %v", oldAdmission, err)
+	}
+
+	current = []store.Generation{"G1", "G2"}
+	newAdmission, err := cli.AdmitWrite(context.Background(), &pb.AdmitWriteRequest{})
+	if err != nil || newAdmission.GetGeneration() != "G2" {
+		t.Fatalf("new admission = %v, %v", newAdmission, err)
+	}
+	if bytes.Equal(oldAdmission.GetSalt(), newAdmission.GetSalt()) {
+		t.Fatal("rollout reused the previous generation salt")
+	}
+
+	data := []byte("old admission completes after rollout")
+	key := store.ContentKey(sha256.Sum256(data))
+	size := uint64(len(data))
+	response, err := streamPutHeader(t, cli, &pb.PutHeader{
+		Partition:  pb.Partition_PARTITION_CHUNK,
+		Key:        key[:],
+		Generation: oldAdmission.GetGeneration(),
+		Size:       &size,
+	}, data)
+	if err != nil || !response.GetIsNew() {
+		t.Fatalf("listed old admission Put = %v, %v", response, err)
+	}
+}
+
 func TestOpaqueSaltIsStableWithinAndIsolatedAcrossWriteDomains(t *testing.T) {
-	a, err := New(Options{Backend: newFSStore(t, "G1")})
+	a, err := New(Options{Backend: newFSStore(t, "G1"), Generations: func() []store.Generation { return []store.Generation{"G1"} }})
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := New(Options{Backend: newFSStore(t, "G1")})
+	b, err := New(Options{Backend: newFSStore(t, "G1"), Generations: func() []store.Generation { return []store.Generation{"G1"} }})
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := New(Options{Backend: newFSStore(t, "G2")})
+	c, err := New(Options{Backend: newFSStore(t, "G2"), Generations: func() []store.Generation { return []store.Generation{"G2"} }})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.salt != b.salt {
+	if deriveSalt("G1") != deriveSalt("G1") {
 		t.Fatal("the same store write domain produced different salts")
 	}
-	if a.salt == c.salt {
+	if deriveSalt("G1") == deriveSalt("G2") {
 		t.Fatal("different store write domains produced the same salt")
 	}
+	_, _, _ = a, b, c
 }
 
 // streamPut is a helper for tests: take a key + payload, drive the
@@ -110,9 +152,10 @@ func streamPut(t *testing.T, cli pb.StoreClient, partition pb.Partition, key sto
 	if err != nil {
 		return nil, err
 	}
+	size := uint64(len(data))
 	if err := stream.Send(&pb.PutRequest{
 		Body: &pb.PutRequest_Header{
-			Header: &pb.PutHeader{Partition: partition, Key: key[:]},
+			Header: &pb.PutHeader{Partition: partition, Key: key[:], Generation: "G1", Size: &size},
 		},
 	}); err != nil {
 		return nil, err
@@ -128,6 +171,23 @@ func streamPut(t *testing.T, cli pb.StoreClient, partition pb.Partition, key sto
 			if err == io.EOF {
 				break // server closed early
 			}
+			return nil, err
+		}
+	}
+	return stream.CloseAndRecv()
+}
+
+func streamPutHeader(t *testing.T, cli pb.StoreClient, header *pb.PutHeader, frames ...[]byte) (*pb.PutResponse, error) {
+	t.Helper()
+	stream, err := cli.Put(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	if err := stream.Send(&pb.PutRequest{Body: &pb.PutRequest_Header{Header: header}}); err != nil {
+		return nil, err
+	}
+	for _, frame := range frames {
+		if err := stream.Send(&pb.PutRequest{Body: &pb.PutRequest_Data{Data: frame}}); err != nil && err != io.EOF {
 			return nil, err
 		}
 	}
@@ -211,8 +271,8 @@ func TestDedupShortCircuit(t *testing.T) {
 }
 
 // TestVerifyKeyMismatch — client claims a key that doesn't match the
-// streamed bytes. With verify on, server must reject and the temp
-// file should be cleaned up.
+// streamed bytes. With verify on, server must reject and its owned
+// direct-final file should be cleaned up.
 func TestVerifyKeyMismatch(t *testing.T) {
 	cli, _ := startBufconnServer(t, Options{Backend: newFSStore(t, "G1"), VerifyKey: true})
 
@@ -299,7 +359,7 @@ func TestPutHeaderAfterDataRejected(t *testing.T) {
 	// Send valid header.
 	if err := stream.Send(&pb.PutRequest{
 		Body: &pb.PutRequest_Header{
-			Header: &pb.PutHeader{Partition: pb.Partition_PARTITION_CHUNK, Key: key[:]},
+			Header: &pb.PutHeader{Partition: pb.Partition_PARTITION_CHUNK, Key: key[:], Generation: "G1", Size: func() *uint64 { n := uint64(len(data)); return &n }()},
 		},
 	}); err != nil {
 		t.Fatalf("send header: %v", err)
@@ -312,7 +372,7 @@ func TestPutHeaderAfterDataRejected(t *testing.T) {
 	}
 	// Try to inject another header mid-stream.
 	_ = stream.Send(&pb.PutRequest{
-		Body: &pb.PutRequest_Header{Header: &pb.PutHeader{Partition: pb.Partition_PARTITION_CHUNK, Key: key[:]}},
+		Body: &pb.PutRequest_Header{Header: &pb.PutHeader{Partition: pb.Partition_PARTITION_CHUNK, Key: key[:], Generation: "G1"}},
 	})
 	_, err = stream.CloseAndRecv()
 	if err == nil {
@@ -335,4 +395,154 @@ func TestServerInterfaceCheck(t *testing.T) {
 		t.Fatalf("unexpected: %d", got)
 	}
 	_ = b
+}
+
+func TestPutHeaderOptionalSizeAbsentZeroAndOverflow(t *testing.T) {
+	cli, _ := startBufconnServer(t, Options{Backend: newFSStore(t, "G1"), VerifyKey: true})
+
+	emptyKey := store.ContentKey(sha256.Sum256(nil))
+	zero := uint64(0)
+	response, err := streamPutHeader(t, cli, &pb.PutHeader{
+		Partition:  pb.Partition_PARTITION_CHUNK,
+		Key:        emptyKey[:],
+		Generation: "G1",
+		Size:       &zero,
+	})
+	if err != nil || !response.GetIsNew() {
+		t.Fatalf("zero-size Put = %v, %v", response, err)
+	}
+
+	data := []byte("size absent")
+	key := store.ContentKey(sha256.Sum256(data))
+	response, err = streamPutHeader(t, cli, &pb.PutHeader{
+		Partition:  pb.Partition_PARTITION_CHUNK,
+		Key:        key[:],
+		Generation: "G1",
+	}, data)
+	if err != nil || !response.GetIsNew() {
+		t.Fatalf("absent-size Put = %v, %v", response, err)
+	}
+
+	overflow := uint64(math.MaxInt64) + 1
+	_, err = streamPutHeader(t, cli, &pb.PutHeader{
+		Partition:  pb.Partition_PARTITION_CHUNK,
+		Key:        key[:],
+		Generation: "G1",
+		Size:       &overflow,
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("overflow status = %v, want InvalidArgument", err)
+	}
+
+	_, err = streamPutHeader(t, cli, &pb.PutHeader{
+		Partition:  pb.Partition_PARTITION_CHUNK,
+		Key:        key[:],
+		Generation: "../unsafe",
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("unsafe generation status = %v, want InvalidArgument", err)
+	}
+}
+
+func TestPutRejectsShortAndOversizedPayloads(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		data     []byte
+		expected uint64
+	}{
+		{name: "short", data: []byte("abc"), expected: 4},
+		{name: "oversized", data: []byte("abcd"), expected: 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cli, _ := startBufconnServer(t, Options{Backend: newFSStore(t, "G1"), VerifyKey: true})
+			key := store.ContentKey(sha256.Sum256(test.data))
+			_, err := streamPutHeader(t, cli, &pb.PutHeader{
+				Partition:  pb.Partition_PARTITION_CHUNK,
+				Key:        key[:],
+				Generation: "G1",
+				Size:       &test.expected,
+			}, test.data)
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("status = %v, want InvalidArgument", err)
+			}
+			if _, err := streamGet(t, cli, pb.Partition_PARTITION_CHUNK, key); status.Code(err) != codes.NotFound {
+				t.Fatalf("failed Put left readable path: %v", err)
+			}
+		})
+	}
+}
+
+func TestPutRejectsAdmissionRemovedFromCurrentList(t *testing.T) {
+	current := []store.Generation{"G1"}
+	cli, _ := startBufconnServer(t, Options{
+		Backend:     newFSStore(t, "G1"),
+		Generations: func() []store.Generation { return current },
+		VerifyKey:   true,
+	})
+	admission, err := cli.AdmitWrite(context.Background(), &pb.AdmitWriteRequest{})
+	if err != nil || admission.GetGeneration() != "G1" {
+		t.Fatalf("AdmitWrite = %v, %v", admission, err)
+	}
+	current = []store.Generation{"G2"}
+	data := []byte("stale admission")
+	key := store.ContentKey(sha256.Sum256(data))
+	size := uint64(len(data))
+	_, err = streamPutHeader(t, cli, &pb.PutHeader{
+		Partition:  pb.Partition_PARTITION_CHUNK,
+		Key:        key[:],
+		Generation: admission.GetGeneration(),
+		Size:       &size,
+	}, data)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("stale admission status = %v", err)
+	}
+}
+
+type lookupBackend struct {
+	order []store.Generation
+	hit   store.Generation
+	data  []byte
+}
+
+func (b *lookupBackend) Get(_ context.Context, generation store.Generation, _ store.Partition, _ store.ContentKey) (bool, []byte, error) {
+	b.order = append(b.order, generation)
+	if generation == b.hit {
+		return true, b.data, nil
+	}
+	return false, nil, nil
+}
+
+func (*lookupBackend) Exists(context.Context, store.Generation, store.Partition, store.ContentKey, *int64) (bool, error) {
+	return false, nil
+}
+
+func (*lookupBackend) OpenPut(store.Generation, store.Partition, store.ContentKey, *int64) (store.PutHandle, error) {
+	return nil, errors.New("not implemented")
+}
+
+func TestGetObjectSnapshotsOnceAndSearchesNewestFirst(t *testing.T) {
+	backend := &lookupBackend{hit: "G1", data: []byte("oldest")}
+	loads := 0
+	server, err := New(Options{
+		Backend: backend,
+		Generations: func() []store.Generation {
+			loads++
+			return []store.Generation{"G1", "G2", "G3"}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loads = 0 // exclude New's startup validation
+	found, data, err := server.GetObject(context.Background(), store.PartitionChunk, store.ContentKey{})
+	if err != nil || !found || string(data) != "oldest" {
+		t.Fatalf("GetObject = %v, %q, %v", found, data, err)
+	}
+	if loads != 1 {
+		t.Fatalf("generation loads = %d, want 1", loads)
+	}
+	wantOrder := []store.Generation{"G3", "G2", "G1"}
+	if !reflect.DeepEqual(backend.order, wantOrder) {
+		t.Fatalf("lookup order = %v, want %v", backend.order, wantOrder)
+	}
 }

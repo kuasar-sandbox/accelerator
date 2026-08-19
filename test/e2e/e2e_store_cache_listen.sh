@@ -56,7 +56,8 @@ fs:
 EOF
 "$BIN/store-ctl" init --config "$TMPDIR/store-ctl.yaml" --generation G1
 "$BIN/store-ctl" serve --config "$TMPDIR/store-ctl.yaml" &
-PIDS+=($!)
+STORE_PID=$!
+PIDS+=("$STORE_PID")
 for _ in $(seq 1 30); do
     (echo >/dev/tcp/127.0.0.1/$STORE_PORT) 2>/dev/null && break
     sleep 0.1
@@ -91,9 +92,33 @@ dd if=/dev/urandom of="$TMPDIR/payload.bin" bs=1024 count=128 2>/dev/null
 MKEY=$("$BIN/manifest-ctl" store $CFG --no-progress "$TMPDIR/artifact.tar")
 echo "  ingested manifest-key=$MKEY"
 
+# Roll out G2 without restarting serve. Repeatedly store a second artifact
+# until its manifest appears under G2; this proves SIGHUP changed admission
+# in the running daemon. The G1 manifest above is then used by Test 1 to prove
+# cache_listen shares the same newest-to-oldest lookup as gRPC Get.
+"$BIN/store-ctl" rollout --config "$TMPDIR/store-ctl.yaml" --generation G2
+kill -HUP "$STORE_PID"
+dd if=/dev/urandom of="$TMPDIR/payload-g2.bin" bs=1024 count=32 2>/dev/null
+"$BIN/flatten-ctl" tar stream -f "$TMPDIR/artifact-g2.tar" \
+    "payload-g2.bin:$TMPDIR/payload-g2.bin"
+G2_VISIBLE=0
+for _ in $(seq 1 30); do
+    "$BIN/manifest-ctl" store $CFG --no-progress "$TMPDIR/artifact-g2.tar" >/dev/null
+    if find "$STORE_ROOT/manifest/G2" -type f -print -quit 2>/dev/null | grep -q .; then
+        G2_VISIBLE=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "$G2_VISIBLE" -eq 1 ]; then
+    ok "SIGHUP refresh admits new writes to G2 without restart"
+else
+    fail "SIGHUP refresh did not move admission to G2"
+fi
+
 # ============================================================
 echo ""
-echo "=== Test 1: cache_listen serves the manifest over the wire (== store gRPC) ==="
+echo "=== Test 1: cache_listen serves the older G1 manifest after G2 rollout ==="
 # Fetch the same manifest object two ways: via the store gRPC (manifest-ctl
 # get-manifest) and via store-ctl's cache wire (cache-ctl object get). Both
 # read the identical stored object, so the bytes must match.

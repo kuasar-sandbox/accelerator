@@ -5,14 +5,15 @@ import (
 	"flag"
 	"fmt"
 	"os"
+
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
-// cmdInit creates a fresh store at the configured location with
-// `--generation` as the single (and active) generation. Refuses to
-// clobber an already-initialised store; recovery is `purge --all`
-// followed by a fresh init.
+// cmdInit creates a writable generation source with --generation as its only
+// (and therefore write-admission) entry. It refuses to overwrite an existing
+// source. A config source is read-only and must be edited in the main YAML.
 //
-// Symmetric across backends:
+// Default-source compatibility:
 //
 //	fs:  writes <root>/__meta/generations
 //	s3:  PUTs <prefix>/__meta/generations with If-None-Match: *
@@ -34,20 +35,21 @@ func cmdInit(args []string) {
 		fatal("%v", err)
 	}
 
-	switch cfg.Backend {
-	case "fs":
-		if err := initFSStore(cfg, *generation); err != nil {
-			fatal("init fs: %v", err)
-		}
-		fmt.Fprintf(os.Stderr, "init OK: backend=fs root=%s generation=%s\n",
-			cfg.FS.Root, *generation)
-	case "s3":
-		if err := initS3Store(context.Background(), cfg, *generation); err != nil {
-			fatal("init s3: %v", err)
-		}
-		fmt.Fprintf(os.Stderr, "init OK: backend=s3 bucket=%s prefix=%s generation=%s\n",
-			cfg.S3.Bucket, cfg.S3.Prefix, *generation)
-	default:
-		fatal("unknown backend %q", cfg.Backend)
+	ctx := context.Background()
+	source, err := openGenerationSource(ctx, cfg, resolved)
+	if err != nil {
+		fatal("open generation source: %v", err)
 	}
+	if source.readOnly() {
+		fatal("init generation source: config source is read-only; update the main YAML")
+	}
+	if cfg.Backend == "fs" {
+		if err := os.MkdirAll(cfg.FS.Root, 0o755); err != nil {
+			fatal("create fs root: %v", err)
+		}
+	}
+	if err := source.initialise(ctx, store.Generation(*generation)); err != nil {
+		fatal("init generation source: %v", err)
+	}
+	fmt.Fprintf(os.Stderr, "init OK: backend=%s generation=%s\n", cfg.Backend, *generation)
 }

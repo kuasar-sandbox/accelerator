@@ -7,8 +7,8 @@
 //   - client.go (this file): the minimal s3Client interface that
 //     hides whichever SDK we end up using and the small data types
 //     it needs (ObjectMeta, PutOptions, sentinel errors).
-//   - store.go: Store implementation — generations meta load/init,
-//     Get/Put/Exists/OpenPut, generation-walk on Get,
+//   - store.go: Store implementation — explicit-generation
+//     Get/Exists/OpenPut,
 //     defensive wrapper (timeout + semaphore + size limit).
 //   - puthandle.go: streaming-Put session that buffers in memory
 //     and uploads on Commit via s3Client.Put.

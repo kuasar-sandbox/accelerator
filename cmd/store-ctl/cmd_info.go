@@ -9,7 +9,7 @@ import (
 )
 
 // cmdInfo opens the store described by the config in read-only mode
-// and prints a short report: backend, location, active generation,
+// and prints a short report: backend, location, current write generation,
 // the full generations list, and per-generation chunk/manifest object
 // counts.
 //
@@ -29,9 +29,18 @@ func cmdInfo(args []string) {
 	if err != nil {
 		fatal("%v", err)
 	}
-	s, err := openAdminStore(cfg)
+	ctx := context.Background()
+	source, err := openGenerationSource(ctx, cfg, resolved)
 	if err != nil {
-		fatal("%v", err)
+		fatal("open generation source: %v", err)
+	}
+	generations, err := source.source.Load(ctx)
+	if err != nil {
+		fatal("load generations: %v", err)
+	}
+	data, err := openAdminStore(cfg)
+	if err != nil {
+		fatal("open object backend: %v", err)
 	}
 
 	fmt.Printf("Backend: %s\n", cfg.Backend)
@@ -42,18 +51,16 @@ func cmdInfo(args []string) {
 		fmt.Printf("Bucket:  %s\n", cfg.S3.Bucket)
 		fmt.Printf("Prefix:  %s\n", cfg.S3.Prefix)
 	}
-	fmt.Printf("Active:  %s\n", s.ActiveGeneration())
-	gens := s.Generations()
-	fmt.Printf("Generations (newest first): %v\n\n", gens)
+	fmt.Printf("Write:   %s\n", generations[len(generations)-1])
+	fmt.Printf("Generations (oldest first): %v\n\n", generations)
 
-	ctx := context.Background()
-	for _, gen := range gens {
-		stats, err := s.GenerationStats(ctx, gen)
+	for _, generation := range generations {
+		stats, err := data.GenerationStats(ctx, generation)
 		if err != nil {
-			fmt.Printf("  %s: error: %v\n", gen, err)
+			fmt.Printf("  %s: error: %v\n", generation, err)
 			continue
 		}
 		fmt.Printf("  %s: chunk=%d manifest=%d blob=%d\n",
-			gen, stats[store.PartitionChunk], stats[store.PartitionManifest], stats[store.PartitionBlob])
+			generation, stats[store.PartitionChunk], stats[store.PartitionManifest], stats[store.PartitionBlob])
 	}
 }

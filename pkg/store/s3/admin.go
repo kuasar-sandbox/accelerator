@@ -2,7 +2,6 @@ package s3
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"path"
 	"time"
@@ -10,216 +9,65 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
-// ErrGenerationNotFound is returned by Drop when the named generation
-// is not in the store's __meta/generations list.
-var ErrGenerationNotFound = errors.New("s3: generation not found")
-
-// ErrGenerationExists is returned by Rollout when the named
-// generation is already in the list (would create a duplicate).
-var ErrGenerationExists = errors.New("s3: generation already exists")
-
-// ErrCannotDropActive is returned by Drop when the named generation
-// is the currently-active one. Demoting active is rejected because
-// it leaves the store with no writable generation; rotate to a new
-// gen via Rollout first.
-var ErrCannotDropActive = errors.New("s3: cannot drop the active generation")
-
-// Rollout appends `gen` to the generations list and makes it active.
-// `gen` must not already exist. The meta object is rewritten via
-// CAS (If-Match: <etag>); a concurrent writer triggers a re-read +
-// retry up to MetaCASRetries times.
-func (s *Store) Rollout(ctx context.Context, gen string) error {
-	if gen == "" {
-		return errors.New("s3: generation is required")
+func (s *Store) DropGeneration(ctx context.Context, generation store.Generation) error {
+	if err := store.ValidateGeneration(generation); err != nil {
+		return fmt.Errorf("s3: %w", err)
 	}
-	for attempt := 0; attempt < s.metaTries; attempt++ {
-		if err := s.refreshMeta(ctx); err != nil {
-			return err
+	for _, partition := range s3Partitions() {
+		prefix := path.Join(s.prefix, string(partition), string(generation)) + "/"
+		if err := s.deleteUnder(ctx, prefix); err != nil {
+			return fmt.Errorf("s3: delete under %s: %w", prefix, err)
 		}
-		s.mu.RLock()
-		current := append([]string(nil), s.gens...)
-		etag := s.metaETag
-		s.mu.RUnlock()
-
-		if contains(current, gen) {
-			return fmt.Errorf("%w: %q", ErrGenerationExists, gen)
-		}
-
-		// On-disk is oldest-first (reverse of in-memory).
-		oldestFirst := make([]string, 0, len(current)+1)
-		for i := len(current) - 1; i >= 0; i-- {
-			oldestFirst = append(oldestFirst, current[i])
-		}
-		oldestFirst = append(oldestFirst, gen)
-
-		newETag, err := s.boundedPut(ctx, s.metaKey(),
-			renderGenerations(oldestFirst),
-			PutOptions{IfMatch: etag, ContentType: "text/plain"})
-		if errors.Is(err, ErrPreconditionFailed) {
-			continue // raced; refresh and retry
-		}
-		if err != nil {
-			return fmt.Errorf("s3: rollout meta: %w", err)
-		}
-		s.setGenerations(oldestFirst, newETag)
-		return nil
 	}
-	return fmt.Errorf("s3: rollout exceeded %d CAS retries (concurrent writers?)", s.metaTries)
-}
-
-// Drop removes `gen` from the generations list and deletes every
-// chunk + manifest object under that generation. Refuses to drop
-// the active generation.
-//
-// Order of operations:
-//
-//  1. CAS-rewrite the meta object minus `gen` (so failures partway
-//     through delete leave the list as the source of truth for
-//     "live" generations and a re-run can finish the cleanup).
-//  2. List + delete every key under <prefix>/{chunk,manifest}/<gen>/.
-func (s *Store) Drop(ctx context.Context, gen string) error {
-	if gen == "" {
-		return errors.New("s3: generation is required")
-	}
-	for attempt := 0; attempt < s.metaTries; attempt++ {
-		if err := s.refreshMeta(ctx); err != nil {
-			return err
-		}
-		s.mu.RLock()
-		current := append([]string(nil), s.gens...)
-		active := s.active
-		etag := s.metaETag
-		s.mu.RUnlock()
-
-		if gen == active {
-			return fmt.Errorf("%w: %q", ErrCannotDropActive, gen)
-		}
-		idx := -1
-		for i, g := range current {
-			if g == gen {
-				idx = i
-				break
-			}
-		}
-		if idx < 0 {
-			return fmt.Errorf("%w: %q (known: %v)", ErrGenerationNotFound, gen, current)
-		}
-
-		remaining := append(append([]string(nil), current[:idx]...), current[idx+1:]...)
-		oldestFirst := make([]string, len(remaining))
-		for i := range remaining {
-			oldestFirst[i] = remaining[len(remaining)-1-i]
-		}
-		newETag, err := s.boundedPut(ctx, s.metaKey(),
-			renderGenerations(oldestFirst),
-			PutOptions{IfMatch: etag, ContentType: "text/plain"})
-		if errors.Is(err, ErrPreconditionFailed) {
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("s3: drop meta: %w", err)
-		}
-		s.setGenerations(oldestFirst, newETag)
-
-		// Delete data trees. Failures here are recoverable by re-Drop
-		// (the meta is already updated, so the gen is gone from the
-		// "live" list and a second Drop call would short-circuit on
-		// ErrGenerationNotFound — but the data sweep is idempotent
-		// so a manual purge can clean up).
-		for _, p := range []store.Partition{store.PartitionChunk, store.PartitionManifest, store.PartitionBlob} {
-			pref := path.Join(s.prefix, string(p), gen) + "/"
-			if err := s.deleteUnder(ctx, pref); err != nil {
-				return fmt.Errorf("s3: delete under %s: %w", pref, err)
-			}
-		}
-		return nil
-	}
-	return fmt.Errorf("s3: drop exceeded %d CAS retries (concurrent writers?)", s.metaTries)
-}
-
-// Wipe deletes every object under the store's prefix, including the
-// meta object. The Store stays usable for a subsequent Init; until
-// then any Get/Put/Exists call will produce ErrUninitialised-style
-// errors at the s3 layer (NoSuchKey).
-func (s *Store) Wipe(ctx context.Context) error {
-	pref := s.prefix
-	if pref != "" {
-		pref += "/"
-	}
-	if err := s.deleteUnder(ctx, pref); err != nil {
-		return fmt.Errorf("s3: wipe: %w", err)
-	}
-	s.mu.Lock()
-	s.gens = nil
-	s.active = ""
-	s.metaETag = ""
-	s.mu.Unlock()
 	return nil
 }
 
-// GenerationStats returns the number of objects per partition under
-// the given generation. Walks the in-bucket tree once via List.
-func (s *Store) GenerationStats(ctx context.Context, gen string) (map[store.Partition]int, error) {
+// Wipe deletes object partitions only and never generation-source metadata.
+func (s *Store) Wipe(ctx context.Context) error {
+	for _, partition := range s3Partitions() {
+		prefix := path.Join(s.prefix, string(partition)) + "/"
+		if err := s.deleteUnder(ctx, prefix); err != nil {
+			return fmt.Errorf("s3: wipe under %s: %w", prefix, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) GenerationStats(ctx context.Context, generation store.Generation) (map[store.Partition]int, error) {
+	if err := store.ValidateGeneration(generation); err != nil {
+		return nil, fmt.Errorf("s3: %w", err)
+	}
 	out := make(map[store.Partition]int)
-	for _, p := range []store.Partition{store.PartitionChunk, store.PartitionManifest, store.PartitionBlob} {
-		pref := path.Join(s.prefix, string(p), gen) + "/"
+	for _, partition := range s3Partitions() {
+		prefix := path.Join(s.prefix, string(partition), string(generation)) + "/"
 		count := 0
-		if err := s.listBounded(ctx, pref, func(_ string) bool {
+		if err := s.listBounded(ctx, prefix, func(string) bool {
 			count++
 			return true
 		}); err != nil {
-			return nil, fmt.Errorf("s3: list %s: %w", pref, err)
+			return nil, fmt.Errorf("s3: list %s: %w", prefix, err)
 		}
-		out[p] = count
+		out[partition] = count
 	}
 	return out, nil
 }
 
-// refreshMeta re-reads the meta object so subsequent CAS attempts
-// see the latest etag. Used by Rollout / Drop on each attempt.
-func (s *Store) refreshMeta(ctx context.Context) error {
-	body, meta, err := s.bounded(ctx, func(ctx context.Context) ([]byte, *ObjectMeta, error) {
-		return s.client.Get(ctx, s.metaKey())
-	})
-	if errors.Is(err, ErrNotFound) {
-		return fmt.Errorf("%w: missing %s", ErrUninitialised, s.metaKey())
-	}
-	if err != nil {
-		return fmt.Errorf("s3: read meta: %w", err)
-	}
-	gens := parseGenerations(body)
-	if len(gens) == 0 {
-		return fmt.Errorf("%w: %s is empty", ErrUninitialised, s.metaKey())
-	}
-	s.setGenerations(gens, meta.ETag)
-	return nil
-}
-
-// deleteUnder lists every key under `prefix` and deletes them. The
-// caller picks the prefix scope; this helper does NOT skip the meta
-// object — Drop and Wipe both want the cleanup, and the meta key is
-// covered (Drop targets per-generation subtrees that don't include
-// the meta path; Wipe deliberately includes it).
 func (s *Store) deleteUnder(ctx context.Context, prefix string) error {
-	var collected []string
-	if err := s.listBounded(ctx, prefix, func(k string) bool {
-		collected = append(collected, k)
+	var keys []string
+	if err := s.listBounded(ctx, prefix, func(key string) bool {
+		keys = append(keys, key)
 		return true
 	}); err != nil {
 		return err
 	}
-	for _, k := range collected {
-		if err := s.deleteBounded(ctx, k); err != nil {
-			return fmt.Errorf("delete %s: %w", k, err)
+	for _, key := range keys {
+		if err := s.deleteBounded(ctx, key); err != nil {
+			return fmt.Errorf("delete %s: %w", key, err)
 		}
 	}
 	return nil
 }
 
-// listBounded wraps s3Client.List with the semaphore + timeout.
-// Pagination happens inside List itself; we budget a single context
-// deadline generous enough to span all pages of a typical sweep
-// (tens of thousands of keys at most).
 func (s *Store) listBounded(parent context.Context, prefix string, visit func(string) bool) error {
 	select {
 	case s.sem <- struct{}{}:
@@ -227,7 +75,7 @@ func (s *Store) listBounded(parent context.Context, prefix string, visit func(st
 		return parent.Err()
 	}
 	defer func() { <-s.sem }()
-	timeout := s.opTimeout * 6
+	timeout := s.timeout * 6
 	if timeout < 60*time.Second {
 		timeout = 60 * time.Second
 	}
@@ -236,7 +84,6 @@ func (s *Store) listBounded(parent context.Context, prefix string, visit func(st
 	return s.client.List(ctx, prefix, visit)
 }
 
-// deleteBounded wraps s3Client.Delete with the semaphore + timeout.
 func (s *Store) deleteBounded(parent context.Context, key string) error {
 	select {
 	case s.sem <- struct{}{}:
@@ -244,7 +91,11 @@ func (s *Store) deleteBounded(parent context.Context, key string) error {
 		return parent.Err()
 	}
 	defer func() { <-s.sem }()
-	ctx, cancel := s.opCtx(parent)
+	ctx, cancel := s.opContext(parent)
 	defer cancel()
 	return s.client.Delete(ctx, key)
+}
+
+func s3Partitions() []store.Partition {
+	return []store.Partition{store.PartitionChunk, store.PartitionManifest, store.PartitionBlob}
 }

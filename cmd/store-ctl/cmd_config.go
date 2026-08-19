@@ -77,6 +77,8 @@ backend: fs
 # Filesystem backend (when backend: fs).
 fs:
   root: /var/lib/store-ctl
+  # Use strict O_DIRECT reads for objects only. Default false.
+  direct_io: false
   # Refuse to PUT a chunk whose declared content key doesn't match its
   # bytes. Cheap insurance against client bugs; off only for benchmarks.
   verify_content_key: true
@@ -94,4 +96,29 @@ fs:
 #   max_inflight: 64
 #   op_timeout: 10s
 #   max_object_size_bytes: 16777216
+
+# Generation source: configure exactly one of config, file, or s3. Entries
+# are oldest -> newest; the last entry admits new writes. When this entire
+# section is omitted, fs uses <fs.root>/__meta/generations and s3 uses
+# <s3.prefix>/__meta/generations for backward compatibility.
+# generations:
+#   config:
+#     - G1
+#     - G2
+
+# generations:
+#   refresh_interval: 5s
+#   file:
+#     path: /var/lib/store-ctl/__meta/generations
+
+# generations:
+#   refresh_interval: 5s
+#   s3:
+#     endpoint: https://example-s3-endpoint
+#     region: us-east-1
+#     bucket: kuasar-store-meta
+#     key: production/__meta/generations
+#     path_style: true
+#     access_key: ${GENERATION_S3_ACCESS_KEY}
+#     secret_key: ${GENERATION_S3_SECRET_KEY}
 `

@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"os"
+	"path"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -39,10 +41,9 @@ func (c *Config) StatsIntervalDur() time.Duration {
 //	backend: fs   — local filesystem
 //	backend: s3   — S3-compatible object storage
 //
-// Generation lifecycle is owned by the admin subcommands
-// (init / rollout / purge), NOT by the yaml. `serve` reads whatever
-// the backend reports as the active generation; refusing to start
-// when the meta object is absent so misconfiguration surfaces fast.
+// Generations selects a config, file, or S3 list source. Admin subcommands can
+// mutate only writable file/S3 sources; serve loads and refreshes the selected
+// source independently of the object data backend.
 type Config struct {
 	// Listen is the gRPC server address (host:port). Required by
 	// `serve`; ignored by other subcommands.
@@ -72,6 +73,10 @@ type Config struct {
 	// OBS exists only to detect and silently normalise the complete
 	// legacy backend=obs + obs: input pair. It is nil after LoadConfig.
 	OBS *S3Config `yaml:"obs,omitempty"`
+
+	// Generations selects exactly one oldest-to-newest list source. When
+	// omitted, LoadConfig normalises it to the legacy backend-local path.
+	Generations *GenerationsConfig `yaml:"generations,omitempty"`
 
 	fsSectionSet  bool
 	s3SectionSet  bool
@@ -106,12 +111,82 @@ func (c *Config) UnmarshalYAML(node *yaml.Node) error {
 
 // FSConfig is the filesystem backend's parameter set.
 type FSConfig struct {
-	// Root is the on-disk directory that holds the store. Must be
-	// initialised by `store-ctl init` before `serve` will start.
+	// Root is the on-disk directory that holds the store. It must
+	// exist before the filesystem object backend can be opened.
 	Root string `yaml:"root"`
 
 	// VerifyContentKey: re-hash on Put. Default true.
 	VerifyContentKey *bool `yaml:"verify_content_key"`
+
+	// DirectIO enables strict O_DIRECT reads for object Get only.
+	DirectIO bool `yaml:"direct_io"`
+}
+
+// GenerationsConfig selects one mutually-exclusive generation source.
+type GenerationsConfig struct {
+	RefreshInterval string                `yaml:"refresh_interval,omitempty"`
+	Config          []string              `yaml:"config,omitempty"`
+	File            *GenerationFileConfig `yaml:"file,omitempty"`
+	S3              *GenerationS3Config   `yaml:"s3,omitempty"`
+
+	configSet bool
+	fileSet   bool
+	s3Set     bool
+}
+
+func (c *GenerationsConfig) UnmarshalYAML(node *yaml.Node) error {
+	type plain GenerationsConfig
+	var decoded plain
+	if err := node.Decode(&decoded); err != nil {
+		return err
+	}
+	*c = GenerationsConfig(decoded)
+	if node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		switch node.Content[i].Value {
+		case "config":
+			c.configSet = true
+		case "file":
+			c.fileSet = true
+		case "s3":
+			c.s3Set = true
+		}
+	}
+	return nil
+}
+
+type GenerationFileConfig struct {
+	Path string `yaml:"path"`
+}
+
+// GenerationS3Config is intentionally independent from the data backend's
+// S3 location and credentials.
+type GenerationS3Config struct {
+	Endpoint  string `yaml:"endpoint"`
+	Region    string `yaml:"region"`
+	Bucket    string `yaml:"bucket"`
+	Key       string `yaml:"key"`
+	PathStyle *bool  `yaml:"path_style"`
+	AccessKey string `yaml:"access_key"`
+	SecretKey string `yaml:"secret_key"`
+}
+
+func (c *GenerationS3Config) expandEnv() {
+	c.Endpoint = expandEnv(c.Endpoint)
+	c.Region = expandEnv(c.Region)
+	c.Bucket = expandEnv(c.Bucket)
+	c.Key = expandEnv(c.Key)
+	c.AccessKey = expandEnv(c.AccessKey)
+	c.SecretKey = expandEnv(c.SecretKey)
+}
+
+func (c *GenerationS3Config) pathStyle() bool {
+	if c.PathStyle == nil {
+		return true
+	}
+	return *c.PathStyle
 }
 
 // S3Config is the S3-compatible backend's parameter set. String fields
@@ -270,11 +345,102 @@ func LoadConfig(path string, requireListen bool) (*Config, error) {
 			return nil, fmt.Errorf("store-ctl: s3.access_key and s3.secret_key must be set together")
 		}
 	}
+	if err := cfg.normaliseGenerations(); err != nil {
+		return nil, err
+	}
 	return &cfg, nil
 }
 
+func (c *Config) normaliseGenerations() error {
+	if c.Generations == nil {
+		switch c.Backend {
+		case "fs":
+			c.Generations = &GenerationsConfig{
+				File:    &GenerationFileConfig{Path: filepath.Join(c.FS.Root, "__meta", "generations")},
+				fileSet: true,
+			}
+		case "s3":
+			c.Generations = &GenerationsConfig{
+				S3: &GenerationS3Config{
+					Endpoint:  c.S3.Endpoint,
+					Region:    c.S3.Region,
+					Bucket:    c.S3.Bucket,
+					Key:       path.Join(strings.Trim(c.S3.Prefix, "/"), "__meta/generations"),
+					PathStyle: c.S3.PathStyle,
+					AccessKey: c.S3.AccessKey,
+					SecretKey: c.S3.SecretKey,
+				},
+				s3Set: true,
+			}
+		}
+	}
+	g := c.Generations
+	count := 0
+	if g.configSet || g.Config != nil {
+		g.configSet = true
+		count++
+	}
+	if g.fileSet || g.File != nil {
+		g.fileSet = true
+		count++
+	}
+	if g.s3Set || g.S3 != nil {
+		g.s3Set = true
+		count++
+	}
+	if count != 1 {
+		return fmt.Errorf("store-ctl: generations must configure exactly one of config, file, or s3")
+	}
+	if g.fileSet && g.File == nil {
+		return fmt.Errorf("store-ctl: generations.file must be a mapping with path")
+	}
+	if g.s3Set && g.S3 == nil {
+		return fmt.Errorf("store-ctl: generations.s3 must be a mapping")
+	}
+	if g.configSet {
+		if g.RefreshInterval != "" {
+			return fmt.Errorf("store-ctl: generations.refresh_interval is not valid for config source")
+		}
+		return nil
+	}
+	if g.File != nil {
+		g.File.Path = expandEnv(g.File.Path)
+		if g.File.Path == "" {
+			return fmt.Errorf("store-ctl: generations.file.path is required")
+		}
+	}
+	if g.S3 != nil {
+		g.S3.expandEnv()
+		if g.S3.Region == "" {
+			g.S3.Region = defaultS3Region
+		}
+		if g.S3.Endpoint == "" || g.S3.Bucket == "" || g.S3.Key == "" {
+			return fmt.Errorf("store-ctl: generations.s3 endpoint, bucket, and key are required")
+		}
+		if (g.S3.AccessKey == "") != (g.S3.SecretKey == "") {
+			return fmt.Errorf("store-ctl: generations.s3 access_key and secret_key must be set together")
+		}
+	}
+	if g.RefreshInterval == "" {
+		g.RefreshInterval = "5s"
+	}
+	duration, err := time.ParseDuration(g.RefreshInterval)
+	if err != nil || duration <= 0 {
+		return fmt.Errorf("store-ctl: invalid generations.refresh_interval %q", g.RefreshInterval)
+	}
+	return nil
+}
+
+func (c *Config) GenerationRefreshInterval() time.Duration {
+	if c.Generations == nil || c.Generations.configSet {
+		return 0
+	}
+	duration, _ := time.ParseDuration(c.Generations.RefreshInterval)
+	return duration
+}
+
 // VerifyKey returns the resolved verify-content-key value for the
-// active backend. Both flavours default to true.
+// selected data backend. Both flavours default to true.
 func (c *Config) VerifyKey() bool {
 	switch c.Backend {
 	case "s3":

@@ -17,7 +17,7 @@ type Stats struct {
 	putN     atomic.Uint64 // Put attempts
 	putBytes atomic.Uint64 // bytes received + stored on Put (excludes dedup hits)
 	putDedup atomic.Uint64 // Put that short-circuited on an existing key (no store)
-	saltN    atomic.Uint64 // GetSalt calls
+	admitN   atomic.Uint64 // AdmitWrite calls
 	errN     atomic.Uint64 // requests that returned a gRPC error
 	inflight atomic.Int64  // gauge: Get+Put currently executing
 
@@ -29,7 +29,7 @@ type Stats struct {
 type StatsSnapshot struct {
 	GetN, GetHits, GetBytes  uint64
 	PutN, PutBytes, PutDedup uint64
-	SaltN, ErrN              uint64
+	AdmitN, ErrN             uint64
 	Inflight                 int64
 	GetHist, PutHist         obstat.HistSnapshot
 }
@@ -39,7 +39,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	return StatsSnapshot{
 		GetN: s.getN.Load(), GetHits: s.getHits.Load(), GetBytes: s.getBytes.Load(),
 		PutN: s.putN.Load(), PutBytes: s.putBytes.Load(), PutDedup: s.putDedup.Load(),
-		SaltN: s.saltN.Load(), ErrN: s.errN.Load(),
+		AdmitN: s.admitN.Load(), ErrN: s.errN.Load(),
 		Inflight: s.inflight.Load(),
 		GetHist:  s.getHist.Snapshot(),
 		PutHist:  s.putHist.Snapshot(),

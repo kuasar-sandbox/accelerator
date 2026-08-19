@@ -1,9 +1,9 @@
 // Package client implements a gRPC client for the store-ctl service.
 //
 // The client exposes byte-level Get / Put against the remote store.
-// Get buffers streamed frames into a single byte slice; Put streams
-// the caller's []byte to the server in 256 KiB frames after sending
-// a header carrying the client-computed ContentKey.
+// Get buffers streamed frames into a single byte slice; Put streams the
+// caller's []byte after a header carrying the write-admission generation,
+// client-computed ContentKey, and exact payload size.
 package client
 
 import (
@@ -113,20 +113,25 @@ func (c *Client) withTimeout(ctx context.Context) (context.Context, context.Canc
 	return context.WithTimeout(ctx, c.timeout)
 }
 
-// GetSalt returns the server's opaque salt. Callers may combine it with
-// their own extra salt to produce the convergent-encryption seed.
-func (c *Client) GetSalt(ctx context.Context) (salt [32]byte, err error) {
+// AdmitWrite returns the generation and salt that one ingest must reuse for
+// every chunk and its final manifest.
+func (c *Client) AdmitWrite(ctx context.Context) (store.WriteAdmission, error) {
 	ctx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	resp, err := c.pickStub().GetSalt(ctx, &pb.GetSaltRequest{})
+	resp, err := c.pickStub().AdmitWrite(ctx, &pb.AdmitWriteRequest{})
 	if err != nil {
-		return [32]byte{}, fmt.Errorf("store: GetSalt: %w", err)
+		return store.WriteAdmission{}, fmt.Errorf("store: AdmitWrite: %w", err)
+	}
+	generation := store.Generation(resp.GetGeneration())
+	if err := store.ValidateGeneration(generation); err != nil {
+		return store.WriteAdmission{}, fmt.Errorf("store: AdmitWrite: %w", err)
 	}
 	if len(resp.GetSalt()) != 32 {
-		return [32]byte{}, fmt.Errorf("store: GetSalt: salt length %d, want 32", len(resp.GetSalt()))
+		return store.WriteAdmission{}, fmt.Errorf("store: AdmitWrite: salt length %d, want 32", len(resp.GetSalt()))
 	}
+	var salt [32]byte
 	copy(salt[:], resp.GetSalt())
-	return salt, nil
+	return store.WriteAdmission{Generation: generation, Salt: salt}, nil
 }
 
 // Get fetches a stored object as raw bytes. The server-streamed
@@ -168,7 +173,7 @@ func (c *Client) Get(ctx context.Context, partition store.Partition, key store.C
 // streamed. The server may SendAndClose early on dedup hits — the
 // client handles the resulting io.EOF on its next Send by breaking
 // out of the loop; CloseAndRecv still returns the response.
-func (c *Client) Put(ctx context.Context, partition store.Partition, key store.ContentKey, data []byte) (bool, error) {
+func (c *Client) Put(ctx context.Context, admission store.WriteAdmission, partition store.Partition, key store.ContentKey, data []byte) (bool, error) {
 	ctx, cancel := c.withTimeout(ctx)
 	defer cancel()
 
@@ -182,9 +187,15 @@ func (c *Client) Put(ctx context.Context, partition store.Partition, key store.C
 	}
 
 	// 1. Header.
+	size := uint64(len(data))
 	if err := stream.Send(&pb.PutRequest{
 		Body: &pb.PutRequest_Header{
-			Header: &pb.PutHeader{Partition: pp, Key: key[:]},
+			Header: &pb.PutHeader{
+				Partition:  pp,
+				Key:        key[:],
+				Generation: string(admission.Generation),
+				Size:       &size,
+			},
 		},
 	}); err != nil {
 		return false, fmt.Errorf("store: Put send header: %w", err)

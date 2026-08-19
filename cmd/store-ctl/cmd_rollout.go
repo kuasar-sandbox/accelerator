@@ -5,14 +5,16 @@ import (
 	"flag"
 	"fmt"
 	"os"
+
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
-// cmdRollout adds a new generation to the store and makes it active.
-// The previous active generation stays in the list (chunks/manifests
+// cmdRollout appends a new generation to a writable source, making it the
+// write-admission generation. Previous generations stay in the list (objects
 // remain readable via the reverse-search Get path) until a future
 // `purge --generation` removes it.
 //
-// Symmetric across backends:
+// Default-source compatibility:
 //
 //	fs:  rewrites <root>/__meta/generations atomically
 //	s3:  CAS-rewrites <prefix>/__meta/generations with If-Match
@@ -34,20 +36,25 @@ func cmdRollout(args []string) {
 		fatal("%v", err)
 	}
 
-	store, err := openAdminStore(cfg)
+	ctx := context.Background()
+	source, err := openGenerationSource(ctx, cfg, resolved)
 	if err != nil {
-		fatal("%v", err)
+		fatal("open generation source: %v", err)
 	}
-	if err := store.Rollout(context.Background(), *generation); err != nil {
+	newGeneration := store.Generation(*generation)
+	if err := store.ValidateGeneration(newGeneration); err != nil {
 		fatal("rollout: %v", err)
 	}
-	fmt.Fprintf(os.Stderr, "rollout OK: backend=%s generation=%s (now active)\n",
+	if err := source.mutate(ctx, func(current []store.Generation) ([]store.Generation, error) {
+		return appendGeneration(current, newGeneration)
+	}); err != nil {
+		fatal("rollout: %v", err)
+	}
+	fmt.Fprintf(os.Stderr, "rollout OK: backend=%s generation=%s (now receives write admission)\n",
 		cfg.Backend, *generation)
 }
 
-// openAdminStore opens an existing store of either backend as an
-// adminStore. Used by rollout / purge / info — anything that needs
-// to call Rollout/Drop/Wipe/Generations.
+// openAdminStore opens the explicit-generation object admin helper.
 func openAdminStore(cfg *Config) (adminStore, error) {
 	switch cfg.Backend {
 	case "fs":

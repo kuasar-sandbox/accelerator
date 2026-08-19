@@ -26,6 +26,12 @@ var errCacheReadOnly = errors.New("store-ctl cache server is read-only; write vi
 // the canonical "writes not supported" status before touching Fill.
 type storeTier struct{ cache.Getter }
 
+type serverObjectGetter struct{ server *server.Server }
+
+func (g serverObjectGetter) Get(ctx context.Context, partition store.Partition, key store.ContentKey) (bool, []byte, error) {
+	return g.server.GetObject(ctx, partition, key)
+}
+
 func (storeTier) Fill(context.Context, store.Partition, store.ContentKey, []byte) error {
 	return errCacheReadOnly
 }
@@ -43,8 +49,8 @@ func (storeTier) RejectsWrites() bool { return true }
 // idleTimeout mirrors cache-ctl (120s silent-connection retirement);
 // rpcTimeout is 0 (no per-request deadline — the backend's own timeouts
 // and the client govern), so no config beyond cache_listen is added.
-func startCacheWireServer(cfg *Config, backend server.Backend) (func(), error) {
-	tier := storeTier{cache.NewStoreOrigin(backend)}
+func startCacheWireServer(cfg *Config, storeServer *server.Server) (func(), error) {
+	tier := storeTier{cache.NewStoreOrigin(serverObjectGetter{server: storeServer})}
 	handler := cacheserver.NewCacheHandler(tier, nil) // shard=nil: the store has no shard tier
 	ws := cacheserver.NewWireServer(handler, 120*time.Second, 0)
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"io"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -26,14 +27,17 @@ func startBufconnPair(t *testing.T, pool int, verifyKey bool) *Client {
 	t.Helper()
 
 	root := t.TempDir()
-	if err := fs.Init(fs.Config{Root: root}, "G1"); err != nil {
-		t.Fatalf("fs.Init: %v", err)
-	}
-	backend, err := fs.New(fs.Config{Root: root, VerifyKey: verifyKey})
+	backend, err := fs.New(fs.Config{Root: root})
 	if err != nil {
 		t.Fatalf("fs.New: %v", err)
 	}
-	srv, err := storeserver.New(storeserver.Options{Backend: backend, VerifyKey: verifyKey})
+	srv, err := storeserver.New(storeserver.Options{
+		Backend: backend,
+		Generations: func() []store.Generation {
+			return []store.Generation{"G1"}
+		},
+		VerifyKey: verifyKey,
+	})
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -73,6 +77,15 @@ func startBufconnPair(t *testing.T, pool int, verifyKey bool) *Client {
 	return c
 }
 
+func testAdmission(t *testing.T, client *Client) store.WriteAdmission {
+	t.Helper()
+	admission, err := client.AdmitWrite(context.Background())
+	if err != nil {
+		t.Fatalf("AdmitWrite: %v", err)
+	}
+	return admission
+}
+
 // TestPutGetRoundtrip — Put a payload through the client, Get it
 // back, verify bytes match.
 func TestPutGetRoundtrip(t *testing.T) {
@@ -80,8 +93,9 @@ func TestPutGetRoundtrip(t *testing.T) {
 
 	data := bytes.Repeat([]byte("client-roundtrip-"), 32*1024) // ~544 KiB
 	key := store.ContentKey(sha256.Sum256(data))
+	admission := testAdmission(t, c)
 
-	isNew, err := c.Put(context.Background(), store.PartitionChunk, key, data)
+	isNew, err := c.Put(context.Background(), admission, store.PartitionChunk, key, data)
 	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -110,15 +124,16 @@ func TestDedupShortCircuit(t *testing.T) {
 
 	data := bytes.Repeat([]byte("dedup-payload"), 50*1024) // 650 KiB
 	key := store.ContentKey(sha256.Sum256(data))
+	admission := testAdmission(t, c)
 
-	isNew1, err := c.Put(context.Background(), store.PartitionChunk, key, data)
+	isNew1, err := c.Put(context.Background(), admission, store.PartitionChunk, key, data)
 	if err != nil {
 		t.Fatalf("first Put: %v", err)
 	}
 	if !isNew1 {
 		t.Fatal("first Put should report isNew=true")
 	}
-	isNew2, err := c.Put(context.Background(), store.PartitionChunk, key, data)
+	isNew2, err := c.Put(context.Background(), admission, store.PartitionChunk, key, data)
 	if err != nil {
 		t.Fatalf("second Put: %v", err)
 	}
@@ -145,16 +160,19 @@ func TestGetMiss(t *testing.T) {
 	}
 }
 
-// TestGetSalt — happy path through the gRPC client.
-func TestGetSalt(t *testing.T) {
+// TestAdmitWrite — happy path through the gRPC client.
+func TestAdmitWrite(t *testing.T) {
 	c := startBufconnPair(t, 1, true)
 
-	salt, err := c.GetSalt(context.Background())
+	admission, err := c.AdmitWrite(context.Background())
 	if err != nil {
-		t.Fatalf("GetSalt: %v", err)
+		t.Fatalf("AdmitWrite: %v", err)
+	}
+	if admission.Generation != "G1" {
+		t.Errorf("Generation = %q, want G1", admission.Generation)
 	}
 	var zero [32]byte
-	if salt == zero {
+	if admission.Salt == zero {
 		t.Error("Salt: got all zeros, want derived bytes")
 	}
 }
@@ -193,8 +211,9 @@ func TestLargeStreamFraming(t *testing.T) {
 		data[i] = byte(i % 251)
 	}
 	key := store.ContentKey(sha256.Sum256(data))
+	admission := testAdmission(t, c)
 
-	isNew, err := c.Put(context.Background(), store.PartitionChunk, key, data)
+	isNew, err := c.Put(context.Background(), admission, store.PartitionChunk, key, data)
 	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -218,5 +237,81 @@ func TestClientBasic(t *testing.T) {
 	_ = startBufconnPair(t, 1, true)
 	if got := atomic.LoadInt32(new(int32)); got != 0 {
 		t.Fatalf("unexpected: %d", got)
+	}
+}
+
+type capturePutServer struct {
+	pb.UnimplementedStoreServer
+	headers chan *pb.PutHeader
+}
+
+func (s *capturePutServer) Put(stream pb.Store_PutServer) error {
+	first, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	header := first.GetHeader()
+	copyHeader := &pb.PutHeader{
+		Partition:  header.GetPartition(),
+		Key:        append([]byte(nil), header.GetKey()...),
+		Generation: header.GetGeneration(),
+	}
+	if header.Size != nil {
+		size := *header.Size
+		copyHeader.Size = &size
+	}
+	s.headers <- copyHeader
+	for {
+		if _, err := stream.Recv(); err == io.EOF {
+			break
+		} else if err != nil {
+			return err
+		}
+	}
+	return stream.SendAndClose(&pb.PutResponse{IsNew: true})
+}
+
+func startCaptureClient(t *testing.T, server pb.StoreServer) *Client {
+	t.Helper()
+	listener := bufconn.Listen(1 << 20)
+	grpcServer := grpc.NewServer()
+	pb.RegisterStoreServer(grpcServer, server)
+	go func() { _ = grpcServer.Serve(listener) }()
+	t.Cleanup(func() {
+		grpcServer.Stop()
+		_ = listener.Close()
+	})
+	connection, err := grpc.NewClient(
+		"passthrough://capture",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{conns: []*grpc.ClientConn{connection}, stubs: []pb.StoreClient{pb.NewStoreClient(connection)}}
+	t.Cleanup(func() { _ = client.Close() })
+	return client
+}
+
+func TestOfficialClientAlwaysSendsSizePresence(t *testing.T) {
+	server := &capturePutServer{headers: make(chan *pb.PutHeader, 2)}
+	client := startCaptureClient(t, server)
+	admission := store.WriteAdmission{Generation: "G1"}
+	for _, data := range [][]byte{nil, []byte("normal payload")} {
+		key := store.ContentKey(sha256.Sum256(data))
+		if _, err := client.Put(context.Background(), admission, store.PartitionChunk, key, data); err != nil {
+			t.Fatal(err)
+		}
+		header := <-server.headers
+		if header.Size == nil {
+			t.Fatalf("len=%d: size has no presence", len(data))
+		}
+		if got := *header.Size; got != uint64(len(data)) {
+			t.Fatalf("len=%d: header size = %d", len(data), got)
+		}
+		if header.GetGeneration() != "G1" {
+			t.Fatalf("generation = %q", header.GetGeneration())
+		}
 	}
 }

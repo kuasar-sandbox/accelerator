@@ -1,6 +1,6 @@
 // Package server implements the gRPC store-ctl service. It wraps a
 // filesystem backend (or future object-storage backend) and exposes
-// GetSalt / Get / Put over gRPC, with streaming transport for Get
+// AdmitWrite / Get / Put over gRPC, with streaming transport for Get
 // and Put to avoid buffering large payloads in memory.
 package server
 
@@ -17,28 +17,18 @@ import (
 // Implementations: fs.Store (local filesystem) and s3.Store
 // (S3-compatible object storage via the S3 API).
 type Backend interface {
-	// Get fetches an object by key under the given partition.
+	// Get fetches an object from exactly one generation.
 	// Returns (true, data, nil) on hit, (false, nil, nil) on miss.
-	Get(ctx context.Context, partition store.Partition, key store.ContentKey) (bool, []byte, error)
-
-	// Put writes data under the given partition. The caller-supplied
-	// key is authoritative for path resolution. Returns isNew=true
-	// when a new object was written, false on dedup hit.
-	Put(ctx context.Context, partition store.Partition, key store.ContentKey, data []byte) (bool, error)
+	Get(ctx context.Context, generation store.Generation, partition store.Partition, key store.ContentKey) (bool, []byte, error)
 
 	// OpenPut returns a streaming-Put handle for the given partition.
 	// Callers write bytes, then Commit (with the claimed key and a
 	// verification digest) or Abort. The PutHandle contract is
 	// defined in pkg/store.
-	OpenPut(partition store.Partition) (store.PutHandle, error)
+	OpenPut(generation store.Generation, partition store.Partition, key store.ContentKey, expectedSize *int64) (store.PutHandle, error)
 
-	// Exists reports whether the given key already lives under the
-	// partition's active generation (a cheap stat check, not a
-	// reverse-generation search). Used by the Put handler to
-	// SendAndClose early on dedup hits.
-	Exists(partition store.Partition, key store.ContentKey) bool
-
-	// ActiveGeneration returns the generation the backend is
-	// writing new objects to. Surfaced via GetSalt.
-	ActiveGeneration() string
+	// Exists checks exactly one generation. A non-nil expectedSize
+	// requires a regular object of exactly that size; nil uses existence
+	// semantics. Storage errors are never converted into misses.
+	Exists(ctx context.Context, generation store.Generation, partition store.Partition, key store.ContentKey, expectedSize *int64) (bool, error)
 }

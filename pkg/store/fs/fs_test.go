@@ -1,553 +1,614 @@
 package fs
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
-// newTestStore initialises a fresh fs store at a temp dir with the
-// given generation, then opens it. The test gets a ready-to-use
-// Store and the temp dir is cleaned up by t.TempDir().
-func newTestStore(t *testing.T, gen string) *Store {
+const testGeneration store.Generation = "G1"
+
+func newTestStore(t *testing.T) (*Store, string) {
 	t.Helper()
 	root := t.TempDir()
-	if err := Init(Config{Root: root}, gen); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-	s, err := New(Config{Root: root, VerifyKey: true})
+	backend, err := New(Config{Root: root})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	return s
+	return backend, root
 }
 
-func sum(b []byte) store.ContentKey {
-	return store.ContentKey(sha256.Sum256(b))
+func contentKey(data []byte) store.ContentKey {
+	return store.ContentKey(sha256.Sum256(data))
 }
 
-// TestRoundtrip exercises the happy path: Put a blob, read it back,
-// bytes should match.
-func TestRoundtrip(t *testing.T) {
-	s := newTestStore(t, "G1")
-	ctx := context.Background()
+func int64Pointer(value int64) *int64 { return &value }
 
-	data := []byte("hello store")
-	key := sum(data)
-
-	isNew, err := s.Put(ctx, store.PartitionChunk, key, data)
-	if err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-	if !isNew {
-		t.Fatal("first Put should report isNew=true")
-	}
-
-	found, blob, err := s.Get(ctx, store.PartitionChunk, key)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if !found {
-		t.Fatal("Get should find the just-Put key")
-	}
-	got := blob
-	if string(got) != "hello store" {
-		t.Fatalf("Get returned %q, want %q", got, "hello store")
-	}
-}
-
-// TestBlobPartition exercises the blob partition: content-addressed
-// Put/Get/Exists and generation scope identical to chunk/manifest,
-// isolated only by partition.
-func TestBlobPartition(t *testing.T) {
-	s := newTestStore(t, "G1")
-	ctx := context.Background()
-
-	data := []byte("arbitrary blob payload")
-	key := sum(data)
-
-	if isNew, err := s.Put(ctx, store.PartitionBlob, key, data); err != nil || !isNew {
-		t.Fatalf("Put blob: isNew=%v err=%v", isNew, err)
-	}
-	if !s.Exists(store.PartitionBlob, key) {
-		t.Fatal("Exists(blob) should be true after Put")
-	}
-	found, got, err := s.Get(ctx, store.PartitionBlob, key)
-	if err != nil || !found || string(got) != string(data) {
-		t.Fatalf("Get blob: found=%v err=%v got=%q", found, err, got)
-	}
-
-	// Partition isolation: the same key under chunk must be absent.
-	if s.Exists(store.PartitionChunk, key) {
-		t.Fatal("blob Put must not leak into the chunk partition")
-	}
-	if f, _, _ := s.Get(ctx, store.PartitionChunk, key); f {
-		t.Fatal("Get(chunk) must miss a blob-only key")
-	}
-
-	// Generation-scoped: still reverse-found after rollout, gone after
-	// dropping its generation (same as chunk/manifest).
-	if err := s.Rollout(ctx, "G2"); err != nil {
-		t.Fatalf("Rollout: %v", err)
-	}
-	if f, _, _ := s.Get(ctx, store.PartitionBlob, key); !f {
-		t.Fatal("blob should still be reverse-found after rollout")
-	}
-	if err := s.Drop(ctx, "G1"); err != nil {
-		t.Fatalf("Drop G1: %v", err)
-	}
-	if f, _, _ := s.Get(ctx, store.PartitionBlob, key); f {
-		t.Fatal("blob should be gone after dropping its generation")
-	}
-}
-
-// TestDedupShortCircuit verifies that a second Put with the same
-// key returns isNew=false and does NOT rewrite the temp/final file.
-func TestDedupShortCircuit(t *testing.T) {
-	s := newTestStore(t, "G1")
-	ctx := context.Background()
-
-	data := []byte("dedup me")
-	key := sum(data)
-
-	if _, err := s.Put(ctx, store.PartitionChunk, key, data); err != nil {
-		t.Fatalf("first Put: %v", err)
-	}
-	isNew, err := s.Put(ctx, store.PartitionChunk, key, data)
-	if err != nil {
-		t.Fatalf("second Put: %v", err)
-	}
-	if isNew {
-		t.Fatal("second Put should report isNew=false (dedup hit)")
-	}
-}
-
-// TestVerifyKeyMismatch asserts that a Put with a deliberately
-// wrong key is rejected and no temp file is left behind.
-func TestVerifyKeyMismatch(t *testing.T) {
-	s := newTestStore(t, "G1")
-	ctx := context.Background()
-
-	data := []byte("real bytes")
-	wrongKey := sum([]byte("lying about these"))
-
-	_, err := s.Put(ctx, store.PartitionChunk, wrongKey, data)
-	if err == nil {
-		t.Fatal("Put with mismatched key should return an error")
-	}
-
-	// tmp dir should be clean — verify by listing.
-	tmpRoot := filepath.Join(s.root, metaDir, tmpDir)
-	entries, _ := os.ReadDir(tmpRoot)
-	for _, e := range entries {
-		if !e.IsDir() {
-			t.Errorf("leftover temp file %s after verify-mismatch abort", e.Name())
-		}
-	}
-}
-
-// TestVerifyOff — VerifyKey=false lets a mismatched key through
-// (dangerous but documented; useful for trusted-loader scenarios).
-func TestVerifyOff(t *testing.T) {
-	root := t.TempDir()
-	if err := Init(Config{Root: root}, "G1"); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-	s, err := New(Config{Root: root, VerifyKey: false})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	ctx := context.Background()
-
-	data := []byte("real bytes")
-	wrongKey := sum([]byte("but we tell the store this"))
-
-	isNew, err := s.Put(ctx, store.PartitionChunk, wrongKey, data)
-	if err != nil {
-		t.Fatalf("Put with verify off: %v", err)
-	}
-	if !isNew {
-		t.Fatal("Put with verify off should still write")
-	}
-
-	// Get using the wrong-but-committed key should return the data.
-	found, blob, err := s.Get(ctx, store.PartitionChunk, wrongKey)
-	if err != nil || !found {
-		t.Fatal("Get on verify-off key should hit")
-	}
-	got := blob
-	if string(got) != "real bytes" {
-		t.Fatalf("Get returned %q, want %q", got, "real bytes")
-	}
-}
-
-// TestGetMiss returns (false, nil, nil) for unknown keys.
-func TestGetMiss(t *testing.T) {
-	s := newTestStore(t, "G1")
-	found, blob, err := s.Get(context.Background(), store.PartitionChunk, sum([]byte("nope")))
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if found {
-		t.Fatal("Get on unknown key should miss")
-	}
-	if blob != nil {
-		t.Fatal("Get miss should return nil blob")
-	}
-}
-
-// TestNewUninitialised — opening a never-initialised root must
-// return ErrUninitialised so the caller can suggest `store-ctl init`.
-func TestNewUninitialised(t *testing.T) {
-	root := t.TempDir()
-	_, err := New(Config{Root: root})
-	if !errors.Is(err, ErrUninitialised) {
-		t.Fatalf("New on fresh root: got %v, want ErrUninitialised", err)
-	}
-}
-
-// TestNewMissingRoot — root directory absent → still ErrUninitialised
-// (with the missing-path detail in the wrapped message).
-func TestNewMissingRoot(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "does-not-exist")
-	_, err := New(Config{Root: root})
-	if !errors.Is(err, ErrUninitialised) {
-		t.Fatalf("got %v, want ErrUninitialised", err)
-	}
-}
-
-// TestInit_Then_New — Init writes the meta file with the given
-// generation, then New picks it up as the single active generation.
-func TestInit_Then_New(t *testing.T) {
-	root := t.TempDir()
-	if err := Init(Config{Root: root}, "G1"); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-	data, _ := os.ReadFile(filepath.Join(root, metaDir, generationsFile))
-	if string(data) != "G1\n" {
-		t.Errorf("generations file: got %q, want %q", data, "G1\n")
-	}
-	s, err := New(Config{Root: root})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	if got := s.ActiveGeneration(); got != "G1" {
-		t.Errorf("active: got %q, want G1", got)
-	}
-	if got := s.Generations(); len(got) != 1 || got[0] != "G1" {
-		t.Errorf("gens: got %v, want [G1]", got)
-	}
-}
-
-// TestInitTwiceRejects — Init refuses to clobber an existing meta
-// file. The recovery path is Wipe (deliberate) + re-Init.
-func TestInitTwiceRejects(t *testing.T) {
-	root := t.TempDir()
-	if err := Init(Config{Root: root}, "G1"); err != nil {
-		t.Fatalf("first Init: %v", err)
-	}
-	err := Init(Config{Root: root}, "G2")
-	if !errors.Is(err, ErrAlreadyInitialised) {
-		t.Errorf("second Init: got %v, want ErrAlreadyInitialised", err)
-	}
-}
-
-// TestInitRequiresGeneration — empty generation string is rejected
-// (avoids creating a meta file containing only "\n" which would
-// break New's empty-file check).
-func TestInitRequiresGeneration(t *testing.T) {
-	if err := Init(Config{Root: t.TempDir()}, ""); err == nil {
-		t.Error("Init with empty generation should fail")
-	}
-}
-
-// TestRollout_AppendsAndActivates — Rollout adds a new generation,
-// makes it active, persists oldest-first to disk, and the in-memory
-// cache reflects newest-first ordering.
-func TestRollout_AppendsAndActivates(t *testing.T) {
-	root := t.TempDir()
-	if err := Init(Config{Root: root}, "G1"); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-	s, err := New(Config{Root: root})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-
-	if err := s.Rollout(context.Background(), "G2"); err != nil {
-		t.Fatalf("Rollout G2: %v", err)
-	}
-	if got := s.ActiveGeneration(); got != "G2" {
-		t.Errorf("active after Rollout: got %q, want G2", got)
-	}
-	gens := s.Generations()
-	want := []string{"G2", "G1"}
-	if len(gens) != 2 || gens[0] != want[0] || gens[1] != want[1] {
-		t.Errorf("gens: got %v, want %v", gens, want)
-	}
-	data, _ := os.ReadFile(filepath.Join(root, metaDir, generationsFile))
-	if string(data) != "G1\nG2\n" {
-		t.Errorf("meta file: got %q, want %q", data, "G1\nG2\n")
-	}
-}
-
-// TestRollout_RejectsDuplicate — re-Rollout the same generation
-// returns ErrGenerationExists; meta file is left untouched.
-func TestRollout_RejectsDuplicate(t *testing.T) {
-	root := t.TempDir()
-	if err := Init(Config{Root: root}, "G1"); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-	s, _ := New(Config{Root: root})
-	err := s.Rollout(context.Background(), "G1")
-	if !errors.Is(err, ErrGenerationExists) {
-		t.Errorf("got %v, want ErrGenerationExists", err)
-	}
-}
-
-// TestExistingMetaIsLoaded_NewestFirst — New on a hand-written meta
-// file picks the last line as active and reverses for in-memory.
-// Mirrors the on-disk convention: oldest-first persisted, newest-
-// first in memory.
-func TestExistingMetaIsLoaded_NewestFirst(t *testing.T) {
-	root := t.TempDir()
-	metaFile := filepath.Join(root, metaDir, generationsFile)
-	_ = os.MkdirAll(filepath.Dir(metaFile), 0o755)
-	_ = os.WriteFile(metaFile, []byte("G1\nG2\nG3\n"), 0o644)
-
-	s, err := New(Config{Root: root})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	if got := s.ActiveGeneration(); got != "G3" {
-		t.Errorf("active: got %q, want G3", got)
-	}
-	gens := s.Generations()
-	want := []string{"G3", "G2", "G1"}
-	if len(gens) != len(want) {
-		t.Fatalf("gens: got %v, want %v", gens, want)
-	}
-	for i := range want {
-		if gens[i] != want[i] {
-			t.Errorf("gens[%d] = %q, want %q", i, gens[i], want[i])
-		}
-	}
-}
-
-// TestGetReverseSearch — a key written under an older generation is
-// still findable after Rollout to a younger active generation.
-func TestGetReverseSearch(t *testing.T) {
-	root := t.TempDir()
-	if err := Init(Config{Root: root}, "G1"); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-
-	// Phase 1: open as G1, write a blob.
-	s1, err := New(Config{Root: root, VerifyKey: true})
-	if err != nil {
-		t.Fatalf("New G1: %v", err)
-	}
-	data := []byte("old-gen payload")
-	key := sum(data)
-	if _, err := s1.Put(context.Background(), store.PartitionChunk, key, data); err != nil {
-		t.Fatalf("Put G1: %v", err)
-	}
-
-	// Phase 2: rotate to G2 (in-place, no reopen needed).
-	if err := s1.Rollout(context.Background(), "G2"); err != nil {
-		t.Fatalf("Rollout G2: %v", err)
-	}
-	if got := s1.ActiveGeneration(); got != "G2" {
-		t.Fatalf("active: got %q, want G2", got)
-	}
-
-	// Get the G1 blob from the G2 store — reverse search should hit.
-	found, blob, err := s1.Get(context.Background(), store.PartitionChunk, key)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if !found {
-		t.Fatal("reverse search should find G1 blob from G2 store")
-	}
-	if string(blob) != "old-gen payload" {
-		t.Fatalf("got %q, want %q", blob, "old-gen payload")
-	}
-}
-
-// TestDrop_RefusesActive — refuses to drop the currently active
-// generation (would leave the store with no writable destination).
-func TestDrop_RefusesActive(t *testing.T) {
-	root := t.TempDir()
-	if err := Init(Config{Root: root}, "G1"); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-	s, _ := New(Config{Root: root})
-	err := s.Drop(context.Background(), "G1")
-	if !errors.Is(err, ErrCannotDropActive) {
-		t.Errorf("got %v, want ErrCannotDropActive", err)
-	}
-}
-
-// TestDrop_RemovesGenAndData — Drop removes the gen from meta and
-// deletes per-partition data trees underneath.
-func TestDrop_RemovesGenAndData(t *testing.T) {
-	root := t.TempDir()
-	if err := Init(Config{Root: root}, "G1"); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-	s, _ := New(Config{Root: root, VerifyKey: true})
-
-	// Write a blob into G1 and rotate to G2.
-	data := []byte("g1 data")
-	key := sum(data)
-	if _, err := s.Put(context.Background(), store.PartitionChunk, key, data); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-	if err := s.Rollout(context.Background(), "G2"); err != nil {
-		t.Fatalf("Rollout: %v", err)
-	}
-
-	// Drop G1.
-	if err := s.Drop(context.Background(), "G1"); err != nil {
-		t.Fatalf("Drop: %v", err)
-	}
-	gens := s.Generations()
-	if len(gens) != 1 || gens[0] != "G2" {
-		t.Errorf("gens after Drop: got %v, want [G2]", gens)
-	}
-
-	// Data tree for G1 must be gone.
-	g1Dir := filepath.Join(root, "chunk", "G1")
-	if _, err := os.Stat(g1Dir); !os.IsNotExist(err) {
-		t.Errorf("G1 chunk dir should be gone, stat err: %v", err)
-	}
-
-	// Get for the now-orphaned key must miss (G1 no longer searched).
-	found, _, _ := s.Get(context.Background(), store.PartitionChunk, key)
-	if found {
-		t.Error("Get should miss after dropping the source generation")
-	}
-}
-
-// TestDrop_UnknownGeneration — Drop on a name not in the meta list
-// returns ErrGenerationNotFound.
-func TestDrop_UnknownGeneration(t *testing.T) {
-	root := t.TempDir()
-	if err := Init(Config{Root: root}, "G1"); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-	s, _ := New(Config{Root: root})
-	err := s.Drop(context.Background(), "ZZZ")
-	if !errors.Is(err, ErrGenerationNotFound) {
-		t.Errorf("got %v, want ErrGenerationNotFound", err)
-	}
-}
-
-// TestWipe_RemovesEverything — Wipe blows away the whole root,
-// including the meta file. Subsequent New must report ErrUninitialised.
-func TestWipe_RemovesEverything(t *testing.T) {
-	root := t.TempDir()
-	if err := Init(Config{Root: root}, "G1"); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-	s, _ := New(Config{Root: root, VerifyKey: true})
-
-	data := []byte("to be wiped")
-	key := sum(data)
-	if _, err := s.Put(context.Background(), store.PartitionChunk, key, data); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-
-	if err := s.Wipe(context.Background()); err != nil {
-		t.Fatalf("Wipe: %v", err)
-	}
-
-	if _, err := os.Stat(root); !os.IsNotExist(err) {
-		t.Errorf("root should be gone, stat err: %v", err)
-	}
-	if _, err := New(Config{Root: root}); !errors.Is(err, ErrUninitialised) {
-		t.Errorf("New after Wipe: got %v, want ErrUninitialised", err)
-	}
-}
-
-// TestGenerationStats — reports per-partition object counts after a
-// few writes.
-func TestGenerationStats(t *testing.T) {
-	root := t.TempDir()
-	if err := Init(Config{Root: root}, "G1"); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-	s, _ := New(Config{Root: root, VerifyKey: true})
-	for i := 0; i < 3; i++ {
-		data := []byte{byte(i), byte(i + 1), byte(i + 2)}
-		if _, err := s.Put(context.Background(), store.PartitionChunk, sum(data), data); err != nil {
-			t.Fatalf("Put: %v", err)
-		}
-	}
-	stats, err := s.GenerationStats(context.Background(), "G1")
-	if err != nil {
-		t.Fatalf("GenerationStats: %v", err)
-	}
-	if stats[store.PartitionChunk] != 3 {
-		t.Errorf("chunk count: got %d, want 3", stats[store.PartitionChunk])
-	}
-	if stats[store.PartitionManifest] != 0 {
-		t.Errorf("manifest count: got %d, want 0", stats[store.PartitionManifest])
-	}
-}
-
-// TestPutHandleAbort exercises the OpenPut/Abort path: opening a
-// handle, writing some bytes, then Aborting should leave no temp
-// file and the target path should stay absent.
-func TestPutHandleAbort(t *testing.T) {
-	s := newTestStore(t, "G1")
-
-	h, err := s.OpenPut(store.PartitionChunk)
+func writeObject(t *testing.T, backend *Store, generation store.Generation, partition store.Partition, key store.ContentKey, data []byte, expected *int64, verify bool) bool {
+	t.Helper()
+	handle, err := backend.OpenPut(generation, partition, key, expected)
 	if err != nil {
 		t.Fatalf("OpenPut: %v", err)
 	}
-	if _, err := h.Write([]byte("partial")); err != nil {
+	if _, err := handle.Write(data); err != nil {
+		_ = handle.Abort()
 		t.Fatalf("Write: %v", err)
 	}
-	if err := h.Abort(); err != nil {
-		t.Fatalf("Abort: %v", err)
+	digest := key
+	if verify {
+		digest = contentKey(data)
+	}
+	isNew, err := handle.Commit(key, digest)
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	return isNew
+}
+
+func TestExplicitGenerationGetAndExists(t *testing.T) {
+	backend, _ := newTestStore(t)
+	data := []byte("generation-bound object")
+	key := contentKey(data)
+	size := int64(len(data))
+	if !writeObject(t, backend, "G1", store.PartitionChunk, key, data, &size, true) {
+		t.Fatal("first write was not new")
 	}
 
-	// tmp dir should be empty.
-	tmpRoot := filepath.Join(s.root, metaDir, tmpDir)
-	entries, _ := os.ReadDir(tmpRoot)
-	if len(entries) != 0 {
-		names := make([]string, 0, len(entries))
-		for _, e := range entries {
-			names = append(names, e.Name())
-		}
-		t.Errorf("temp dir should be empty after Abort, got: %v", names)
+	for _, test := range []struct {
+		name     string
+		expected *int64
+		want     bool
+	}{
+		{name: "unknown size", want: true},
+		{name: "matching size", expected: int64Pointer(size), want: true},
+		{name: "different size", expected: int64Pointer(size + 1), want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			exists, err := backend.Exists(context.Background(), "G1", store.PartitionChunk, key, test.expected)
+			if err != nil || exists != test.want {
+				t.Fatalf("Exists = %v, %v; want %v, nil", exists, err, test.want)
+			}
+		})
+	}
+	if found, _, err := backend.Get(context.Background(), "G2", store.PartitionChunk, key); err != nil || found {
+		t.Fatalf("Get G2 = %v, %v; want miss", found, err)
+	}
+	found, got, err := backend.Get(context.Background(), "G1", store.PartitionChunk, key)
+	if err != nil || !found || !bytes.Equal(got, data) {
+		t.Fatalf("Get G1 = %v, %q, %v", found, got, err)
 	}
 }
 
-// TestOrphanCleanup — a leftover put-* temp file is removed when a
-// new Store opens an already-initialised root.
-func TestOrphanCleanup(t *testing.T) {
-	root := t.TempDir()
-	if err := Init(Config{Root: root}, "G1"); err != nil {
-		t.Fatalf("Init: %v", err)
+func TestOpenPutNoopAndMismatchedReplacement(t *testing.T) {
+	backend, _ := newTestStore(t)
+	key := contentKey([]byte("claimed payload"))
+	original := []byte("bad")
+	writeObject(t, backend, testGeneration, store.PartitionChunk, key, original, int64Pointer(int64(len(original))), false)
+
+	replacement := []byte("correct-size")
+	size := int64(len(replacement))
+	if !writeObject(t, backend, testGeneration, store.PartitionChunk, key, replacement, &size, false) {
+		t.Fatal("size-mismatch replacement was not new")
 	}
-	tmpRoot := filepath.Join(root, metaDir, tmpDir)
-	orphan := filepath.Join(tmpRoot, "put-stale-123")
-	if err := os.WriteFile(orphan, []byte("stale"), 0o644); err != nil {
+	found, got, err := backend.Get(context.Background(), testGeneration, store.PartitionChunk, key)
+	if err != nil || !found || !bytes.Equal(got, replacement) {
+		t.Fatalf("replacement Get = %v, %q, %v", found, got, err)
+	}
+	if writeObject(t, backend, testGeneration, store.PartitionChunk, key, bytes.Repeat([]byte{'x'}, len(replacement)), &size, false) {
+		t.Fatal("same-size target should return no-op dedup")
+	}
+	if writeObject(t, backend, testGeneration, store.PartitionChunk, key, []byte("ignored without size"), nil, false) {
+		t.Fatal("existing target without expected size should return no-op dedup")
+	}
+}
+
+func TestOpenPutCopiesExpectedSize(t *testing.T) {
+	backend, _ := newTestStore(t)
+	data := []byte("four")
+	key := contentKey(data)
+	expected := int64(len(data))
+	handle, err := backend.OpenPut(testGeneration, store.PartitionChunk, key, &expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected = 999
+	if _, err := handle.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if isNew, err := handle.Commit(key, key); err != nil || !isNew {
+		t.Fatalf("Commit = %v, %v", isNew, err)
+	}
+}
+
+func TestPutValidationFailuresCleanOwnedFile(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		commit func(store.PutHandle, store.ContentKey) error
+	}{
+		{
+			name: "commit key mismatch",
+			commit: func(handle store.PutHandle, key store.ContentKey) error {
+				other := contentKey([]byte("other"))
+				_, err := handle.Commit(other, key)
+				return err
+			},
+		},
+		{
+			name: "digest mismatch",
+			commit: func(handle store.PutHandle, key store.ContentKey) error {
+				_, err := handle.Commit(key, contentKey([]byte("other")))
+				return err
+			},
+		},
+		{
+			name: "short payload",
+			commit: func(handle store.PutHandle, key store.ContentKey) error {
+				_, err := handle.Commit(key, key)
+				return err
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			backend, _ := newTestStore(t)
+			data := []byte("payload")
+			key := contentKey(data)
+			expected := int64(len(data) + 1)
+			if test.name != "short payload" {
+				expected = int64(len(data))
+			}
+			handle, err := backend.OpenPut(testGeneration, store.PartitionChunk, key, &expected)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := handle.Write(data); err != nil {
+				t.Fatal(err)
+			}
+			if err := test.commit(handle, key); err == nil {
+				t.Fatal("Commit unexpectedly succeeded")
+			}
+			if _, err := os.Lstat(backend.objectPath(store.PartitionChunk, testGeneration, key)); !os.IsNotExist(err) {
+				t.Fatalf("owned path survived failure: %v", err)
+			}
+		})
+	}
+}
+
+func TestWriteOverExpectedSizeAndAbort(t *testing.T) {
+	backend, _ := newTestStore(t)
+	data := []byte("too long")
+	key := contentKey(data)
+	handle, err := backend.OpenPut(testGeneration, store.PartitionChunk, key, int64Pointer(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handle.Write(data); err == nil {
+		t.Fatal("oversized Write succeeded")
+	}
+	if err := handle.Abort(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(backend.objectPath(store.PartitionChunk, testGeneration, key)); !os.IsNotExist(err) {
+		t.Fatalf("aborted path survived: %v", err)
+	}
+}
+
+func TestVerifyFalseUsesOnlySize(t *testing.T) {
+	backend, _ := newTestStore(t)
+	claimedKey := contentKey([]byte("right"))
+	wrong := []byte("wrong") // same size
+	size := int64(len(wrong))
+	if !writeObject(t, backend, testGeneration, store.PartitionChunk, claimedKey, wrong, &size, false) {
+		t.Fatal("verify=false write was not new")
+	}
+	if writeObject(t, backend, testGeneration, store.PartitionChunk, claimedKey, []byte("other"), &size, false) {
+		t.Fatal("same-size wrong content should be indistinguishable and dedup")
+	}
+
+	unknownSizeKey := contentKey([]byte("another claimed value"))
+	unknownSizePayload := []byte("unverified payload with no expected size")
+	if !writeObject(t, backend, testGeneration, store.PartitionChunk, unknownSizeKey, unknownSizePayload, nil, false) {
+		t.Fatal("verify=false unknown-size write was not new")
+	}
+	if writeObject(t, backend, testGeneration, store.PartitionChunk, unknownSizeKey, []byte("incomplete would still dedup"), nil, false) {
+		t.Fatal("unknown-size existing target should use existence-only dedup")
+	}
+}
+
+func TestConcurrentWritersSameKeyOwnership(t *testing.T) {
+	backend, _ := newTestStore(t)
+	data := []byte("concurrent final payload")
+	key := contentKey(data)
+	size := int64(len(data))
+	handleA, err := backend.OpenPut(testGeneration, store.PartitionChunk, key, &size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	half := len(data) / 2
+	if _, err := handleA.Write(data[:half]); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := New(Config{Root: root}); err != nil {
-		t.Fatalf("New: %v", err)
+	opened := make(chan struct{})
+	done := make(chan struct{})
+	var (
+		resultB bool
+		errorB  error
+	)
+	go func() {
+		handleB, err := backend.OpenPut(testGeneration, store.PartitionChunk, key, &size)
+		close(opened)
+		if err == nil {
+			_, err = handleB.Write(data)
+		}
+		if err == nil {
+			resultB, err = handleB.Commit(key, key)
+		}
+		errorB = err
+		close(done)
+	}()
+	<-opened
+	if _, err := handleA.Write(data[half:]); err != nil {
+		t.Fatal(err)
 	}
+	<-done
+	if errorB != nil || !resultB {
+		t.Fatalf("writer B = %v, %v; want new", resultB, errorB)
+	}
+	resultA, err := handleA.Commit(key, key)
+	if err != nil || resultA {
+		t.Fatalf("writer A = %v, %v; want dedup", resultA, err)
+	}
+	found, got, err := backend.Get(context.Background(), testGeneration, store.PartitionChunk, key)
+	if err != nil || !found || !bytes.Equal(got, data) {
+		t.Fatalf("final object = %v, %q, %v", found, got, err)
+	}
+}
 
-	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
-		t.Errorf("orphan temp file should have been cleaned up, stat err: %v", err)
+func TestLoserErrorsWhileReplacementStillInvalid(t *testing.T) {
+	backend, _ := newTestStore(t)
+	data := []byte("complete payload")
+	key := contentKey(data)
+	size := int64(len(data))
+	handleA, _ := backend.OpenPut(testGeneration, store.PartitionChunk, key, &size)
+	_, _ = handleA.Write(data[:1])
+	handleB, err := backend.OpenPut(testGeneration, store.PartitionChunk, key, &size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = handleA.Write(data[1:])
+	_, _ = handleB.Write(data[:1])
+	if isNew, err := handleA.Commit(key, key); err == nil || isNew {
+		t.Fatalf("loser Commit = %v, %v; want invalid replacement error", isNew, err)
+	}
+	if _, err := handleB.Write(data[1:]); err != nil {
+		t.Fatal(err)
+	}
+	if isNew, err := handleB.Commit(key, key); err != nil || !isNew {
+		t.Fatalf("winner Commit = %v, %v", isNew, err)
+	}
+}
+
+func TestAbortDoesNotDeleteReplacement(t *testing.T) {
+	backend, _ := newTestStore(t)
+	data := []byte("replacement")
+	key := contentKey(data)
+	size := int64(len(data))
+	handleA, _ := backend.OpenPut(testGeneration, store.PartitionChunk, key, &size)
+	_, _ = handleA.Write(data[:1])
+	handleB, err := backend.OpenPut(testGeneration, store.PartitionChunk, key, &size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = handleB.Write(data)
+	if _, err := handleB.Commit(key, key); err != nil {
+		t.Fatal(err)
+	}
+	if err := handleA.Abort(); err != nil {
+		t.Fatal(err)
+	}
+	found, got, err := backend.Get(context.Background(), testGeneration, store.PartitionChunk, key)
+	if err != nil || !found || !bytes.Equal(got, data) {
+		t.Fatalf("replacement removed: %v, %q, %v", found, got, err)
+	}
+}
+
+func TestMismatchIdentityRecheckedBeforeDelete(t *testing.T) {
+	backend, _ := newTestStore(t)
+	key := contentKey([]byte("claimed"))
+	path := backend.objectPath(store.PartitionChunk, testGeneration, key)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	replacement := []byte("valid")
+	var once sync.Once
+	backend.beforeMismatchRemove = func(path string) {
+		once.Do(func() {
+			replacementPath := path + ".replacement"
+			if err := os.WriteFile(replacementPath, replacement, 0o644); err != nil {
+				t.Errorf("prepare replacement: %v", err)
+				return
+			}
+			if err := os.Remove(path); err != nil {
+				t.Errorf("remove old: %v", err)
+				return
+			}
+			if err := os.Link(replacementPath, path); err != nil {
+				t.Errorf("install replacement: %v", err)
+			}
+			_ = os.Remove(replacementPath)
+		})
+	}
+	size := int64(len(replacement))
+	handle, err := backend.OpenPut(testGeneration, store.PartitionChunk, key, &size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = handle.Write(replacement)
+	if isNew, err := handle.Commit(key, key); err != nil || isNew {
+		t.Fatalf("Commit = %v, %v; want dedup", isNew, err)
+	}
+	got, _ := os.ReadFile(path)
+	if !bytes.Equal(got, replacement) {
+		t.Fatalf("replacement was deleted: %q", got)
+	}
+}
+
+func TestExclusiveEEXISTRechecksTarget(t *testing.T) {
+	backend, _ := newTestStore(t)
+	data := []byte("race winner")
+	key := contentKey(data)
+	var once sync.Once
+	backend.beforeExclusiveOpen = func(path string) {
+		once.Do(func() {
+			if err := os.WriteFile(path, data, 0o644); err != nil {
+				t.Errorf("create racing target: %v", err)
+			}
+		})
+	}
+	eexists := 0
+	backend.afterExclusiveEEXIST = func(string) { eexists++ }
+	size := int64(len(data))
+	handle, err := backend.OpenPut(testGeneration, store.PartitionChunk, key, &size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = handle.Write(data)
+	if isNew, err := handle.Commit(key, key); err != nil || isNew {
+		t.Fatalf("Commit = %v, %v; want dedup", isNew, err)
+	}
+	if eexists != 1 {
+		t.Fatalf("EEXIST hook count = %d, want 1", eexists)
+	}
+}
+
+func TestFailureDoesNotDeleteAnotherWritersResult(t *testing.T) {
+	backend, _ := newTestStore(t)
+	data := []byte("other writer result")
+	key := contentKey(data)
+	size := int64(len(data))
+	handleA, _ := backend.OpenPut(testGeneration, store.PartitionChunk, key, &size)
+	_, _ = handleA.Write(data)
+	path := backend.objectPath(store.PartitionChunk, testGeneration, key)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handleA.Commit(key, contentKey([]byte("bad digest"))); !errors.Is(err, ErrKeyMismatch) {
+		t.Fatalf("Commit error = %v, want ErrKeyMismatch", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("other result removed: %q, %v", got, err)
+	}
+}
+
+func TestNonRegularTargetsAreErrors(t *testing.T) {
+	for _, kind := range []string{"symlink", "directory"} {
+		t.Run(kind, func(t *testing.T) {
+			backend, _ := newTestStore(t)
+			key := contentKey([]byte(kind))
+			path := backend.objectPath(store.PartitionChunk, testGeneration, key)
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			switch kind {
+			case "symlink":
+				if err := os.Symlink("missing", path); err != nil {
+					t.Fatal(err)
+				}
+			case "directory":
+				if err := os.Mkdir(path, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if exists, err := backend.Exists(context.Background(), testGeneration, store.PartitionChunk, key, nil); err == nil || exists {
+				t.Fatalf("Exists = %v, %v; want error", exists, err)
+			}
+			if _, err := backend.OpenPut(testGeneration, store.PartitionChunk, key, nil); err == nil {
+				t.Fatal("OpenPut accepted non-regular target")
+			}
+		})
+	}
+}
+
+func TestExistsPropagatesFilesystemErrors(t *testing.T) {
+	for _, injected := range []error{syscall.EACCES, syscall.EIO, syscall.ESTALE} {
+		t.Run(injected.Error(), func(t *testing.T) {
+			backend, _ := newTestStore(t)
+			backend.ops.lstat = func(string) (os.FileInfo, error) { return nil, injected }
+			key := contentKey([]byte("error"))
+			exists, err := backend.Exists(context.Background(), testGeneration, store.PartitionChunk, key, nil)
+			if exists || !errors.Is(err, injected) {
+				t.Fatalf("Exists = %v, %v; want false, %v", exists, err, injected)
+			}
+		})
+	}
+}
+
+type failingFile struct {
+	ownedFile
+	writeErr error
+	syncErr  error
+	closeErr error
+	closed   bool
+}
+
+func (f *failingFile) Write(p []byte) (int, error) {
+	if f.writeErr != nil {
+		return 0, f.writeErr
+	}
+	return f.ownedFile.Write(p)
+}
+
+func (f *failingFile) Sync() error {
+	if f.syncErr != nil {
+		return f.syncErr
+	}
+	return f.ownedFile.Sync()
+}
+
+func (f *failingFile) Close() error {
+	if f.closed {
+		return nil
+	}
+	f.closed = true
+	err := f.ownedFile.Close()
+	if f.closeErr != nil {
+		return f.closeErr
+	}
+	return err
+}
+
+func TestWriteSyncCloseFailuresCleanOwnedPath(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		writeErr error
+		syncErr  error
+		closeErr error
+	}{
+		{name: "write", writeErr: errors.New("write failure")},
+		{name: "sync", syncErr: errors.New("sync failure")},
+		{name: "close", closeErr: errors.New("close failure")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			backend, _ := newTestStore(t)
+			open := backend.ops.openExclusive
+			backend.ops.openExclusive = func(path string, mode os.FileMode) (ownedFile, error) {
+				file, err := open(path, mode)
+				if err != nil {
+					return nil, err
+				}
+				return &failingFile{ownedFile: file, writeErr: test.writeErr, syncErr: test.syncErr, closeErr: test.closeErr}, nil
+			}
+			data := []byte("failure payload")
+			key := contentKey(data)
+			size := int64(len(data))
+			handle, err := backend.OpenPut(testGeneration, store.PartitionChunk, key, &size)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, writeErr := handle.Write(data)
+			if test.writeErr != nil {
+				if writeErr == nil {
+					t.Fatal("Write succeeded")
+				}
+				_ = handle.Abort()
+			} else {
+				if writeErr != nil {
+					t.Fatal(writeErr)
+				}
+				if _, err := handle.Commit(key, key); err == nil {
+					t.Fatal("Commit succeeded")
+				}
+			}
+			if _, err := os.Lstat(backend.objectPath(store.PartitionChunk, testGeneration, key)); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("owned path survived: %v", err)
+			}
+		})
+	}
+}
+
+func TestExplicitGenerationAdminHelpers(t *testing.T) {
+	backend, root := newTestStore(t)
+	for _, generation := range []store.Generation{"G1", "G2"} {
+		data := []byte(generation)
+		writeObject(t, backend, generation, store.PartitionBlob, contentKey(data), data, int64Pointer(int64(len(data))), true)
+	}
+	stats, err := backend.GenerationStats(context.Background(), "G1")
+	if err != nil || stats[store.PartitionBlob] != 1 {
+		t.Fatalf("GenerationStats = %v, %v", stats, err)
+	}
+	if err := backend.DropGeneration(context.Background(), "G1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "blob", "G2")); err != nil {
+		t.Fatalf("G2 removed with G1: %v", err)
+	}
+	if err := backend.Wipe(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "blob")); !os.IsNotExist(err) {
+		t.Fatalf("partition survived Wipe: %v", err)
+	}
+}
+
+func BenchmarkGetBuffered(b *testing.B) {
+	benchmarkGet(b, false)
+}
+
+func BenchmarkGetDirectIO(b *testing.B) {
+	benchmarkGet(b, true)
+}
+
+func benchmarkGet(b *testing.B, direct bool) {
+	root := b.TempDir()
+	writer, err := New(Config{Root: root})
+	if err != nil {
+		b.Fatal(err)
+	}
+	data := bytes.Repeat([]byte("benchmark"), 128*1024)
+	key := contentKey(data)
+	size := int64(len(data))
+	handle, err := writer.OpenPut(testGeneration, store.PartitionChunk, key, &size)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, err := handle.Write(data); err != nil {
+		b.Fatal(err)
+	}
+	if _, err := handle.Commit(key, key); err != nil {
+		b.Fatal(err)
+	}
+	reader, err := New(Config{Root: root, DirectIO: direct})
+	if err != nil {
+		b.Fatal(err)
+	}
+	if direct {
+		if _, _, err := reader.Get(context.Background(), testGeneration, store.PartitionChunk, key); errors.Is(err, ErrDirectIOUnsupported) {
+			b.Skip(err)
+		}
+	}
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		found, got, err := reader.Get(context.Background(), testGeneration, store.PartitionChunk, key)
+		if err != nil || !found || len(got) != len(data) {
+			b.Fatalf("Get = %v, %d, %v", found, len(got), err)
+		}
 	}
 }

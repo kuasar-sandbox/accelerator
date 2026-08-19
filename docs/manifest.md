@@ -403,9 +403,9 @@ Salt 隔离 dedup 域 —— 同样的明文用不同 salt 派生不同 key → 
 
 实际 salt 由两部分组合:
 
-- `server_salt` — manifest-ctl 启动时调一次 `store-ctl GetSalt()` 取得
-  store 提供的 opaque salt。Store 内部切换写入域时
-  salt 变,不同写入域天然隔离。manifest consumer 不感知 store 的内部代次。
+- `server_salt` — 每次 ingest 调一次 `store-ctl AdmitWrite()`，取得 generation
+  与 opaque salt；全部 chunk 和最终 manifest Put 复用该 admission。切换写入
+  generation 后，新 ingest 使用新的 salt，已开始的 ingest 不会跨代。
 - `extra_salt` — `--extra-salt <bytes>` flag(§2.3),叠加到上面。
 
 最终:
@@ -467,9 +467,9 @@ crypto.derive(salt, plain)
 sha256(ciphertext)           ← ContentKey
    │
    ▼
-store-ctl Put(partition=chunk, key=ContentKey, ciphertext)
-   │  server checks Exists first → dedup hit skips upload (SendAndClose)
-   │  else stream-write to tmp → atomic rename to chunk/{gen}/aa/bb/<hash>
+store-ctl Put(admission, partition=chunk, key=ContentKey, size, ciphertext)
+	│  server checks Exists first → dedup hit skips upload (SendAndClose)
+	│  else stream-write directly to chunk/{generation}/aa/bb/<hash>
    ▼
 manifest.append(chunk_meta, key)   ← accumulate index + key table
    │
@@ -477,6 +477,9 @@ manifest.append(chunk_meta, key)   ← accumulate index + key table
 seal(manifest.key, key_table)
    ↓
 emit Manifest
+   │
+   ▼
+store-ctl Put(same admission, partition=manifest, size, manifest)
 ```
 
 上图按单个 chunk 画顺序流,但 derive/encrypt/`Put` 那一段是**并发**执行的:
