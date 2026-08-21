@@ -506,7 +506,7 @@ Stream (single manifest; callers use NewLayered for explicit top-to-bottom array
    │     └─ manifest Data additionally implements fetch.ChunkRun
    ├─ Run.ReadAt: read one already-resolved visible run
    ├─ Stream.ReadAt: collect runs, then fetch visible Data concurrently
-   │     └─ on-demand Getter → cache/store → verify → decrypt
+   │     └─ on-demand Getter → cache/store → verify → decrypt → bounded chunk cache
    │
    └─ optional Prefetcher.Prefetch
          └─ prefetch Getter → cache/store → Release
@@ -539,10 +539,24 @@ on-demand 时不再准入新的 prefetch,且每个 Fetcher 最多一个 prefetch
 途。已开始的 prefetch 不抢占,可与后来到达的 on-demand 短暂重叠。不同
 Fetcher 相互独立,调度器不创建后台 goroutine,也不拥有底层 Getter 生命周期。
 
-Stream 层不维护 chunk seen set 或 singleflight。同一物理 chunk 经多个真实可
-见区间暴露、并发调用 Prefetch,或同时被 Prefetch 和 ReadAt 访问时,允许产生
-独立 Get;缓存层负责把后续请求转化为命中。这保持了读取与预取路径一致的对象
-所有权和失败语义。
+每个 manifest Stream 内部维护独立的解密 chunk cache,仅服务 on-demand 部分读。
+cache key 包含 `CiphertextHash`、chunk decrypt key 和 plaintext size,因此同一
+Stream 内重复物理内容可以复用,不同密钥或逻辑大小不会错误别名。cache 同时受
+`32 entries` 和 `32 MiB` 两个硬预算约束,按 LRU 淘汰;entry 自最后一次命中起空闲
+`5s` 后过期。每个 Stream 只保留一个指向最早到期 entry 的 timer,即使后续没有
+读请求也会主动回收陈旧数据,不为每个 entry 创建 timer 或常驻扫描 goroutine。
+
+同一 cache key 的并发 miss 合并为一次 Get、SHA-256 校验和解密,不同 key 仍可
+并行加载。加载失败不进入 cache;等待者如果自身 context 仍有效会重新尝试,不会
+永久继承首个加载者的取消。密文先从 immutable Blob 复制到 Stream 自有内存再
+原地解密,Blob 随即 Release。淘汰、TTL 到期和 `Close()` 都会清零明文;正在复制
+的 entry 先从 LRU 移除,待最后一个 reader 释放后再清零。
+
+冷态完整物理 chunk 读取保持直通路径,避免一次性顺序扫描污染 cache;已有 cache
+命中仍可服务完整读取。单个 plaintext chunk 超过 `32 MiB` 时同样直通且不准入。
+`Prefetch` 仍只执行完整物理 chunk 的 cache Get 并立即 Release,不校验、解密或
+填充上述明文 cache。因此 Prefetch 与 on-demand ReadAt 可以各自产生 Get,而重复
+的 on-demand 部分读由 Stream 内部合并和复用。
 
 ### 4.9 本地 immutable tarstream 加密
 
