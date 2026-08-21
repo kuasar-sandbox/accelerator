@@ -48,16 +48,16 @@ import (
 type Stream interface {
 	sparse.Source
 
-	// Close releases resources owned by this stream (e.g. a file descriptor).
-	// manifest streams own none (no-op); a layered stream closes its layers.
+	// Close releases resources owned by this stream (e.g. a file descriptor or
+	// decrypted-chunk cache); a layered stream closes its layers.
 	// It must not run concurrently with RunAt, ReadAt, or Prefetch.
 	Close() error
 }
 
 // ChunkRun marks a Data Run whose serving leaf is a physical manifest chunk.
-// Reading any sub-range normally pays the full fetch, verification, and decrypt
-// cost, so callers with enough bounded memory should prefer the whole visible
-// Run. The unexported method reserves implementations to this package.
+// Partial reads can reuse the stream's bounded decrypted-chunk cache; a cold
+// whole-chunk read bypasses it. The unexported method reserves implementations
+// to this package.
 type ChunkRun interface {
 	sparse.Run
 	chunkRun()
@@ -86,6 +86,7 @@ type manifestStream struct {
 	prefetchGetter cache.Getter
 	encryptor      crypto.ChunkEncryptor
 	keys           [][32]byte // decrypted per-chunk keys, parallel to m.Entries
+	chunkCache     *decryptedChunkCache
 	// Tests may replace this metadata-only lookup to verify a Run reuses its
 	// captured index. Production leaves it nil for the direct codec fast path.
 	chunkIndexLookup func([]codec.ChunkEntry, uint64) int
@@ -103,11 +104,19 @@ func newManifestStream(
 		prefetchGetter: prefetch,
 		encryptor:      enc,
 		keys:           keys,
+		chunkCache: newDecryptedChunkCache(
+			manifestChunkCacheMaxEntries,
+			manifestChunkCacheMaxBytes,
+			manifestChunkCacheIdleTTL,
+		),
 	}
 }
 
 func (s *manifestStream) Size() uint64 { return s.m.ImageSize }
-func (s *manifestStream) Close() error { return nil }
+func (s *manifestStream) Close() error {
+	s.chunkCache.close()
+	return nil
+}
 
 // RunAt resolves one visible forward run. Data remains bounded to one physical
 // chunk and captures its index; adjacent Hole or Zero metadata may be merged.
@@ -273,8 +282,9 @@ func (s *manifestStream) loadChunkAt(ctx context.Context, chunkIdx uint64, kind 
 	return blob, nil
 }
 
-// readChunkAt synchronously fetches, verifies, decrypts, and copies one
-// sub-range from the already-resolved chunk index.
+// readChunkAt copies one sub-range from the already-resolved chunk index.
+// Partial reads share a bounded plaintext cache; cold whole-chunk reads and
+// chunks larger than the byte budget retain the direct path.
 func (s *manifestStream) readChunkAt(ctx context.Context, buf []byte, chunkIdx, offset uint64) (int, error) {
 	if chunkIdx >= uint64(len(s.m.Entries)) {
 		return 0, fmt.Errorf("fetch: chunk index %d out of range", chunkIdx)
@@ -304,7 +314,36 @@ func (s *manifestStream) readChunkAt(ctx context.Context, buf []byte, chunkIdx, 
 	if s.encryptor == nil {
 		return 0, fmt.Errorf("fetch: chunk %d: decryptor is nil", chunkIdx)
 	}
+	key := decryptedChunkKey{
+		ciphertextHash: e.CiphertextHash,
+		decryptKey:     s.keys[chunkIdx],
+		plaintextSize:  e.Size,
+	}
+	if lease := s.chunkCache.acquire(key); lease != nil {
+		defer lease.release()
+		return copyChunkRange(buf, lease.bytes(), chunkIdx, e, offset, end)
+	}
+	if (offset == e.Offset && uint64(len(buf)) == uint64(e.Size)) || uint64(e.Size) > manifestChunkCacheMaxBytes {
+		return s.readChunkDirect(ctx, buf, chunkIdx, e, offset, end)
+	}
 
+	lease, err := s.chunkCache.acquireOrLoad(ctx, key, func(ctx context.Context) ([]byte, error) {
+		return s.loadOwnedPlainChunk(ctx, chunkIdx, e)
+	})
+	if err != nil {
+		return 0, err
+	}
+	defer lease.release()
+	return copyChunkRange(buf, lease.bytes(), chunkIdx, e, offset, end)
+}
+
+func (s *manifestStream) readChunkDirect(
+	ctx context.Context,
+	buf []byte,
+	chunkIdx uint64,
+	e codec.ChunkEntry,
+	offset, end uint64,
+) (int, error) {
 	blob, err := s.loadChunkAt(ctx, chunkIdx, loadOnDemand)
 	if err != nil {
 		return 0, err
@@ -323,6 +362,54 @@ func (s *manifestStream) readChunkAt(ctx context.Context, buf []byte, chunkIdx, 
 	if err != nil {
 		return 0, fmt.Errorf("chunk %d: decrypt: %w", chunkIdx, err)
 	}
+	if uint64(len(plain)) < uint64(e.Size) {
+		return 0, fmt.Errorf("chunk %d: decrypted data has %d bytes, need %d", chunkIdx, len(plain), e.Size)
+	}
+	return copyChunkRange(buf, plain, chunkIdx, e, offset, end)
+}
+
+// loadOwnedPlainChunk copies immutable ciphertext out of its Blob before
+// decrypting. The returned slice is owned by the stream cache and has exactly
+// the manifest entry's plaintext length.
+func (s *manifestStream) loadOwnedPlainChunk(ctx context.Context, chunkIdx uint64, e codec.ChunkEntry) ([]byte, error) {
+	blob, err := s.loadChunkAt(ctx, chunkIdx, loadOnDemand)
+	if err != nil {
+		return nil, err
+	}
+	ciphertext := blob.Bytes()
+	if sha256.Sum256(ciphertext) != e.CiphertextHash {
+		blob.Release()
+		return nil, fmt.Errorf("chunk %d: ciphertext hash mismatch (corrupt or tampered store/cache)", chunkIdx)
+	}
+	owned := append([]byte(nil), ciphertext...)
+	blob.Release()
+
+	plain, err := s.encryptor.DecryptInPlace(s.keys[chunkIdx], owned)
+	if err != nil {
+		clearSlice(owned)
+		return nil, fmt.Errorf("chunk %d: decrypt: %w", chunkIdx, err)
+	}
+	if uint64(len(plain)) < uint64(e.Size) {
+		clearSlice(owned)
+		return nil, fmt.Errorf("chunk %d: decrypted data has %d bytes, need %d", chunkIdx, len(plain), e.Size)
+	}
+	plain = plain[:e.Size]
+	// The production contract returns owned[1:]. Tests and future codecs are
+	// still forced into cache-owned storage if they return any other slice.
+	if len(plain) > 0 && len(owned) == len(plain)+1 && &plain[0] == &owned[1] {
+		return plain, nil
+	}
+	cacheOwned := append([]byte(nil), plain...)
+	clearSlice(owned)
+	return cacheOwned, nil
+}
+
+func copyChunkRange(
+	buf, plain []byte,
+	chunkIdx uint64,
+	e codec.ChunkEntry,
+	offset, end uint64,
+) (int, error) {
 	if uint64(len(plain)) < uint64(e.Size) {
 		return 0, fmt.Errorf("chunk %d: decrypted data has %d bytes, need %d", chunkIdx, len(plain), e.Size)
 	}

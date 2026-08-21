@@ -158,8 +158,8 @@ func TestManifestDataRunCapturesChunkIndexOnce(t *testing.T) {
 	if lookups.Load() != 1 {
 		t.Fatalf("chunk index lookups after Run.ReadAt = %d, want 1", lookups.Load())
 	}
-	if getter.calls.Load() != readers {
-		t.Fatalf("payload Gets = %d, want %d", getter.calls.Load(), readers)
+	if getter.calls.Load() != 1 {
+		t.Fatalf("payload Gets = %d, want 1 coalesced load", getter.calls.Load())
 	}
 }
 
