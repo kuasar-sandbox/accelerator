@@ -108,6 +108,13 @@ func (s *WireServer) serveConn(c net.Conn) {
 		tc.SetKeepAlivePeriod(30 * time.Second)
 		tc.SetNoDelay(true)
 	}
+	// Unix-socket buffers sized to wire.MaxFrameSize — see client
+	// udsSockTune for the rationale (chunk responses vs the 224KiB kernel
+	// default; the kernel doubles the request, giving two frames in flight).
+	if uc, ok := c.(*net.UnixConn); ok {
+		uc.SetReadBuffer(wire.MaxFrameSize)
+		uc.SetWriteBuffer(wire.MaxFrameSize)
+	}
 
 	wc := wire.NewConn(c)
 
