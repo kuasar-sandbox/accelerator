@@ -3,6 +3,7 @@ package wire
 import (
 	"log"
 	"net"
+	"sync"
 	"syscall"
 )
 
@@ -21,11 +22,13 @@ import (
 // with EPERM and we fall back to the plain SO_SNDBUF/SO_RCVBUF (still
 // clamped) after logging once per process, so deployments that cannot
 // raise the sysctl at least get a diagnosable hint in their logs.
+// Called concurrently (one serveConn goroutine per connection, plus
+// client burst dials), so the warning guard must be synchronized.
 //
 // bestEffort: errors other than EPERM on the force path, and all errors on
 // the fallback path, are swallowed — buffer sizing must never break a
 // connection that would otherwise work.
-var warnedSockBufFallback bool
+var warnSockBufFallbackOnce sync.Once
 
 func SetSocketBuffers(c net.Conn) {
 	raw, ok := c.(interface {
@@ -47,12 +50,11 @@ func SetSocketBuffers(c net.Conn) {
 	if forceErr == nil {
 		return
 	}
-	if !warnedSockBufFallback {
-		warnedSockBufFallback = true
+	warnSockBufFallbackOnce.Do(func() {
 		log.Printf("wire: SO_SNDBUFFORCE %d failed (%v); falling back to plain SO_SNDBUF "+
 			"(clamped by net.core.wmem_max — raise it or grant CAP_NET_ADMIN for full effect)",
 			int(MaxFrameSize), forceErr)
-	}
+	})
 	// Plain setsockopt as fallback (clamped by wmem_max/rmem_max).
 	_ = rc.Control(func(fd uintptr) {
 		_ = setsockoptBuffers(fd, syscall.SO_SNDBUF, syscall.SO_RCVBUF)
