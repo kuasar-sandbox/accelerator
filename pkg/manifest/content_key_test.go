@@ -69,6 +69,16 @@ func TestGetManifestBlobVerifiesRequestedPhysicalContentKey(t *testing.T) {
 	if _, err := cfg.GetManifestBlob(context.Background(), wrongKey); err == nil {
 		t.Fatal("GetManifestBlob accepted bytes that did not match the requested key")
 	}
+	verifyOff := false
+	cfg.Manifest.VerifyContent = &verifyOff
+	gotUnchecked, err := cfg.GetManifestBlob(context.Background(), wrongKey)
+	if err != nil {
+		t.Fatalf("GetManifestBlob verify_content=false: %v", err)
+	}
+	if !bytes.Equal(gotUnchecked, physical) {
+		t.Fatal("GetManifestBlob verify_content=false changed physical manifest bytes")
+	}
+	cfg.Manifest.VerifyContent = nil
 	if _, err := client.Put(context.Background(), admission, store.PartitionManifest, actualKey, physical); err != nil {
 		t.Fatal(err)
 	}

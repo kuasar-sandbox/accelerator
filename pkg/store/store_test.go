@@ -1,6 +1,7 @@
 package store
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"strings"
 	"testing"
@@ -37,5 +38,22 @@ func TestValidateGenerations(t *testing.T) {
 	}
 	if err := ValidateGenerations(tooMany); err == nil {
 		t.Fatal("oversized list accepted")
+	}
+}
+
+func TestSaltForGeneration(t *testing.T) {
+	want := sha256.Sum256([]byte("accelerator-salt-v1G1"))
+	got, err := SaltForGeneration("G1")
+	if err != nil {
+		t.Fatalf("SaltForGeneration: %v", err)
+	}
+	if got != want {
+		t.Fatalf("SaltForGeneration = %x, want %x", got, want)
+	}
+	if other, err := SaltForGeneration("G2"); err != nil || other == got {
+		t.Fatalf("different generation salt = %x, %v", other, err)
+	}
+	if _, err := SaltForGeneration("bad/generation"); err == nil {
+		t.Fatal("unsafe generation accepted")
 	}
 }

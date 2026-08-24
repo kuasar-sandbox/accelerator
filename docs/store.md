@@ -16,7 +16,7 @@ generation 只有一种表示：
 名称必须匹配 `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`；空列表、重复项、`.`、
 `..`、路径分隔符、控制字符和过长列表都会被拒绝。
 
-`AdmitWrite` 返回：
+`AdmitWrite` / `AdmitWriteFor` 返回：
 
 ```go
 type WriteAdmission struct {
@@ -25,10 +25,21 @@ type WriteAdmission struct {
 }
 ```
 
-它只是路由和加密派生信息，不是凭据。一次 manifest ingest 只调用一次
-`AdmitWrite`，全部 chunk Put 和最后的 manifest Put 都复用同一个 admission。
+它只是路由和加密派生信息，不是凭据。空请求的 `AdmitWrite` 选择当前列表最后一项；
+`AdmitWriteFor(generation)` 请求列表中仍存在的指定项。一次 manifest ingest 只调用
+一次 admission RPC，全部 chunk Put 和最后的 manifest Put 都复用同一个 admission。
 generation 仍在当前列表中时 admission 可继续写入；移出列表后，该 generation
 不再接受 Put，也不再参与 Get。
+
+generation salt 只有一个公共实现：
+
+```go
+salt, err := store.SaltForGeneration(generation)
+```
+
+Store server、离线 Manifest Bundle writer 和测试都调用它，不复制 derivation
+domain 常量。函数先执行 `ValidateGeneration`；`NONE` 等任何合法字符串都按普通
+generation 处理，没有保留值或特殊分支。
 
 ## 2. 配置
 
@@ -145,6 +156,12 @@ rpc AdmitWrite(AdmitWriteRequest) returns (AdmitWriteResponse);
 rpc Get(GetRequest) returns (stream GetResponse);
 rpc Put(stream PutRequest) returns (PutResponse);
 ```
+
+`AdmitWriteRequest.generation` 为空时保持选择最新可写 generation 的原语义；非空时
+先校验名称，再要求它仍在本请求读取的当前列表中，否则返回
+`FailedPrecondition`。成功响应始终返回该 generation 的 canonical
+`WriteAdmission`。官方 Go client 保留 `AdmitWrite(ctx)`，并新增
+`AdmitWriteFor(ctx, generation)`；Put wire 与 Backend 接口不变。
 
 `PutHeader` 包含 partition、32-byte key、generation 和真正有 presence 的
 `optional uint64 size`。零表示已知的空对象；字段缺席才表示大小未知。官方 Go

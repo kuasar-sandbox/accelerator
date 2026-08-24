@@ -21,6 +21,8 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"log"
+	"sync"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
@@ -77,6 +79,27 @@ type ManifestSubConfig struct {
 	// so an absent key only trips a call site that actually needs to
 	// seal/unseal.
 	Key string `yaml:"key"`
+
+	// VerifyContent controls SHA-256 verification of physical Manifest and
+	// Chunk objects during ordinary reads. Nil defaults to true.
+	VerifyContent *bool `yaml:"verify_content,omitempty"`
+
+	// WriteGeneration optionally pins locally produced objects to one
+	// generation. An online Store must admit it; offline writers derive the
+	// canonical salt locally. Empty offline defaults to the ordinary name NONE.
+	WriteGeneration string `yaml:"write_generation,omitempty"`
+}
+
+var warnVerificationDisabled sync.Once
+
+func (c *Config) fetchOptions() fetch.Options {
+	verify := c.Manifest.VerifyContent == nil || *c.Manifest.VerifyContent
+	if !verify {
+		warnVerificationDisabled.Do(func() {
+			log.Printf("WARNING: manifest.verify_content=false; ordinary Manifest/Chunk SHA-256 verification is disabled")
+		})
+	}
+	return fetch.Options{VerifyContent: verify}
 }
 
 // StoreConfig is the wire-level connection schema for the store-ctl
@@ -139,6 +162,53 @@ func (c *Config) NewIngester(keyFn ingest.CustomerKeyFunc, extraSaltFn ingest.Ex
 	if c.Store.Endpoint == "" {
 		return nil, fmt.Errorf("manifest: store.endpoint required for ingest")
 	}
+	storeTO, err := parseTimeout(c.Store.Timeout, defaultStoreTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("manifest: store.timeout: %w", err)
+	}
+	sc, err := storeclient.New(c.Store.Endpoint, c.Store.Pool, storeTO)
+	if err != nil {
+		return nil, fmt.Errorf("manifest: dial store: %w", err)
+	}
+	var writer ingest.StoreWriter = sc
+	if c.Manifest.WriteGeneration != "" {
+		generation := store.Generation(c.Manifest.WriteGeneration)
+		if err := store.ValidateGeneration(generation); err != nil {
+			_ = sc.Close()
+			return nil, fmt.Errorf("manifest: write_generation: %w", err)
+		}
+		writer = &generationStoreWriter{client: sc, generation: generation}
+	}
+	ing, err := c.NewIngesterWithWriter(keyFn, extraSaltFn, writer)
+	if err != nil {
+		_ = sc.Close()
+		return nil, err
+	}
+	return &ingesterCloser{Ingester: ing, store: sc}, nil
+}
+
+type generationStoreWriter struct {
+	client     *storeclient.Client
+	generation store.Generation
+}
+
+func (w *generationStoreWriter) AdmitWrite(ctx context.Context) (store.WriteAdmission, error) {
+	return w.client.AdmitWriteFor(ctx, w.generation)
+}
+
+func (w *generationStoreWriter) Put(ctx context.Context, admission store.WriteAdmission, partition store.Partition, key store.ContentKey, data []byte) (bool, error) {
+	return w.client.Put(ctx, admission, partition, key, data)
+}
+
+func (w *generationStoreWriter) PoolSize() int { return w.client.PoolSize() }
+
+// NewIngesterWithWriter wires Chunker + Crypto to a caller-owned writer. It is
+// used by local containers such as Manifest Bundles; writer lifetime and
+// admission acquisition remain the caller's responsibility.
+func (c *Config) NewIngesterWithWriter(keyFn ingest.CustomerKeyFunc, extraSaltFn ingest.ExtraSaltFunc, writer ingest.StoreWriter) (ingest.Ingester, error) {
+	if writer == nil {
+		return nil, fmt.Errorf("manifest: store writer is required")
+	}
 	chk, err := chunker.New(c.Chunker)
 	if err != nil {
 		return nil, err
@@ -154,16 +224,44 @@ func (c *Config) NewIngester(keyFn ingest.CustomerKeyFunc, extraSaltFn ingest.Ex
 	if err != nil {
 		return nil, err
 	}
+	return ingest.NewIngester(keyFn, extraSaltFn, writer, chk, enc), nil
+}
+
+// NewBundleIngester wires a caller-owned multi-Manifest writer with the
+// configured customer key and no extra salt. Bundle Chunk keys must remain in
+// the recorded WriteAdmission's canonical salt domain so exact upload can
+// validate and copy physical objects without rewriting them.
+func (c *Config) NewBundleIngester(writer ingest.StoreWriter) (ingest.Ingester, error) {
+	return c.NewIngesterWithWriter(c.IngestKeyFunc(), nil, writer)
+}
+
+// WriteAdmission resolves the one admission a local multi-object writer must
+// reuse. Store RPC failures never fall back to offline derivation.
+func (c *Config) WriteAdmission(ctx context.Context) (store.WriteAdmission, error) {
+	generation := store.Generation(c.Manifest.WriteGeneration)
+	if c.Store.Endpoint == "" {
+		if generation == "" {
+			generation = "NONE"
+		}
+		salt, err := store.SaltForGeneration(generation)
+		if err != nil {
+			return store.WriteAdmission{}, fmt.Errorf("manifest: write_generation: %w", err)
+		}
+		return store.WriteAdmission{Generation: generation, Salt: salt}, nil
+	}
 	storeTO, err := parseTimeout(c.Store.Timeout, defaultStoreTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("manifest: store.timeout: %w", err)
+		return store.WriteAdmission{}, fmt.Errorf("manifest: store.timeout: %w", err)
 	}
 	sc, err := storeclient.New(c.Store.Endpoint, c.Store.Pool, storeTO)
 	if err != nil {
-		return nil, fmt.Errorf("manifest: dial store: %w", err)
+		return store.WriteAdmission{}, fmt.Errorf("manifest: dial store: %w", err)
 	}
-	ing := ingest.NewIngester(keyFn, extraSaltFn, sc, chk, enc)
-	return &ingesterCloser{Ingester: ing, store: sc}, nil
+	defer sc.Close()
+	if generation == "" {
+		return sc.AdmitWrite(ctx)
+	}
+	return sc.AdmitWriteFor(ctx, generation)
 }
 
 // NewFetcher wires Cache (or store fallback) + Crypto into a Fetcher.
@@ -175,6 +273,12 @@ func (c *Config) NewIngester(keyFn ingest.CustomerKeyFunc, extraSaltFn ingest.Ex
 // underlying client pools.
 
 func (c *Config) NewFetcher() (FetcherCloser, error) {
+	return c.NewFetcherWithOptions(c.fetchOptions())
+}
+
+// NewFetcherWithOptions wires the configured remote Getter with an explicit
+// verification policy. Explicit verification commands use this to force true.
+func (c *Config) NewFetcherWithOptions(opts fetch.Options) (FetcherCloser, error) {
 	customerKey, err := c.CustomerKey()
 	if err != nil {
 		return nil, err
@@ -196,7 +300,7 @@ func (c *Config) NewFetcher() (FetcherCloser, error) {
 		if err != nil {
 			return nil, fmt.Errorf("manifest: dial cache: %w", err)
 		}
-		f := fetch.NewFetcher(customerKey, cc, dec)
+		f := fetch.NewFetcherWithOptions(customerKey, cc, dec, opts)
 		return &fetcherCloser{Fetcher: f, closers: []io.Closer{cc}}, nil
 	}
 
@@ -212,8 +316,32 @@ func (c *Config) NewFetcher() (FetcherCloser, error) {
 		return nil, fmt.Errorf("manifest: dial store: %w", err)
 	}
 	getter := cache.NewStoreOrigin(sc)
-	f := fetch.NewFetcher(customerKey, getter, dec)
+	f := fetch.NewFetcherWithOptions(customerKey, getter, dec, opts)
 	return &fetcherCloser{Fetcher: f, closers: []io.Closer{sc}}, nil
+}
+
+// NewFetcherWithGetter wires a caller-owned Getter using the configured
+// ordinary-read verification policy. The returned Fetcher does not close the
+// Getter.
+func (c *Config) NewFetcherWithGetter(getter cache.Getter) (fetch.Fetcher, error) {
+	return c.NewFetcherWithGetterOptions(getter, c.fetchOptions())
+}
+
+// NewFetcherWithGetterOptions is the explicit-policy form used by local
+// containers and mandatory verification operations.
+func (c *Config) NewFetcherWithGetterOptions(getter cache.Getter, opts fetch.Options) (fetch.Fetcher, error) {
+	if getter == nil {
+		return nil, fmt.Errorf("manifest: cache getter is required")
+	}
+	customerKey, err := c.CustomerKey()
+	if err != nil {
+		return nil, err
+	}
+	_, dec, err := crypto.New(c.Crypto)
+	if err != nil {
+		return nil, err
+	}
+	return fetch.NewFetcherWithOptions(customerKey, getter, dec, opts), nil
 }
 
 type ingesterCloser struct {
@@ -247,6 +375,12 @@ func (f *fetcherCloser) Close() error {
 // wrote (Marshal is deterministic for any (manifest, sealedKT) pair),
 // so they can be piped into `manifest-ctl info` or saved verbatim.
 func (c *Config) GetManifestBlob(ctx context.Context, key store.ContentKey) ([]byte, error) {
+	return c.GetManifestBlobWithOptions(ctx, key, c.fetchOptions())
+}
+
+// GetManifestBlobWithOptions is the explicit-policy form used by mandatory
+// verification operations.
+func (c *Config) GetManifestBlobWithOptions(ctx context.Context, key store.ContentKey, opts fetch.Options) ([]byte, error) {
 	if c.Cache.Endpoint != "" {
 		cacheTO, err := parseTimeout(c.Cache.Timeout, defaultCacheTimeout)
 		if err != nil {
@@ -277,9 +411,11 @@ func (c *Config) GetManifestBlob(ctx context.Context, key store.ContentKey) ([]b
 			return nil, fmt.Errorf("manifest: cache hit returned nil blob")
 		}
 		borrowed := blob.Bytes()
-		if err := verifyManifestContentKey(borrowed, key, "cache"); err != nil {
-			blob.Release()
-			return nil, err
+		if opts.VerifyContent {
+			if err := verifyManifestContentKey(borrowed, key, "cache"); err != nil {
+				blob.Release()
+				return nil, err
+			}
 		}
 		data := append([]byte(nil), borrowed...)
 		blob.Release()
@@ -304,8 +440,10 @@ func (c *Config) GetManifestBlob(ctx context.Context, key store.ContentKey) ([]b
 	if !found {
 		return nil, fmt.Errorf("manifest: not found: %s", HexKey(key))
 	}
-	if err := verifyManifestContentKey(data, key, "store"); err != nil {
-		return nil, err
+	if opts.VerifyContent {
+		if err := verifyManifestContentKey(data, key, "store"); err != nil {
+			return nil, err
+		}
 	}
 	return data, nil
 }

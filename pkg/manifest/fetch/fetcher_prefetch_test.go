@@ -65,6 +65,23 @@ func TestFetcherRejectsManifestPhysicalContentKeyMismatch(t *testing.T) {
 	}
 }
 
+func TestFetcherOptionsCanSkipManifestPhysicalContentKeyVerification(t *testing.T) {
+	chunk := []byte("manifest-hash-option")
+	manifest := marshalFetcherTestManifest(t, chunk, 0x73)
+	wrongKey := store.ContentKey(sha256.Sum256([]byte("different manifest")))
+	getter := blobReleaseGetter{value: manifest, released: &atomic.Int64{}}
+
+	stream, err := NewFetcherWithOptions(
+		[32]byte{}, getter, fetcherTestDecryptor{}, Options{VerifyContent: false},
+	).OpenManifest(context.Background(), wrongKey)
+	if err != nil {
+		t.Fatalf("OpenManifest verify_content=false: %v", err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestFetcherSharesAdmissionAcrossStreams(t *testing.T) {
 	chunk := []byte("shared-chunk")
 	manifestA := marshalFetcherTestManifest(t, chunk, 0x51)

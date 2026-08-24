@@ -64,20 +64,33 @@ func New(opts Options) (*Server, error) {
 	}, nil
 }
 
-func deriveSalt(generation store.Generation) [32]byte {
-	return sha256.Sum256(append([]byte("accelerator-salt-v1"), []byte(generation)...))
-}
-
-// AdmitWrite fixes one ingest to the newest current generation.
-func (s *Server) AdmitWrite(_ context.Context, _ *pb.AdmitWriteRequest) (*pb.AdmitWriteResponse, error) {
+// AdmitWrite fixes one ingest to the requested current generation, or to the
+// newest current generation when the request leaves generation empty.
+func (s *Server) AdmitWrite(_ context.Context, req *pb.AdmitWriteRequest) (*pb.AdmitWriteResponse, error) {
 	s.stats.admitN.Add(1)
 	gens := s.generations()
 	if len(gens) == 0 {
 		s.stats.errN.Add(1)
 		return nil, status.Error(codes.Unavailable, "generation list is empty")
 	}
-	gen := gens[len(gens)-1]
-	salt := deriveSalt(gen)
+	gen := store.Generation(req.GetGeneration())
+	if gen == "" {
+		gen = gens[len(gens)-1]
+	} else {
+		if err := store.ValidateGeneration(gen); err != nil {
+			s.stats.errN.Add(1)
+			return nil, status.Errorf(codes.InvalidArgument, "admit write: generation: %v", err)
+		}
+		if !containsGeneration(gens, gen) {
+			s.stats.errN.Add(1)
+			return nil, status.Errorf(codes.FailedPrecondition, "admit write: generation %q is not current", gen)
+		}
+	}
+	salt, err := store.SaltForGeneration(gen)
+	if err != nil {
+		s.stats.errN.Add(1)
+		return nil, status.Errorf(codes.Internal, "admit write: canonical salt: %v", err)
+	}
 	return &pb.AdmitWriteResponse{Generation: string(gen), Salt: salt[:]}, nil
 }
 

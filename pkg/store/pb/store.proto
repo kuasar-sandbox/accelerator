@@ -40,7 +40,11 @@ service Store {
     rpc Put(stream PutRequest) returns (PutResponse);
 }
 
-message AdmitWriteRequest {}
+message AdmitWriteRequest {
+    // Empty selects the newest current generation. A non-empty value asks for
+    // that exact generation and succeeds only while it remains current.
+    string generation = 1;
+}
 
 message AdmitWriteResponse {
     string generation = 1;

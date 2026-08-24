@@ -62,6 +62,15 @@ type StoreWriter interface {
 	Put(ctx context.Context, admission store.WriteAdmission, p store.Partition, key store.ContentKey, data []byte) (isNew bool, err error)
 }
 
+// OrderedChunkStoreWriter is an optional local-container capability. Ingest
+// still encrypts chunks concurrently, but supplies each non-zero chunk's
+// logical ordinal so a serial writer can append physical objects in image
+// order with bounded backpressure. Remote Store writers need not implement it.
+type OrderedChunkStoreWriter interface {
+	StoreWriter
+	PutChunkOrdered(ctx context.Context, admission store.WriteAdmission, key store.ContentKey, data []byte, ordinal uint64) (isNew bool, err error)
+}
+
 // IngestOption holds the per-call knobs for Ingest. Zero value is
 // valid.
 type IngestOption struct {
@@ -211,8 +220,9 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 	defer cancel()
 
 	type job struct {
-		oc   *chunkOutcome
-		data []byte
+		oc      *chunkOutcome
+		data    []byte
+		ordinal uint64
 	}
 	// cap == workers: at most `workers` queued + `workers` executing, so
 	// the chunker blocks (upstream backpressure, bounded memory) instead
@@ -253,7 +263,12 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 					continue
 				}
 				ck := store.ContentKey(hash)
-				isNew, err := i.store.Put(wctx, admission, store.PartitionChunk, ck, ciphertext)
+				var isNew bool
+				if ordered, ok := i.store.(OrderedChunkStoreWriter); ok {
+					isNew, err = ordered.PutChunkOrdered(wctx, admission, ck, ciphertext, j.ordinal)
+				} else {
+					isNew, err = i.store.Put(wctx, admission, store.PartitionChunk, ck, ciphertext)
+				}
 				if err != nil {
 					fail(fmt.Errorf("ingest: store put chunk: %w", err))
 					continue
@@ -275,6 +290,7 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 	// only by holes.
 	var chunkErr error
 	cursor := uint64(0)
+	var chunkOrdinal uint64
 	for cursor < size && chunkErr == nil {
 		run, err := src.RunAt(cursor, size-cursor)
 		if err != nil {
@@ -326,7 +342,8 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 				return nil
 			}
 			select {
-			case jobs <- job{oc: oc, data: cr.Data}:
+			case jobs <- job{oc: oc, data: cr.Data, ordinal: chunkOrdinal}:
+				chunkOrdinal++
 				return nil
 			case <-wctx.Done():
 				return wctx.Err()

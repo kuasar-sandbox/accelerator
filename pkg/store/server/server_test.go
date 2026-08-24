@@ -86,6 +86,47 @@ func TestAdmitWrite(t *testing.T) {
 	}
 }
 
+func TestAdmitWriteForCurrentGeneration(t *testing.T) {
+	cli, _ := startBufconnServer(t, Options{
+		Backend:     newFSStore(t, "G1"),
+		Generations: func() []store.Generation { return []store.Generation{"G1", "G2"} },
+		VerifyKey:   true,
+	})
+
+	resp, err := cli.AdmitWrite(context.Background(), &pb.AdmitWriteRequest{Generation: "G1"})
+	if err != nil {
+		t.Fatalf("AdmitWrite(G1): %v", err)
+	}
+	wantSalt, err := store.SaltForGeneration("G1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.GetGeneration() != "G1" || !bytes.Equal(resp.GetSalt(), wantSalt[:]) {
+		t.Fatalf("admission = %q/%x, want G1/%x", resp.GetGeneration(), resp.GetSalt(), wantSalt)
+	}
+}
+
+func TestAdmitWriteForRemovedAndInvalidGeneration(t *testing.T) {
+	cli, _ := startBufconnServer(t, Options{
+		Backend:     newFSStore(t, "G2"),
+		Generations: func() []store.Generation { return []store.Generation{"G2"} },
+		VerifyKey:   true,
+	})
+
+	for _, tc := range []struct {
+		generation string
+		code       codes.Code
+	}{
+		{generation: "G1", code: codes.FailedPrecondition},
+		{generation: "bad/generation", code: codes.InvalidArgument},
+	} {
+		_, err := cli.AdmitWrite(context.Background(), &pb.AdmitWriteRequest{Generation: tc.generation})
+		if status.Code(err) != tc.code {
+			t.Fatalf("AdmitWrite(%q) code = %v, want %v", tc.generation, status.Code(err), tc.code)
+		}
+	}
+}
+
 func TestRolloutChangesNewAdmissionWhileListedOldAdmissionCanFinish(t *testing.T) {
 	current := []store.Generation{"G1"}
 	cli, _ := startBufconnServer(t, Options{
@@ -134,10 +175,22 @@ func TestOpaqueSaltIsStableWithinAndIsolatedAcrossWriteDomains(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if deriveSalt("G1") != deriveSalt("G1") {
+	saltG1A, err := store.SaltForGeneration("G1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	saltG1B, err := store.SaltForGeneration("G1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	saltG2, err := store.SaltForGeneration("G2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saltG1A != saltG1B {
 		t.Fatal("the same store write domain produced different salts")
 	}
-	if deriveSalt("G1") == deriveSalt("G2") {
+	if saltG1A == saltG2 {
 		t.Fatal("different store write domains produced the same salt")
 	}
 	_, _, _ = a, b, c

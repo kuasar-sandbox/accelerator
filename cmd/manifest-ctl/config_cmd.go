@@ -66,10 +66,17 @@ manifest:
   # variable instead (MANIFEST_KEY also overrides a value set here), so the
   # secret can stay out of this shared file.
   key: ""
+  # Re-hash physical Manifest/Chunk objects during ordinary reads. Omitted
+  # defaults to true. Explicit verify/import/upload operations always verify.
+  verify_content: true
+  # Optional generation for writes. With store.endpoint it must still be in
+  # the Store's current list; without a Store, local Bundle creation derives
+  # its canonical admission locally (empty defaults to the ordinary name NONE).
+  # write_generation: G3
 
 store:
-  # store-ctl gRPC endpoint, host:port. Required for any operation
-  # that ingests or fetches chunks.
+  # store-ctl gRPC endpoint, host:port. Required for remote ingest/fetch;
+  # may be empty for offline local Bundle creation.
   endpoint: "127.0.0.1:7100"
   # Independent gRPC ClientConns to multiplex over.
   pool: 4

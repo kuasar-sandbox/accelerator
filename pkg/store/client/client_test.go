@@ -177,6 +177,36 @@ func TestAdmitWrite(t *testing.T) {
 	}
 }
 
+func TestAdmitWriteFor(t *testing.T) {
+	c := startBufconnPair(t, 1, true)
+	admission, err := c.AdmitWriteFor(context.Background(), "G1")
+	if err != nil {
+		t.Fatalf("AdmitWriteFor: %v", err)
+	}
+	if admission.Generation != "G1" {
+		t.Fatalf("Generation = %q, want G1", admission.Generation)
+	}
+	if _, err := c.AdmitWriteFor(context.Background(), "G2"); err == nil {
+		t.Fatal("removed generation accepted")
+	}
+	if _, err := c.AdmitWriteFor(context.Background(), "bad/generation"); err == nil {
+		t.Fatal("invalid generation accepted")
+	}
+}
+
+type nonCanonicalAdmissionServer struct{ pb.UnimplementedStoreServer }
+
+func (nonCanonicalAdmissionServer) AdmitWrite(context.Context, *pb.AdmitWriteRequest) (*pb.AdmitWriteResponse, error) {
+	return &pb.AdmitWriteResponse{Generation: "G1", Salt: make([]byte, 32)}, nil
+}
+
+func TestAdmitWriteRejectsNonCanonicalServerSalt(t *testing.T) {
+	client := startCaptureClient(t, nonCanonicalAdmissionServer{})
+	if _, err := client.AdmitWrite(context.Background()); err == nil {
+		t.Fatal("non-canonical Store admission was accepted")
+	}
+}
+
 // TestRoundRobinAcrossPool — with pool=4 the client should rotate
 // stubs round-robin per pickStub. Verify by tracking the underlying
 // stub identity across N consecutive calls.

@@ -94,7 +94,10 @@ func (Partition) EnumDescriptor() ([]byte, []int) {
 }
 
 type AdmitWriteRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Empty selects the newest current generation. A non-empty value asks for
+	// that exact generation and succeeds only while it remains current.
+	Generation    string `protobuf:"bytes,1,opt,name=generation,proto3" json:"generation,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -127,6 +130,13 @@ func (x *AdmitWriteRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use AdmitWriteRequest.ProtoReflect.Descriptor instead.
 func (*AdmitWriteRequest) Descriptor() ([]byte, []int) {
 	return file_pkg_store_pb_store_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *AdmitWriteRequest) GetGeneration() string {
+	if x != nil {
+		return x.Generation
+	}
+	return ""
 }
 
 type AdmitWriteResponse struct {
@@ -490,8 +500,11 @@ var File_pkg_store_pb_store_proto protoreflect.FileDescriptor
 
 const file_pkg_store_pb_store_proto_rawDesc = "" +
 	"\n" +
-	"\x18pkg/store/pb/store.proto\x12\fcac.store.v1\"\x13\n" +
-	"\x11AdmitWriteRequest\"H\n" +
+	"\x18pkg/store/pb/store.proto\x12\fcac.store.v1\"3\n" +
+	"\x11AdmitWriteRequest\x12\x1e\n" +
+	"\n" +
+	"generation\x18\x01 \x01(\tR\n" +
+	"generation\"H\n" +
 	"\x12AdmitWriteResponse\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x01 \x01(\tR\n" +

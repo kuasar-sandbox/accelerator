@@ -85,6 +85,7 @@ type manifestStream struct {
 	onDemandGetter cache.Getter
 	prefetchGetter cache.Getter
 	decryptor      crypto.Decryptor
+	verifyContent  bool
 	keys           [][32]byte // decrypted per-chunk keys, parallel to m.Entries
 	chunkCache     *decryptedChunkCache
 	// Tests may replace this metadata-only lookup to verify a Run reuses its
@@ -105,11 +106,22 @@ func newManifestStream(
 	onDemand, prefetch cache.Getter,
 	dec crypto.Decryptor,
 ) *manifestStream {
+	return newManifestStreamWithOptions(m, keys, onDemand, prefetch, dec, Options{VerifyContent: true})
+}
+
+func newManifestStreamWithOptions(
+	m *codec.Manifest,
+	keys [][32]byte,
+	onDemand, prefetch cache.Getter,
+	dec crypto.Decryptor,
+	opts Options,
+) *manifestStream {
 	return &manifestStream{
 		m:              m,
 		onDemandGetter: onDemand,
 		prefetchGetter: prefetch,
 		decryptor:      dec,
+		verifyContent:  opts.VerifyContent,
 		keys:           keys,
 		chunkCache: newDecryptedChunkCache(
 			manifestChunkCacheMaxEntries,
@@ -365,7 +377,7 @@ func (s *manifestStream) readChunkDirect(
 	// or tampered chunk before the unauthenticated AES-CTR decrypt would turn
 	// attacker-chosen ciphertext into attacker-chosen plaintext. Hash the bytes
 	// as received and keep the borrowed Blob bytes immutable throughout decode.
-	if sha256.Sum256(ciphertext) != e.CiphertextHash {
+	if s.verifyContent && sha256.Sum256(ciphertext) != e.CiphertextHash {
 		return 0, fmt.Errorf("chunk %d: ciphertext hash mismatch (corrupt or tampered store/cache)", chunkIdx)
 	}
 	if offset == e.Offset && uint64(len(buf)) == uint64(e.Size) {
@@ -396,7 +408,7 @@ func (s *manifestStream) loadOwnedPlainChunk(ctx context.Context, chunkIdx uint6
 		return nil, err
 	}
 	ciphertext := blob.Bytes()
-	if sha256.Sum256(ciphertext) != e.CiphertextHash {
+	if s.verifyContent && sha256.Sum256(ciphertext) != e.CiphertextHash {
 		blob.Release()
 		return nil, fmt.Errorf("chunk %d: ciphertext hash mismatch (corrupt or tampered store/cache)", chunkIdx)
 	}
