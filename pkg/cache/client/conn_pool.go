@@ -350,20 +350,18 @@ func tcpTune(c net.Conn) {
 	udsSockTune(c)
 }
 
-// udsSockTune enlarges unix-socket SO_SNDBUF/SO_RCVBUF to wire.MaxFrameSize.
+// udsSockTune sizes unix-socket SO_SNDBUF/SO_RCVBUF to wire.MaxFrameSize.
 // The kernel default (net.core.wmem_default, 224KiB on this host) is smaller
 // than a max-size chunk, so a large response makes the writer sleep until the
 // reader drains — a ping-pong per ~224KiB that measured ~25% end-to-end on
-// snapshot restore. One wire frame (header + one max-size chunk value) is the
-// largest single write on this socket; the kernel doubles the requested
-// value, so a frame-sized request yields two frames in flight, which keeps
-// the writer streaming when the reader is briefly busy (measured: batch
-// p50 stdev 76ms vs 194ms at one-frame depth). The buffer is a cap, not a
-// preallocation, so there is no idle memory cost. It still clamps to
-// net.core.wmem_max unless raised. No-op on TCP (tcpTune covers that).
+// snapshot restore. One wire frame is the largest single write on this
+// socket; a frame-sized buffer (doubled by the kernel to two frames in
+// flight) keeps the writer streaming while the reader is briefly busy. The
+// buffer is a cap, not a preallocation, so there is no idle memory cost.
+// See wire.SetSocketBuffers for the FORCE/fallback handling. No-op on TCP
+// (tcpTune covers that).
 func udsSockTune(c net.Conn) {
-	if uc, ok := c.(*net.UnixConn); ok {
-		uc.SetReadBuffer(wire.MaxFrameSize)
-		uc.SetWriteBuffer(wire.MaxFrameSize)
+	if _, ok := c.(*net.UnixConn); ok {
+		wire.SetSocketBuffers(c)
 	}
 }
