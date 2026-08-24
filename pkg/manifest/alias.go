@@ -13,10 +13,11 @@ import (
 // aliases are purely import-ergonomic.
 
 type (
-	Manifest   = codec.Manifest
-	ChunkEntry = codec.ChunkEntry
-	ChunkMode  = codec.ChunkMode
-	Stream     = fetch.Stream
+	Manifest     = codec.Manifest
+	ChunkEntry   = codec.ChunkEntry
+	ChunkMode    = codec.ChunkMode
+	Stream       = fetch.Stream
+	FetchOptions = fetch.Options
 
 	IngestOption = ingest.IngestOption
 	IngestResult = ingest.Result

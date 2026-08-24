@@ -116,9 +116,22 @@ func (c *Client) withTimeout(ctx context.Context) (context.Context, context.Canc
 // AdmitWrite returns the generation and salt that one ingest must reuse for
 // every chunk and its final manifest.
 func (c *Client) AdmitWrite(ctx context.Context) (store.WriteAdmission, error) {
+	return c.admitWrite(ctx, "")
+}
+
+// AdmitWriteFor returns the canonical admission for generation when it is
+// still present in the Store's current generation list.
+func (c *Client) AdmitWriteFor(ctx context.Context, generation store.Generation) (store.WriteAdmission, error) {
+	if err := store.ValidateGeneration(generation); err != nil {
+		return store.WriteAdmission{}, fmt.Errorf("store: AdmitWriteFor: %w", err)
+	}
+	return c.admitWrite(ctx, generation)
+}
+
+func (c *Client) admitWrite(ctx context.Context, requested store.Generation) (store.WriteAdmission, error) {
 	ctx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	resp, err := c.pickStub().AdmitWrite(ctx, &pb.AdmitWriteRequest{})
+	resp, err := c.pickStub().AdmitWrite(ctx, &pb.AdmitWriteRequest{Generation: string(requested)})
 	if err != nil {
 		return store.WriteAdmission{}, fmt.Errorf("store: AdmitWrite: %w", err)
 	}
@@ -126,11 +139,21 @@ func (c *Client) AdmitWrite(ctx context.Context) (store.WriteAdmission, error) {
 	if err := store.ValidateGeneration(generation); err != nil {
 		return store.WriteAdmission{}, fmt.Errorf("store: AdmitWrite: %w", err)
 	}
+	if requested != "" && generation != requested {
+		return store.WriteAdmission{}, fmt.Errorf("store: AdmitWrite: returned generation %q, requested %q", generation, requested)
+	}
 	if len(resp.GetSalt()) != 32 {
 		return store.WriteAdmission{}, fmt.Errorf("store: AdmitWrite: salt length %d, want 32", len(resp.GetSalt()))
 	}
 	var salt [32]byte
 	copy(salt[:], resp.GetSalt())
+	wantSalt, err := store.SaltForGeneration(generation)
+	if err != nil {
+		return store.WriteAdmission{}, fmt.Errorf("store: AdmitWrite: canonical salt: %w", err)
+	}
+	if salt != wantSalt {
+		return store.WriteAdmission{}, fmt.Errorf("store: AdmitWrite: non-canonical salt for generation %q", generation)
+	}
 	return store.WriteAdmission{Generation: generation, Salt: salt}, nil
 }
 

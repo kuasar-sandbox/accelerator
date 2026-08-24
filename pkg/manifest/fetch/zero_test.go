@@ -271,6 +271,37 @@ func TestReadAt_HashMismatchRejected(t *testing.T) {
 	}
 }
 
+func TestReadAt_VerifyContentFalseSkipsChunkHash(t *testing.T) {
+	const chunkSize = 4096
+	tampered := bytes.Repeat([]byte{0x42}, chunkSize)
+	m := &codec.Manifest{
+		Version:   codec.Version1,
+		ImageSize: chunkSize,
+		Entries: []codec.ChunkEntry{{
+			Offset:         0,
+			Size:           chunkSize,
+			CiphertextHash: sha256.Sum256([]byte("authentic ciphertext")),
+		}},
+	}
+	getter := &staticGetter{plain: tampered}
+	stream := newManifestStreamWithOptions(
+		m,
+		make([][32]byte, 1),
+		getter,
+		getter,
+		&passthroughEncryptor{plain: tampered},
+		Options{VerifyContent: false},
+	)
+	defer stream.Close()
+	got := make([]byte, chunkSize)
+	if n, err := stream.ReadAt(context.Background(), got, 0); err != nil || n != chunkSize {
+		t.Fatalf("ReadAt = %d, %v", n, err)
+	}
+	if !bytes.Equal(got, tampered) {
+		t.Fatal("verify_content=false read changed bytes")
+	}
+}
+
 // passthroughEncryptor writes its captured plaintext regardless
 // of key/ciphertext, isolating fetch logic from real crypto.
 type passthroughEncryptor struct {

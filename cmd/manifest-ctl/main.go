@@ -646,7 +646,7 @@ func cmdVerify(args []string) {
 	}
 	cfg := loadCfg(*gf.configPath)
 
-	fc, err := cfg.NewFetcher()
+	fc, err := cfg.NewFetcherWithOptions(manifest.FetchOptions{VerifyContent: true})
 	if err != nil {
 		fatal("fetcher: %v", err)
 	}
@@ -662,7 +662,7 @@ func cmdVerify(args []string) {
 	// Enumerate chunks from the raw manifest blob (as `info` does), then
 	// verify each non-zero chunk through the fetch path — fetch, decrypt,
 	// and per-chunk key validation end-to-end.
-	data, derr := cfg.GetManifestBlob(ctx, key)
+	data, derr := cfg.GetManifestBlobWithOptions(ctx, key, manifest.FetchOptions{VerifyContent: true})
 	if derr != nil {
 		fatal("get manifest: %v", derr)
 	}

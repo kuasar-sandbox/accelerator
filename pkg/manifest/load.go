@@ -38,6 +38,7 @@ func LoadConfig(flagPath, envName string) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("manifest: parse %s: %w", path, err)
 	}
+	_ = cfg.fetchOptions() // emits the process-once startup warning when disabled
 	return &cfg, nil
 }
 
@@ -50,5 +51,6 @@ func ParseConfig(data []byte) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("manifest: parse config bytes: %w", err)
 	}
+	_ = cfg.fetchOptions() // emits the process-once startup warning when disabled
 	return &cfg, nil
 }

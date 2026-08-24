@@ -256,8 +256,10 @@ manifest-ctl config generate
 ```yaml
 manifest:
   key: "0a1b2c3d..."              # 32 字节 hex 客户密钥;Manifest 内嵌的密钥表用它密封
+  verify_content: true             # 普通读取是否复验 physical Manifest/Chunk SHA-256;缺省 true
+  # write_generation: G3           # 可选;指定写入 generation
 store:
-  endpoint: 127.0.0.1:7100        # store-ctl 端点(必填):host:port 或 Unix socket
+  endpoint: 127.0.0.1:7100        # 远端读写必填;离线 Bundle 可省略:host:port 或 Unix socket
                                   # (/run/sandbox/store.sock 或 unix:///...);须与 store-ctl listen 一致
   pool: 4                         # 客户端并行 grpc.ClientConn 数 (round-robin)
   timeout: 5s                     # 单次 store RPC 超时
@@ -286,6 +288,20 @@ crypto:
   `$MANIFEST_KEY` 环境变量提供——这是密钥的**主要交付方式**,且 `$MANIFEST_KEY`
   存在时**覆盖**此处 YAML 的值(密钥懒解析、不写回 Config,故不会被
   `config show` 回显)。两者皆空时,真正用到密封/解封的命令才报错。
+- `manifest.verify_content` — 缺省 `true`。普通 Bundle/cache/store Fetcher、
+  `GetManifestBlob` 和 `CheckManifest` 都用同一策略：`true` 时在解析 Manifest
+  前复验 `SHA256(physical Manifest) == requested key`，首次读取 Chunk 时复验
+  `SHA256(physical Chunk) == CiphertextHash`；`false` 时 ContentKey 只作 locator，
+  不执行这两次完整对象扫描。关闭后进程只记录一次清晰 WARNING；Manifest
+  envelope/geometry、key table GCM、Chunk format/长度、解密/解压等结构检查仍然
+  执行。`manifest-ctl verify`、Bundle full verify/upload/export 和对象修复始终
+  强制开启 SHA 校验，不受该字段影响。
+- `manifest.write_generation` — 可选写入 generation。有 `store.endpoint` 时，
+  留空调用 `AdmitWrite()` 选择当前最新项，非空调用
+  `AdmitWriteFor(generation)`，generation 已移除则失败；Store RPC 失败不会降级为
+  本地派生。无 Store 的离线 Bundle writer 在字段留空时使用普通 generation 名
+  `NONE`，显式配置时使用该值，两者都调用公共
+  `store.SaltForGeneration` 派生 salt。`NONE` 不是保留字或协议特殊值。
 - `store.endpoint` — manifest-ctl 不直接读写持久层;所有 chunk / Manifest
   I/O 通过这个 gRPC 客户端打到 store-ctl 守护进程。取 `host:port`(TCP)或一个
   Unix socket(裸路径 `/run/sandbox/store.sock` 会被规范化为 gRPC 的
@@ -677,6 +693,71 @@ expected `sha256|hmac` 和 outer EOF。跨 artifact record splice 会在顺序�
 调用方主动停止消费时,尚未读取部分不具备完整验证结论;任何发布、上传或转换
 路径必须消费全部 Data extents并传播终点错误。
 
+### 4.10 多 Manifest ZIP Bundle
+
+本地 Manifest 快照使用标准 ZIP64，所有 entry 固定为 `zip.Store`：
+
+```text
+admission/<generation>/<64-lowercase-hex-salt>   # 恰好一个，空 payload
+manifest/<64-lowercase-hex-content-key>          # 一个或多个
+chunk/<64-lowercase-hex-content-key>             # 零个或多个
+```
+
+Manifest/Chunk payload 是现有 physical object 的原始字节。Bundle 不使用 ZIP
+Deflate、ZIP encryption、整文件 SHA/HMAC、外层加密、自定义 pack、root entry 或
+JSON/YAML metadata。archive/entry comment、时间、权限和平台字段固定；重复 entry、
+未知 entry、目录、非 Store method、加密 flag、非法 key/admission 与截断均失败。
+标准 ZIP64 EOCD/size 扩展受支持。
+
+一个 Bundle 从首版容纳根内存 Manifest、根/数据盘当前层 Manifest，以及必要时
+收编的父层 Manifest。全部对象共用 admission entry 中的同一完整
+`store.WriteAdmission`。`bundle.Writer` 在构造前取得一次 admission；后续多个
+`Ingest` 只读取这份固定值。共享 Chunk 按 ContentKey 只写一份。Chunk 编码仍可
+并行，但实现通过有界 ordinal reorder 等待逻辑顺序并串行 append ZIP，不产生无界
+完成队列。
+
+配置层用 `Config.NewBundleIngester` 装配该 writer；此入口固定不混入
+`extra_salt`，保证 Chunk key 始终属于 recorded admission 的 canonical salt domain，
+从而可在 exact upload 时逐对象验证且无需重写。
+
+Bundle 中每个 Manifest 必须有完整非零 Chunk 闭包。读侧仅在
+`Fetcher.OpenManifest` 选择来源：
+
+| Manifest 来源 | Manifest/Chunk Getter | 失败语义 |
+|---|---|---|
+| Bundle 命中 | Bundle-only | 缺失、损坏、I/O、解析、闭包或解密错误直接失败 |
+| Bundle 不含该 Manifest | remote-only cache/store | Bundle 中碰巧同 key 的 Chunk 不参与 |
+
+因此不存在对象级 `Bundle → remote` fallback Getter；本地 Manifest 错误也不会改读
+远端同 key Manifest。Manifest 解析完成后，闭包检查只做 Central Directory map
+lookup，不读取 Chunk payload。
+
+`bundle.Open` 解析 Central Directory 与 admission；选中 Manifest 前不读取
+Manifest，Chunk 数据区在实际读 Chunk 前不触碰。文件打开优先使用 read-only mmap，
+热路径缓存 `DataOffset` 并直接构造 immutable Blob；回退路径使用 `ReaderAt`，不经
+`zip.File.Open` 重复执行 CRC32 扫描，并使用按 4 KiB～2 MiB 分级、每个 Reader
+最多保留 32 MiB 的有界 buffer pool。`manifest.verify_content=false` 时也不会隐藏
+执行 physical SHA 扫描。
+
+Bundle → Store exact upload 固定执行：
+
+1. 读取 recorded admission，并调用目标 Store
+   `AdmitWriteFor(recorded.Generation)`；返回 Generation/Salt 必须逐字节相等。
+2. 强制验证每个 Manifest physical ContentKey、解析并用 customer key 解封 key
+   table，建立完整闭包与跨 Manifest 的唯一 Chunk 元数据。
+3. 每个唯一 Chunk 强制验证 physical ContentKey，解密/解压为原明文，并要求
+   `DeriveKey(recorded.Salt, plaintext)` 等于 key table 中的 key；同一
+   ContentKey 对应不同 key 或 plaintext size 时拒绝。
+4. 先并发上传全部唯一 Chunk，再上传非根 Manifest，最后发布选定根 Manifest。
+
+上传使用 Bundle 的 recorded admission，不改投最新 generation，不重新 chunk、
+压缩、加密、seal key table 或改写上层 `snapshot.cfg`，因此 root ManifestKey 与
+physical bytes 保持不变。generation 在上传中移除时后续 Put 失败，根不会发布。
+`FullVerify` 还拒绝未被任何本地 Manifest 引用的 Chunk；调用方解析
+snapshot-specific metadata 后可通过 `ExpectedManifests` 提交精确的本地可达
+Manifest 集，从而拒绝无关 Manifest，而无需让 accelerator 解释
+`snapshot.cfg`。
+
 ## 5. 性能特征
 
 测量入口:`kuasar-sandbox/docs/perf.md` §2.1–2.2(冷/热 L1 状态下
@@ -693,6 +774,11 @@ Better、Zstd SpeedFastest 控制组）、`BenchmarkAESChunkCanonicalCodec` 和
 `BenchmarkManifestAESPhysicalRead`。生产实现只使用 Go Snappy；benchmark 候选不会
 进入配置或协商面。codec benchmark 另报告 `scratch-misses/op`,用于确认 warm
 size class 没有每次重新分配 payload-sized buffer。
+
+Bundle Central Directory 的 4K/20K Chunk 打开成本由
+`BenchmarkBundleOpen4K` / `BenchmarkBundleOpen20K` 报告；两者只测索引构造，
+不会读取 Chunk payload。`BenchmarkVerifyContent` 分别报告 Manifest open 与冷态
+1 MiB Chunk read 在 `verify_content=true|false` 下的差异。
 
 ## 6. See Also
 

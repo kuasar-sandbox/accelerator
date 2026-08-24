@@ -2,6 +2,7 @@
 package store
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -40,6 +41,8 @@ const maxGenerations = 1024
 
 var generationNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 
+const generationSaltDomain = "accelerator-salt-v1"
+
 // ValidateGeneration rejects names that could escape the single path
 // component reserved for a generation.
 func ValidateGeneration(g Generation) error {
@@ -47,6 +50,21 @@ func ValidateGeneration(g Generation) error {
 		return fmt.Errorf("store: unsafe generation %q (want [A-Za-z0-9][A-Za-z0-9._-]{0,127})", g)
 	}
 	return nil
+}
+
+// SaltForGeneration returns the canonical convergent-encryption salt for one
+// generation. Online Store admission and offline writers must use this single
+// derivation so objects created outside a Store stay in the same salt domain.
+func SaltForGeneration(g Generation) ([32]byte, error) {
+	if err := ValidateGeneration(g); err != nil {
+		return [32]byte{}, err
+	}
+	h := sha256.New()
+	_, _ = h.Write([]byte(generationSaltDomain))
+	_, _ = h.Write([]byte(g))
+	var salt [32]byte
+	copy(salt[:], h.Sum(nil))
+	return salt, nil
 }
 
 // ValidateGenerations validates one complete oldest-to-newest generation
