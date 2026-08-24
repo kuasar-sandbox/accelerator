@@ -74,9 +74,12 @@ flag 实参处停止解析)。
 `pkg/manifest` 同时提供 canonical ref parser。`manifest://` 只允许一个 64 位
 小写十六进制 content key;多层组合必须由调用方传入显式 ref 数组并使用
 `fetch.NewLayered`,不再使用 `manifest://k1:k2`。文件引用为
-`file://<path>[@sha256:<digest>][@location:<name>]`;带 location 时 path 必须是
-basename,location 匹配 `[A-Za-z0-9][A-Za-z0-9._-]*`,只保存逻辑名称,不携带
-宿主目录。允许数字开头以直接容纳 UUIDv7 sandbox/build ID。
+`file://<path>[@sha256:<digest>|@hmac:<digest>|@manifest:<key>][@location:<name>]`;
+三个 identity qualifier 互斥。`@manifest` 选择 Manifest Bundle 中的根 Manifest，
+tarstream opener 必须拒绝它；反之 Bundle opener 必须拒绝 `@sha256/@hmac`。带
+location 时 path 必须是 basename,location 匹配
+`[A-Za-z0-9][A-Za-z0-9._-]*`,只保存逻辑名称,不携带宿主目录。允许数字开头以直接
+容纳 UUIDv7 sandbox/build ID。
 
 ### 2.3 `manifest-ctl store` — 数据写入
 

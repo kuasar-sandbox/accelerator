@@ -42,6 +42,12 @@ func TestParseRef(t *testing.T) {
 			want:     Ref{Scheme: RefSchemeFile, Path: "base.image", DigestScheme: "hmac", Digest: digest, Location: "build.1"},
 			portable: true,
 		},
+		{
+			name:     "Manifest-selected located Bundle",
+			raw:      "file://snapshot.bundle@manifest:" + digest + "@location:build.1",
+			want:     Ref{Scheme: RefSchemeFile, Path: "snapshot.bundle", DigestScheme: "manifest", Digest: digest, Location: "build.1"},
+			portable: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -78,11 +84,17 @@ func TestParseRefRejectsInvalid(t *testing.T) {
 		"file://root.snapshot@location:",
 		"file://base.image@sha256:",
 		"file://base.image@hmac:",
+		"file://base.image@manifest:",
 		"file://base.image@location:x@sha256:" + digest,
 		"file://base.image@location:x@hmac:" + digest,
+		"file://base.image@location:x@manifest:" + digest,
 		"file://base.image@sha256:" + digest + "@hmac:" + digest,
+		"file://base.image@sha256:" + digest + "@manifest:" + digest,
+		"file://base.image@hmac:" + digest + "@manifest:" + digest,
 		"file://base.image@hmac:" + digest + "@hmac:" + digest,
+		"file://base.image@manifest:" + digest + "@manifest:" + digest,
 		"file://base.image@sha256:" + strings.Repeat("A", 64),
+		"file://base.image@manifest:" + strings.Repeat("A", 64),
 	} {
 		t.Run(raw, func(t *testing.T) {
 			if _, err := ParseRef(raw); err == nil {
