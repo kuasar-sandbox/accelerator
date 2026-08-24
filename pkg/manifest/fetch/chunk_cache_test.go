@@ -35,7 +35,13 @@ func TestManifestPartialReadsReuseDecryptedChunk(t *testing.T) {
 		plain[i] = byte(i % 251)
 	}
 	enc := &countingChunkEncryptor{inner: &manifestcrypto.AESChunkEncryptor{}}
-	ciphertext, hash, key := enc.inner.Encrypt([32]byte{0x31}, plain)
+	ciphertext, hash, key, err := enc.inner.EncryptChunk(context.Background(), [32]byte{0x31}, plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ciphertext[0] != manifestcrypto.ChunkFormatAESSnappy {
+		t.Fatalf("fixture format = %#x, want Snappy", ciphertext[0])
+	}
 	originalCiphertext := append([]byte(nil), ciphertext...)
 	getter := &chunkMapGetter{chunks: map[store.ContentKey][]byte{hash: ciphertext}}
 	m := &codec.Manifest{
@@ -336,22 +342,17 @@ func TestManifestWholeChunkColdReadBypassesCache(t *testing.T) {
 }
 
 type countingChunkEncryptor struct {
-	inner    manifestcrypto.ChunkEncryptor
+	inner    *manifestcrypto.AESChunkEncryptor
 	decrypts atomic.Int64
 }
 
-func (e *countingChunkEncryptor) Encrypt(salt [32]byte, plain []byte) ([]byte, [32]byte, [32]byte) {
-	return e.inner.Encrypt(salt, plain)
+func (e *countingChunkEncryptor) DecryptChunkTo(ctx context.Context, key [32]byte, ciphertext, dst []byte) error {
+	e.decrypts.Add(1)
+	return e.inner.DecryptChunkTo(ctx, key, ciphertext, dst)
 }
 
-func (e *countingChunkEncryptor) Decrypt(key [32]byte, ciphertext []byte) ([]byte, error) {
-	e.decrypts.Add(1)
-	return e.inner.Decrypt(key, ciphertext)
-}
-
-func (e *countingChunkEncryptor) DecryptInPlace(key [32]byte, ciphertext []byte) ([]byte, error) {
-	e.decrypts.Add(1)
-	return e.inner.DecryptInPlace(key, ciphertext)
+func (e *countingChunkEncryptor) UnsealKeyTable(_ [32]byte, sealed, _ []byte) ([]byte, error) {
+	return sealed, nil
 }
 
 type chunkMapGetter struct {

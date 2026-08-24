@@ -271,20 +271,21 @@ func TestReadAt_HashMismatchRejected(t *testing.T) {
 	}
 }
 
-// passthroughEncryptor returns its captured plaintext from Decrypt regardless
+// passthroughEncryptor writes its captured plaintext regardless
 // of key/ciphertext, isolating fetch logic from real crypto.
 type passthroughEncryptor struct {
 	plain []byte
 }
 
-func (e *passthroughEncryptor) Encrypt(_ [32]byte, plaintext []byte) ([]byte, [32]byte, [32]byte) {
-	return plaintext, [32]byte{}, [32]byte{}
+func (e *passthroughEncryptor) DecryptChunkTo(_ context.Context, _ [32]byte, _ []byte, dst []byte) error {
+	if len(e.plain) < len(dst) {
+		return errors.New("test decryptor: plaintext too short")
+	}
+	copy(dst, e.plain[:len(dst)])
+	return nil
 }
-func (e *passthroughEncryptor) Decrypt(_ [32]byte, _ []byte) ([]byte, error) {
-	return e.plain, nil
-}
-func (e *passthroughEncryptor) DecryptInPlace(_ [32]byte, _ []byte) ([]byte, error) {
-	return e.plain, nil
+func (e *passthroughEncryptor) UnsealKeyTable(_ [32]byte, sealed, _ []byte) ([]byte, error) {
+	return sealed, nil
 }
 
 // fixedHitGetter returns a fixed hit on a specific hash; any other key misses.

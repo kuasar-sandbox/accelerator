@@ -29,6 +29,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/chunker"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/internal/objectformat"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
@@ -84,7 +85,21 @@ type Result struct {
 	StoredChunks uint32 // chunks newly written to the store
 	DedupChunks  uint32 // chunks already present (Put returned isNew=false)
 	ZeroChunks   uint32 // chunks whose plaintext was all-zero (not stored)
-	StoredBytes  uint64 // bytes newly written to the store (ciphertext)
+	StoredBytes  uint64 // bytes newly written to the store (physical chunks + manifest)
+
+	// RawChunks and CompressedChunks count every non-hole, non-zero chunk,
+	// including chunks whose physical object is already present in the store.
+	RawChunks        uint32
+	CompressedChunks uint32
+	// LogicalChunkBytes is original plaintext; EncodedChunkBytes is the selected
+	// payload before the format byte and encryption. Both include dedup hits.
+	LogicalChunkBytes     uint64
+	EncodedChunkBytes     uint64
+	CompressionSavedBytes uint64 // LogicalChunkBytes - EncodedChunkBytes
+
+	ManifestLogicalBytes uint64 // decoded logical manifest, including magic
+	ManifestStoredBytes  uint64 // physical envelope size, including magic + encoding
+	ManifestCompressed   bool
 }
 
 // Ingester is the write-side handle. One Ingester per (process,
@@ -172,6 +187,8 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 		key    [32]byte
 		ck     store.ContentKey
 		ctLen  uint64
+		encLen uint64
+		format byte
 		isNew  bool
 	}
 	var (
@@ -226,8 +243,16 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 				if wctx.Err() != nil {
 					continue // drain fast; error already recorded
 				}
-				ciphertext, _, key := i.enc.EncryptChunk(salt, j.data)
-				ck := store.ContentKey(sha256.Sum256(ciphertext))
+				ciphertext, hash, key, err := i.enc.EncryptChunk(wctx, salt, j.data)
+				if err != nil {
+					fail(fmt.Errorf("ingest: encrypt chunk: %w", err))
+					continue
+				}
+				if err := validateEncryptedChunkObject(ciphertext, j.oc.size); err != nil {
+					fail(fmt.Errorf("ingest: encrypt chunk: %w", err))
+					continue
+				}
+				ck := store.ContentKey(hash)
 				isNew, err := i.store.Put(wctx, admission, store.PartitionChunk, ck, ciphertext)
 				if err != nil {
 					fail(fmt.Errorf("ingest: store put chunk: %w", err))
@@ -236,6 +261,8 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 				j.oc.key = key
 				j.oc.ck = ck
 				j.oc.ctLen = uint64(len(ciphertext))
+				j.oc.encLen = uint64(len(ciphertext) - 1)
+				j.oc.format = ciphertext[0]
 				j.oc.isNew = isNew
 				emitProgress(j.oc.size)
 			}
@@ -332,6 +359,14 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 			res.ZeroChunks++
 		} else {
 			entry.CiphertextHash = oc.ck
+			res.LogicalChunkBytes += uint64(oc.size)
+			res.EncodedChunkBytes += oc.encLen
+			switch oc.format {
+			case crypto.ChunkFormatAESRaw:
+				res.RawChunks++
+			case crypto.ChunkFormatAESSnappy:
+				res.CompressedChunks++
+			}
 			if oc.isNew {
 				res.StoredChunks++
 				res.StoredBytes += oc.ctLen
@@ -369,13 +404,42 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 	if err != nil {
 		return nil, fmt.Errorf("ingest: marshal manifest: %w", err)
 	}
+	res.ManifestLogicalBytes = uint64(codec.HeaderSize) + uint64(len(m.Entries))*codec.EntrySize + uint64(len(m.Holes))*codec.HoleSize + uint64(len(sealed))
+	res.ManifestStoredBytes = uint64(len(blob))
+	res.ManifestCompressed = len(blob) >= 5 && blob[4] == codec.ManifestEncodingSnappy
+	res.CompressionSavedBytes = res.LogicalChunkBytes - res.EncodedChunkBytes
+
 	manifestKey := store.ContentKey(sha256.Sum256(blob))
-	if _, err := i.store.Put(ctx, admission, store.PartitionManifest, manifestKey, blob); err != nil {
+	manifestIsNew, err := i.store.Put(ctx, admission, store.PartitionManifest, manifestKey, blob)
+	if err != nil {
 		return nil, fmt.Errorf("ingest: store put manifest: %w", err)
+	}
+	if manifestIsNew {
+		res.StoredBytes += uint64(len(blob))
 	}
 
 	res.ManifestKey = manifestKey
 	return &res, nil
+}
+
+func validateEncryptedChunkObject(object []byte, plaintextSize uint32) error {
+	if len(object) == 0 {
+		return fmt.Errorf("empty physical object")
+	}
+	encodedSize := uint64(len(object) - 1)
+	switch object[0] {
+	case crypto.ChunkFormatAESRaw:
+		if encodedSize != uint64(plaintextSize) {
+			return fmt.Errorf("RAW payload size %d, want %d", encodedSize, plaintextSize)
+		}
+	case crypto.ChunkFormatAESSnappy:
+		if !objectformat.CompressionBeneficial(uint64(plaintextSize), encodedSize) {
+			return fmt.Errorf("Snappy payload size %d does not satisfy canonical benefit rule for %d plaintext bytes", encodedSize, plaintextSize)
+		}
+	default:
+		return fmt.Errorf("unknown physical format 0x%02x", object[0])
+	}
+	return nil
 }
 
 // segReader feeds one hole-bounded segment [cur, end) of a

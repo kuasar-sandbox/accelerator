@@ -2,14 +2,12 @@ package crypto
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"testing"
 )
 
-// TestAES_DecryptInPlace_RoundTrip — encrypt then decrypt-in-place
-// returns the original plaintext, with the working buffer reusing
-// the ciphertext storage (no fresh allocation).
-func TestAES_DecryptInPlace_RoundTrip(t *testing.T) {
+func TestAES_DecryptChunkTo_RoundTrip(t *testing.T) {
 	var salt [32]byte
 	if _, err := rand.Read(salt[:]); err != nil {
 		t.Fatal(err)
@@ -17,28 +15,25 @@ func TestAES_DecryptInPlace_RoundTrip(t *testing.T) {
 	plain := bytes.Repeat([]byte{0xAB, 0xCD, 0xEF, 0x12}, 4096)
 
 	enc := &AESChunkEncryptor{}
-	ct, _, key := enc.Encrypt(salt, plain)
-
-	// In-place decrypt: the buffer ct itself is mutated.
-	got, err := enc.DecryptInPlace(key, ct)
+	ct, _, key, err := enc.EncryptChunk(context.Background(), salt, plain)
 	if err != nil {
-		t.Fatalf("DecryptInPlace: %v", err)
+		t.Fatal(err)
+	}
+
+	got := make([]byte, len(plain))
+	if err := enc.DecryptChunkTo(context.Background(), key, ct, got); err != nil {
+		t.Fatalf("DecryptChunkTo: %v", err)
 	}
 	if !bytes.Equal(got, plain) {
 		t.Fatalf("plaintext mismatch")
 	}
-	// got must alias ct[1:] — same underlying array.
-	if &got[0] != &ct[1] {
-		t.Fatalf("DecryptInPlace returned a fresh slice; expected aliasing into ct[1:]")
-	}
 }
 
-// TestAES_DecryptInPlace_FlagMismatch — wrong flag byte rejected.
-func TestAES_DecryptInPlace_FlagMismatch(t *testing.T) {
+func TestAES_DecryptChunkTo_FlagMismatch(t *testing.T) {
 	var key [32]byte
 	enc := &AESChunkEncryptor{}
 	bad := []byte{0xFF, 0x01, 0x02}
-	if _, err := enc.DecryptInPlace(key, bad); err == nil {
+	if err := enc.DecryptChunkTo(context.Background(), key, bad, make([]byte, 2)); err == nil {
 		t.Fatal("expected flag mismatch error, got nil")
 	}
 }
@@ -140,35 +135,5 @@ func TestAESKeyTable_InputChangeChangesOutput(t *testing.T) {
 	}
 	if bytes.Equal(base[1:1+gcmNonceSize], v2[1:1+gcmNonceSize]) {
 		t.Fatal("nonce unchanged after aad change")
-	}
-}
-
-// TestAES_DecryptInPlace_LegacyDecryptUnchanged — Decrypt still
-// returns a fresh allocation independent of the input buffer.
-func TestAES_DecryptInPlace_LegacyDecryptUnchanged(t *testing.T) {
-	var salt [32]byte
-	if _, err := rand.Read(salt[:]); err != nil {
-		t.Fatal(err)
-	}
-	plain := []byte("hello world")
-
-	enc := &AESChunkEncryptor{}
-	ct, _, key := enc.Encrypt(salt, plain)
-
-	out, err := enc.Decrypt(key, ct)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(out, plain) {
-		t.Fatalf("plaintext mismatch")
-	}
-	// ct must NOT have been mutated by legacy Decrypt — re-decrypting
-	// works again.
-	out2, err := enc.Decrypt(key, ct)
-	if err != nil {
-		t.Fatalf("second Decrypt: %v", err)
-	}
-	if !bytes.Equal(out2, plain) {
-		t.Fatalf("ct was mutated by legacy Decrypt; expected immutable")
 	}
 }

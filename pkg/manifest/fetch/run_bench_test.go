@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
@@ -67,6 +69,153 @@ func BenchmarkManifestReadAt(b *testing.B) {
 			}
 		})
 	}
+}
+
+func BenchmarkManifestAESPhysicalRead(b *testing.B) {
+	enc, dec, err := manifestcrypto.New(manifestcrypto.Config{Chunk: "aes", Manifest: "aes"})
+	if err != nil {
+		b.Fatal(err)
+	}
+	for name, plain := range map[string][]byte{
+		"raw":    fetchNoise(1 << 20),
+		"snappy": bytes.Repeat([]byte("snapshot-working-set\x00"), 48<<10),
+	} {
+		b.Run(name, func(b *testing.B) {
+			object, hash, key, err := enc.EncryptChunk(context.Background(), [32]byte{0x72}, plain)
+			if err != nil {
+				b.Fatal(err)
+			}
+			entry := codec.ChunkEntry{Size: uint32(len(plain)), CiphertextHash: hash}
+			stream := newTestManifestStream(&codec.Manifest{
+				Version: codec.Version1, ImageSize: uint64(len(plain)), Entries: []codec.ChunkEntry{entry},
+			}, [][32]byte{key}, &chunkMapGetter{chunks: map[store.ContentKey][]byte{hash: object}}, dec).(*manifestStream)
+			defer stream.Close()
+
+			b.Run("whole", func(b *testing.B) {
+				dst := make([]byte, len(plain))
+				b.ReportAllocs()
+				b.SetBytes(int64(len(dst)))
+				b.ReportMetric(float64(len(object))/float64(len(plain)), "physical/logical")
+				for range b.N {
+					if n, err := stream.readChunkDirect(context.Background(), dst, 0, entry, 0); err != nil || n != len(dst) {
+						b.Fatal(n, err)
+					}
+				}
+			})
+			b.Run("4KiB-range", func(b *testing.B) {
+				dst := make([]byte, 4<<10)
+				const offset = 12345
+				b.ReportAllocs()
+				b.SetBytes(int64(len(dst)))
+				b.ReportMetric(float64(len(object))/float64(len(plain)), "physical/logical")
+				for range b.N {
+					if n, err := stream.readChunkDirect(context.Background(), dst, 0, entry, offset); err != nil || n != len(dst) {
+						b.Fatal(n, err)
+					}
+				}
+			})
+			b.Run("partial-miss", func(b *testing.B) {
+				b.ReportAllocs()
+				b.SetBytes(int64(len(plain)))
+				b.ReportMetric(float64(len(object))/float64(len(plain)), "physical/logical")
+				for range b.N {
+					decoded, err := stream.loadOwnedPlainChunk(context.Background(), 0, entry)
+					if err != nil {
+						b.Fatal(err)
+					}
+					clear(decoded)
+				}
+			})
+		})
+	}
+}
+
+func BenchmarkManifestAESReadLatencyQuantiles(b *testing.B) {
+	enc, dec, err := manifestcrypto.New(manifestcrypto.Config{Chunk: "aes", Manifest: "aes"})
+	if err != nil {
+		b.Fatal(err)
+	}
+	for name, plain := range map[string][]byte{
+		"raw":    fetchNoise(1 << 20),
+		"snappy": bytes.Repeat([]byte("snapshot-working-set\x00"), 48<<10),
+	} {
+		object, hash, key, err := enc.EncryptChunk(context.Background(), [32]byte{0x72}, plain)
+		if err != nil {
+			b.Fatal(err)
+		}
+		entry := codec.ChunkEntry{Size: uint32(len(plain)), CiphertextHash: hash}
+		stream := newTestManifestStream(&codec.Manifest{
+			Version: codec.Version1, ImageSize: uint64(len(plain)), Entries: []codec.ChunkEntry{entry},
+		}, [][32]byte{key}, &chunkMapGetter{chunks: map[store.ContentKey][]byte{hash: object}}, dec).(*manifestStream)
+		defer stream.Close()
+
+		whole := make([]byte, len(plain))
+		page := make([]byte, 4<<10)
+		for _, operation := range []struct {
+			name string
+			run  func() error
+		}{
+			{name: "whole", run: func() error {
+				_, err := stream.readChunkDirect(context.Background(), whole, 0, entry, 0)
+				return err
+			}},
+			{name: "partial-miss", run: func() error {
+				plain, err := stream.loadOwnedPlainChunk(context.Background(), 0, entry)
+				clear(plain)
+				return err
+			}},
+		} {
+			b.Run(name+"/"+operation.name, func(b *testing.B) {
+				samples := make([]int64, b.N)
+				b.ReportAllocs()
+				b.ReportMetric(float64(len(object))/float64(len(plain)), "physical/logical")
+				b.ResetTimer()
+				for i := range b.N {
+					started := time.Now()
+					if err := operation.run(); err != nil {
+						b.Fatal(err)
+					}
+					samples[i] = time.Since(started).Nanoseconds()
+				}
+				b.StopTimer()
+				sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
+				b.ReportMetric(float64(fetchPercentileNanos(samples, 0.50)), "p50-ns")
+				b.ReportMetric(float64(fetchPercentileNanos(samples, 0.95)), "p95-ns")
+				b.ReportMetric(float64(fetchPercentileNanos(samples, 0.99)), "p99-ns")
+			})
+		}
+
+		// Fill once, then measure the #69 plaintext-cache hit path independently
+		// of object encoding. The same benchmark guards RAW and Snappy against an L1
+		// regression while preserving their separate fixtures.
+		if _, err := stream.ReadAt(context.Background(), page, 0); err != nil {
+			b.Fatal(err)
+		}
+		b.Run(name+"/4KiB-cache-hit", func(b *testing.B) {
+			samples := make([]int64, b.N)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := range b.N {
+				started := time.Now()
+				if _, err := stream.ReadAt(context.Background(), page, 0); err != nil {
+					b.Fatal(err)
+				}
+				samples[i] = time.Since(started).Nanoseconds()
+			}
+			b.StopTimer()
+			sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
+			b.ReportMetric(float64(fetchPercentileNanos(samples, 0.50)), "p50-ns")
+			b.ReportMetric(float64(fetchPercentileNanos(samples, 0.95)), "p95-ns")
+			b.ReportMetric(float64(fetchPercentileNanos(samples, 0.99)), "p99-ns")
+		})
+	}
+}
+
+func fetchPercentileNanos(sorted []int64, percentile float64) int64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	return sorted[int(percentile*float64(len(sorted)-1))]
 }
 
 func BenchmarkTarStreamReadAt(b *testing.B) {
@@ -167,7 +316,10 @@ func BenchmarkManifestChunkCacheWorkingSet(b *testing.B) {
 			stored := make(map[store.ContentKey][]byte, chunks)
 			for i := range chunks {
 				plain := bytes.Repeat([]byte{byte(i + 1)}, chunkSize)
-				ciphertext, hash, key := enc.Encrypt([32]byte{0x55}, plain)
+				ciphertext, hash, key, err := enc.EncryptChunk(context.Background(), [32]byte{0x55}, plain)
+				if err != nil {
+					b.Fatal(err)
+				}
 				entries[i] = codec.ChunkEntry{
 					Offset:         uint64(i * chunkSize),
 					Size:           chunkSize,
@@ -182,7 +334,7 @@ func BenchmarkManifestChunkCacheWorkingSet(b *testing.B) {
 				Entries:   entries,
 			}
 			getter := &chunkMapGetter{chunks: stored}
-			stream := newTestManifestStream(m, keys, getter, enc)
+			stream := newTestManifestStream(m, keys, getter, &countingChunkEncryptor{inner: enc})
 			defer stream.Close()
 			buf := make([]byte, 4<<10)
 			for i := range chunks {

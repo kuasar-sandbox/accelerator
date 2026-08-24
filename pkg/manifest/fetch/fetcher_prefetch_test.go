@@ -3,6 +3,7 @@ package fetch
 import (
 	"context"
 	"crypto/sha256"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,10 +13,11 @@ import (
 )
 
 func TestFetcherReturnsPrefetcher(t *testing.T) {
-	manifestKey := keyForFetcherTest(0x41)
 	chunk := []byte("chunk-data")
+	manifest := marshalFetcherTestManifest(t, chunk, 0x41)
+	manifestKey := store.ContentKey(sha256.Sum256(manifest))
 	getter := newFetcherRouteGetter(t, map[store.ContentKey][]byte{
-		manifestKey: marshalFetcherTestManifest(t, chunk),
+		manifestKey: manifest,
 	}, chunk)
 	fetcher := NewFetcher([32]byte{}, getter, fetcherTestDecryptor{})
 
@@ -45,12 +47,31 @@ func TestFetcherReturnsPrefetcher(t *testing.T) {
 	assertNoFetcherChunkCall(t, getter.chunkCalls)
 }
 
+func TestFetcherRejectsManifestPhysicalContentKeyMismatch(t *testing.T) {
+	chunk := []byte("manifest-hash-check")
+	manifest := marshalFetcherTestManifest(t, chunk, 0x72)
+	key := store.ContentKey(sha256.Sum256(manifest))
+	tampered := append([]byte(nil), manifest...)
+	tampered[len(tampered)-1] ^= 0x80
+	var released atomic.Int64
+	getter := blobReleaseGetter{value: tampered, released: &released}
+
+	_, err := NewFetcher([32]byte{}, getter, fetcherTestDecryptor{}).OpenManifest(context.Background(), key)
+	if err == nil {
+		t.Fatal("tampered manifest was accepted under its original ContentKey")
+	}
+	if got := released.Load(); got != 1 {
+		t.Fatalf("manifest Blob releases = %d, want 1", got)
+	}
+}
+
 func TestFetcherSharesAdmissionAcrossStreams(t *testing.T) {
-	keyA := keyForFetcherTest(0x51)
-	keyB := keyForFetcherTest(0x52)
 	chunk := []byte("shared-chunk")
-	manifest := marshalFetcherTestManifest(t, chunk)
-	getter := newFetcherRouteGetter(t, map[store.ContentKey][]byte{keyA: manifest, keyB: manifest}, chunk)
+	manifestA := marshalFetcherTestManifest(t, chunk, 0x51)
+	manifestB := marshalFetcherTestManifest(t, chunk, 0x52)
+	keyA := store.ContentKey(sha256.Sum256(manifestA))
+	keyB := store.ContentKey(sha256.Sum256(manifestB))
+	getter := newFetcherRouteGetter(t, map[store.ContentKey][]byte{keyA: manifestA, keyB: manifestB}, chunk)
 	publicFetcher := NewFetcher([32]byte{}, getter, fetcherTestDecryptor{})
 	fetcher := publicFetcher.(*fetcher)
 
@@ -89,11 +110,12 @@ func TestFetcherSharesAdmissionAcrossStreams(t *testing.T) {
 }
 
 func TestFetcherManifestLoadBypassesActivePrefetch(t *testing.T) {
-	keyA := keyForFetcherTest(0x61)
-	keyB := keyForFetcherTest(0x62)
 	chunk := []byte("metadata-priority")
-	manifest := marshalFetcherTestManifest(t, chunk)
-	getter := newFetcherRouteGetter(t, map[store.ContentKey][]byte{keyA: manifest, keyB: manifest}, chunk)
+	manifestA := marshalFetcherTestManifest(t, chunk, 0x61)
+	manifestB := marshalFetcherTestManifest(t, chunk, 0x62)
+	keyA := store.ContentKey(sha256.Sum256(manifestA))
+	keyB := store.ContentKey(sha256.Sum256(manifestB))
+	getter := newFetcherRouteGetter(t, map[store.ContentKey][]byte{keyA: manifestA, keyB: manifestB}, chunk)
 	fetcher := NewFetcher([32]byte{}, getter, fetcherTestDecryptor{})
 
 	stream, err := fetcher.OpenManifest(context.Background(), keyA)
@@ -122,11 +144,12 @@ func TestFetcherManifestLoadBypassesActivePrefetch(t *testing.T) {
 }
 
 func TestFetcherManifestLoadBlocksNewPrefetch(t *testing.T) {
-	keyA := keyForFetcherTest(0x63)
-	keyB := keyForFetcherTest(0x64)
 	chunk := []byte("metadata-admission")
-	manifest := marshalFetcherTestManifest(t, chunk)
-	route := newFetcherRouteGetter(t, map[store.ContentKey][]byte{keyA: manifest, keyB: manifest}, chunk)
+	manifestA := marshalFetcherTestManifest(t, chunk, 0x63)
+	manifestB := marshalFetcherTestManifest(t, chunk, 0x64)
+	keyA := store.ContentKey(sha256.Sum256(manifestA))
+	keyB := store.ContentKey(sha256.Sum256(manifestB))
+	route := newFetcherRouteGetter(t, map[store.ContentKey][]byte{keyA: manifestA, keyB: manifestB}, chunk)
 	getter := &fetcherMetadataGateGetter{
 		inner:   route,
 		gateKey: keyB,
@@ -206,12 +229,9 @@ func TestNewStreamsHaveIndependentAdmission(t *testing.T) {
 
 type fetcherTestDecryptor struct{}
 
-func (fetcherTestDecryptor) DecryptChunk(_ [32]byte, ciphertext []byte) ([]byte, error) {
-	return append([]byte(nil), ciphertext...), nil
-}
-
-func (fetcherTestDecryptor) DecryptChunkInPlace(_ [32]byte, ciphertext []byte) ([]byte, error) {
-	return ciphertext, nil
+func (fetcherTestDecryptor) DecryptChunkTo(_ context.Context, _ [32]byte, ciphertext, dst []byte) error {
+	copy(dst, ciphertext)
+	return nil
 }
 
 func (fetcherTestDecryptor) UnsealKeyTable(_ [32]byte, _, _ []byte) ([]byte, error) {
@@ -294,18 +314,20 @@ func (g *fetcherRouteGetter) Get(ctx context.Context, partition store.Partition,
 	}
 }
 
-func marshalFetcherTestManifest(t *testing.T, chunk []byte) []byte {
+func marshalFetcherTestManifest(t *testing.T, chunk []byte, marker byte) []byte {
 	t.Helper()
 	m := &codec.Manifest{
-		Version:   codec.Version1,
-		ImageSize: uint64(len(chunk)),
+		Version:      codec.Version1,
+		ImageSize:    uint64(len(chunk)),
+		MinChunkSize: uint32(len(chunk)),
+		MaxChunkSize: uint32(len(chunk)),
 		Entries: []codec.ChunkEntry{{
 			Offset:         0,
 			Size:           uint32(len(chunk)),
 			CiphertextHash: sha256.Sum256(chunk),
 		}},
 	}
-	data, err := codec.Marshal(m, []byte("sealed"))
+	data, err := codec.Marshal(m, append([]byte("sealed"), marker))
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
@@ -341,10 +363,4 @@ func assertNoFetcherChunkCall(t *testing.T, calls <-chan *fetcherChunkCall) {
 		t.Fatal("unexpected chunk Get")
 	default:
 	}
-}
-
-func keyForFetcherTest(value byte) store.ContentKey {
-	var key store.ContentKey
-	key[0] = value
-	return key
 }

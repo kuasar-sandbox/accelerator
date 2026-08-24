@@ -132,8 +132,11 @@ func TestIngest_AllZeroNoStorePut(t *testing.T) {
 	if res.ZeroChunks != numChunks {
 		t.Errorf("ZeroChunks=%d, want %d", res.ZeroChunks, numChunks)
 	}
-	if res.StoredChunks != 0 || res.DedupChunks != 0 || res.StoredBytes != 0 {
+	if res.StoredChunks != 0 || res.DedupChunks != 0 || res.StoredBytes != res.ManifestStoredBytes {
 		t.Errorf("unexpected non-zero counters: stored=%d dedup=%d bytes=%d", res.StoredChunks, res.DedupChunks, res.StoredBytes)
+	}
+	if res.RawChunks != 0 || res.CompressedChunks != 0 || res.LogicalChunkBytes != 0 || res.EncodedChunkBytes != 0 || res.CompressionSavedBytes != 0 {
+		t.Fatalf("zero chunks contributed to compression stats: %+v", res)
 	}
 	if res.ManifestKey != rec.manifestKey {
 		t.Errorf("Result.ManifestKey != captured manifest key")

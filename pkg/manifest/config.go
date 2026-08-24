@@ -18,6 +18,7 @@ package manifest
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"time"
@@ -254,12 +255,26 @@ func (c *Config) GetManifestBlob(ctx context.Context, key store.ContentKey) ([]b
 		defer cc.Close()
 		result, blob, err := cc.Get(ctx, store.PartitionManifest, key)
 		if err != nil {
+			if blob != nil {
+				blob.Release()
+			}
 			return nil, err
 		}
 		if result != cache.CacheHit {
+			if blob != nil {
+				blob.Release()
+			}
 			return nil, fmt.Errorf("manifest: not found: %s", HexKey(key))
 		}
-		data := append([]byte(nil), blob.Bytes()...)
+		if blob == nil {
+			return nil, fmt.Errorf("manifest: cache hit returned nil blob")
+		}
+		borrowed := blob.Bytes()
+		if err := verifyManifestContentKey(borrowed, key, "cache"); err != nil {
+			blob.Release()
+			return nil, err
+		}
+		data := append([]byte(nil), borrowed...)
 		blob.Release()
 		return data, nil
 	}
@@ -282,7 +297,17 @@ func (c *Config) GetManifestBlob(ctx context.Context, key store.ContentKey) ([]b
 	if !found {
 		return nil, fmt.Errorf("manifest: not found: %s", HexKey(key))
 	}
+	if err := verifyManifestContentKey(data, key, "store"); err != nil {
+		return nil, err
+	}
 	return data, nil
+}
+
+func verifyManifestContentKey(data []byte, key store.ContentKey, source string) error {
+	if sha256.Sum256(data) != key {
+		return fmt.Errorf("manifest: content key mismatch (corrupt or tampered %s)", source)
+	}
+	return nil
 }
 
 // CheckManifest verifies a manifest layer is PRESENT and sealed under the

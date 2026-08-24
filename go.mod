@@ -9,6 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.100.1
 	github.com/aws/smithy-go v1.25.1
 	github.com/golang/protobuf v1.5.4
+	github.com/golang/snappy v1.0.0
 	github.com/google/go-containerregistry v0.20.6
 	github.com/klauspost/compress v1.18.0
 	github.com/klauspost/reedsolomon v1.13.3
@@ -29,7 +30,7 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/vbatts/tar-split v0.12.1 // indirect
-	golang.org/x/sync v0.19.0 // indirect
+	golang.org/x/sync v0.19.0
 )
 
 require (
