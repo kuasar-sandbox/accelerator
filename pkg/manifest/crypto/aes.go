@@ -1,96 +1,312 @@
 package crypto
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/sha256"
 	"errors"
 	"fmt"
+
+	"github.com/golang/snappy"
 )
 
-// AESChunkEncryptor implements ChunkEncryptor using AES-256-CTR.
-type AESChunkEncryptor struct{}
+// AESChunkEncryptor implements the fixed adaptive RAW/Snappy chunk format. Its
+// zero value uses process-wide bounded encode/decode scratch managers.
+type AESChunkEncryptor struct {
+	encodeScratch *scratchManager
+	decodeScratch *scratchManager
+	encodeBlock   func(dst, src []byte) ([]byte, error)
+}
 
-// Encrypt derives the convergent chunk key key = SHA256(salt || plaintext)
-// (DeriveKey) and encrypts plaintext with AES-256-CTR under it. It returns the
-// ciphertext, the ciphertext hash (SHA256 over the full output, flag byte
-// included), and the derived key for the caller to record in the manifest key
-// table.
-//
-// Format: [0x01] + AES-256-CTR(key, iv=0, plaintext)
-//
-// The IV is fixed at zero. This is safe ONLY because the key is convergent:
-// within one salt domain the key is a pure function of the plaintext, so a
-// given (key, iv=0) pair never encrypts two distinct plaintexts and the CTR
-// keystream is never reused. Derivation is owned here — the caller supplies the
-// salt, never a key — so the invariant cannot be violated from outside.
-func (e *AESChunkEncryptor) Encrypt(salt [32]byte, plaintext []byte) ([]byte, [32]byte, [32]byte) {
+func (e *AESChunkEncryptor) encode(dst, src []byte) ([]byte, error) {
+	if e != nil && e.encodeBlock != nil {
+		return e.encodeBlock(dst, src)
+	}
+	return encodeSnappyBlock(dst, src)
+}
+
+func (e *AESChunkEncryptor) encScratch() *scratchManager {
+	if e != nil && e.encodeScratch != nil {
+		return e.encodeScratch
+	}
+	return defaultEncodeScratch
+}
+
+func (e *AESChunkEncryptor) decScratch() *scratchManager {
+	if e != nil && e.decodeScratch != nil {
+		return e.decodeScratch
+	}
+	return defaultDecodeScratch
+}
+
+// EncryptChunk derives K=SHA256(salt||original plaintext), evaluates the
+// canonical Snappy block candidate, encrypts the selected payload with AES-CTR
+// and a zero IV, and hashes the complete physical object. The encoded scratch is
+// released before this method returns and therefore before Store.Put begins.
+func (e *AESChunkEncryptor) EncryptChunk(
+	ctx context.Context,
+	salt [32]byte,
+	plaintext []byte,
+) ([]byte, [32]byte, [32]byte, error) {
+	var zero [32]byte
+	if err := ctx.Err(); err != nil {
+		return nil, zero, zero, err
+	}
+	if len(plaintext) > MaxChunkDecodedSize {
+		return nil, zero, zero, fmt.Errorf("%w: %d > %d", ErrChunkTooLarge, len(plaintext), MaxChunkDecodedSize)
+	}
+	maxEncoded := snappy.MaxEncodedLen(len(plaintext))
+	if maxEncoded < 0 {
+		return nil, zero, zero, fmt.Errorf("crypto: snappy max encoded length for %d", len(plaintext))
+	}
+	lease, err := e.encScratch().acquire(ctx, maxEncoded)
+	if err != nil {
+		return nil, zero, zero, fmt.Errorf("crypto: acquire encode scratch: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		lease.release()
+		return nil, zero, zero, err
+	}
+	// golang/snappy requires len(dst), rather than only cap(dst), to cover
+	// MaxEncodedLen. Passing the complete lease prevents a fallback allocation
+	// outside the process-wide scratch bound.
+	encoded, err := e.encode(lease.buf, plaintext)
+	if err != nil {
+		lease.markTouched(cap(lease.buf))
+		lease.release()
+		return nil, zero, zero, fmt.Errorf("crypto: Snappy encode: %w", err)
+	}
+	if len(encoded) > maxEncoded || (len(encoded) > 0 && &encoded[0] != &lease.buf[0]) {
+		lease.markTouched(cap(lease.buf))
+		lease.release()
+		return nil, zero, zero, fmt.Errorf("crypto: Snappy encoder did not reuse bounded scratch: encoded=%d max=%d", len(encoded), maxEncoded)
+	}
+	lease.markTouched(len(encoded))
+	decodedLen, err := snappy.DecodedLen(encoded)
+	if err != nil {
+		lease.release()
+		return nil, zero, zero, fmt.Errorf("crypto: invalid Snappy encoder output length: %w", err)
+	}
+	if decodedLen != len(plaintext) {
+		lease.release()
+		return nil, zero, zero, fmt.Errorf("crypto: invalid Snappy encoder output: encoded=%d decoded=%d, want %d", len(encoded), decodedLen, len(plaintext))
+	}
+	if err := ctx.Err(); err != nil {
+		lease.release()
+		return nil, zero, zero, err
+	}
+
+	format := ChunkFormatAESRaw
+	payload := plaintext
+	if compressionBeneficial(uint64(len(plaintext)), uint64(len(encoded))) {
+		format = ChunkFormatAESSnappy
+		payload = encoded
+	}
+
 	key := DeriveKey(salt, plaintext)
 	block, err := aes.NewCipher(key[:])
 	if err != nil {
-		panic(fmt.Sprintf("crypto: aes.NewCipher: %v", err))
+		lease.release()
+		return nil, zero, zero, fmt.Errorf("crypto: aes.NewCipher: %w", err)
 	}
+	object := make([]byte, 1+len(payload))
+	object[0] = format
+	var iv [aes.BlockSize]byte
+	cipher.NewCTR(block, iv[:]).XORKeyStream(object[1:], payload)
+	lease.release()
 
-	iv := make([]byte, aes.BlockSize) // zero IV — safe under the convergent-key invariant above
-	stream := cipher.NewCTR(block, iv)
-
-	ciphertext := make([]byte, 1+len(plaintext))
-	ciphertext[0] = FlagAES
-	stream.XORKeyStream(ciphertext[1:], plaintext)
-
-	hash := sha256.Sum256(ciphertext)
-	return ciphertext, hash, key
+	hash := sha256.Sum256(object)
+	return object, hash, key, nil
 }
 
-// Decrypt decrypts AES-256-CTR ciphertext into a fresh allocation.
-// Expects format: [0x01] + encrypted_data. For hot paths that own the
-// ciphertext buffer, prefer DecryptInPlace to avoid the per-call alloc.
-func (e *AESChunkEncryptor) Decrypt(key [32]byte, ciphertext []byte) ([]byte, error) {
-	if len(ciphertext) < 1 {
-		return nil, errors.New("crypto: ciphertext too short")
-	}
-	if ciphertext[0] != FlagAES {
-		return nil, fmt.Errorf("crypto: unexpected flag byte 0x%02x, want 0x%02x", ciphertext[0], FlagAES)
-	}
-
-	block, err := aes.NewCipher(key[:])
-	if err != nil {
-		return nil, fmt.Errorf("crypto: aes.NewCipher: %w", err)
-	}
-
-	iv := make([]byte, aes.BlockSize) // zero IV
-	stream := cipher.NewCTR(block, iv)
-
-	plaintext := make([]byte, len(ciphertext)-1)
-	stream.XORKeyStream(plaintext, ciphertext[1:])
-	return plaintext, nil
+func encodeSnappyBlock(dst, src []byte) (encoded []byte, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			encoded = nil
+			err = fmt.Errorf("crypto: Snappy encode failed: %v", recovered)
+		}
+	}()
+	return snappy.Encode(dst, src), nil
 }
 
-// DecryptInPlace XORs AES-256-CTR keystream over buf[1:] in place and
-// returns buf[1:] as the plaintext. The flag byte at buf[0] is checked
-// then ignored (caller's storage may keep it for re-encryption or pool
-// return). XORKeyStream(dst, src) with dst==src is well-defined: each
-// block reads src[i] then writes dst[i] sequentially.
-func (e *AESChunkEncryptor) DecryptInPlace(key [32]byte, buf []byte) ([]byte, error) {
-	if len(buf) < 1 {
-		return nil, errors.New("crypto: ciphertext too short")
+// DecryptChunkTo decrypts immutable ciphertext into an exact-size caller
+// destination. RAW writes AES output straight into dst. Snappy uses bounded
+// encoded scratch and asks snappy.Decode to reuse dst's backing array.
+func (e *AESChunkEncryptor) DecryptChunkTo(
+	ctx context.Context,
+	key [32]byte,
+	object []byte,
+	dst []byte,
+) error {
+	if err := validateChunkDestination(ctx, object, dst); err != nil {
+		return err
 	}
-	if buf[0] != FlagAES {
-		return nil, fmt.Errorf("crypto: unexpected flag byte 0x%02x, want 0x%02x", buf[0], FlagAES)
+	switch object[0] {
+	case ChunkFormatAESRaw:
+		if len(object)-1 != len(dst) {
+			return fmt.Errorf("crypto: RAW payload length %d, want %d", len(object)-1, len(dst))
+		}
+		return xorCTR(key, dst, object[1:], 0)
+	case ChunkFormatAESSnappy:
+		return e.decryptSnappyTo(ctx, key, object[1:], dst)
+	default:
+		return fmt.Errorf("crypto: unknown chunk format 0x%02x", object[0])
 	}
+}
 
+// DecryptChunkRangeTo serves the exceptional oversized partial-read path. RAW
+// seeks the CTR stream and writes only the requested range. Snappy is a single
+// block and therefore must decode the complete chunk into bounded temporary
+// plaintext before copying the range.
+func (e *AESChunkEncryptor) DecryptChunkRangeTo(
+	ctx context.Context,
+	key [32]byte,
+	object []byte,
+	plaintextSize int,
+	plaintextOffset int,
+	dst []byte,
+) error {
+	if plaintextSize < 0 || plaintextSize > MaxChunkDecodedSize {
+		return fmt.Errorf("%w: %d", ErrChunkTooLarge, plaintextSize)
+	}
+	if plaintextOffset < 0 || plaintextOffset > plaintextSize || len(dst) > plaintextSize-plaintextOffset {
+		return fmt.Errorf("crypto: range [%d,%d) outside plaintext size %d", plaintextOffset, plaintextOffset+len(dst), plaintextSize)
+	}
+	if err := validateChunkDestination(ctx, object, dst); err != nil {
+		return err
+	}
+	switch object[0] {
+	case ChunkFormatAESRaw:
+		if len(object)-1 != plaintextSize {
+			return fmt.Errorf("crypto: RAW payload length %d, want %d", len(object)-1, plaintextSize)
+		}
+		return xorCTR(key, dst, object[1+plaintextOffset:1+plaintextOffset+len(dst)], uint64(plaintextOffset))
+	case ChunkFormatAESSnappy:
+		maxEncoded := snappy.MaxEncodedLen(plaintextSize)
+		if maxEncoded < 0 || len(object)-1 > maxEncoded {
+			return fmt.Errorf("crypto: Snappy payload length %d exceeds maximum %d for %d decoded bytes", len(object)-1, maxEncoded, plaintextSize)
+		}
+		if !compressionBeneficial(uint64(plaintextSize), uint64(len(object)-1)) {
+			return fmt.Errorf("crypto: non-canonical Snappy payload length %d for %d decoded bytes", len(object)-1, plaintextSize)
+		}
+		encodedSize := len(object) - 1
+		combinedSize := encodedSize + plaintextSize
+		if combinedSize < encodedSize {
+			return errors.New("crypto: oversized Snappy scratch length overflows")
+		}
+		lease, err := e.decScratch().acquire(ctx, combinedSize)
+		if err != nil {
+			return fmt.Errorf("crypto: acquire oversized decode scratch: %w", err)
+		}
+		defer lease.release()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		lease.markTouched(combinedSize)
+		encoded := lease.buf[:encodedSize]
+		plain := lease.buf[encodedSize:]
+		if err := xorCTR(key, encoded, object[1:], 0); err != nil {
+			return err
+		}
+		if err := decodeSnappyExact(encoded, plain); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		copy(dst, plain[plaintextOffset:plaintextOffset+len(dst)])
+		return nil
+	default:
+		return fmt.Errorf("crypto: unknown chunk format 0x%02x", object[0])
+	}
+}
+
+func (e *AESChunkEncryptor) decryptSnappyTo(ctx context.Context, key [32]byte, payload, dst []byte) error {
+	maxEncoded := snappy.MaxEncodedLen(len(dst))
+	if maxEncoded < 0 || len(payload) > maxEncoded {
+		return fmt.Errorf("crypto: Snappy payload length %d exceeds maximum %d for %d decoded bytes", len(payload), maxEncoded, len(dst))
+	}
+	if !compressionBeneficial(uint64(len(dst)), uint64(len(payload))) {
+		return fmt.Errorf("crypto: non-canonical Snappy payload length %d for %d decoded bytes", len(payload), len(dst))
+	}
+	lease, err := e.decScratch().acquire(ctx, len(payload))
+	if err != nil {
+		return fmt.Errorf("crypto: acquire decode scratch: %w", err)
+	}
+	defer lease.release()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	lease.markTouched(len(lease.buf))
+	if err := xorCTR(key, lease.buf, payload, 0); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := decodeSnappyExact(lease.buf, dst); err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
+func decodeSnappyExact(encoded, dst []byte) error {
+	decodedLen, err := snappy.DecodedLen(encoded)
+	if err != nil {
+		return fmt.Errorf("crypto: Snappy decoded length: %w", err)
+	}
+	if decodedLen != len(dst) {
+		return fmt.Errorf("crypto: Snappy decoded length %d, want %d", decodedLen, len(dst))
+	}
+	decoded, err := snappy.Decode(dst, encoded)
+	if err != nil {
+		return fmt.Errorf("crypto: Snappy decode: %w", err)
+	}
+	if len(decoded) != len(dst) || (len(dst) > 0 && &decoded[0] != &dst[0]) {
+		return errors.New("crypto: Snappy decode did not reuse the exact destination")
+	}
+	return nil
+}
+
+func validateChunkDestination(ctx context.Context, object, dst []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(object) == 0 {
+		return errors.New("crypto: chunk object is empty")
+	}
+	if len(dst) > MaxChunkDecodedSize {
+		return fmt.Errorf("%w: %d > %d", ErrChunkTooLarge, len(dst), MaxChunkDecodedSize)
+	}
+	if slicesOverlap(object, dst) {
+		return errors.New("crypto: ciphertext and destination overlap")
+	}
+	return nil
+}
+
+func xorCTR(key [32]byte, dst, src []byte, plaintextOffset uint64) error {
+	if len(dst) != len(src) {
+		return fmt.Errorf("crypto: AES source length %d, destination length %d", len(src), len(dst))
+	}
 	block, err := aes.NewCipher(key[:])
 	if err != nil {
-		return nil, fmt.Errorf("crypto: aes.NewCipher: %w", err)
+		return fmt.Errorf("crypto: aes.NewCipher: %w", err)
 	}
-
-	iv := make([]byte, aes.BlockSize) // zero IV
-	stream := cipher.NewCTR(block, iv)
-
-	plain := buf[1:]
-	stream.XORKeyStream(plain, plain)
-	return plain, nil
+	blockIndex := plaintextOffset / aes.BlockSize
+	var iv [aes.BlockSize]byte
+	for i := len(iv) - 1; blockIndex > 0; i-- {
+		iv[i] = byte(blockIndex)
+		blockIndex >>= 8
+	}
+	stream := cipher.NewCTR(block, iv[:])
+	if skip := int(plaintextOffset % aes.BlockSize); skip != 0 {
+		var zeros, discard [aes.BlockSize]byte
+		stream.XORKeyStream(discard[:skip], zeros[:skip])
+	}
+	stream.XORKeyStream(dst, src)
+	return nil
 }
 
 // AESKeyTableEncryptor implements KeyTableEncryptor using AES-256-GCM.
@@ -144,7 +360,7 @@ func (e *AESKeyTableEncryptor) Seal(customerKey [32]byte, keys []byte, aad []byt
 
 	// [flag(1)] + [nonce(12)] + [encrypted + tag]
 	sealed := make([]byte, 0, 1+gcmNonceSize+len(encrypted))
-	sealed = append(sealed, FlagAES)
+	sealed = append(sealed, KeyTableFormatAESGCM)
 	sealed = append(sealed, nonce...)
 	sealed = append(sealed, encrypted...)
 	return sealed, nil
@@ -157,8 +373,8 @@ func (e *AESKeyTableEncryptor) Unseal(customerKey [32]byte, sealed []byte, aad [
 	if len(sealed) < 1+gcmNonceSize+16 {
 		return nil, errors.New("crypto: sealed data too short")
 	}
-	if sealed[0] != FlagAES {
-		return nil, fmt.Errorf("crypto: unexpected flag byte 0x%02x, want 0x%02x", sealed[0], FlagAES)
+	if sealed[0] != KeyTableFormatAESGCM {
+		return nil, fmt.Errorf("crypto: unexpected key-table format byte 0x%02x, want 0x%02x", sealed[0], KeyTableFormatAESGCM)
 	}
 
 	block, err := aes.NewCipher(customerKey[:])

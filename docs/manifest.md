@@ -11,13 +11,13 @@
 ### 1.1 模块定位
 
 ```
-   ┌─ input source ──┐      ┌─ manifest-ctl store ──────────────┐      ┌─ output ──────────┐
-   │  sparse.Source  │ ───► │  chunker (data segments)          │ ───► │  Manifest         │
-   │  (file/stdin/   │      │      ↓                            │      │  (binary file or  │
-   │   tar stream)   │      │  convergent encrypt               │      │   stdout)         │
-   └─────────────────┘      │      ↓                            │      └───────────────────┘
-                            │  store-ctl Put(chunk_hash) ───────┼───►  chunk bytes land in
-                            └───────────────────────────────────┘      store-ctl backend
+   ┌─ input source ──┐      ┌─ manifest-ctl store ──────────────────┐      ┌─ output ──────────┐
+   │  sparse.Source  │ ───► │  chunker (data segments)              │ ───► │  Manifest         │
+   │  (file/stdin/   │      │      ↓                                │      │  (binary file or  │
+   │   tar stream)   │      │  Snappy candidate → RAW/Snappy        │      │   stdout)         │
+   └─────────────────┘      │      ↓ encrypt                        │      └───────────────────┘
+                            │  store-ctl Put(chunk_hash) ───────────┼───►  chunk bytes land in
+                            └───────────────────────────────────────┘      store-ctl backend
 ```
 
 读取方向相反:`manifest-ctl load` 从 Manifest 取 chunk 列表 → 经 cache-ctl
@@ -26,7 +26,7 @@ tarstream 工件。
 
 ### 1.2 设计原则
 
-- **写入路径**:`sparse.Source → chunker → encrypt → store.Put → Manifest`
+- **写入路径**:`sparse.Source → chunker → Snappy/RAW 选择 → encrypt → store.Put → Manifest`
   (Hole 段记为 manifest 空洞、不读取;Zero 段合成零字节过 chunker、免取数)
 - **读取路径**:`Manifest → fetch → decrypt → io.Writer`
 - **去重单位**:chunk(可变长 FastCDC 或固定长度)
@@ -101,6 +101,8 @@ stdout 输出一行 64 字符 hex —— 这是上传后的 manifest content key
 image size:   10.0 GiB
 stored bytes: 1.0 GiB
 chunks:       stored=2048 dedup=18432 zero=0
+compression:  raw=512 snappy=19968 logical=10.0 GiB encoded=2.1 GiB saved=7.9 GiB
+manifest:     encoding=raw logical=1.8 MiB stored=1.8 MiB
 manifest key: a1b2c3d4...
 ```
 
@@ -361,28 +363,52 @@ salt = server_salt (+ extra_salt mixing)   # 见 §4.5
 key  = SHA256(salt || plaintext)           # convergent key
 ```
 
-AES-CTR 的 IV 取全零——key 本身已由 `(salt, plaintext)` 唯一决定,同一
-key 永远只加密同一明文,(key, IV) 对不会复用。由 `salt + plaintext` 决定
-chunk 的密钥,因此同 salt 域内同 plaintext 必然产出同 ciphertext;同
-ciphertext → 同 ContentKey(= `SHA256(ciphertext)`)→ store 上同一份字节。
+AES-CTR 的 IV 取全零。key 始终由**原始 plaintext**派生,而固定 canonical
+encoder 又保证同一 plaintext 只对应一个 RAW 或 Snappy payload,因此同一 `(key,
+IV=0)` 不会加密两个不同 payload。由 `salt + plaintext` 决定 chunk 的密钥,
+同 salt 域内同 plaintext 必然产出同 physical object;同 object → 同
+ContentKey(= `SHA256(object)`)→ store 上同一份字节。
+
+这个不变量要求 Go Snappy 版本、`snappy.Encode`、收益门槛和 format byte 固定。当前
+项目尚未发布,本格式直接替换旧开发格式且 reader 不兼容旧对象。首次使用前必须
+清空旧 salt domain 或换 generation salt,并禁止旧/new writer 混写。以后若改变
+encoder 输出或门槛,必须更换 salt/key domain,不能只换 format byte。
+
+canonical encoder 固定为 `github.com/golang/snappy` v1.0.0 的 block API。相同
+输入的 encoded bytes 由 amd64、amd64 `noasm` 与 arm64 golden 共同约束；这项
+逐字节一致性优先于更高压缩比。`klauspost/compress/s2` 的标准及 Snappy-compatible
+encoder 会因架构实现产生不同 block bytes，因此不用于 canonical 写路径。
 
 #### Content key
 
-Chunk 上传时,`SHA256(ciphertext)` 是 store 的寻址键;Manifest 上传时同样
-按 `SHA256(manifest_bytes)`。Salt **不参与寻址** —— 寻址完全由密文哈希决定,
+Chunk 上传时,`SHA256(physical_object)` 是 store 的寻址键;Manifest 上传时同样
+按 `SHA256(physical_envelope)`。Salt **不参与寻址** —— 寻址完全由物理字节哈希决定,
 保留 salt 的隔离性,但允许 store 端以单一 KV 视图存储(详见 [`store.md`](store.md))。
 
 ### 4.3 加密模式 — chunk
 
-YAML `crypto.chunk` 仅支持 `aes`;任何其它值在构造时即被拒绝(无明文回退):
+YAML `crypto.chunk` 仅支持 `aes`;任何其它值在构造时即被拒绝(无明文回退)。
+每个非零 chunk 固定执行 Go Snappy block `snappy.Encode`。仅当同时满足以下 canonical
+门槛才选 Snappy,否则选 RAW；这不是配置项：
 
-| 模式 | 行为 | 用途 |
+```text
+saved = rawSize - encodedSize
+Snappy iff saved >= 4 KiB AND encodedSize * 4 <= rawSize * 3
+```
+
+物理格式：
+
+| format byte | payload | physical object |
 |---|---|---|
-| `aes` | `[flag=0x01] + AES-256-CTR(key, plaintext)`(IV 全零,§4.2) | 唯一模式 |
+| `0x01` (`AESRaw`) | 原始 plaintext | `[0x01] || AES-256-CTR(key, IV=0, plaintext)` |
+| `0x02` (`AESSnappy`) | `snappy.Encode(plaintext)` | `[0x02] || AES-256-CTR(key, IV=0, snappy_block)` |
 
 chunk key 是收敛密钥 `SHA256(salt‖plaintext)`,由加密层内部派生(调用方只
 传 salt、不传 key),故 (key, IV=0) 对不同明文不复用、CTR keystream 不重用。
-flag byte 在解密时做格式校验。
+format byte 未加密但被 physical ContentKey 覆盖。Manifest entry 仍只记录原始
+plaintext size 与完整 physical hash,不增加 codec 字段。unknown format、长度不
+匹配、损坏、截断或不满足固定收益门槛的 Snappy object 一律失败,没有兼容探测或
+fallback。
 
 ### 4.4 加密模式 — Manifest
 
@@ -419,7 +445,24 @@ final_salt = SHA256("accelerator-extra-salt-v1" || server_salt || extra_salt)  #
 
 ### 4.6 Manifest 二进制格式
 
-Manifest 是一段紧凑的小型二进制(整数 little-endian):
+Manifest 的当前 Version1 physical envelope 是：
+
+```text
+[4 bytes "MANI"][1 byte encoding][payload]
+
+encoding 0x00 (RAW): payload = logical manifest bytes after magic
+encoding 0x01 (Snappy):  payload = snappy.Encode(logical manifest bytes after magic)
+```
+
+RAW/Snappy 使用与 Chunk 相同的固定 4 KiB + 75% 收益门槛。reader 不接受旧的
+`[MANI][Version1]...` 表示。Snappy decode 前先调用 `snappy.DecodedLen`,完整 logical
+manifest（含 magic）硬限制为 64 MiB；encoded length、table offset/length 和所有
+整数加法均先做边界检查，并拒绝不满足固定收益门槛的 Snappy envelope。RAW 直接在
+envelope payload 上解析,不为重建旧布局复制
+完整 Manifest；Snappy 只保留一个有界 decoded buffer。
+
+envelope 内的 logical Manifest 是一段紧凑二进制(整数 little-endian；magic 本身
+是字节串 `MANI`)：
 
 ```
    ┌──────────────── header (64 B) ───────────────┐
@@ -448,7 +491,8 @@ Manifest 是一段紧凑的小型二进制(整数 little-endian):
 合成零字节;hole 是外部声明的"无数据"区间(文件系统空洞等),与数据 chunk
 无重叠、无缝隙地铺满整个镜像。
 
-读路径:解析 header → 二分查找 chunk index 定位 offset → 用 `manifest.key`
+按 key 获取时先验证 `SHA256(physical envelope) == requested ManifestKey`,再解析
+envelope。随后解析 header → 二分查找 chunk index 定位 offset → 用 `manifest.key`
 解密 key table 得每 chunk 的对称 key → store/cache.Get(cipher_hash) → 解
 密 → 写入 io.Writer。
 
@@ -462,9 +506,15 @@ chunker (cdc | fixed)        ← split per configured mode
    │  → plaintext_chunk[i]
    ▼
 crypto.derive(salt, plain)
-   │  → key, ciphertext
+   │  → key = SHA256(salt || original plain)
    ▼
-sha256(ciphertext)           ← ContentKey
+Go Snappy candidate + fixed benefit rule
+   │  → RAW or Snappy payload
+   ▼
+AES-CTR + format byte
+   │  → physical object + SHA-256
+   ▼
+returned physical hash       ← ContentKey (ingest does not hash it again)
    │
    ▼
 store-ctl Put(admission, partition=chunk, key=ContentKey, size, ciphertext)
@@ -476,7 +526,7 @@ manifest.append(chunk_meta, key)   ← accumulate index + key table
    ▼
 seal(manifest.key, key_table)
    ↓
-emit Manifest
+logical Manifest → RAW/Snappy physical envelope
    │
    ▼
 store-ctl Put(same admission, partition=manifest, size, manifest)
@@ -546,14 +596,27 @@ Stream 内重复物理内容可以复用,不同密钥或逻辑大小不会错误
 `5s` 后过期。每个 Stream 只保留一个指向最早到期 entry 的 timer,即使后续没有
 读请求也会主动回收陈旧数据,不为每个 entry 创建 timer 或常驻扫描 goroutine。
 
-同一 cache key 的并发 miss 合并为一次 Get、SHA-256 校验和解密,不同 key 仍可
-并行加载。加载失败不进入 cache;等待者如果自身 context 仍有效会重新尝试,不会
-永久继承首个加载者的取消。密文先从 immutable Blob 复制到 Stream 自有内存再
-原地解密,Blob 随即 Release。淘汰、TTL 到期和 `Close()` 都会清零明文;正在复制
+同一 cache key 的并发 miss 合并为一次 Get、SHA-256 校验、解密和可选 Snappy
+decode,不同 key 仍可并行加载。加载失败不进入 cache;等待者如果自身 context 仍有效会重新尝试,不会
+永久继承首个加载者的取消。partial miss 只分配一个 plaintext-sized cache buffer,
+在 immutable Blob 仍存活时直接写入该 buffer；不复制或修改 ciphertext。淘汰、TTL
+到期和 `Close()` 都会清零明文;正在复制
 的 entry 先从 LRU 移除,待最后一个 reader 释放后再清零。
 
 冷态完整物理 chunk 读取保持直通路径,避免一次性顺序扫描污染 cache;已有 cache
 命中仍可服务完整读取。单个 plaintext chunk 超过 `32 MiB` 时同样直通且不准入。
+RAW 整块由 AES 直接写 caller buffer,没有 plaintext allocation 或额外整块 copy；
+RAW 超大 partial 按 CTR block/offset 直接解密请求范围。Snappy 整块把 encrypted payload
+解到有界 encoded scratch,校验 `DecodedLen == entry.Size`,再直接 decode 到 caller
+buffer；Snappy 超大 partial 因 block format 限制必须完整 decode 到有界临时 plaintext
+后复制范围。
+
+Snappy encoded scratch 使用显式 size class free-list,不是无峰值保证的 `sync.Pool`。
+encode/decode 分别有独立的 `max(1, GOMAXPROCS)` CPU slot、192 MiB active byte budget
+和 64 MiB retained budget（每方向合计最多 256 MiB codec-owned scratch）；常用最大
+retained buffer 为 2 MiB,异常大 buffer 用后丢弃。slot 和 weighted byte admission
+都响应调用方 context；RAW 读取不获取 decode slot。没有后台 goroutine。
+
 `Prefetch` 仍只执行完整物理 chunk 的 cache Get 并立即 Release,不校验、解密或
 填充上述明文 cache。因此 Prefetch 与 on-demand ReadAt 可以各自产生 Get,而重复
 的 on-demand 部分读由 Stream 内部合并和复用。
@@ -622,8 +685,14 @@ manifest:// 加载端到端时长)。
 主要决定项:
 
 - chunk 模式(cdc 命中率高于 fixed,但分块本身略慢);
-- 加密模式(aes 是 CPU 大头,~50–100% CPU 在大 chunk 上);
+- 固定 RAW/Snappy 选择与 AES（不可压缩内容保持 RAW；可压缩内容减少 hash/AES/wire bytes）；
 - store 端点延迟(本地 fs vs 远端 S3-compatible object storage,详见 [`store.md`](store.md))。
+
+可重复 microbenchmark 为 `BenchmarkCompressionCandidates`（raw、Go Snappy、S2、S2
+Better、Zstd SpeedFastest 控制组）、`BenchmarkAESChunkCanonicalCodec` 和
+`BenchmarkManifestAESPhysicalRead`。生产实现只使用 Go Snappy；benchmark 候选不会
+进入配置或协商面。codec benchmark 另报告 `scratch-misses/op`,用于确认 warm
+size class 没有每次重新分配 payload-sized buffer。
 
 ## 6. See Also
 

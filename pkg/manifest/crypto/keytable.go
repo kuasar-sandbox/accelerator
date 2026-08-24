@@ -5,10 +5,10 @@ import (
 	"fmt"
 )
 
-// NewChunkEncryptor creates a ChunkEncryptor for the given mode. The only
+// NewChunkEncryptor creates the chunk codec for the given mode. The only
 // supported mode is "aes"; any other value is rejected so a misconfiguration
 // fails loudly at startup rather than silently storing unencrypted chunks.
-func NewChunkEncryptor(mode string) (ChunkEncryptor, error) {
+func NewChunkEncryptor(mode string) (*AESChunkEncryptor, error) {
 	switch mode {
 	case "aes":
 		return &AESChunkEncryptor{}, nil

@@ -84,7 +84,7 @@ type manifestStream struct {
 	m              *codec.Manifest
 	onDemandGetter cache.Getter
 	prefetchGetter cache.Getter
-	encryptor      crypto.ChunkEncryptor
+	decryptor      crypto.Decryptor
 	keys           [][32]byte // decrypted per-chunk keys, parallel to m.Entries
 	chunkCache     *decryptedChunkCache
 	// Tests may replace this metadata-only lookup to verify a Run reuses its
@@ -92,17 +92,24 @@ type manifestStream struct {
 	chunkIndexLookup func([]codec.ChunkEntry, uint64) int
 }
 
+// chunkRangeDecryptor is the exceptional capability needed only when an
+// oversized chunk bypasses the plaintext cache. Keeping it private avoids
+// widening the canonical crypto.Decryptor interface beyond DecryptChunkTo.
+type chunkRangeDecryptor interface {
+	DecryptChunkRangeTo(ctx context.Context, key [32]byte, ciphertext []byte, plaintextSize, plaintextOffset int, dst []byte) error
+}
+
 func newManifestStream(
 	m *codec.Manifest,
 	keys [][32]byte,
 	onDemand, prefetch cache.Getter,
-	enc crypto.ChunkEncryptor,
+	dec crypto.Decryptor,
 ) *manifestStream {
 	return &manifestStream{
 		m:              m,
 		onDemandGetter: onDemand,
 		prefetchGetter: prefetch,
-		encryptor:      enc,
+		decryptor:      dec,
 		keys:           keys,
 		chunkCache: newDecryptedChunkCache(
 			manifestChunkCacheMaxEntries,
@@ -304,6 +311,9 @@ func (s *manifestStream) readChunkAt(ctx context.Context, buf []byte, chunkIdx, 
 	if len(buf) == 0 {
 		return 0, nil
 	}
+	if uint64(e.Size) > uint64(crypto.MaxChunkDecodedSize) {
+		return 0, fmt.Errorf("fetch: chunk %d: plaintext size %d exceeds hard limit %d", chunkIdx, e.Size, crypto.MaxChunkDecodedSize)
+	}
 	if e.IsZero {
 		clearSlice(buf)
 		return len(buf), nil
@@ -311,7 +321,7 @@ func (s *manifestStream) readChunkAt(ctx context.Context, buf []byte, chunkIdx, 
 	if chunkIdx >= uint64(len(s.keys)) {
 		return 0, fmt.Errorf("fetch: chunk %d: missing decryption key", chunkIdx)
 	}
-	if s.encryptor == nil {
+	if s.decryptor == nil {
 		return 0, fmt.Errorf("fetch: chunk %d: decryptor is nil", chunkIdx)
 	}
 	key := decryptedChunkKey{
@@ -324,7 +334,7 @@ func (s *manifestStream) readChunkAt(ctx context.Context, buf []byte, chunkIdx, 
 		return copyChunkRange(buf, lease.bytes(), chunkIdx, e, offset, end)
 	}
 	if (offset == e.Offset && uint64(len(buf)) == uint64(e.Size)) || uint64(e.Size) > manifestChunkCacheMaxBytes {
-		return s.readChunkDirect(ctx, buf, chunkIdx, e, offset, end)
+		return s.readChunkDirect(ctx, buf, chunkIdx, e, offset)
 	}
 
 	lease, err := s.chunkCache.acquireOrLoad(ctx, key, func(ctx context.Context) ([]byte, error) {
@@ -342,7 +352,7 @@ func (s *manifestStream) readChunkDirect(
 	buf []byte,
 	chunkIdx uint64,
 	e codec.ChunkEntry,
-	offset, end uint64,
+	offset uint64,
 ) (int, error) {
 	blob, err := s.loadChunkAt(ctx, chunkIdx, loadOnDemand)
 	if err != nil {
@@ -354,23 +364,32 @@ func (s *manifestStream) readChunkDirect(
 	// table's AAD, so verifying the returned bytes against it rejects a corrupt
 	// or tampered chunk before the unauthenticated AES-CTR decrypt would turn
 	// attacker-chosen ciphertext into attacker-chosen plaintext. Hash the bytes
-	// as received — DecryptInPlace mutates the buffer in place.
+	// as received and keep the borrowed Blob bytes immutable throughout decode.
 	if sha256.Sum256(ciphertext) != e.CiphertextHash {
 		return 0, fmt.Errorf("chunk %d: ciphertext hash mismatch (corrupt or tampered store/cache)", chunkIdx)
 	}
-	plain, err := s.encryptor.DecryptInPlace(s.keys[chunkIdx], ciphertext)
-	if err != nil {
-		return 0, fmt.Errorf("chunk %d: decrypt: %w", chunkIdx, err)
+	if offset == e.Offset && uint64(len(buf)) == uint64(e.Size) {
+		if err := s.decryptor.DecryptChunkTo(ctx, s.keys[chunkIdx], ciphertext, buf); err != nil {
+			return 0, fmt.Errorf("chunk %d: decrypt: %w", chunkIdx, err)
+		}
+		return len(buf), nil
 	}
-	if uint64(len(plain)) < uint64(e.Size) {
-		return 0, fmt.Errorf("chunk %d: decrypted data has %d bytes, need %d", chunkIdx, len(plain), e.Size)
+	rangeDecryptor, ok := s.decryptor.(chunkRangeDecryptor)
+	if !ok {
+		return 0, fmt.Errorf("chunk %d: decryptor cannot serve an oversized partial range", chunkIdx)
 	}
-	return copyChunkRange(buf, plain, chunkIdx, e, offset, end)
+	innerOffset := offset - e.Offset
+	if innerOffset > uint64(^uint(0)>>1) || uint64(e.Size) > uint64(^uint(0)>>1) {
+		return 0, fmt.Errorf("chunk %d: plaintext offset %d overflows int", chunkIdx, innerOffset)
+	}
+	if err := rangeDecryptor.DecryptChunkRangeTo(ctx, s.keys[chunkIdx], ciphertext, int(e.Size), int(innerOffset), buf); err != nil {
+		return 0, fmt.Errorf("chunk %d: range decrypt: %w", chunkIdx, err)
+	}
+	return len(buf), nil
 }
 
-// loadOwnedPlainChunk copies immutable ciphertext out of its Blob before
-// decrypting. The returned slice is owned by the stream cache and has exactly
-// the manifest entry's plaintext length.
+// loadOwnedPlainChunk allocates exactly one plaintext-sized cache buffer and
+// keeps the immutable Blob alive while the decryptor writes directly into it.
 func (s *manifestStream) loadOwnedPlainChunk(ctx context.Context, chunkIdx uint64, e codec.ChunkEntry) ([]byte, error) {
 	blob, err := s.loadChunkAt(ctx, chunkIdx, loadOnDemand)
 	if err != nil {
@@ -381,27 +400,14 @@ func (s *manifestStream) loadOwnedPlainChunk(ctx context.Context, chunkIdx uint6
 		blob.Release()
 		return nil, fmt.Errorf("chunk %d: ciphertext hash mismatch (corrupt or tampered store/cache)", chunkIdx)
 	}
-	owned := append([]byte(nil), ciphertext...)
+	plain := make([]byte, e.Size)
+	err = s.decryptor.DecryptChunkTo(ctx, s.keys[chunkIdx], ciphertext, plain)
 	blob.Release()
-
-	plain, err := s.encryptor.DecryptInPlace(s.keys[chunkIdx], owned)
 	if err != nil {
-		clearSlice(owned)
+		clearSlice(plain)
 		return nil, fmt.Errorf("chunk %d: decrypt: %w", chunkIdx, err)
 	}
-	if uint64(len(plain)) < uint64(e.Size) {
-		clearSlice(owned)
-		return nil, fmt.Errorf("chunk %d: decrypted data has %d bytes, need %d", chunkIdx, len(plain), e.Size)
-	}
-	plain = plain[:e.Size]
-	// The production contract returns owned[1:]. Tests and future codecs are
-	// still forced into cache-owned storage if they return any other slice.
-	if len(plain) > 0 && len(owned) == len(plain)+1 && &plain[0] == &owned[1] {
-		return plain, nil
-	}
-	cacheOwned := append([]byte(nil), plain...)
-	clearSlice(owned)
-	return cacheOwned, nil
+	return plain, nil
 }
 
 func copyChunkRange(

@@ -2,6 +2,7 @@ package fetch
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 
@@ -37,15 +38,27 @@ type fetcher struct {
 func (f *fetcher) OpenManifest(ctx context.Context, manifestKey store.ContentKey) (Stream, error) {
 	result, blob, err := f.cache.OnDemandGetter().Get(ctx, store.PartitionManifest, manifestKey)
 	if err != nil {
+		if blob != nil {
+			blob.Release()
+		}
 		return nil, fmt.Errorf("fetch: manifest blob: %w", err)
 	}
 	if result != cache.CacheHit {
+		if blob != nil {
+			blob.Release()
+		}
 		return nil, fmt.Errorf("fetch: manifest not found: %s", hex.EncodeToString(manifestKey[:]))
 	}
-	mData := append([]byte(nil), blob.Bytes()...)
-	blob.Release()
-
+	if blob == nil {
+		return nil, fmt.Errorf("fetch: manifest cache hit returned nil blob")
+	}
+	mData := blob.Bytes()
+	if sha256.Sum256(mData) != manifestKey {
+		blob.Release()
+		return nil, fmt.Errorf("fetch: manifest content key mismatch (corrupt or tampered store/cache)")
+	}
 	m, sealedKT, err := codec.Unmarshal(mData)
+	blob.Release()
 	if err != nil {
 		return nil, fmt.Errorf("fetch: unmarshal manifest: %w", err)
 	}
@@ -53,32 +66,11 @@ func (f *fetcher) OpenManifest(ctx context.Context, manifestKey store.ContentKey
 	if err != nil {
 		return nil, fmt.Errorf("fetch: unseal keys: %w", err)
 	}
-	// manifestStream takes a ChunkEncryptor (legacy interface); the same codec
-	// impl satisfies both it and Decryptor. Adapt so the call site doesn't reach
-	// into pkg/manifest/crypto internals.
 	return newManifestStream(
 		m,
 		keys,
 		f.cache.OnDemandGetter(),
 		f.cache.PrefetchGetter(),
-		decryptorAsChunkEncryptor{dec: f.dec},
+		f.dec,
 	), nil
-}
-
-// decryptorAsChunkEncryptor bridges crypto.Decryptor (DecryptChunk /
-// DecryptChunkInPlace) to crypto.ChunkEncryptor (Decrypt /
-// DecryptInPlace). Read-only — Encrypt panics if called, signalling a
-// mis-use (the stream never encrypts).
-type decryptorAsChunkEncryptor struct{ dec crypto.Decryptor }
-
-func (a decryptorAsChunkEncryptor) Encrypt(salt [32]byte, plain []byte) ([]byte, [32]byte, [32]byte) {
-	panic("fetch: Encrypt called on read-only stream adapter")
-}
-
-func (a decryptorAsChunkEncryptor) Decrypt(key [32]byte, cipher []byte) ([]byte, error) {
-	return a.dec.DecryptChunk(key, cipher)
-}
-
-func (a decryptorAsChunkEncryptor) DecryptInPlace(key [32]byte, buf []byte) ([]byte, error) {
-	return a.dec.DecryptChunkInPlace(key, buf)
 }

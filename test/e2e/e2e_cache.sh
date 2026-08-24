@@ -167,9 +167,18 @@ payload_hash() {
     tar xOf "$1" | sha256sum | awk '{print $1}'
 }
 
-# Prepare a 2 MiB payload wrapped in a tarstream artifact. The default CDC max
-# is 1 MiB, so the readiness checks below always exercise multiple chunks.
-dd if=/dev/urandom of="$TMPDIR/payload.bin" bs=1024 count=2048 2>/dev/null
+# Prepare a 2 MiB snapshot-like payload. Every page has a distinct header, so
+# CDC produces multiple independently addressed chunks, while the repeated
+# page body makes those chunks exercise the canonical Snappy path through store,
+# embedded/Redis caches, and EC. Other E2E fixtures remain high-entropy RAW.
+python3 - "$TMPDIR/payload.bin" <<'PY'
+import sys
+
+with open(sys.argv[1], "wb") as output:
+    for page in range(512):
+        header = f"snapshot-page={page:06d}\n".encode()
+        output.write(header + b"A" * (4096 - len(header)))
+PY
 "$BIN/flatten-ctl" tar stream -f "$TMPDIR/test.bin" \
     "payload.bin:$TMPDIR/payload.bin"
 
@@ -248,7 +257,13 @@ EOF
 # Store test data via store-ctl.
 echo ""
 echo "=== Ingest test data (via store-ctl) ==="
-MKEY=$("$BIN/manifest-ctl" store $COMMON --no-progress "$TMPDIR/test.bin")
+MKEY=$("$BIN/manifest-ctl" store $COMMON --no-progress "$TMPDIR/test.bin" 2>"$TMPDIR/store-summary.log")
+cat "$TMPDIR/store-summary.log" >&2
+if grep -Eq 'compression:.*snappy=[1-9][0-9]*' "$TMPDIR/store-summary.log"; then
+    ok "main cache/EC artifact contains compressed chunks"
+else
+    fail "main cache/EC artifact did not produce compressed chunks"
+fi
 ORIG_HASH=$(payload_hash "$TMPDIR/test.bin")
 echo "  Stored. SHA256=$ORIG_HASH  manifest-key=$MKEY"
 

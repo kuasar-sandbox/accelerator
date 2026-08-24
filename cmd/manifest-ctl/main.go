@@ -267,6 +267,15 @@ func cmdStore(args []string) {
 	fmt.Fprintf(os.Stderr, "stored bytes: %s\n", formatSize(result.StoredBytes))
 	fmt.Fprintf(os.Stderr, "chunks:       stored=%d dedup=%d zero=%d\n",
 		result.StoredChunks, result.DedupChunks, result.ZeroChunks)
+	fmt.Fprintf(os.Stderr, "compression:  raw=%d snappy=%d logical=%s encoded=%s saved=%s\n",
+		result.RawChunks, result.CompressedChunks,
+		formatSize(result.LogicalChunkBytes), formatSize(result.EncodedChunkBytes), formatSize(result.CompressionSavedBytes))
+	manifestEncoding := "raw"
+	if result.ManifestCompressed {
+		manifestEncoding = "snappy"
+	}
+	fmt.Fprintf(os.Stderr, "manifest:     encoding=%s logical=%s stored=%s\n",
+		manifestEncoding, formatSize(result.ManifestLogicalBytes), formatSize(result.ManifestStoredBytes))
 	fmt.Fprintf(os.Stderr, "manifest key: %s\n", hex.EncodeToString(result.ManifestKey[:]))
 }
 

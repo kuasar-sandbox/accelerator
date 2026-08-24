@@ -1,24 +1,29 @@
 package crypto
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // Encryptor is the write-side narrow interface: encrypt a chunk, seal
 // a key table. Returned by New together with a matching Decryptor; the
 // two views over the same underlying codec keep ingest and fetch paths
 // from accidentally touching each other's primitives.
 type Encryptor interface {
-	// EncryptChunk derives the convergent key from (salt, plaintext), encrypts
-	// under it, and returns the ciphertext, its hash, and the derived key (to
-	// record in the key table). See crypto.DeriveKey and the AES zero-IV invariant.
-	EncryptChunk(salt [32]byte, plaintext []byte) (ciphertext []byte, hash [32]byte, key [32]byte)
+	// EncryptChunk derives the convergent key from (salt, original plaintext),
+	// chooses the fixed canonical RAW/Snappy payload, encrypts it, and returns the
+	// complete physical object, its hash, and the key recorded in the key table.
+	EncryptChunk(ctx context.Context, salt [32]byte, plaintext []byte) (object []byte, hash [32]byte, key [32]byte, err error)
 	SealKeyTable(customerKey [32]byte, keys, aad []byte) ([]byte, error)
 }
 
 // Decryptor is the read-side narrow interface. Symmetric counterpart
 // to Encryptor — same algorithms, opposite direction.
 type Decryptor interface {
-	DecryptChunk(key [32]byte, ciphertext []byte) (plaintext []byte, err error)
-	DecryptChunkInPlace(key [32]byte, buf []byte) (plaintext []byte, err error)
+	// DecryptChunkTo treats ciphertext as immutable and fills the exact-size
+	// destination. The slices must not overlap. ctx controls bounded Snappy scratch
+	// admission; on an error dst is unspecified.
+	DecryptChunkTo(ctx context.Context, key [32]byte, ciphertext, dst []byte) error
 	UnsealKeyTable(customerKey [32]byte, sealed, aad []byte) (keys []byte, err error)
 }
 
@@ -44,24 +49,23 @@ func New(cfg Config) (Encryptor, Decryptor, error) {
 	return c, c, nil
 }
 
-// codec adapts the legacy split-interface impls
-// (ChunkEncryptor + KeyTableEncryptor) to the new narrow interfaces.
-// Single struct so both views share state if any is ever added.
+// codec combines the chunk and key-table implementations behind the narrow
+// read/write interfaces. Both views share the same bounded codec state.
 type codec struct {
-	chunk ChunkEncryptor
+	chunk *AESChunkEncryptor
 	kt    KeyTableEncryptor
 }
 
-func (c *codec) EncryptChunk(salt [32]byte, plaintext []byte) ([]byte, [32]byte, [32]byte) {
-	return c.chunk.Encrypt(salt, plaintext)
+func (c *codec) EncryptChunk(ctx context.Context, salt [32]byte, plaintext []byte) ([]byte, [32]byte, [32]byte, error) {
+	return c.chunk.EncryptChunk(ctx, salt, plaintext)
 }
 
-func (c *codec) DecryptChunk(key [32]byte, ciphertext []byte) ([]byte, error) {
-	return c.chunk.Decrypt(key, ciphertext)
+func (c *codec) DecryptChunkTo(ctx context.Context, key [32]byte, ciphertext, dst []byte) error {
+	return c.chunk.DecryptChunkTo(ctx, key, ciphertext, dst)
 }
 
-func (c *codec) DecryptChunkInPlace(key [32]byte, buf []byte) ([]byte, error) {
-	return c.chunk.DecryptInPlace(key, buf)
+func (c *codec) DecryptChunkRangeTo(ctx context.Context, key [32]byte, ciphertext []byte, plaintextSize, plaintextOffset int, dst []byte) error {
+	return c.chunk.DecryptChunkRangeTo(ctx, key, ciphertext, plaintextSize, plaintextOffset, dst)
 }
 
 func (c *codec) SealKeyTable(customerKey [32]byte, keys, aad []byte) ([]byte, error) {

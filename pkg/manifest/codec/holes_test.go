@@ -2,6 +2,7 @@ package codec
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"testing"
 
@@ -150,19 +151,24 @@ func TestValidateGeometry_AllHoles(t *testing.T) {
 // TestUnmarshal_RejectsBadGeometry — corrupt manifest bytes that
 // describe a tile violation must fail at Unmarshal.
 func TestUnmarshal_RejectsBadGeometry(t *testing.T) {
-	// Build a manifest with a deliberately-invalid layout (gap),
-	// Marshal it, then Unmarshal — should fail.
+	// Marshal a valid small RAW envelope, then corrupt ImageSize to create a
+	// logical gap. Marshal itself also validates geometry, so malformed input
+	// must be injected at the physical boundary.
 	m := &Manifest{
-		Version:   Version1,
-		ChunkMode: ChunkModeFixed,
-		ImageSize: 8192, // claims 8192 but only describes [0, 4096)
-		Entries:   []ChunkEntry{{Offset: 0, Size: 4096}},
+		Version:      Version1,
+		ChunkMode:    ChunkModeFixed,
+		ImageSize:    4096,
+		MaxChunkSize: 4096,
+		Entries:      []ChunkEntry{{Offset: 0, Size: 4096}},
 	}
-	// Skip ValidateGeometry on construction — Marshal doesn't validate.
 	data, err := Marshal(m, nil)
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
+	if data[4] != ManifestEncodingRaw {
+		t.Fatalf("fixture encoding = %d, want RAW", data[4])
+	}
+	binary.LittleEndian.PutUint64(data[9:17], 8192)
 	if _, _, err := Unmarshal(data); !errors.Is(err, ErrBadGeometry) {
 		t.Fatalf("expected ErrBadGeometry from Unmarshal, got %v", err)
 	}
