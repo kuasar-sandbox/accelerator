@@ -143,6 +143,13 @@ func (c *Config) NewIngester(keyFn ingest.CustomerKeyFunc, extraSaltFn ingest.Ex
 	if err != nil {
 		return nil, err
 	}
+	if maxSize := chk.Info().MaxSize; uint64(maxSize) > uint64(codec.MaxChunkDecodedSize) {
+		return nil, fmt.Errorf(
+			"manifest: chunker maximum size %d exceeds canonical decoded chunk limit %d",
+			maxSize,
+			codec.MaxChunkDecodedSize,
+		)
+	}
 	enc, _, err := crypto.New(c.Crypto)
 	if err != nil {
 		return nil, err
