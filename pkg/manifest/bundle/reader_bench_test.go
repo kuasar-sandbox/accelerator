@@ -15,6 +15,10 @@ import (
 )
 
 func syntheticBundle(tb testing.TB, chunkCount, chunkBytes int) []byte {
+	return syntheticBundleWithRefs(tb, chunkCount, chunkBytes, nil)
+}
+
+func syntheticBundleWithRefs(tb testing.TB, chunkCount, chunkBytes int, refs []string) []byte {
 	tb.Helper()
 	salt, err := store.SaltForGeneration("BENCH")
 	if err != nil {
@@ -22,7 +26,7 @@ func syntheticBundle(tb testing.TB, chunkCount, chunkBytes int) []byte {
 	}
 	admission := store.WriteAdmission{Generation: "BENCH", Salt: salt}
 	var output bytes.Buffer
-	w, err := NewWriter(&output, admission, WriterOptions{Concurrency: 1})
+	w, err := NewWriter(&output, admission, WriterOptions{Concurrency: 1, Refs: refs})
 	if err != nil {
 		tb.Fatal(err)
 	}

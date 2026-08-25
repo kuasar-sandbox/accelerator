@@ -17,6 +17,7 @@ import (
 // writer itself is always serialized.
 type WriterOptions struct {
 	Concurrency int
+	Refs        []string
 }
 
 // Writer is a multi-Manifest ingest.StoreWriter backed by one ZIP stream. It
@@ -43,11 +44,16 @@ type writtenObject struct {
 	size uint64
 }
 
-// NewWriter starts a Bundle and writes its sole admission entry. admission is
-// required to use the canonical public generation salt.
+// NewWriter fully validates the immutable refs list, then writes refs (when
+// non-empty) followed by the sole admission entry. admission is required to
+// use the canonical public generation salt.
 func NewWriter(dst io.Writer, admission store.WriteAdmission, opts WriterOptions) (*Writer, error) {
 	if dst == nil {
 		return nil, fmt.Errorf("manifest bundle: destination is required")
+	}
+	refsPayload, err := EncodeRefs(opts.Refs)
+	if err != nil {
+		return nil, err
 	}
 	wantSalt, err := store.SaltForGeneration(admission.Generation)
 	if err != nil {
@@ -70,6 +76,12 @@ func NewWriter(dst io.Writer, admission store.WriteAdmission, opts WriterOptions
 		manifests:   make(map[store.ContentKey]struct{}),
 		concurrency: concurrency,
 		turn:        make(chan struct{}),
+	}
+	if len(refsPayload) != 0 {
+		if err := w.writeEntryLocked(refsName, refsPayload); err != nil {
+			_ = w.zip.Close()
+			return nil, err
+		}
 	}
 	if err := w.writeEntryLocked(admissionName(admission), nil); err != nil {
 		_ = w.zip.Close()
