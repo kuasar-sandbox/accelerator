@@ -18,8 +18,12 @@ type Conn struct {
 	br  *bufio.Reader
 }
 
-// NewConn wraps c with a 64 KB read buffer.
+// NewConn wraps c with a 64 KB read buffer. Unix sockets additionally get
+// their send buffer tuned for whole-frame chunk responses (see
+// sockbuf_linux.go); centralising that here covers every connection path —
+// client pre-established/burst/refill dials and server accepts.
 func NewConn(c net.Conn) *Conn {
+	tuneUnixSocket(c)
 	return &Conn{
 		raw: c,
 		br:  bufio.NewReaderSize(c, 64*1024),
