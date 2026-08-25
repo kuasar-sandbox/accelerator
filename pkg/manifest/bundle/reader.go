@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -162,6 +163,26 @@ func NewReader(source io.ReaderAt, size int64) (*Reader, error) {
 	return newReader(source, size, nil, nil)
 }
 
+func readFullAt(source io.ReaderAt, dst []byte, offset int64) error {
+	n, err := source.ReadAt(dst, offset)
+	if n < 0 || n > len(dst) {
+		if err != nil {
+			return fmt.Errorf("invalid ReaderAt byte count %d for %d-byte buffer: %w", n, len(dst), err)
+		}
+		return fmt.Errorf("invalid ReaderAt byte count %d for %d-byte buffer", n, len(dst))
+	}
+	if n == len(dst) {
+		if err == nil || errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
+	}
+	if err == nil || errors.Is(err, io.EOF) {
+		return fmt.Errorf("%w: ReaderAt read %d of %d bytes", io.ErrUnexpectedEOF, n, len(dst))
+	}
+	return fmt.Errorf("ReaderAt read %d of %d bytes: %w", n, len(dst), err)
+}
+
 func newReader(source io.ReaderAt, size int64, slicer entrySlicer, cleanup func() error) (*Reader, error) {
 	if source == nil {
 		return nil, fmt.Errorf("manifest bundle: source is required")
@@ -171,14 +192,14 @@ func newReader(source io.ReaderAt, size int64, slicer entrySlicer, cleanup func(
 		return nil, fmt.Errorf("manifest bundle: truncated ZIP")
 	}
 	var magic [4]byte
-	if _, err := source.ReadAt(magic[:], 0); err != nil {
+	if err := readFullAt(source, magic[:], 0); err != nil {
 		return nil, fmt.Errorf("manifest bundle: read ZIP magic: %w", err)
 	}
 	if magic != zipLocalHeaderMagic {
 		return nil, fmt.Errorf("manifest bundle: invalid ZIP local-header magic %x", magic)
 	}
 	var directoryEnd [directoryEndSize]byte
-	if _, err := source.ReadAt(directoryEnd[:], size-directoryEndSize); err != nil {
+	if err := readFullAt(source, directoryEnd[:], size-directoryEndSize); err != nil {
 		return nil, fmt.Errorf("manifest bundle: read ZIP directory end: %w", err)
 	}
 	if !bytesEqual4(directoryEnd[:4], zipDirectoryEndMagic) || binary.LittleEndian.Uint16(directoryEnd[20:22]) != 0 {
@@ -479,7 +500,7 @@ func (r *Reader) validateLocalHeader(file *zip.File) (int64, error) {
 		return 0, fmt.Errorf("manifest bundle: ZIP entry %q local header is outside archive", file.Name)
 	}
 	header := make([]byte, headerSize)
-	if _, err := r.source.ReadAt(header, headerOffset); err != nil {
+	if err := readFullAt(r.source, header, headerOffset); err != nil {
 		return 0, fmt.Errorf("manifest bundle: read ZIP entry %q local header: %w", file.Name, err)
 	}
 	if !bytesEqual4(header[:4], zipLocalHeaderMagic) {
