@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 
@@ -687,6 +689,108 @@ func canonicalManifestEntry(t *testing.T) rawEntry {
 	}
 	key := sha256.Sum256(data)
 	return rawEntry{name: manifestPrefix + fmt.Sprintf("%x", key), data: data}
+}
+
+const zipDirectoryEndSize = 22
+
+type eocdResultReaderAt struct {
+	data  []byte
+	n     int
+	err   error
+	reads int
+}
+
+func (r *eocdResultReaderAt) ReadAt(dst []byte, offset int64) (int, error) {
+	if r.reads == 0 && len(dst) == zipDirectoryEndSize && offset == int64(len(r.data)-zipDirectoryEndSize) {
+		r.reads++
+		copySize := r.n
+		if copySize < 0 {
+			copySize = 0
+		}
+		if copySize > len(dst) {
+			copySize = len(dst)
+		}
+		copy(dst[:copySize], r.data[int(offset):int(offset)+copySize])
+		return r.n, r.err
+	}
+	return bytes.NewReader(r.data).ReadAt(dst, offset)
+}
+
+func TestNewReaderAcceptsFullEOCDReadWithEOF(t *testing.T) {
+	admissionEntry := canonicalAdmissionEntry(t)
+	manifestEntry := canonicalManifestEntry(t)
+	data := rawZIP(t, []rawEntry{admissionEntry, manifestEntry}, "")
+	source := &eocdResultReaderAt{data: data, n: zipDirectoryEndSize, err: io.EOF}
+
+	reader, err := NewReader(source, int64(len(data)))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	defer reader.Close()
+	if source.reads != 1 {
+		t.Fatalf("overridden EOCD reads = %d, want 1", source.reads)
+	}
+	wantAdmission, err := parseAdmissionName(admissionEntry.name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reader.Admission() != wantAdmission {
+		t.Fatalf("Admission = %#v, want %#v", reader.Admission(), wantAdmission)
+	}
+	manifestKey, err := parseObjectEntry(manifestEntry.name, manifestPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, blob, err := reader.Getter().Get(context.Background(), store.PartitionManifest, manifestKey)
+	if err != nil || result != cache.CacheHit || blob == nil {
+		t.Fatalf("Get Manifest = %v, %v, %v", result, blob, err)
+	}
+	defer blob.Release()
+	if !bytes.Equal(blob.Bytes(), manifestEntry.data) {
+		t.Fatal("Manifest payload differs")
+	}
+}
+
+func TestNewReaderRejectsInvalidEOCDReadResults(t *testing.T) {
+	admission := canonicalAdmissionEntry(t)
+	manifest := canonicalManifestEntry(t)
+	data := rawZIP(t, []rawEntry{admission, manifest}, "")
+	sentinel := errors.New("sentinel ReaderAt error")
+	for _, tc := range []struct {
+		name     string
+		n        int
+		err      error
+		wantIs   error
+		wantText string
+	}{
+		{name: "short EOF", n: zipDirectoryEndSize - 1, err: io.EOF, wantIs: io.ErrUnexpectedEOF},
+		{name: "short nil", n: zipDirectoryEndSize - 1, wantIs: io.ErrUnexpectedEOF},
+		{name: "short other error", n: zipDirectoryEndSize - 1, err: sentinel, wantIs: sentinel},
+		{name: "full other error", n: zipDirectoryEndSize, err: sentinel, wantIs: sentinel},
+		{name: "negative count", n: -1, wantText: "invalid ReaderAt byte count"},
+		{name: "oversized count", n: zipDirectoryEndSize + 1, wantText: "invalid ReaderAt byte count"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := &eocdResultReaderAt{data: data, n: tc.n, err: tc.err}
+			reader, err := NewReader(source, int64(len(data)))
+			if reader != nil {
+				_ = reader.Close()
+				t.Fatal("invalid EOCD read result was accepted")
+			}
+			if err == nil {
+				t.Fatal("invalid EOCD read result returned no error")
+			}
+			if source.reads != 1 {
+				t.Fatalf("overridden EOCD reads = %d, want 1", source.reads)
+			}
+			if tc.wantIs != nil && !errors.Is(err, tc.wantIs) {
+				t.Fatalf("NewReader error = %v, want errors.Is(_, %v)", err, tc.wantIs)
+			}
+			if tc.wantText != "" && !strings.Contains(err.Error(), tc.wantText) {
+				t.Fatalf("NewReader error = %v, want text %q", err, tc.wantText)
+			}
+		})
+	}
 }
 
 func TestReaderRejectsMalformedProfileAndTruncation(t *testing.T) {
