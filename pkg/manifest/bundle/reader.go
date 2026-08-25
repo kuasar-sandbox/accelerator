@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"math"
 	"os"
@@ -22,8 +23,11 @@ import (
 )
 
 var (
-	zipLocalHeaderMagic  = [4]byte{'P', 'K', 0x03, 0x04}
-	zipDirectoryEndMagic = [4]byte{'P', 'K', 0x05, 0x06}
+	zipLocalHeaderMagic        = [4]byte{'P', 'K', 0x03, 0x04}
+	zipDirectoryMagic          = [4]byte{'P', 'K', 0x01, 0x02}
+	zipDirectory64Magic        = [4]byte{'P', 'K', 0x06, 0x06}
+	zipDirectory64LocatorMagic = [4]byte{'P', 'K', 0x06, 0x07}
+	zipDirectoryEndMagic       = [4]byte{'P', 'K', 0x05, 0x06}
 )
 
 const (
@@ -95,11 +99,8 @@ type entrySlicer interface {
 }
 
 type archiveEntry struct {
-	file *zip.File
-
-	offsetOnce sync.Once
-	offset     int64
-	offsetErr  error
+	file   *zip.File
+	offset int64
 }
 
 // Reader indexes one immutable Bundle. Construction reads ZIP metadata only;
@@ -111,6 +112,7 @@ type Reader struct {
 	size   int64
 
 	admission store.WriteAdmission
+	refs      []string
 	manifests map[store.ContentKey]*archiveEntry
 	chunks    map[store.ContentKey]*archiveEntry
 	buffers   readBufferPool
@@ -205,6 +207,10 @@ func newReader(source io.ReaderAt, size int64, slicer entrySlicer, cleanup func(
 	if !bytesEqual4(directoryEnd[:4], zipDirectoryEndMagic) || binary.LittleEndian.Uint16(directoryEnd[20:22]) != 0 {
 		return nil, fmt.Errorf("manifest bundle: Central Directory does not end at archive EOF with an empty comment")
 	}
+	directoryOffset, directoryRecords, err := readCentralDirectoryLocation(source, size, directoryEnd)
+	if err != nil {
+		return nil, err
+	}
 	zr, err := zip.NewReader(source, size)
 	if err != nil {
 		return nil, fmt.Errorf("manifest bundle: parse ZIP: %w", err)
@@ -214,6 +220,9 @@ func newReader(source io.ReaderAt, size int64, slicer entrySlicer, cleanup func(
 	}
 	if len(zr.File) > maxBundleEntries {
 		return nil, fmt.Errorf("manifest bundle: %d entries exceed limit %d", len(zr.File), maxBundleEntries)
+	}
+	if directoryRecords != uint64(len(zr.File)) {
+		return nil, fmt.Errorf("manifest bundle: Central Directory record count %d differs from parsed count %d", directoryRecords, len(zr.File))
 	}
 	r := &Reader{
 		source:    source,
@@ -225,8 +234,10 @@ func newReader(source io.ReaderAt, size int64, slicer entrySlicer, cleanup func(
 	}
 	seenNames := make(map[string]struct{}, len(zr.File))
 	admissions := 0
-	var admissionEntry *archiveEntry
-	for _, file := range zr.File {
+	var refsEntry *archiveEntry
+	var expectedOffset int64
+	var localHeaderScratch [256]byte
+	for index, file := range zr.File {
 		if _, duplicate := seenNames[file.Name]; duplicate {
 			return nil, fmt.Errorf("manifest bundle: duplicate ZIP entry %q", file.Name)
 		}
@@ -234,8 +245,24 @@ func newReader(source io.ReaderAt, size int64, slicer entrySlicer, cleanup func(
 		if err := validateEntryHeader(file); err != nil {
 			return nil, err
 		}
-		entry := &archiveEntry{file: file}
+		dataOffset, nextOffset, err := r.validateLocalHeaderAt(file, expectedOffset, localHeaderScratch[:])
+		if err != nil {
+			return nil, err
+		}
+		expectedOffset = nextOffset
+		entry := &archiveEntry{file: file, offset: dataOffset}
 		switch {
+		case file.Name == refsName:
+			if index != 0 {
+				return nil, fmt.Errorf("manifest bundle: %s must be the first ZIP entry", refsName)
+			}
+			if file.UncompressedSize64 == 0 {
+				return nil, fmt.Errorf("manifest bundle: refs payload must be non-empty")
+			}
+			if file.UncompressedSize64 > maxRefsPayload {
+				return nil, fmt.Errorf("manifest bundle: refs payload exceeds %d bytes", maxRefsPayload)
+			}
+			refsEntry = entry
 		case strings.HasPrefix(file.Name, admissionPrefix):
 			admissions++
 			if admissions > 1 {
@@ -244,13 +271,27 @@ func newReader(source io.ReaderAt, size int64, slicer entrySlicer, cleanup func(
 			if file.UncompressedSize64 != 0 {
 				return nil, fmt.Errorf("manifest bundle: admission payload must be empty")
 			}
+			if file.CRC32 != crc32.ChecksumIEEE(nil) {
+				return nil, fmt.Errorf("manifest bundle: admission entry has non-canonical CRC")
+			}
+			wantIndex := 0
+			if refsEntry != nil {
+				wantIndex = 1
+			}
+			if index != wantIndex {
+				return nil, fmt.Errorf("manifest bundle: admission must be ZIP entry %d", wantIndex)
+			}
 			admission, err := parseAdmissionName(file.Name)
 			if err != nil {
 				return nil, err
 			}
 			r.admission = admission
-			admissionEntry = entry
+		case strings.HasPrefix(file.Name, legacyAdmissionPrefix):
+			return nil, fmt.Errorf("manifest bundle: legacy admission entry %q is not allowed", file.Name)
 		case strings.HasPrefix(file.Name, manifestPrefix):
+			if admissions == 0 {
+				return nil, fmt.Errorf("manifest bundle: object entry %q precedes admission", file.Name)
+			}
 			key, err := parseObjectEntry(file.Name, manifestPrefix)
 			if err != nil {
 				return nil, err
@@ -263,6 +304,9 @@ func newReader(source io.ReaderAt, size int64, slicer entrySlicer, cleanup func(
 			}
 			r.manifests[key] = entry
 		case strings.HasPrefix(file.Name, chunkPrefix):
+			if admissions == 0 {
+				return nil, fmt.Errorf("manifest bundle: object entry %q precedes admission", file.Name)
+			}
 			key, err := parseObjectEntry(file.Name, chunkPrefix)
 			if err != nil {
 				return nil, err
@@ -275,8 +319,14 @@ func newReader(source io.ReaderAt, size int64, slicer entrySlicer, cleanup func(
 			}
 			r.chunks[key] = entry
 		default:
+			if strings.HasPrefix(file.Name, "bundle/") {
+				return nil, fmt.Errorf("manifest bundle: unknown bundle metadata entry %q", file.Name)
+			}
 			return nil, fmt.Errorf("manifest bundle: unknown ZIP entry %q", file.Name)
 		}
+	}
+	if expectedOffset != directoryOffset {
+		return nil, fmt.Errorf("manifest bundle: local entries are not contiguous with the Central Directory")
 	}
 	if admissions != 1 {
 		return nil, fmt.Errorf("manifest bundle: exactly one admission entry is required")
@@ -288,13 +338,90 @@ func newReader(source io.ReaderAt, size int64, slicer entrySlicer, cleanup func(
 	if r.admission.Salt != canonicalSalt {
 		return nil, fmt.Errorf("manifest bundle: admission salt is not canonical for generation %q", r.admission.Generation)
 	}
-	if _, err := r.validateLocalHeader(admissionEntry.file); err != nil {
-		return nil, err
+	if refsEntry != nil {
+		payload, err := r.readMetadataEntry(refsEntry)
+		if err != nil {
+			return nil, err
+		}
+		r.refs, err = ParseRefs(payload)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if len(r.manifests) == 0 {
 		return nil, fmt.Errorf("manifest bundle: at least one Manifest entry is required")
 	}
 	return r, nil
+}
+
+func readCentralDirectoryLocation(source io.ReaderAt, archiveSize int64, end [22]byte) (int64, uint64, error) {
+	if binary.LittleEndian.Uint16(end[4:6]) != 0 || binary.LittleEndian.Uint16(end[6:8]) != 0 {
+		return 0, 0, fmt.Errorf("manifest bundle: multi-disk ZIP is not allowed")
+	}
+	recordsDisk := binary.LittleEndian.Uint16(end[8:10])
+	recordsTotal := binary.LittleEndian.Uint16(end[10:12])
+	directorySize32 := binary.LittleEndian.Uint32(end[12:16])
+	directoryOffset32 := binary.LittleEndian.Uint32(end[16:20])
+	zip64 := recordsDisk == math.MaxUint16 || recordsTotal == math.MaxUint16 ||
+		directorySize32 == math.MaxUint32 || directoryOffset32 == math.MaxUint32
+	if !zip64 {
+		if recordsDisk != recordsTotal {
+			return 0, 0, fmt.Errorf("manifest bundle: Central Directory record counts differ")
+		}
+		offset := uint64(directoryOffset32)
+		directorySize := uint64(directorySize32)
+		endOffset := uint64(archiveSize - int64(len(end)))
+		if offset > endOffset || directorySize != endOffset-offset {
+			return 0, 0, fmt.Errorf("manifest bundle: Central Directory range is not contiguous with EOCD")
+		}
+		return int64(offset), uint64(recordsTotal), nil
+	}
+	if recordsDisk != math.MaxUint16 || recordsTotal != math.MaxUint16 ||
+		directorySize32 != math.MaxUint32 || directoryOffset32 != math.MaxUint32 {
+		return 0, 0, fmt.Errorf("manifest bundle: non-canonical partial ZIP64 EOCD sentinels")
+	}
+
+	const locatorSize = 20
+	locatorOffset := archiveSize - int64(len(end)) - locatorSize
+	if locatorOffset < 0 {
+		return 0, 0, fmt.Errorf("manifest bundle: ZIP64 locator is missing")
+	}
+	var locator [locatorSize]byte
+	if err := readFullAt(source, locator[:], locatorOffset); err != nil {
+		return 0, 0, fmt.Errorf("manifest bundle: read ZIP64 locator: %w", err)
+	}
+	if !bytesEqual4(locator[:4], zipDirectory64LocatorMagic) ||
+		binary.LittleEndian.Uint32(locator[4:8]) != 0 || binary.LittleEndian.Uint32(locator[16:20]) != 1 {
+		return 0, 0, fmt.Errorf("manifest bundle: ZIP64 locator is not canonical")
+	}
+	zip64Offset := binary.LittleEndian.Uint64(locator[8:16])
+	const zip64EndSize = 56
+	if zip64Offset > uint64(locatorOffset) || zip64EndSize > uint64(locatorOffset)-zip64Offset {
+		return 0, 0, fmt.Errorf("manifest bundle: ZIP64 EOCD is outside archive")
+	}
+	var zip64End [zip64EndSize]byte
+	if err := readFullAt(source, zip64End[:], int64(zip64Offset)); err != nil {
+		return 0, 0, fmt.Errorf("manifest bundle: read ZIP64 EOCD: %w", err)
+	}
+	if !bytesEqual4(zip64End[:4], zipDirectory64Magic) || binary.LittleEndian.Uint64(zip64End[4:12]) != 44 ||
+		binary.LittleEndian.Uint16(zip64End[12:14]) != 45 || binary.LittleEndian.Uint16(zip64End[14:16]) != 45 ||
+		binary.LittleEndian.Uint32(zip64End[16:20]) != 0 || binary.LittleEndian.Uint32(zip64End[20:24]) != 0 {
+		return 0, 0, fmt.Errorf("manifest bundle: ZIP64 EOCD is not canonical")
+	}
+	if zip64Offset+zip64EndSize != uint64(locatorOffset) {
+		return 0, 0, fmt.Errorf("manifest bundle: ZIP64 EOCD and locator are not contiguous")
+	}
+	recordsDisk64 := binary.LittleEndian.Uint64(zip64End[24:32])
+	recordsTotal64 := binary.LittleEndian.Uint64(zip64End[32:40])
+	if recordsDisk64 != recordsTotal64 {
+		return 0, 0, fmt.Errorf("manifest bundle: ZIP64 Central Directory record counts differ")
+	}
+	directorySize := binary.LittleEndian.Uint64(zip64End[40:48])
+	directoryOffset := binary.LittleEndian.Uint64(zip64End[48:56])
+	if directoryOffset > zip64Offset || directorySize != zip64Offset-directoryOffset || directoryOffset > math.MaxInt64 {
+		return 0, 0, fmt.Errorf("manifest bundle: ZIP64 Central Directory range is not contiguous with EOCD")
+	}
+	return int64(directoryOffset), recordsTotal64, nil
 }
 
 func parseObjectEntry(name, prefix string) (store.ContentKey, error) {
@@ -363,6 +490,11 @@ func validateExtra(extra []byte) error {
 
 // Admission returns the exact admission recorded in the Bundle name entry.
 func (r *Reader) Admission() store.WriteAdmission { return r.admission }
+
+// Refs returns a copy of the immutable ordered external Bundle search path.
+func (r *Reader) Refs() []string { return append([]string(nil), r.refs...) }
+
+func (r *Reader) refsView() []string { return r.refs }
 
 func (r *Reader) HasManifest(key store.ContentKey) bool {
 	_, ok := r.manifests[key]
@@ -439,12 +571,6 @@ func (r *Reader) entryBlob(entry *archiveEntry) (cache.Blob, error) {
 			r.releaseBlob()
 		}
 	}()
-	entry.offsetOnce.Do(func() {
-		entry.offset, entry.offsetErr = r.validateLocalHeader(entry.file)
-	})
-	if entry.offsetErr != nil {
-		return nil, entry.offsetErr
-	}
 	if entry.file.UncompressedSize64 > uint64(maxInt()) {
 		return nil, fmt.Errorf("manifest bundle: ZIP entry %q is too large", entry.file.Name)
 	}
@@ -483,63 +609,76 @@ func (r *Reader) entryBlob(entry *archiveEntry) (cache.Blob, error) {
 	return &readerBlob{reader: r, backing: backing}, nil
 }
 
-// validateLocalHeader checks the canonical local-file header before exposing
-// an entry payload. archive/zip indexes from the Central Directory and does
-// not require its name and metadata to match the local header. Bundle reads
-// deliberately avoid scanning payload CRCs, but must not accept two different
-// descriptions of the same entry.
-func (r *Reader) validateLocalHeader(file *zip.File) (int64, error) {
-	dataOffset, err := file.DataOffset()
-	if err != nil {
-		return 0, fmt.Errorf("manifest bundle: ZIP entry %q data offset: %w", file.Name, err)
+func (r *Reader) readMetadataEntry(entry *archiveEntry) ([]byte, error) {
+	size := int(entry.file.UncompressedSize64)
+	payload := make([]byte, size)
+	if err := readFullAt(r.source, payload, entry.offset); err != nil {
+		return nil, fmt.Errorf("manifest bundle: read ZIP entry %q: %w", entry.file.Name, err)
 	}
+	if crc32.ChecksumIEEE(payload) != entry.file.CRC32 {
+		return nil, fmt.Errorf("manifest bundle: ZIP entry %q CRC mismatch", entry.file.Name)
+	}
+	return payload, nil
+}
+
+// validateLocalHeaderAt proves that the next Central Directory item is also
+// the next physical local entry. Starting at offset zero and carrying the
+// returned end offset across every entry rejects reordering, hidden entries,
+// and arbitrary gaps without reading any object payload.
+func (r *Reader) validateLocalHeaderAt(file *zip.File, headerOffset int64, scratch []byte) (int64, int64, error) {
 	const fixedSize = 30
 	headerSize := fixedSize + len(file.Name)
-	headerOffset := dataOffset - int64(headerSize)
 	if headerOffset < 0 || int64(headerSize) > r.size-headerOffset {
-		return 0, fmt.Errorf("manifest bundle: ZIP entry %q local header is outside archive", file.Name)
+		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q local header is outside archive", file.Name)
 	}
-	header := make([]byte, headerSize)
+	if headerSize > len(scratch) {
+		scratch = make([]byte, headerSize)
+	}
+	header := scratch[:headerSize]
 	if err := readFullAt(r.source, header, headerOffset); err != nil {
-		return 0, fmt.Errorf("manifest bundle: read ZIP entry %q local header: %w", file.Name, err)
+		return 0, 0, fmt.Errorf("manifest bundle: read ZIP entry %q local header: %w", file.Name, err)
 	}
 	if !bytesEqual4(header[:4], zipLocalHeaderMagic) {
-		return 0, fmt.Errorf("manifest bundle: ZIP entry %q has non-canonical local-header position", file.Name)
+		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q does not match physical local-header order", file.Name)
 	}
 	if version := binary.LittleEndian.Uint16(header[4:6]); version != 45 {
-		return 0, fmt.Errorf("manifest bundle: ZIP entry %q local reader version %d is not canonical", file.Name, version)
+		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q local reader version %d is not canonical", file.Name, version)
 	}
 	if flags := binary.LittleEndian.Uint16(header[6:8]); flags != 0 {
-		return 0, fmt.Errorf("manifest bundle: ZIP entry %q local flags 0x%x are not allowed", file.Name, flags)
+		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q local flags 0x%x are not allowed", file.Name, flags)
 	}
 	if method := binary.LittleEndian.Uint16(header[8:10]); method != zip.Store {
-		return 0, fmt.Errorf("manifest bundle: ZIP entry %q local method %d, want Store", file.Name, method)
+		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q local method %d, want Store", file.Name, method)
 	}
 	if binary.LittleEndian.Uint16(header[10:12]) != 0 || binary.LittleEndian.Uint16(header[12:14]) != 0 {
-		return 0, fmt.Errorf("manifest bundle: ZIP entry %q has non-canonical local timestamp", file.Name)
+		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q has non-canonical local timestamp", file.Name)
 	}
 	if crc := binary.LittleEndian.Uint32(header[14:18]); crc != file.CRC32 {
-		return 0, fmt.Errorf("manifest bundle: ZIP entry %q local CRC differs from Central Directory", file.Name)
+		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q local CRC differs from Central Directory", file.Name)
 	}
 	if file.CompressedSize64 > math.MaxUint32 || file.UncompressedSize64 > math.MaxUint32 {
-		return 0, fmt.Errorf("manifest bundle: ZIP entry %q requires a non-canonical local ZIP64 size", file.Name)
+		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q requires a non-canonical local ZIP64 size", file.Name)
 	}
 	if size := binary.LittleEndian.Uint32(header[18:22]); uint64(size) != file.CompressedSize64 {
-		return 0, fmt.Errorf("manifest bundle: ZIP entry %q local compressed size differs from Central Directory", file.Name)
+		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q local compressed size differs from Central Directory", file.Name)
 	}
 	if size := binary.LittleEndian.Uint32(header[22:26]); uint64(size) != file.UncompressedSize64 {
-		return 0, fmt.Errorf("manifest bundle: ZIP entry %q local uncompressed size differs from Central Directory", file.Name)
+		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q local uncompressed size differs from Central Directory", file.Name)
 	}
 	if nameSize := int(binary.LittleEndian.Uint16(header[26:28])); nameSize != len(file.Name) {
-		return 0, fmt.Errorf("manifest bundle: ZIP entry %q local name length differs from Central Directory", file.Name)
+		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q local name length differs from Central Directory", file.Name)
 	}
 	if extraSize := binary.LittleEndian.Uint16(header[28:30]); extraSize != 0 {
-		return 0, fmt.Errorf("manifest bundle: ZIP entry %q local extra field is not allowed", file.Name)
+		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q local extra field is not allowed", file.Name)
 	}
 	if string(header[fixedSize:]) != file.Name {
-		return 0, fmt.Errorf("manifest bundle: ZIP entry %q local name differs from Central Directory", file.Name)
+		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q local name differs from Central Directory", file.Name)
 	}
-	return dataOffset, nil
+	dataOffset := headerOffset + int64(headerSize)
+	if dataOffset < 0 || uint64(dataOffset) > uint64(r.size) || file.CompressedSize64 > uint64(r.size-dataOffset) {
+		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q data range is outside archive", file.Name)
+	}
+	return dataOffset, dataOffset + int64(file.CompressedSize64), nil
 }
 
 func bytesEqual4(data []byte, magic [4]byte) bool {

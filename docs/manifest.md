@@ -701,16 +701,46 @@ expected `sha256|hmac` 和 outer EOF。跨 artifact record splice 会在顺序�
 本地 Manifest 快照使用标准 ZIP64，所有 entry 固定为 `zip.Store`：
 
 ```text
-admission/<generation>/<64-lowercase-hex-salt>   # 恰好一个，空 payload
-manifest/<64-lowercase-hex-content-key>          # 一个或多个
-chunk/<64-lowercase-hex-content-key>             # 零个或多个
+有外部 Bundle refs：
+  [0] bundle/refs
+  [1] bundle/admission/<generation>/<64-lowercase-hex-salt>
+  [2...] manifest/<64-lowercase-hex-content-key> | chunk/<64-lowercase-hex-content-key>
+
+无外部 Bundle refs：
+  [0] bundle/admission/<generation>/<64-lowercase-hex-salt>
+  [1...] manifest/<64-lowercase-hex-content-key> | chunk/<64-lowercase-hex-content-key>
 ```
 
 Manifest/Chunk payload 是现有 physical object 的原始字节。Bundle 不使用 ZIP
 Deflate、ZIP encryption、整文件 SHA/HMAC、外层加密、自定义 pack、root entry 或
 JSON/YAML metadata。archive/entry comment、时间、权限和平台字段固定；重复 entry、
 未知 entry、目录、非 Store method、加密 flag、非法 key/admission 与截断均失败。
-标准 ZIP64 EOCD/size 扩展受支持。
+标准 ZIP64 EOCD/size 扩展受支持。旧 `admission/*` 不再接受，也没有旧格式探测或
+兼容 fallback。
+
+`bundle/refs` 存在时必须非空并作为第一个物理 Local File Header；admission 必须紧随
+其后，否则 admission 必须是第一个 entry。admission payload 为空。admission 后只
+允许 Manifest/Chunk。Reader 从 offset 0 按 Central Directory 顺序逐个核对 Local
+File Header、名称、method、size、CRC metadata 和连续 data range，因此 Central
+Directory 重排、隐藏 local entry、metadata gap 或 Local Header/Central Directory
+描述不一致均 fail closed；该检查只读取 header 和 refs payload，不扫描 Chunk data。
+
+`bundle/refs` 一行一个 canonical、按文件顺序搜索的 Bundle file ref：
+
+```text
+file://<basename>.bundle
+file://<basename>.bundle@location:<name>
+```
+
+它禁止 `@manifest/@sha256/@hmac`、`manifest://`、绝对路径、目录分隔符和非
+`.bundle` 文件名。payload 必须是有效 UTF-8、仅 LF 换行且最后一行也以 LF 结束；
+禁止 BOM、CR、空行、注释、首尾空白和重复 ref。Writer 保留调用方顺序，不排序；
+最多 1024 项、1 MiB。空路径通过省略 entry 表达。`WriterOptions.Refs` 在
+`NewWriter` 写出任何 byte 前完成验证；Writer 创建后 refs/admission 均不可变。
+`Reader.Refs()` 返回副本。
+preflight 只需发现 location/admission 时可使用 `OpenMetadata`/`ReadMetadata`；该入口
+只读取连续 Local Header metadata prefix，不解析 Central Directory 或对象，真正消费
+Manifest/Chunk 前仍必须使用 `Open`/`NewReader` 完成完整 profile 校验。
 
 一个 Bundle 从首版容纳根内存 Manifest、根/数据盘当前层 Manifest，以及必要时
 收编的父层 Manifest。全部对象共用 admission entry 中的同一完整
@@ -724,16 +754,28 @@ JSON/YAML metadata。archive/entry comment、时间、权限和平台字段固�
 从而可在 exact upload 时逐对象验证且无需重写。
 
 Bundle 中每个 Manifest 必须有完整非零 Chunk 闭包。读侧仅在
-`Fetcher.OpenManifest` 选择来源：
+`Fetcher.OpenManifest` 按以下顺序选择来源：
+
+```text
+当前 Bundle -> bundle/refs[0] -> bundle/refs[1] -> ... -> 默认 remote Cache/Store
+```
+
+路径和 `@location` 解析由调用方实现的 `bundle.SourceResolver` 完成；accelerator 只
+消费 Reader 中已经验证的 canonical ref。resolver 可用 `ErrSourceUnavailable`
+表达 sibling 不存在、location mapping 缺失或 located 文件不存在，此时尚未选源，
+可保留诊断并继续。文件存在但 profile/ZIP 损坏必须返回普通错误并 fail closed。
+引用 Bundle 自己的 `Refs()` 不参与搜索，路径必须由创建者提前展平。
 
 | Manifest 来源 | Manifest/Chunk Getter | 失败语义 |
 |---|---|---|
-| Bundle 命中 | Bundle-only | 缺失、损坏、I/O、解析、闭包或解密错误直接失败 |
-| Bundle 不含该 Manifest | remote-only cache/store | Bundle 中碰巧同 key 的 Chunk 不参与 |
+| current 或首个 refs Bundle 命中 | 该 Bundle-only | 缺失、损坏、I/O、解析、闭包或解密错误直接失败，不再搜索 |
+| 所有 Bundle clean miss/unavailable | remote-only cache/store | Bundle 中碰巧同 key 的 Chunk 不参与 |
 
-因此不存在对象级 `Bundle → remote` fallback Getter；本地 Manifest 错误也不会改读
-远端同 key Manifest。Manifest 解析完成后，闭包检查只做 Central Directory map
-lookup，不读取 Chunk payload。
+因此不存在对象级 Bundle fallback Getter；本地 Manifest 错误也不会改读后续
+Bundle/Store。Manifest 解析完成后，闭包检查只做 Central Directory map lookup，
+不读取 Chunk payload。外部 root selector 必须通过 `OpenRootManifest`/`SelectRoot`
+证明 root 物理存在于 current Bundle，不能从 refs 或 Store 间接取得。并发 source
+选择只读取 immutable Reader state；resolver 负责按需打开、缓存和统一关闭其 Reader。
 
 `bundle.Open` 解析 Central Directory 与 admission；选中 Manifest 前不读取
 Manifest，Chunk 数据区在实际读 Chunk 前不触碰。文件打开优先使用 read-only mmap，
@@ -742,20 +784,25 @@ Manifest，Chunk 数据区在实际读 Chunk 前不触碰。文件打开优先�
 最多保留 32 MiB 的有界 buffer pool。`manifest.verify_content=false` 时也不会隐藏
 执行 physical SHA 扫描。
 
-Bundle → Store exact upload 固定执行：
+单 Bundle full verify/upload 与多 source `VerifyExactManifests` /
+`UploadExactManifests` 均强制验证，不受 `manifest.verify_content` 影响。多 source
+exact upload 固定执行：
 
-1. 读取 recorded admission，并调用目标 Store
+1. 调用方在 OpenManifest 层为每个逻辑 key 选择 current/refs Bundle；已经在目标
+   Store 严格存在的依赖不进入 Bundle upload plan。
+2. 在任何 Put 前，对全部实际 source recorded admissions 调用
    `AdmitWriteFor(recorded.Generation)`；返回 Generation/Salt 必须逐字节相等。
-2. 强制验证每个 Manifest physical ContentKey、解析并用 customer key 解封 key
-   table，建立完整闭包与跨 Manifest 的唯一 Chunk 元数据。
-3. 每个唯一 Chunk 强制验证 physical ContentKey，解密/解压为原明文，并要求
-   `DeriveKey(recorded.Salt, plaintext)` 等于 key table 中的 key；同一
-   ContentKey 对应不同 key 或 plaintext size 时拒绝。
-4. 先并发上传全部唯一 Chunk，再上传非根 Manifest，最后发布选定根 Manifest。
+3. 强制验证每个选定 Manifest physical ContentKey、解析并用 customer key 解封 key
+   table，并证明该 Manifest 的完整 Chunk 闭包位于同一 source Bundle。
+4. 每个 source 中实际使用的唯一 Chunk 强制验证 physical ContentKey，解密/解压为
+   原明文，并要求 `DeriveKey(sourceAdmission.Salt, plaintext)` 等于 key table 中的
+   key；跨 Manifest 的同一 ContentKey 对应不同 key 或 plaintext size 时拒绝。
+5. 先并发上传全部 Chunk，再上传依赖 Manifest，最后发布调用方指定的 current root。
 
-上传使用 Bundle 的 recorded admission，不改投最新 generation，不重新 chunk、
-压缩、加密、seal key table 或改写上层 `snapshot.cfg`，因此 root ManifestKey 与
-physical bytes 保持不变。generation 在上传中移除时后续 Put 失败，根不会发布。
+每个对象使用其 source Bundle 的 recorded admission，不改投最新 generation，不
+重新 chunk、压缩、加密、seal key table 或改写上层 `snapshot.cfg`，因此 root
+ManifestKey 与 physical bytes 保持不变。任一 admission 预检、依赖验证或 Put 失败
+时根不会发布。`bundle/refs` 和 `bundle/admission/*` 不是 Store object，不上传。
 `FullVerify` 还拒绝未被任何本地 Manifest 引用的 Chunk；调用方解析
 snapshot-specific metadata 后可通过 `ExpectedManifests` 提交精确的本地可达
 Manifest 集，从而拒绝无关 Manifest，而无需让 accelerator 解释
@@ -782,6 +829,9 @@ Bundle Central Directory 的 4K/20K Chunk 打开成本由
 `BenchmarkBundleOpen4K` / `BenchmarkBundleOpen20K` 报告；两者只测索引构造，
 不会读取 Chunk payload。`BenchmarkVerifyContent` 分别报告 Manifest open 与冷态
 1 MiB Chunk read 在 `verify_content=true|false` 下的差异。
+`BenchmarkManifestSourceSearch` 报告 refs 为 0/1/8/32 时的 clean miss 与尾部 remote
+fallback 成本；`BenchmarkMetadataOpen4K` / `BenchmarkMetadataOpen20K` 证明 prefix-only
+metadata 读取不随 Chunk 数增长。
 
 ## 6. See Also
 

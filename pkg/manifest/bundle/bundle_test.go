@@ -859,13 +859,8 @@ func TestReaderRejectsMismatchedLocalHeaderBeforePayload(t *testing.T) {
 	headerOffset := dataOffset - int64(30+len(target.Name))
 	data[headerOffset+8] = byte(zip.Deflate) // Central Directory still says Store.
 
-	reader, err := NewReader(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		t.Fatalf("NewReader should remain metadata-only: %v", err)
-	}
-	defer reader.Close()
-	if _, _, err := reader.Getter().Get(context.Background(), store.PartitionManifest, fixture.root); err == nil {
-		t.Fatal("mismatched local header was accepted")
+	if _, err := NewReader(bytes.NewReader(data), int64(len(data))); err == nil {
+		t.Fatal("mismatched local header was accepted during profile validation")
 	}
 }
 
