@@ -11,16 +11,26 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// unixSendBufferSize is the SO_SNDBUF working-set target for unix-socket
+// unixSendBufferSize is the SO_SNDBUF setsockopt request for unix-socket
 // wire connections: one maximum-size chunk frame (chunker max 1MiB plus
-// wire header). The kernel doubles the setsockopt value, so the effective
-// send buffer is ~2MiB — enough to stream a whole frame without the
-// writer/reader ping-pong the 224KiB kernel default inflicts on every
-// chunk response (measured ~30% end-to-end on snapshot restore). It is a
-// deliberate private constant, not wire.MaxFrameSize: the frame ceiling
-// is a protocol safety limit, while this is a socket working-set size
-// that happens to be derived from the chunker maximum.
-const unixSendBufferSize = 1 << 20
+// wire header) — enough to stream a whole frame without the writer/reader
+// ping-pong the 224KiB kernel default inflicts on every chunk response
+// (measured ~30% end-to-end on snapshot restore). It is a deliberate
+// private constant, not wire.MaxFrameSize: the frame ceiling is a
+// protocol safety limit, while this is a socket working-set size derived
+// from the chunker maximum.
+//
+// sendBufTargetEffective is the threshold the read-back SO_SNDBUF value
+// must reach. Kernel bookkeeping doubles the setsockopt request (data
+// plus estimated overhead) and getsockopt reports that doubled value, so
+// the read-back must be compared against the doubled target. Without
+// this, a host with net.core.wmem_max between 512KiB and 1MiB clamps the
+// request yet reads back >= the undoubled target, takes the early
+// return, skips SO_SNDBUFFORCE, and silently keeps half the throttling.
+const (
+	unixSendBufferSize     = 1 << 20
+	sendBufTargetEffective = 2 * unixSendBufferSize
+)
 
 // tuneUnixSocket sizes a unix-socket connection's send buffer, best
 // effort. Linux AF_UNIX stream backpressure is driven by the sender's
@@ -48,15 +58,15 @@ func tuneUnixSocket(c net.Conn) {
 	if err != nil {
 		return
 	}
-	if setAndGetSendBuf(raw, unix.SO_SNDBUF) >= unixSendBufferSize {
+	if setAndGetSendBuf(raw, unix.SO_SNDBUF) >= sendBufTargetEffective {
 		return
 	}
 	got := setAndGetSendBuf(raw, unix.SO_SNDBUFFORCE)
-	if got < unixSendBufferSize {
+	if got < sendBufTargetEffective {
 		warnSmallSendBufOnce.Do(func() {
-			log.Printf("wire: unix socket send buffer stuck at %d bytes (< %d target); "+
+			log.Printf("wire: unix socket send buffer stuck at %d bytes (< %d effective target); "+
 				"raise net.core.wmem_max or grant CAP_NET_ADMIN to avoid chunk-transfer throttling",
-				got, unixSendBufferSize)
+				got, sendBufTargetEffective)
 		})
 	}
 }
