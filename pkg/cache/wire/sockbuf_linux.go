@@ -58,17 +58,25 @@ func tuneUnixSocket(c net.Conn) {
 	if err != nil {
 		return
 	}
-	if setAndGetSendBuf(raw, unix.SO_SNDBUF) >= sendBufTargetEffective {
+	if sufficientSendBuf(setAndGetSendBuf(raw, unix.SO_SNDBUF)) {
 		return
 	}
 	got := setAndGetSendBuf(raw, unix.SO_SNDBUFFORCE)
-	if got < sendBufTargetEffective {
+	if !sufficientSendBuf(got) {
 		warnSmallSendBufOnce.Do(func() {
 			log.Printf("wire: unix socket send buffer stuck at %d bytes (< %d effective target); "+
 				"raise net.core.wmem_max or grant CAP_NET_ADMIN to avoid chunk-transfer throttling",
 				got, sendBufTargetEffective)
 		})
 	}
+}
+
+// sufficientSendBuf reports whether an effective (kernel-doubled, read-back)
+// SO_SNDBUF value meets the working-set target. It is the single decision
+// point for both the plain-set and post-FORCE checks so the boundary tests
+// pin the production predicate.
+func sufficientSendBuf(effective int) bool {
+	return effective >= sendBufTargetEffective
 }
 
 // setAndGetSendBuf sets SO_SNDBUF via opt and returns the effective

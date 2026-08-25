@@ -5,20 +5,19 @@ package wire
 import (
 	"net"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
-// TestSendBufTargetEffectiveBoundary pins the kernel-doubling arithmetic:
-// getsockopt(SO_SNDBUF) reports twice the accepted request, so the
-// success/failure threshold must be the doubled target, not
-// unixSendBufferSize. Drives real sockets whose effective value lands on
-// each side of both thresholds.
+// TestSendBufTargetEffectiveBoundary pins the kernel-doubling arithmetic
+// through the production predicate: getsockopt(SO_SNDBUF) reports twice
+// the accepted request, so the success/failure threshold must be the
+// doubled target, not unixSendBufferSize. Effective values land on each
+// side of both thresholds.
 func TestSendBufTargetEffectiveBoundary(t *testing.T) {
 	cases := []struct {
-		name string
-		// effective (read-back) value the kernel will report
-		effective int
-		// wantAtTarget: whether tuneUnixSocket should consider the
-		// connection fully provisioned at this effective value
+		name           string
+		effective      int
 		wantSufficient bool
 	}{
 		{"clamped to 1MiB (wmem_max=512KiB), reads back 1MiB", 1 << 20, false},
@@ -36,26 +35,20 @@ func TestSendBufTargetEffectiveBoundary(t *testing.T) {
 	}
 }
 
-// sufficientSendBuf reports whether an effective (read-back) SO_SNDBUF
-// value meets the working-set target. Extracted so the boundary is testable
-// without root/CAP_NET_ADMIN manipulation of wmem_max.
-func sufficientSendBuf(effective int) bool {
-	return effective >= sendBufTargetEffective
-}
-
-// TestSetAndGetSendBufMonotonic sanity-checks the real syscall path: the
-// read-back for a plain SO_SNDBUF request of unixSendBufferSize is at
-// least the doubled target on hosts with a raised wmem_max, and never
-// exceeds it by more than rounding.
-func TestSetAndGetSendBufMonotonic(t *testing.T) {
+// TestSetAndGetSendBufReadback exercises the real syscall path with the
+// correct option (unix.SO_SNDBUF, not a magic number): the read-back must
+// be positive, equal to an independent GetsockoptInt call, and consistent
+// with a plain set of unixSendBufferSize — either the kernel-doubled
+// target (host with a raised wmem_max) or the wmem_max clamp (a positive
+// value below the target on constrained hosts).
+func TestSetAndGetSendBufReadback(t *testing.T) {
 	ln, err := net.Listen("unix", t.TempDir()+"/sb.sock")
 	if err != nil {
 		t.Skipf("unix listen: %v", err)
 	}
 	defer ln.Close()
 	go func() {
-		c, err := ln.Accept()
-		if err == nil {
+		if c, err := ln.Accept(); err == nil {
 			c.Close()
 		}
 	}()
@@ -64,16 +57,39 @@ func TestSetAndGetSendBufMonotonic(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
-	raw, err := c.(*net.UnixConn).SyscallConn()
+	uc := c.(*net.UnixConn)
+	raw, err := uc.SyscallConn()
 	if err != nil {
 		t.Fatalf("SyscallConn: %v", err)
 	}
-	got := setAndGetSendBuf(raw, 1 /* SO_SNDBUF */)
-	if got < 0 {
-		t.Fatalf("negative read-back %d", got)
+
+	got := setAndGetSendBuf(raw, unix.SO_SNDBUF)
+	if got <= 0 {
+		t.Fatalf("read-back %d not positive", got)
 	}
-	// On a default host (wmem_max=224KiB) the value clamps to ~448KiB;
-	// on a raised host it reports 2MiB. Both are non-negative and even;
-	// the exact threshold behaviour is covered by the table test above.
-	t.Logf("plain-set read-back: %d", got)
+
+	// Cross-check against an independent getsockopt on the same fd.
+	var direct int
+	err = raw.Control(func(fd uintptr) {
+		v, err := unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUF)
+		if err != nil {
+			t.Errorf("direct GetsockoptInt: %v", err)
+			return
+		}
+		direct = v
+	})
+	if err != nil {
+		t.Fatalf("Control: %v", err)
+	}
+	if got != direct {
+		t.Fatalf("setAndGetSendBuf read-back %d != direct getsockopt %d", got, direct)
+	}
+
+	// A plain request of unixSendBufferSize either fully applies (read-back
+	// == doubled target) or is clamped by wmem_max (read-back < target but
+	// still a positive, kernel-doubled bookkeeping value).
+	if got != sendBufTargetEffective && got >= sendBufTargetEffective {
+		t.Fatalf("read-back %d unexpectedly above the doubled target %d", got, sendBufTargetEffective)
+	}
+	t.Logf("plain-set read-back: %d (target %d, sufficient=%v)", got, sendBufTargetEffective, sufficientSendBuf(got))
 }
