@@ -8,10 +8,12 @@ import (
 // NewChunkEncryptor creates the chunk codec for the given mode. The only
 // supported mode is "aes"; any other value is rejected so a misconfiguration
 // fails loudly at startup rather than silently storing unencrypted chunks.
-func NewChunkEncryptor(mode string) (*AESChunkEncryptor, error) {
+func NewChunkEncryptor(mode string) (ChunkEncryptor, error) {
 	switch mode {
 	case "aes":
 		return &AESChunkEncryptor{}, nil
+	case "aes-gcm":
+		return &AESGCMChunkEncryptor{}, nil
 	default:
 		return nil, fmt.Errorf("crypto: unknown chunk encryptor mode %q (only %q is supported)", mode, "aes")
 	}

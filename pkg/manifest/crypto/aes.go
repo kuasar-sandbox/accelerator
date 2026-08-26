@@ -20,6 +20,10 @@ type AESChunkEncryptor struct {
 	encodeBlock   func(dst, src []byte) ([]byte, error)
 }
 
+func (e *AESChunkEncryptor) Mode() string {
+	return "aes"
+}
+
 func (e *AESChunkEncryptor) encode(dst, src []byte) ([]byte, error) {
 	if e != nil && e.encodeBlock != nil {
 		return e.encodeBlock(dst, src)
@@ -313,6 +317,10 @@ func xorCTR(key [32]byte, dst, src []byte, plaintextOffset uint64) error {
 type AESKeyTableEncryptor struct{}
 
 const gcmNonceSize = 12
+
+func GetGCMNonceSize() int {
+	return gcmNonceSize
+}
 
 // Seal encrypts the key table with AES-256-GCM.
 // Format: [0x01] + nonce(12) + encrypted_data + tag(16)

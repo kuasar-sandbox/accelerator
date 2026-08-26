@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"context"
 	"crypto/sha256"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/internal/objectformat"
@@ -15,6 +16,18 @@ func DeriveKey(salt [32]byte, plaintext []byte) [32]byte {
 	var key [32]byte
 	copy(key[:], h.Sum(nil))
 	return key
+}
+
+// ChunkEncryptor encrypts/decrypts chunk data.
+type ChunkEncryptor interface {
+	// Mode returns the mode of the decryptor.
+	Mode() string
+	// EncryptChunk encrypts the plaintext chunk and returns the ciphertext.
+	EncryptChunk(ctx context.Context, salt [32]byte, plaintext []byte) ([]byte, [32]byte, [32]byte, error)
+	// DecryptChunk decrypts the ciphertext and returns the plaintext.
+	DecryptChunkTo(ctx context.Context, key [32]byte, ciphertext, dst []byte) error
+	// DecryptChunkRangeTo decrypts a range of the ciphertext and writes the plaintext to the destination.
+	DecryptChunkRangeTo(ctx context.Context, key [32]byte, ciphertext []byte, plaintextSize, plaintextOffset int, dst []byte) error
 }
 
 // KeyTableEncryptor encrypts/decrypts the manifest key table.
