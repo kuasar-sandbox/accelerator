@@ -216,11 +216,17 @@ func readStrictCentralDirectoryOffsets(ctx context.Context, source io.ReaderAt, 
 		if !bytesEqual4(fixed[:4], zipDirectoryMagic) {
 			return nil, fmt.Errorf("manifest bundle: invalid Central Directory signature at record %d", index)
 		}
-		if binary.LittleEndian.Uint32(fixed[20:24]) == math.MaxUint32 || binary.LittleEndian.Uint32(fixed[24:28]) == math.MaxUint32 {
-			return nil, fmt.Errorf("manifest bundle: Central Directory record %d uses non-canonical ZIP64 object size", index)
+		compressed32 := binary.LittleEndian.Uint32(fixed[20:24])
+		uncompressed32 := binary.LittleEndian.Uint32(fixed[24:28])
+		zip64Sizes := compressed32 == math.MaxUint32 || uncompressed32 == math.MaxUint32
+		if zip64Sizes && (compressed32 != math.MaxUint32 || uncompressed32 != math.MaxUint32) {
+			return nil, fmt.Errorf("manifest bundle: Central Directory record %d uses partial ZIP64 size sentinels", index)
 		}
 		if binary.LittleEndian.Uint16(fixed[34:36]) != 0 {
 			return nil, fmt.Errorf("manifest bundle: Central Directory record %d uses a non-zero disk", index)
+		}
+		if binary.LittleEndian.Uint16(fixed[36:38]) != 0 {
+			return nil, fmt.Errorf("manifest bundle: Central Directory record %d uses non-zero internal attributes", index)
 		}
 		nameSize := int64(binary.LittleEndian.Uint16(fixed[28:30]))
 		extraSize := int64(binary.LittleEndian.Uint16(fixed[30:32]))
@@ -231,23 +237,32 @@ func readStrictCentralDirectoryOffsets(ctx context.Context, source io.ReaderAt, 
 		}
 		localOffset32 := binary.LittleEndian.Uint32(fixed[42:46])
 		if localOffset32 != math.MaxUint32 {
-			if extraSize != 0 {
+			if zip64Sizes || extraSize != 0 {
 				return nil, fmt.Errorf("manifest bundle: Central Directory record %d has an unnecessary extra field", index)
 			}
 			offsets[index] = uint64(localOffset32)
 		} else {
-			if extraSize != 12 {
+			// archive/zip.Writer emits its canonical three-value ZIP64 extra
+			// whenever the Local Header offset reaches the 32-bit limit. It
+			// deliberately places sentinels in both size fields as well as the
+			// offset field, even though Bundle object sizes remain 32-bit.
+			if !zip64Sizes || extraSize != 28 {
 				return nil, fmt.Errorf("manifest bundle: Central Directory record %d has a non-canonical ZIP64 offset extra", index)
 			}
-			var extra [12]byte
+			var extra [28]byte
 			extraOffset := position + fixedSize + nameSize
 			if err := readFullAt(source, extra[:], extraOffset); err != nil {
 				return nil, fmt.Errorf("manifest bundle: read ZIP64 offset extra at record %d: %w", index, err)
 			}
-			if binary.LittleEndian.Uint16(extra[0:2]) != 0x0001 || binary.LittleEndian.Uint16(extra[2:4]) != 8 {
+			if binary.LittleEndian.Uint16(extra[0:2]) != 0x0001 || binary.LittleEndian.Uint16(extra[2:4]) != 24 {
 				return nil, fmt.Errorf("manifest bundle: Central Directory record %d has an invalid ZIP64 offset extra", index)
 			}
-			offsets[index] = binary.LittleEndian.Uint64(extra[4:12])
+			uncompressed64 := binary.LittleEndian.Uint64(extra[4:12])
+			compressed64 := binary.LittleEndian.Uint64(extra[12:20])
+			offsets[index] = binary.LittleEndian.Uint64(extra[20:28])
+			if compressed64 != uncompressed64 || compressed64 > math.MaxUint32 {
+				return nil, fmt.Errorf("manifest bundle: Central Directory record %d has invalid ZIP64 Store sizes", index)
+			}
 			if offsets[index] < math.MaxUint32 {
 				return nil, fmt.Errorf("manifest bundle: Central Directory record %d uses an unnecessary ZIP64 offset", index)
 			}

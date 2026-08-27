@@ -173,6 +173,9 @@ func TestChunkIndexRejectsOrderDuplicatesSizesAndRangesAtPreparation(t *testing.
 		{name: "enters index", mutate: func(section []byte, footer indexFooter) {
 			binary.LittleEndian.PutUint64(section[32:40], footer.IndexHeaderOffset)
 		}},
+		{name: "overlapping object range", mutate: func(section []byte, _ indexFooter) {
+			copy(section[indexRecordSize+32:indexRecordSize+40], section[32:40])
+		}},
 		{name: "zero size", mutate: func(section []byte, _ indexFooter) {
 			binary.LittleEndian.PutUint32(section[40:44], 0)
 		}},

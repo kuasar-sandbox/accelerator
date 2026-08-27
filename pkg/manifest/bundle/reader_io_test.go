@@ -109,13 +109,21 @@ type sparseZIPEntry struct {
 
 func canonicalCentralHeader(entry sparseZIPEntry) []byte {
 	var extra []byte
+	compressedSize := entry.size
+	uncompressedSize := entry.size
 	localOffset := uint32(entry.headerOffset)
 	if entry.headerOffset >= math.MaxUint32 {
+		// Match archive/zip.Writer: a large Local Header offset causes all
+		// three ZIP64 values (two sizes plus offset) to be emitted.
+		compressedSize = math.MaxUint32
+		uncompressedSize = math.MaxUint32
 		localOffset = math.MaxUint32
-		extra = make([]byte, 12)
+		extra = make([]byte, 28)
 		binary.LittleEndian.PutUint16(extra[0:2], 0x0001)
-		binary.LittleEndian.PutUint16(extra[2:4], 8)
-		binary.LittleEndian.PutUint64(extra[4:12], entry.headerOffset)
+		binary.LittleEndian.PutUint16(extra[2:4], 24)
+		binary.LittleEndian.PutUint64(extra[4:12], uint64(entry.size))
+		binary.LittleEndian.PutUint64(extra[12:20], uint64(entry.size))
+		binary.LittleEndian.PutUint64(extra[20:28], entry.headerOffset)
 	}
 	header := make([]byte, 46+len(entry.name)+len(extra))
 	copy(header[:4], zipDirectoryMagic[:])
@@ -123,8 +131,8 @@ func canonicalCentralHeader(entry sparseZIPEntry) []byte {
 	binary.LittleEndian.PutUint16(header[6:8], 45)
 	binary.LittleEndian.PutUint16(header[10:12], zip.Store)
 	binary.LittleEndian.PutUint32(header[16:20], entry.checksum)
-	binary.LittleEndian.PutUint32(header[20:24], entry.size)
-	binary.LittleEndian.PutUint32(header[24:28], entry.size)
+	binary.LittleEndian.PutUint32(header[20:24], compressedSize)
+	binary.LittleEndian.PutUint32(header[24:28], uncompressedSize)
 	binary.LittleEndian.PutUint16(header[28:30], uint16(len(entry.name)))
 	binary.LittleEndian.PutUint16(header[30:32], uint16(len(extra)))
 	binary.LittleEndian.PutUint32(header[42:46], localOffset)
