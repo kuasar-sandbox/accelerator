@@ -59,6 +59,20 @@ func TestReadMetadataWithoutRefs(t *testing.T) {
 	}
 }
 
+func TestReadMetadataRemainsPrefixOnlyWithoutIndex(t *testing.T) {
+	data := rawZIPWithoutIndex(t, []rawEntry{canonicalAdmissionEntry(t), canonicalManifestEntry(t)}, "")
+	metadata, err := ReadMetadata(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("prefix-only ReadMetadata rejected a Bundle without an index: %v", err)
+	}
+	if metadata.Admission().Generation != "G1" {
+		t.Fatalf("Admission = %#v", metadata.Admission())
+	}
+	if _, err := NewReader(bytes.NewReader(data), int64(len(data))); err == nil {
+		t.Fatal("full Reader accepted a Bundle without the mandatory index")
+	}
+}
+
 func BenchmarkMetadataOpen4K(b *testing.B)  { benchmarkMetadataOpen(b, 4_000) }
 func BenchmarkMetadataOpen20K(b *testing.B) { benchmarkMetadataOpen(b, 20_000) }
 

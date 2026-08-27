@@ -39,7 +39,7 @@ type testFixture struct {
 	otherPlain []byte
 }
 
-func newTestFixture(t *testing.T, generation store.Generation) testFixture {
+func newTestFixture(t testing.TB, generation store.Generation) testFixture {
 	t.Helper()
 	salt, err := store.SaltForGeneration(generation)
 	if err != nil {
@@ -371,6 +371,10 @@ func TestLocalManifestMissingChunkNeverFallsBackRemote(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	rootChunks := manifestChunkKeys(t, fixture.reader, fixture.root)
+	if _, err := w.Put(context.Background(), fixture.admission, store.PartitionChunk, rootChunks[0], objectBytes(t, fixture.reader, store.PartitionChunk, rootChunks[0])); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := w.Put(context.Background(), fixture.admission, store.PartitionManifest, fixture.root, manifestData); err != nil {
 		t.Fatal(err)
 	}
@@ -391,9 +395,27 @@ func TestLocalManifestMissingChunkNeverFallsBackRemote(t *testing.T) {
 	}
 	localFetcher := fetch.NewFetcher(fixture.customer, localReader.Getter(), fixture.decryptor)
 	remoteFetcher := fetch.NewFetcher(fixture.customer, remote, fixture.decryptor)
-	_, err = NewManifestFetcher(localReader, localFetcher, remoteFetcher).OpenManifest(context.Background(), fixture.root)
-	if err == nil {
-		t.Fatal("incomplete local Manifest fell back to remote")
+	stream, err := NewManifestFetcher(localReader, localFetcher, remoteFetcher).OpenManifest(context.Background(), fixture.root)
+	if err != nil {
+		t.Fatalf("OpenManifest with an unvisited missing Chunk: %v", err)
+	}
+	defer stream.Close()
+	first := make([]byte, 4096)
+	if n, err := stream.ReadAt(context.Background(), first, 0); err != nil || n != len(first) {
+		t.Fatalf("read existing Chunk = %d, %v", n, err)
+	}
+	if _, err := stream.ReadAt(context.Background(), make([]byte, 4096), 4096); err == nil {
+		t.Fatal("actual missing Chunk read unexpectedly succeeded")
+	}
+	if err := localReader.FullVerify(context.Background(), fixture.root, fixture.customer, fixture.decryptor, VerifyOptions{}); !errors.Is(err, ErrIncomplete) {
+		t.Fatalf("FullVerify error = %v, want ErrIncomplete", err)
+	}
+	target := &recordingExactStore{accepted: fixture.admission}
+	if err := localReader.Upload(context.Background(), fixture.root, fixture.customer, fixture.decryptor, target, VerifyOptions{}); !errors.Is(err, ErrIncomplete) {
+		t.Fatalf("exact Upload error = %v, want ErrIncomplete", err)
+	}
+	if _, _, puts := target.snapshot(); len(puts) != 0 {
+		t.Fatalf("exact Upload performed %d Put calls before closure validation", len(puts))
 	}
 	if got := remote.callCount(store.PartitionManifest) + remote.callCount(store.PartitionChunk); got != 0 {
 		t.Fatalf("remote calls = %d, want 0", got)
@@ -637,9 +659,23 @@ type rawEntry struct {
 }
 
 func rawZIP(t *testing.T, entries []rawEntry, comment string) []byte {
+	return buildRawZIP(t, entries, comment, true)
+}
+
+func rawZIPWithoutIndex(t *testing.T, entries []rawEntry, comment string) []byte {
+	return buildRawZIP(t, entries, comment, false)
+}
+
+func buildRawZIP(t *testing.T, entries []rawEntry, comment string, withIndex bool) []byte {
 	t.Helper()
 	var output bytes.Buffer
 	w := zip.NewWriter(&output)
+	var nextOffset uint64
+	entryEnds := make([]uint64, 0, len(entries))
+	manifestRecords := make([]indexRecord, 0)
+	chunkRecords := make([]indexRecord, 0)
+	seenManifest := make(map[store.ContentKey]struct{})
+	seenChunk := make(map[store.ContentKey]struct{})
 	for _, raw := range entries {
 		method := raw.method
 		if method == 0 {
@@ -660,6 +696,62 @@ func rawZIP(t *testing.T, entries []rawEntry, comment string) []byte {
 			t.Fatal(err)
 		}
 		if _, err := entry.Write(raw.data); err != nil {
+			t.Fatal(err)
+		}
+		dataOffset := nextOffset + uint64(zipLocalHeaderFixedSize+len(raw.name))
+		nextOffset = dataOffset + uint64(len(raw.data))
+		entryEnds = append(entryEnds, nextOffset)
+		partition := store.Partition("")
+		prefix := ""
+		switch {
+		case strings.HasPrefix(raw.name, manifestPrefix):
+			partition, prefix = store.PartitionManifest, manifestPrefix
+		case strings.HasPrefix(raw.name, chunkPrefix):
+			partition, prefix = store.PartitionChunk, chunkPrefix
+		}
+		if partition == "" {
+			continue
+		}
+		key, parseErr := parseObjectEntry(raw.name, prefix)
+		if parseErr != nil {
+			key = store.ContentKey(sha256.Sum256(raw.data))
+		}
+		record := indexRecord{Key: key, DataOffset: dataOffset, Size: uint32(len(raw.data)), CRC32: header.CRC32}
+		if partition == store.PartitionManifest {
+			if _, duplicate := seenManifest[key]; !duplicate {
+				seenManifest[key] = struct{}{}
+				manifestRecords = append(manifestRecords, record)
+			}
+		} else if _, duplicate := seenChunk[key]; !duplicate {
+			seenChunk[key] = struct{}{}
+			chunkRecords = append(chunkRecords, record)
+		}
+	}
+	if withIndex {
+		metadataEnd := uint64(1)
+		if len(entries) != 0 && strings.HasPrefix(entries[0].name, admissionPrefix) {
+			metadataEnd = entryEnds[0]
+		} else if len(entries) > 1 && entries[0].name == refsName && strings.HasPrefix(entries[1].name, admissionPrefix) {
+			metadataEnd = entryEnds[1]
+		}
+		payload, _, err := buildIndexPayload(metadataEnd, nextOffset, manifestRecords, chunkRecords)
+		if err != nil {
+			t.Fatalf("build raw index: %v", err)
+		}
+		header := &zip.FileHeader{
+			Name:               indexName,
+			Method:             zip.Store,
+			CreatorVersion:     45,
+			ReaderVersion:      45,
+			CRC32:              crc32.ChecksumIEEE(payload),
+			CompressedSize64:   uint64(len(payload)),
+			UncompressedSize64: uint64(len(payload)),
+		}
+		entry, err := w.CreateRaw(header)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := entry.Write(payload); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -799,23 +891,36 @@ func TestReaderRejectsMalformedProfileAndTruncation(t *testing.T) {
 	nonCanonicalAdmission := admission
 	nonCanonicalAdmission.name = admissionPrefix + "G1/" + string(bytes.Repeat([]byte{'0'}, 64))
 	for _, tc := range []struct {
-		name    string
-		entries []rawEntry
-		comment string
+		name       string
+		entries    []rawEntry
+		comment    string
+		strictOnly bool
 	}{
 		{name: "missing admission", entries: []rawEntry{manifest}},
 		{name: "non-canonical admission salt", entries: []rawEntry{nonCanonicalAdmission, manifest}},
 		{name: "duplicate admission", entries: []rawEntry{admission, admission, manifest}},
 		{name: "duplicate Manifest", entries: []rawEntry{admission, manifest, manifest}},
 		{name: "unknown entry", entries: []rawEntry{admission, manifest, {name: "meta/root"}}},
-		{name: "Deflate", entries: []rawEntry{admission, {name: manifest.name, method: zip.Deflate, data: manifest.data}}},
-		{name: "encrypted flag", entries: []rawEntry{admission, {name: manifest.name, flags: 1, data: manifest.data}}},
+		{name: "Deflate", entries: []rawEntry{admission, {name: manifest.name, method: zip.Deflate, data: manifest.data}}, strictOnly: true},
+		{name: "encrypted flag", entries: []rawEntry{admission, {name: manifest.name, flags: 1, data: manifest.data}}, strictOnly: true},
 		{name: "archive comment", entries: []rawEntry{admission, manifest}, comment: "not allowed"},
-		{name: "uppercase key", entries: []rawEntry{admission, {name: "manifest/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", data: manifest.data}}},
+		{name: "uppercase key", entries: []rawEntry{admission, {name: "manifest/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", data: manifest.data}}, strictOnly: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			data := rawZIP(t, tc.entries, tc.comment)
-			if _, err := NewReader(bytes.NewReader(data), int64(len(data))); err == nil {
+			reader, err := NewReader(bytes.NewReader(data), int64(len(data)))
+			if !tc.strictOnly {
+				if err == nil {
+					_ = reader.Close()
+					t.Fatal("invalid Bundle accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("hot Reader unexpectedly parsed object CD/LFH metadata: %v", err)
+			}
+			defer reader.Close()
+			if err := reader.verifyContainer(context.Background()); err == nil {
 				t.Fatal("invalid Bundle accepted")
 			}
 		})
@@ -859,8 +964,13 @@ func TestReaderRejectsMismatchedLocalHeaderBeforePayload(t *testing.T) {
 	headerOffset := dataOffset - int64(30+len(target.Name))
 	data[headerOffset+8] = byte(zip.Deflate) // Central Directory still says Store.
 
-	if _, err := NewReader(bytes.NewReader(data), int64(len(data))); err == nil {
-		t.Fatal("mismatched local header was accepted during profile validation")
+	reader, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("hot Reader unexpectedly inspected object Local Header: %v", err)
+	}
+	defer reader.Close()
+	if err := reader.verifyContainer(context.Background()); err == nil {
+		t.Fatal("mismatched object Local Header was accepted by strict verification")
 	}
 }
 
@@ -878,7 +988,7 @@ func TestZIP64EntryCount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const chunks = 65_533 // + admission + Manifest = ZIP64's 65,535 threshold.
+	const chunks = 65_533 // + admission + Manifest + index crosses the ZIP32 entry limit.
 	for index := 0; index < chunks; index++ {
 		var key store.ContentKey
 		binary.LittleEndian.PutUint64(key[:8], uint64(index+1))
@@ -908,6 +1018,9 @@ func TestZIP64EntryCount(t *testing.T) {
 	defer reader.Close()
 	if got := len(reader.ChunkKeys()); got != chunks {
 		t.Fatalf("ZIP64 Chunk entries = %d, want %d", got, chunks)
+	}
+	if err := reader.verifyContainer(context.Background()); err != nil {
+		t.Fatalf("strict ZIP64 container verification: %v", err)
 	}
 }
 

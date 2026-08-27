@@ -221,9 +221,13 @@ func TestManifestFetcherSelectedBundleFailureNeverFallsThrough(t *testing.T) {
 		ref1: sourceFor(fixture, fixture.reader),
 	}}
 	remote := &recordingFetcher{inner: sourceFor(fixture, fixture.reader).Fetcher}
-	_, err := NewManifestFetcherWithResolver(current, sourceFor(fixture, current).Fetcher, resolver, remote).OpenManifest(context.Background(), fixture.root)
-	if err == nil || !errors.Is(err, ErrIncomplete) {
-		t.Fatalf("OpenManifest error = %v, want ErrIncomplete", err)
+	stream, err := NewManifestFetcherWithResolver(current, sourceFor(fixture, current).Fetcher, resolver, remote).OpenManifest(context.Background(), fixture.root)
+	if err != nil {
+		t.Fatalf("OpenManifest with an unvisited missing Chunk: %v", err)
+	}
+	defer stream.Close()
+	if _, err := stream.ReadAt(context.Background(), make([]byte, len(fixture.rootPlain)), 0); err == nil {
+		t.Fatal("selected incomplete Bundle read unexpectedly succeeded")
 	}
 	if got := resolver.snapshot(); !reflect.DeepEqual(got, []string{ref0}) {
 		t.Fatalf("resolver calls = %v, want selected ref only", got)

@@ -20,9 +20,7 @@ type Fetcher interface {
 }
 
 // ManifestValidator is an optional Getter capability for container-level
-// invariants that become checkable only after a Manifest is parsed. A Bundle
-// uses it to prove the selected Manifest's complete Chunk closure by directory
-// lookup, without mixing local and remote object Getters.
+// invariants that become checkable only after a Manifest is parsed.
 type ManifestValidator interface {
 	ValidateManifest(key store.ContentKey, manifest *codec.Manifest) error
 }

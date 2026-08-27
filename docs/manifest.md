@@ -698,34 +698,101 @@ expected `sha256|hmac` 和 outer EOF。跨 artifact record splice 会在顺序�
 
 ### 4.10 多 Manifest ZIP Bundle
 
-本地 Manifest 快照使用标准 ZIP64，所有 entry 固定为 `zip.Store`：
+本地 Manifest 快照使用带强制尾部索引的标准 ZIP64。当前 profile 直接要求
+`bundle/index`，没有旧格式探测、无索引兼容或 Central Directory fallback。所有新
+Bundle 的物理布局为：
 
 ```text
-有外部 Bundle refs：
-  [0] bundle/refs
-  [1] bundle/admission/<generation>/<64-lowercase-hex-salt>
-  [2...] manifest/<64-lowercase-hex-content-key> | chunk/<64-lowercase-hex-content-key>
+[0]     bundle/refs                                            # optional
+[0|1]   bundle/admission/<generation>/<64-lowercase-hex-salt>
+[...]   chunk/<64-lowercase-hex-content-key> |
+        manifest/<64-lowercase-hex-content-key>
+[last]  bundle/index                                           # required
 
-无外部 Bundle refs：
-  [0] bundle/admission/<generation>/<64-lowercase-hex-salt>
-  [1...] manifest/<64-lowercase-hex-content-key> | chunk/<64-lowercase-hex-content-key>
+        Central Directory
+        ZIP64 EOCD + locator                                    # when required
+        EOCD with an empty comment
 ```
 
-Manifest/Chunk payload 是现有 physical object 的原始字节。Bundle 不使用 ZIP
-Deflate、ZIP encryption、整文件 SHA/HMAC、外层加密、自定义 pack、root entry 或
-JSON/YAML metadata。archive/entry comment、时间、权限和平台字段固定；重复 entry、
-未知 entry、目录、非 Store method、加密 flag、非法 key/admission 与截断均失败。
-标准 ZIP64 EOCD/size 扩展受支持。旧 `admission/*` 不再接受，也没有旧格式探测或
-兼容 fallback。
+Manifest/Chunk payload 仍是现有 physical object 的原始字节。Chunk Local Entry 继续按
+Manifest 中首次逻辑出现的 ordinal 写出；只排序索引 record，不按 ContentKey 重排或
+缓存全部 Chunk payload。共享对象仍按 ContentKey 去重，ManifestKey、Chunk key 和对象
+physical bytes 均不改变。
+
+全部 Local Entry 固定为 `zip.Store`、flags 0、无 data descriptor、无 local extra，
+comment、时间、权限和平台字段也固定。`bundle/index` 必须恰好一个并且是最后一个
+Local Entry；其 payload 最后 256 bytes 与真实 Central Directory 紧邻。Bundle 不使用
+ZIP Deflate、ZIP encryption、整文件 SHA/HMAC、外层加密、自定义 pack、root entry 或
+JSON/YAML metadata。旧 `admission/*`、旧的无索引 Bundle、重复或未知 entry、目录、
+非法 key/admission 与截断均 fail closed。
+
+#### 4.10.1 `bundle/index` v1
+
+索引 payload 依次是 Chunk section、Manifest section 和固定 footer。两个 section 各自
+按 ContentKey 严格递增，partition 由 section 隐含；重复或未排序 key 非法。每条 record
+固定 48 bytes，以 little-endian 显式编码：
+
+| byte range | field | encoding |
+|---|---|---|
+| `[0,32)` | ContentKey | 原始 32 bytes |
+| `[32,40)` | payload DataOffset | `uint64`，对象 payload 的 archive 绝对 offset |
+| `[40,44)` | payload Size | `uint32` |
+| `[44,48)` | ZIP CRC32 | `uint32` |
+
+`DataOffset` 不是 Local Header offset。`DataOffset + Size` 必须 checked-add 且完整位于
+metadata prefix 之后、`bundle/index` Local Header 之前。Manifest/Chunk 的 individual
+size 继续受各自 codec 上限约束。整个 ZIP 最多 100,000 个 entry；两个索引 section
+合计最多 99,998 records，index payload 最多 4,800,160 bytes。
+
+footer 固定 256 bytes；除 magic 和 digest 外的整数均为 little-endian：
+
+| byte range | field |
+|---|---|
+| `[0,16)` | magic `KUASARBNDLINDEX1` |
+| `[16,18)` | version，固定 `1` |
+| `[18,20)` | footer size，固定 `256` |
+| `[20,22)` | record size，固定 `48` |
+| `[22,24)` | reserved，必须全零 |
+| `[24,32)` | index payload absolute offset |
+| `[32,40)` | index payload total size |
+| `[40,48)` | `bundle/index` Local Header absolute offset |
+| `[48,56)` | metadata prefix end offset |
+| `[56,64)` | Manifest section absolute offset |
+| `[64,72)` | Manifest record count |
+| `[72,80)` | Manifest section size |
+| `[80,112)` | SHA-256 of the exact encoded Manifest section bytes |
+| `[112,120)` | Chunk section absolute offset |
+| `[120,128)` | Chunk record count |
+| `[128,136)` | Chunk section size |
+| `[136,168)` | SHA-256 of the exact encoded Chunk section bytes |
+| `[168,252)` | reserved，必须全零 |
+| `[252,256)` | CRC32C/Castagnoli of footer bytes `[0,252)` |
+
+section size 必须精确等于 `count * 48`。Chunk section 从 index payload 起点开始，
+Manifest section 必须紧随其后，footer 又必须紧随 Manifest section；三者不能重叠、留
+gap 或覆盖 footer。若 `directoryOffset` 是 EOCD/ZIP64 EOCD 声明的真实 Central
+Directory 起点，则必须同时满足：
+
+```text
+indexPayloadOffset + indexPayloadSize == directoryOffset
+footerOffset + 256 == directoryOffset
+```
+
+section SHA-256 和 footer CRC32C 只用于发现索引损坏，不是签名或认证。对象内容安全仍
+由 Manifest ContentKey、Chunk decrypt/authentication 及 `manifest.verify_content`
+合同承担。
+
+Writer 不依赖 `archive/zip.Writer` 的内部 flush 位置，而是按 canonical Local Header
+布局维护逻辑 `nextOffset`：`dataOffset = nextOffset + 30 + len(name)`。Finalize 先检查
+root Manifest，再分别排序并编码 Chunk/Manifest records，写出最后的 `bundle/index`，
+最后才由标准 ZIP writer 写 Central Directory/ZIP64/EOCD。严格 verifier 和测试会把
+每个 record 的 offset、size、CRC 与实际 CD/LFH/data range 交叉核对。
+
+#### 4.10.2 metadata prefix 与 Reader I/O
 
 `bundle/refs` 存在时必须非空并作为第一个物理 Local File Header；admission 必须紧随
-其后，否则 admission 必须是第一个 entry。admission payload 为空。admission 后只
-允许 Manifest/Chunk。Reader 从 offset 0 按 Central Directory 顺序逐个核对 Local
-File Header、名称、method、size、CRC metadata 和连续 data range，因此 Central
-Directory 重排、隐藏 local entry、metadata gap 或 Local Header/Central Directory
-描述不一致均 fail closed；该检查只读取 header 和 refs payload，不扫描 Chunk data。
-
-`bundle/refs` 一行一个 canonical、按文件顺序搜索的 Bundle file ref：
+其后，否则 admission 必须是第一个 entry。admission payload 为空。`bundle/refs`
+一行一个 canonical、按文件顺序搜索的 Bundle file ref：
 
 ```text
 file://<basename>.bundle
@@ -739,8 +806,29 @@ file://<basename>.bundle@location:<name>
 `NewWriter` 写出任何 byte 前完成验证；Writer 创建后 refs/admission 均不可变。
 `Reader.Refs()` 返回副本。
 preflight 只需发现 location/admission 时可使用 `OpenMetadata`/`ReadMetadata`；该入口
-只读取连续 Local Header metadata prefix，不解析 Central Directory 或对象，真正消费
-Manifest/Chunk 前仍必须使用 `Open`/`NewReader` 完成完整 profile 校验。
+只验证连续 Local Header metadata prefix，不读取尾部、索引、Central Directory 或
+对象。即使某个文件的 prefix 可被该 preflight 解析，也不会证明它是可消费的 Bundle，
+更不构成无索引兼容；真正消费 Manifest/Chunk 必须使用 `Open`/`NewReader`，后者强制
+要求合法 v1 索引。
+
+普通 `Open`/`NewReader` 不调用 `archive/zip.NewReader`，也不读取 Central Directory、
+对象 Local Header、Chunk index 或对象 payload。ReaderAt 远端路径的打开顺序固定为：
+
+1. 从 EOF 读取 EOCD；ZIP64 时再各读取一次 locator 和 ZIP64 EOCD，得到真实
+   `directoryOffset`，但不读取该 offset 开始的 CD bytes。
+2. 从 `directoryOffset - 256` 读取 footer，验证 magic/version/checksum 和全部 section
+   bounds。
+3. 固定读取并验证 `bundle/index` 自己的 canonical Local Header。
+4. 按 footer 的 `metadataPrefixEnd` 一次连续读取 metadata prefix，并在内存中解析
+   refs/admission。
+5. 一次连续读取 Manifest section，验证 digest、排序、重复、size/range 后建立 O(1)
+   只读 map；Chunk section 保持未读。
+
+因此 ZIP32 `Open` 是 5 次固定 range read，ZIP64 是 7 次；次数不随 Chunk 数增长。
+文件打开仍优先使用 read-only mmap；ReaderAt 对象 payload 回退路径使用按
+4 KiB～2 MiB 分级、每个 Reader 最多保留 32 MiB 的有界 buffer pool。
+
+#### 4.10.3 source selection、Chunk preparation 与普通 restore
 
 一个 Bundle 从首版容纳根内存 Manifest、根/数据盘当前层 Manifest，以及必要时
 收编的父层 Manifest。全部对象共用 admission entry 中的同一完整
@@ -753,8 +841,7 @@ Manifest/Chunk 前仍必须使用 `Open`/`NewReader` 完成完整 profile 校验
 `extra_salt`，保证 Chunk key 始终属于 recorded admission 的 canonical salt domain，
 从而可在 exact upload 时逐对象验证且无需重写。
 
-Bundle 中每个 Manifest 必须有完整非零 Chunk 闭包。读侧仅在
-`Fetcher.OpenManifest` 按以下顺序选择来源：
+读侧仅在 `Fetcher.OpenManifest` 按以下顺序选择来源：
 
 ```text
 当前 Bundle -> bundle/refs[0] -> bundle/refs[1] -> ... -> 默认 remote Cache/Store
@@ -768,36 +855,53 @@ Bundle 中每个 Manifest 必须有完整非零 Chunk 闭包。读侧仅在
 
 | Manifest 来源 | Manifest/Chunk Getter | 失败语义 |
 |---|---|---|
-| current 或首个 refs Bundle 命中 | 该 Bundle-only | 缺失、损坏、I/O、解析、闭包或解密错误直接失败，不再搜索 |
+| current 或首个 refs Bundle 命中 | 该 Bundle-only | Chunk index、对象读取、解析或解密错误直接失败，不再搜索 |
 | 所有 Bundle clean miss/unavailable | remote-only cache/store | Bundle 中碰巧同 key 的 Chunk 不参与 |
 
 因此不存在对象级 Bundle fallback Getter；本地 Manifest 错误也不会改读后续
-Bundle/Store。Manifest 解析完成后，闭包检查只做 Central Directory map lookup，
-不读取 Chunk payload。外部 root selector 必须通过 `OpenRootManifest`/`SelectRoot`
-证明 root 物理存在于 current Bundle，不能从 refs 或 Store 间接取得。并发 source
-选择只读取 immutable Reader state；resolver 负责按需打开、缓存和统一关闭其 Reader。
+Bundle/Store。current/refs source selection 只查询 Open 时已经加载的 Manifest map；
+clean miss 不读取 Chunk section。Bundle 一旦被选中，Reader 在返回 Stream 前一次连续
+读取完整 Chunk section，验证 digest/records/ranges 并建立 O(1) 只读 map。并发准备由
+`sync.Once` 合并为一次读取，错误或取消也由所有调用方共享。remote source 没有 Bundle
+Reader，因此不执行这一步。
 
-`bundle.Open` 解析 Central Directory 与 admission；选中 Manifest 前不读取
-Manifest，Chunk 数据区在实际读 Chunk 前不触碰。文件打开优先使用 read-only mmap，
-热路径缓存 `DataOffset` 并直接构造 immutable Blob；回退路径使用 `ReaderAt`，不经
-`zip.File.Open` 重复执行 CRC32 扫描，并使用按 4 KiB～2 MiB 分级、每个 Reader
-最多保留 32 MiB 的有界 buffer pool。`manifest.verify_content=false` 时也不会隐藏
-执行 physical SHA 扫描。
+准备完成后的 Manifest/Chunk `Get` 直接使用 record 中的 payload `DataOffset/Size`，只
+做一次目标 payload range read；不会读取索引、对象 Local Header 或 Central Directory。
+实际 Stream 的第一次 `Read` 因而不承担 O(Chunk records) 的索引初始化。外部
+root selector 必须通过 `OpenRootManifest`/`SelectRoot` 证明 root 物理存在于 current
+Bundle，不能从 refs 或 Store 间接取得。
+
+普通 restore 不再预扫描 Manifest 的完整 Chunk closure。Manifest 声明一个缺失但本次
+不会读取的 Chunk 时，`Open` 和 `OpenManifest` 可以成功，已存在 Chunk 仍可读取；只有
+真正访问缺失 Chunk 时才失败，而且选定 source 后不得 fallback 到后续 Bundle 或 remote
+Store。`manifest.verify_content=false` 仍不会隐式执行 physical SHA 扫描；为 true 时的
+Manifest SHA、Chunk ContentKey/decrypt authentication 语义保持不变。
+
+#### 4.10.4 显式严格验证与 exact upload
 
 单 Bundle full verify/upload 与多 source `VerifyExactManifests` /
-`UploadExactManifests` 均强制验证，不受 `manifest.verify_content` 影响。多 source
-exact upload 固定执行：
+`UploadExactManifests` 均先运行显式 container verifier，不受
+`manifest.verify_content` 影响。它读取完整 Central Directory，并按 CD 原始顺序核对
+每个 Local Header、名称、method、flags、时间、attrs、extra、size、CRC 和连续 data
+range，证明没有重排、gap、隐藏/重叠 entry；随后要求 index 是 sole final entry，并把
+每个 Manifest/Chunk record 与 CD/LFH/data range 精确交叉校验，拒绝未索引对象、索引
+不存在对象和额外 metadata。普通 `Open`/`Get` 不承担这些 O(entries) 检查。
+
+严格路径随后验证完整 closure 和对象内容。缺失但未访问的 Chunk 在 `FullVerify` 立即
+失败；exact upload 在任何 `Put` 前失败。多 source exact upload 固定执行：
 
 1. 调用方在 OpenManifest 层为每个逻辑 key 选择 current/refs Bundle；已经在目标
    Store 严格存在的依赖不进入 Bundle upload plan。
-2. 在任何 Put 前，对全部实际 source recorded admissions 调用
+2. 在任何 admission 或 Put 前，对 plan 中每个实际 source 运行完整
+   CD/LFH/index container verifier。
+3. 在任何 Put 前，对全部实际 source recorded admissions 调用
    `AdmitWriteFor(recorded.Generation)`；返回 Generation/Salt 必须逐字节相等。
-3. 强制验证每个选定 Manifest physical ContentKey、解析并用 customer key 解封 key
+4. 强制验证每个选定 Manifest physical ContentKey、解析并用 customer key 解封 key
    table，并证明该 Manifest 的完整 Chunk 闭包位于同一 source Bundle。
-4. 每个 source 中实际使用的唯一 Chunk 强制验证 physical ContentKey，解密/解压为
+5. 每个 source 中实际使用的唯一 Chunk 强制验证 physical ContentKey，解密/解压为
    原明文，并要求 `DeriveKey(sourceAdmission.Salt, plaintext)` 等于 key table 中的
    key；跨 Manifest 的同一 ContentKey 对应不同 key 或 plaintext size 时拒绝。
-5. 先并发上传全部 Chunk，再上传依赖 Manifest，最后发布调用方指定的 current root。
+6. 先并发上传全部 Chunk，再上传依赖 Manifest，最后发布调用方指定的 current root。
 
 每个对象使用其 source Bundle 的 recorded admission，不改投最新 generation，不
 重新 chunk、压缩、加密、seal key table 或改写上层 `snapshot.cfg`，因此 root
@@ -825,9 +929,13 @@ Better、Zstd SpeedFastest 控制组）、`BenchmarkAESChunkCanonicalCodec` 和
 进入配置或协商面。codec benchmark 另报告 `scratch-misses/op`,用于确认 warm
 size class 没有每次重新分配 payload-sized buffer。
 
-Bundle Central Directory 的 4K/20K Chunk 打开成本由
-`BenchmarkBundleOpen4K` / `BenchmarkBundleOpen20K` 报告；两者只测索引构造，
-不会读取 Chunk payload。`BenchmarkVerifyContent` 分别报告 Manifest open 与冷态
+Bundle 尾索引的 4K/20K/100K Chunk 打开成本由 `BenchmarkBundleOpen4K`、
+`BenchmarkBundleOpen20K` 和 `BenchmarkBundleOpen100K` 报告；Open 只加载
+Manifest index，不读取 Chunk index、Central Directory、对象 Local Header 或对象
+payload。`BenchmarkBundlePrepareChunks4K/20K` 报告选源后的单次 Chunk section
+准备，`BenchmarkBundleGetAfterPrepare` 报告纯 O(1) lookup + payload read，
+`BenchmarkBundleOpenHighRTT20K` 注入固定 ReaderAt RTT 并报告 `read-calls/op` 与
+`read-bytes/op`。`BenchmarkVerifyContent` 分别报告 Manifest open 与冷态
 1 MiB Chunk read 在 `verify_content=true|false` 下的差异。
 `BenchmarkManifestSourceSearch` 报告 refs 为 0/1/8/32 时的 clean miss 与尾部 remote
 fallback 成本；`BenchmarkMetadataOpen4K` / `BenchmarkMetadataOpen20K` 证明 prefix-only

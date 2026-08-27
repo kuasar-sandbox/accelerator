@@ -15,7 +15,7 @@ import (
 
 // Metadata is the immutable Bundle metadata prefix. ReadMetadata validates
 // only this prefix; callers that consume objects must still use Open/NewReader
-// for complete ZIP/profile validation.
+// to require and validate the indexed profile.
 type Metadata struct {
 	refs      []string
 	admission store.WriteAdmission
@@ -42,59 +42,71 @@ func OpenMetadata(path string) (Metadata, error) {
 // ReadMetadata reads the continuous local-header prefix at offset zero. It
 // does not read Manifest/Chunk payloads or the Central Directory.
 func ReadMetadata(source io.ReaderAt, size int64) (Metadata, error) {
+	metadata, _, _, err := readMetadataPrefix(source, size)
+	return metadata, err
+}
+
+// readMetadataPrefix returns the exact end of the canonical refs/admission
+// prefix and its physical entry count. NewReader first obtains that end from
+// the validated index footer, performs one source range read, and invokes this
+// parser against the in-memory buffer. ReadMetadata keeps its lighter prefix-
+// only contract by calling the same parser directly on its source.
+func readMetadataPrefix(source io.ReaderAt, size int64) (Metadata, int64, int, error) {
 	if source == nil {
-		return Metadata{}, fmt.Errorf("manifest bundle: metadata source is required")
+		return Metadata{}, 0, 0, fmt.Errorf("manifest bundle: metadata source is required")
 	}
 	first, err := readPrefixEntry(source, size, 0)
 	if err != nil {
-		return Metadata{}, err
+		return Metadata{}, 0, 0, err
 	}
 	var metadata Metadata
 	admissionEntry := first
+	entryCount := 1
 	if first.name == refsName {
 		if first.size == 0 {
-			return Metadata{}, fmt.Errorf("manifest bundle: refs payload must be non-empty")
+			return Metadata{}, 0, 0, fmt.Errorf("manifest bundle: refs payload must be non-empty")
 		}
 		if first.size > maxRefsPayload {
-			return Metadata{}, fmt.Errorf("manifest bundle: refs payload exceeds %d bytes", maxRefsPayload)
+			return Metadata{}, 0, 0, fmt.Errorf("manifest bundle: refs payload exceeds %d bytes", maxRefsPayload)
 		}
 		payload := make([]byte, first.size)
 		if err := readFullAt(source, payload, first.dataOffset); err != nil {
-			return Metadata{}, fmt.Errorf("manifest bundle: read %s: %w", refsName, err)
+			return Metadata{}, 0, 0, fmt.Errorf("manifest bundle: read %s: %w", refsName, err)
 		}
 		if crc32.ChecksumIEEE(payload) != first.crc {
-			return Metadata{}, fmt.Errorf("manifest bundle: %s CRC mismatch", refsName)
+			return Metadata{}, 0, 0, fmt.Errorf("manifest bundle: %s CRC mismatch", refsName)
 		}
 		metadata.refs, err = ParseRefs(payload)
 		if err != nil {
-			return Metadata{}, err
+			return Metadata{}, 0, 0, err
 		}
 		admissionEntry, err = readPrefixEntry(source, size, first.endOffset)
 		if err != nil {
-			return Metadata{}, err
+			return Metadata{}, 0, 0, err
 		}
+		entryCount = 2
 	}
 	if strings.HasPrefix(admissionEntry.name, legacyAdmissionPrefix) {
-		return Metadata{}, fmt.Errorf("manifest bundle: legacy admission entry %q is not allowed", admissionEntry.name)
+		return Metadata{}, 0, 0, fmt.Errorf("manifest bundle: legacy admission entry %q is not allowed", admissionEntry.name)
 	}
 	if !strings.HasPrefix(admissionEntry.name, admissionPrefix) {
-		return Metadata{}, fmt.Errorf("manifest bundle: metadata prefix expected admission, got %q", admissionEntry.name)
+		return Metadata{}, 0, 0, fmt.Errorf("manifest bundle: metadata prefix expected admission, got %q", admissionEntry.name)
 	}
 	if admissionEntry.size != 0 || admissionEntry.crc != crc32.ChecksumIEEE(nil) {
-		return Metadata{}, fmt.Errorf("manifest bundle: admission payload must be empty")
+		return Metadata{}, 0, 0, fmt.Errorf("manifest bundle: admission payload must be empty")
 	}
 	metadata.admission, err = parseAdmissionName(admissionEntry.name)
 	if err != nil {
-		return Metadata{}, err
+		return Metadata{}, 0, 0, err
 	}
 	wantSalt, err := store.SaltForGeneration(metadata.admission.Generation)
 	if err != nil {
-		return Metadata{}, fmt.Errorf("manifest bundle: admission: %w", err)
+		return Metadata{}, 0, 0, fmt.Errorf("manifest bundle: admission: %w", err)
 	}
 	if metadata.admission.Salt != wantSalt {
-		return Metadata{}, fmt.Errorf("manifest bundle: admission salt is not canonical for generation %q", metadata.admission.Generation)
+		return Metadata{}, 0, 0, fmt.Errorf("manifest bundle: admission salt is not canonical for generation %q", metadata.admission.Generation)
 	}
-	return metadata, nil
+	return metadata, admissionEntry.endOffset, entryCount, nil
 }
 
 type prefixEntry struct {

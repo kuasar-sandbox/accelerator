@@ -2,12 +2,12 @@ package bundle
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"math"
 	"os"
@@ -99,23 +99,31 @@ type entrySlicer interface {
 }
 
 type archiveEntry struct {
-	file   *zip.File
-	offset int64
+	dataOffset uint64
+	size       uint32
+	crc32      uint32
 }
 
-// Reader indexes one immutable Bundle. Construction reads ZIP metadata only;
-// Manifest payloads are parsed when selected and Chunk payloads stay untouched
-// until requested.
+// Reader indexes one immutable Bundle from its mandatory tail index. Open
+// reads the canonical ZIP tail, index footer and Local Header, metadata prefix,
+// and Manifest section. The Chunk section is loaded once only after this
+// Bundle has been selected as a Manifest source.
 type Reader struct {
 	source io.ReaderAt
 	slicer entrySlicer
 	size   int64
 
-	admission store.WriteAdmission
-	refs      []string
-	manifests map[store.ContentKey]*archiveEntry
-	chunks    map[store.ContentKey]*archiveEntry
-	buffers   readBufferPool
+	admission       store.WriteAdmission
+	refs            []string
+	directoryOffset uint64
+	directoryCount  uint64
+	index           indexFooter
+	indexCRC32      uint32
+	manifests       map[store.ContentKey]archiveEntry
+	chunks          map[store.ContentKey]archiveEntry
+	chunkOnce       sync.Once
+	chunkErr        error
+	buffers         readBufferPool
 
 	lifeMu         sync.Mutex
 	closeRequested bool
@@ -193,13 +201,6 @@ func newReader(source io.ReaderAt, size int64, slicer entrySlicer, cleanup func(
 	if size < directoryEndSize {
 		return nil, fmt.Errorf("manifest bundle: truncated ZIP")
 	}
-	var magic [4]byte
-	if err := readFullAt(source, magic[:], 0); err != nil {
-		return nil, fmt.Errorf("manifest bundle: read ZIP magic: %w", err)
-	}
-	if magic != zipLocalHeaderMagic {
-		return nil, fmt.Errorf("manifest bundle: invalid ZIP local-header magic %x", magic)
-	}
 	var directoryEnd [directoryEndSize]byte
 	if err := readFullAt(source, directoryEnd[:], size-directoryEndSize); err != nil {
 		return nil, fmt.Errorf("manifest bundle: read ZIP directory end: %w", err)
@@ -211,147 +212,124 @@ func newReader(source io.ReaderAt, size int64, slicer entrySlicer, cleanup func(
 	if err != nil {
 		return nil, err
 	}
-	zr, err := zip.NewReader(source, size)
+	if directoryRecords > maxBundleEntries {
+		return nil, fmt.Errorf("manifest bundle: Central Directory record count %d exceeds limit %d", directoryRecords, maxBundleEntries)
+	}
+	if directoryOffset < indexFooterSize {
+		return nil, fmt.Errorf("manifest bundle: mandatory index footer is missing")
+	}
+	var encodedFooter [indexFooterSize]byte
+	if err := readFullAt(source, encodedFooter[:], directoryOffset-indexFooterSize); err != nil {
+		return nil, fmt.Errorf("manifest bundle: read index footer: %w", err)
+	}
+	footer, err := decodeIndexFooter(encodedFooter[:], uint64(directoryOffset))
 	if err != nil {
-		return nil, fmt.Errorf("manifest bundle: parse ZIP: %w", err)
+		return nil, err
 	}
-	if zr.Comment != "" {
-		return nil, fmt.Errorf("manifest bundle: ZIP archive comment is not allowed")
-	}
-	if len(zr.File) > maxBundleEntries {
-		return nil, fmt.Errorf("manifest bundle: %d entries exceed limit %d", len(zr.File), maxBundleEntries)
-	}
-	if directoryRecords != uint64(len(zr.File)) {
-		return nil, fmt.Errorf("manifest bundle: Central Directory record count %d differs from parsed count %d", directoryRecords, len(zr.File))
-	}
-	r := &Reader{
-		source:    source,
-		slicer:    slicer,
-		size:      size,
-		manifests: make(map[store.ContentKey]*archiveEntry),
-		chunks:    make(map[store.ContentKey]*archiveEntry),
-		cleanup:   cleanup,
-	}
-	seenNames := make(map[string]struct{}, len(zr.File))
-	admissions := 0
-	var refsEntry *archiveEntry
-	var expectedOffset int64
-	var localHeaderScratch [256]byte
-	for index, file := range zr.File {
-		if _, duplicate := seenNames[file.Name]; duplicate {
-			return nil, fmt.Errorf("manifest bundle: duplicate ZIP entry %q", file.Name)
-		}
-		seenNames[file.Name] = struct{}{}
-		if err := validateEntryHeader(file); err != nil {
-			return nil, err
-		}
-		dataOffset, nextOffset, err := r.validateLocalHeaderAt(file, expectedOffset, localHeaderScratch[:])
-		if err != nil {
-			return nil, err
-		}
-		expectedOffset = nextOffset
-		entry := &archiveEntry{file: file, offset: dataOffset}
-		switch {
-		case file.Name == refsName:
-			if index != 0 {
-				return nil, fmt.Errorf("manifest bundle: %s must be the first ZIP entry", refsName)
-			}
-			if file.UncompressedSize64 == 0 {
-				return nil, fmt.Errorf("manifest bundle: refs payload must be non-empty")
-			}
-			if file.UncompressedSize64 > maxRefsPayload {
-				return nil, fmt.Errorf("manifest bundle: refs payload exceeds %d bytes", maxRefsPayload)
-			}
-			refsEntry = entry
-		case strings.HasPrefix(file.Name, admissionPrefix):
-			admissions++
-			if admissions > 1 {
-				return nil, fmt.Errorf("manifest bundle: multiple admission entries")
-			}
-			if file.UncompressedSize64 != 0 {
-				return nil, fmt.Errorf("manifest bundle: admission payload must be empty")
-			}
-			if file.CRC32 != crc32.ChecksumIEEE(nil) {
-				return nil, fmt.Errorf("manifest bundle: admission entry has non-canonical CRC")
-			}
-			wantIndex := 0
-			if refsEntry != nil {
-				wantIndex = 1
-			}
-			if index != wantIndex {
-				return nil, fmt.Errorf("manifest bundle: admission must be ZIP entry %d", wantIndex)
-			}
-			admission, err := parseAdmissionName(file.Name)
-			if err != nil {
-				return nil, err
-			}
-			r.admission = admission
-		case strings.HasPrefix(file.Name, legacyAdmissionPrefix):
-			return nil, fmt.Errorf("manifest bundle: legacy admission entry %q is not allowed", file.Name)
-		case strings.HasPrefix(file.Name, manifestPrefix):
-			if admissions == 0 {
-				return nil, fmt.Errorf("manifest bundle: object entry %q precedes admission", file.Name)
-			}
-			key, err := parseObjectEntry(file.Name, manifestPrefix)
-			if err != nil {
-				return nil, err
-			}
-			if file.UncompressedSize64 < 5 || file.UncompressedSize64 > uint64(codec.MaxManifestDecodedSize)+1 {
-				return nil, fmt.Errorf("manifest bundle: Manifest %s physical size %d is invalid", hex.EncodeToString(key[:]), file.UncompressedSize64)
-			}
-			if _, duplicate := r.manifests[key]; duplicate {
-				return nil, fmt.Errorf("manifest bundle: duplicate Manifest key %s", hex.EncodeToString(key[:]))
-			}
-			r.manifests[key] = entry
-		case strings.HasPrefix(file.Name, chunkPrefix):
-			if admissions == 0 {
-				return nil, fmt.Errorf("manifest bundle: object entry %q precedes admission", file.Name)
-			}
-			key, err := parseObjectEntry(file.Name, chunkPrefix)
-			if err != nil {
-				return nil, err
-			}
-			if file.UncompressedSize64 == 0 || file.UncompressedSize64 > uint64(codec.MaxChunkDecodedSize)+1 {
-				return nil, fmt.Errorf("manifest bundle: Chunk %s physical size %d is invalid", hex.EncodeToString(key[:]), file.UncompressedSize64)
-			}
-			if _, duplicate := r.chunks[key]; duplicate {
-				return nil, fmt.Errorf("manifest bundle: duplicate Chunk key %s", hex.EncodeToString(key[:]))
-			}
-			r.chunks[key] = entry
-		default:
-			if strings.HasPrefix(file.Name, "bundle/") {
-				return nil, fmt.Errorf("manifest bundle: unknown bundle metadata entry %q", file.Name)
-			}
-			return nil, fmt.Errorf("manifest bundle: unknown ZIP entry %q", file.Name)
-		}
-	}
-	if expectedOffset != directoryOffset {
-		return nil, fmt.Errorf("manifest bundle: local entries are not contiguous with the Central Directory")
-	}
-	if admissions != 1 {
-		return nil, fmt.Errorf("manifest bundle: exactly one admission entry is required")
-	}
-	canonicalSalt, err := store.SaltForGeneration(r.admission.Generation)
+	indexCRC, err := readAndValidateIndexLocalHeader(source, size, footer)
 	if err != nil {
-		return nil, fmt.Errorf("manifest bundle: admission: %w", err)
+		return nil, err
 	}
-	if r.admission.Salt != canonicalSalt {
-		return nil, fmt.Errorf("manifest bundle: admission salt is not canonical for generation %q", r.admission.Generation)
+	metadataSize, err := uint64AsInt(footer.MetadataPrefixEnd, "metadata prefix")
+	if err != nil {
+		return nil, err
 	}
-	if refsEntry != nil {
-		payload, err := r.readMetadataEntry(refsEntry)
-		if err != nil {
-			return nil, err
+	metadataPrefix := make([]byte, metadataSize)
+	if err := readFullAt(source, metadataPrefix, 0); err != nil {
+		return nil, fmt.Errorf("manifest bundle: read metadata prefix: %w", err)
+	}
+	metadata, metadataEnd, metadataEntries, err := readMetadataPrefix(bytes.NewReader(metadataPrefix), int64(len(metadataPrefix)))
+	if err != nil {
+		return nil, err
+	}
+	if uint64(metadataEnd) != footer.MetadataPrefixEnd {
+		return nil, fmt.Errorf("manifest bundle: metadata prefix end %d differs from index footer %d", metadataEnd, footer.MetadataPrefixEnd)
+	}
+	expectedRecords, err := checkedAdd64(footer.Manifest.Count, footer.Chunk.Count)
+	if err == nil {
+		expectedRecords, err = checkedAdd64(expectedRecords, uint64(metadataEntries+1)) // mandatory index entry
+	}
+	if err != nil || expectedRecords != directoryRecords || expectedRecords > maxBundleEntries {
+		return nil, fmt.Errorf("manifest bundle: index and metadata describe %d ZIP entries, Central Directory reports %d", expectedRecords, directoryRecords)
+	}
+	manifestBytes, err := readIndexSectionAt(source, footer.Manifest, store.PartitionManifest)
+	if err != nil {
+		return nil, err
+	}
+	manifests, err := decodeIndexRecords(manifestBytes, footer.Manifest, store.PartitionManifest, footer)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateArchiveEntryRanges(manifests, nil); err != nil {
+		return nil, err
+	}
+	return &Reader{
+		source:          source,
+		slicer:          slicer,
+		size:            size,
+		admission:       metadata.admission,
+		refs:            metadata.refs,
+		directoryOffset: uint64(directoryOffset),
+		directoryCount:  directoryRecords,
+		index:           footer,
+		indexCRC32:      indexCRC,
+		manifests:       manifests,
+		cleanup:         cleanup,
+	}, nil
+}
+
+func readAndValidateIndexLocalHeader(source io.ReaderAt, archiveSize int64, footer indexFooter) (uint32, error) {
+	headerOffset, err := uint64AsInt64(footer.IndexHeaderOffset, "index Local Header offset")
+	if err != nil {
+		return 0, err
+	}
+	if headerOffset < 0 || int64(indexLocalHeaderSize) > archiveSize-headerOffset {
+		return 0, fmt.Errorf("manifest bundle: index Local Header is outside archive")
+	}
+	var header [indexLocalHeaderSize]byte
+	if err := readFullAt(source, header[:], headerOffset); err != nil {
+		return 0, fmt.Errorf("manifest bundle: read index Local Header: %w", err)
+	}
+	if !bytesEqual4(header[:4], zipLocalHeaderMagic) {
+		return 0, fmt.Errorf("manifest bundle: index Local Header magic is invalid")
+	}
+	if binary.LittleEndian.Uint16(header[4:6]) != 45 || binary.LittleEndian.Uint16(header[6:8]) != 0 ||
+		binary.LittleEndian.Uint16(header[8:10]) != zip.Store || binary.LittleEndian.Uint16(header[10:12]) != 0 ||
+		binary.LittleEndian.Uint16(header[12:14]) != 0 {
+		return 0, fmt.Errorf("manifest bundle: index Local Header is not canonical Store metadata")
+	}
+	if footer.IndexPayloadSize > math.MaxUint32 || uint64(binary.LittleEndian.Uint32(header[18:22])) != footer.IndexPayloadSize ||
+		uint64(binary.LittleEndian.Uint32(header[22:26])) != footer.IndexPayloadSize {
+		return 0, fmt.Errorf("manifest bundle: index Local Header size differs from footer")
+	}
+	if int(binary.LittleEndian.Uint16(header[26:28])) != len(indexName) || binary.LittleEndian.Uint16(header[28:30]) != 0 {
+		return 0, fmt.Errorf("manifest bundle: index Local Header name or extra field is not canonical")
+	}
+	if string(header[zipLocalHeaderFixedSize:]) != indexName {
+		return 0, fmt.Errorf("manifest bundle: index Local Header name is invalid")
+	}
+	if footer.IndexHeaderOffset+uint64(indexLocalHeaderSize) != footer.IndexPayloadOffset {
+		return 0, fmt.Errorf("manifest bundle: index Local Header does not precede its payload")
+	}
+	return binary.LittleEndian.Uint32(header[14:18]), nil
+}
+
+func readIndexSectionAt(source io.ReaderAt, section indexSection, partition store.Partition) ([]byte, error) {
+	size, err := uint64AsInt(section.Size, string(partition)+" index section")
+	if err != nil {
+		return nil, err
+	}
+	offset, err := uint64AsInt64(section.Offset, string(partition)+" index section offset")
+	if err != nil {
+		return nil, err
+	}
+	payload := make([]byte, size)
+	if size != 0 {
+		if err := readFullAt(source, payload, offset); err != nil {
+			return nil, fmt.Errorf("manifest bundle: read %s index section: %w", partition, err)
 		}
-		r.refs, err = ParseRefs(payload)
-		if err != nil {
-			return nil, err
-		}
 	}
-	if len(r.manifests) == 0 {
-		return nil, fmt.Errorf("manifest bundle: at least one Manifest entry is required")
-	}
-	return r, nil
+	return payload, nil
 }
 
 func readCentralDirectoryLocation(source io.ReaderAt, archiveSize int64, end [22]byte) (int64, uint64, error) {
@@ -502,6 +480,9 @@ func (r *Reader) HasManifest(key store.ContentKey) bool {
 }
 
 func (r *Reader) HasChunk(key store.ContentKey) bool {
+	if err := r.prepareChunks(context.Background()); err != nil {
+		return false
+	}
 	_, ok := r.chunks[key]
 	return ok
 }
@@ -511,7 +492,57 @@ func (r *Reader) ManifestKeys() []store.ContentKey {
 }
 
 func (r *Reader) ChunkKeys() []store.ContentKey {
+	if err := r.prepareChunks(context.Background()); err != nil {
+		return nil
+	}
 	return sortedKeys(r.chunks)
+}
+
+// prepareChunks loads and validates the complete Chunk section in one
+// contiguous ReaderAt call. The first caller's result, including cancellation
+// or Close, is retained for every concurrent and subsequent caller.
+func (r *Reader) prepareChunks(ctx context.Context) error {
+	if ctx == nil {
+		return fmt.Errorf("manifest bundle: Chunk index preparation context is required")
+	}
+	r.chunkOnce.Do(func() {
+		r.chunkErr = r.loadChunkIndex(ctx)
+	})
+	return r.chunkErr
+}
+
+func (r *Reader) loadChunkIndex(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := r.retainBlob(); err != nil {
+		return err
+	}
+	defer r.releaseBlob()
+	payload, err := readIndexSectionAt(r.source, r.index.Chunk, store.PartitionChunk)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	chunks, err := decodeIndexRecords(payload, r.index.Chunk, store.PartitionChunk, r.index)
+	if err != nil {
+		return err
+	}
+	if err := validateArchiveEntryRanges(r.manifests, chunks); err != nil {
+		return err
+	}
+	r.lifeMu.Lock()
+	defer r.lifeMu.Unlock()
+	if r.closeRequested || r.closed {
+		return ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.chunks = chunks
+	return nil
 }
 
 // Getter returns the Bundle-only object Getter. Misses never consult another
@@ -524,29 +555,34 @@ func (g *getter) Get(ctx context.Context, partition store.Partition, key store.C
 	if err := ctx.Err(); err != nil {
 		return cache.CacheMiss, nil, err
 	}
-	var entry *archiveEntry
+	var entry archiveEntry
+	var ok bool
 	switch partition {
 	case store.PartitionManifest:
-		entry = g.reader.manifests[key]
+		entry, ok = g.reader.manifests[key]
 	case store.PartitionChunk:
-		entry = g.reader.chunks[key]
+		if err := g.reader.prepareChunks(ctx); err != nil {
+			return cache.CacheMiss, nil, err
+		}
+		entry, ok = g.reader.chunks[key]
 	default:
 		return cache.CacheMiss, nil, nil
 	}
-	if entry == nil {
+	if !ok {
 		return cache.CacheMiss, nil, nil
 	}
-	blob, err := g.reader.entryBlob(entry)
+	blob, err := g.reader.entryBlob(partition, key, entry)
 	if err != nil {
 		return cache.CacheMiss, nil, err
 	}
 	return cache.CacheHit, blob, nil
 }
 
-// ValidateManifest implements fetch.ManifestValidator. It proves a local
-// Manifest's non-zero Chunk closure using directory lookups only.
-func (g *getter) ValidateManifest(key store.ContentKey, manifest *codec.Manifest) error {
-	if !g.reader.HasManifest(key) {
+// validateManifestClosure is reserved for explicit verification and exact
+// upload. Ordinary Fetcher.OpenManifest deliberately does not expose this as
+// fetch.ManifestValidator and therefore does not scan an unvisited closure.
+func (r *Reader) validateManifestClosure(key store.ContentKey, manifest *codec.Manifest) error {
+	if !r.HasManifest(key) {
 		return fmt.Errorf("manifest bundle: Manifest %s is not local", hex.EncodeToString(key[:]))
 	}
 	for index, entry := range manifest.Entries {
@@ -554,14 +590,14 @@ func (g *getter) ValidateManifest(key store.ContentKey, manifest *codec.Manifest
 			continue
 		}
 		chunkKey := store.ContentKey(entry.CiphertextHash)
-		if !g.reader.HasChunk(chunkKey) {
+		if _, ok := r.chunks[chunkKey]; !ok {
 			return fmt.Errorf("%w: Manifest %s Chunk %d (%s) is absent", ErrIncomplete, hex.EncodeToString(key[:]), index, hex.EncodeToString(chunkKey[:]))
 		}
 	}
 	return nil
 }
 
-func (r *Reader) entryBlob(entry *archiveEntry) (cache.Blob, error) {
+func (r *Reader) entryBlob(partition store.Partition, key store.ContentKey, entry archiveEntry) (cache.Blob, error) {
 	if err := r.retainBlob(); err != nil {
 		return nil, err
 	}
@@ -571,54 +607,36 @@ func (r *Reader) entryBlob(entry *archiveEntry) (cache.Blob, error) {
 			r.releaseBlob()
 		}
 	}()
-	if entry.file.UncompressedSize64 > uint64(maxInt()) {
-		return nil, fmt.Errorf("manifest bundle: ZIP entry %q is too large", entry.file.Name)
+	size := int(entry.size)
+	offset, err := uint64AsInt64(entry.dataOffset, string(partition)+" data offset")
+	if err != nil {
+		return nil, err
 	}
-	size := int(entry.file.UncompressedSize64)
-	if entry.offset < 0 || uint64(entry.offset) > uint64(r.size) || entry.file.UncompressedSize64 > uint64(r.size-entry.offset) {
-		return nil, fmt.Errorf("manifest bundle: ZIP entry %q data range is outside archive", entry.file.Name)
+	if offset < 0 || offset > r.size || int64(size) > r.size-offset {
+		return nil, fmt.Errorf("manifest bundle: %s %s data range is outside archive", partition, hex.EncodeToString(key[:]))
 	}
 	var data []byte
 	var pooled []byte
-	var err error
 	if r.slicer != nil {
-		data, err = r.slicer.Slice(entry.offset, size)
+		data, err = r.slicer.Slice(offset, size)
 	} else {
 		var reusable bool
 		data, reusable = r.buffers.get(size)
 		if reusable {
 			pooled = data
 		}
-		var n int
-		n, err = r.source.ReadAt(data, entry.offset)
-		if err == io.EOF && len(data) == 0 {
-			err = nil
-		} else if err == nil && n != len(data) {
-			err = io.ErrUnexpectedEOF
-		}
+		err = readFullAt(r.source, data, offset)
 	}
 	if err != nil {
 		if pooled != nil {
 			r.buffers.put(pooled)
 		}
-		return nil, fmt.Errorf("manifest bundle: read ZIP entry %q: %w", entry.file.Name, err)
+		return nil, fmt.Errorf("manifest bundle: read %s %s: %w", partition, hex.EncodeToString(key[:]), err)
 	}
 	backing := &blobBacking{data: data[:len(data):len(data)], pooled: pooled, pool: &r.buffers}
 	backing.refs.Store(1)
 	releaseOnError = false
 	return &readerBlob{reader: r, backing: backing}, nil
-}
-
-func (r *Reader) readMetadataEntry(entry *archiveEntry) ([]byte, error) {
-	size := int(entry.file.UncompressedSize64)
-	payload := make([]byte, size)
-	if err := readFullAt(r.source, payload, entry.offset); err != nil {
-		return nil, fmt.Errorf("manifest bundle: read ZIP entry %q: %w", entry.file.Name, err)
-	}
-	if crc32.ChecksumIEEE(payload) != entry.file.CRC32 {
-		return nil, fmt.Errorf("manifest bundle: ZIP entry %q CRC mismatch", entry.file.Name)
-	}
-	return payload, nil
 }
 
 // validateLocalHeaderAt proves that the next Central Directory item is also
