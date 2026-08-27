@@ -33,6 +33,15 @@ func (s ManifestSource) OpenManifest(ctx context.Context, key store.ContentKey) 
 	if s.Fetcher == nil {
 		return nil, fmt.Errorf("manifest bundle: selected source has no Fetcher for Manifest %s", hex.EncodeToString(key[:]))
 	}
+	if s.Reader != nil {
+		if err := s.Reader.prepareChunks(ctx); err != nil {
+			label := s.Ref
+			if label == "" {
+				label = "current Bundle"
+			}
+			return nil, fmt.Errorf("manifest bundle: selected %s failed to prepare Chunk index: %w", label, err)
+		}
+	}
 	stream, err := s.Fetcher.OpenManifest(ctx, key)
 	if err == nil {
 		return stream, nil
@@ -112,7 +121,7 @@ func (f *ManifestFetcher) OpenRootManifest(ctx context.Context, key store.Conten
 	if err != nil {
 		return nil, err
 	}
-	stream, err := source.Fetcher.OpenManifest(ctx, key)
+	stream, err := source.OpenManifest(ctx, key)
 	if err != nil {
 		return nil, fmt.Errorf("manifest bundle: open root Manifest %s from current Bundle: %w", hex.EncodeToString(key[:]), err)
 	}

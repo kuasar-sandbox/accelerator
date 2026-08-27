@@ -1,6 +1,6 @@
-// Package bundle implements the standard ZIP64 container profile for local
-// Manifest snapshots. It stores exact physical Manifest and Chunk objects and
-// never provides object-level fallback to another source.
+// Package bundle implements the indexed standard-ZIP64 container profile for
+// local Manifest snapshots. It stores exact physical Manifest and Chunk
+// objects and never provides object-level fallback to another source.
 package bundle
 
 import (
@@ -18,6 +18,7 @@ import (
 
 const (
 	refsName              = "bundle/refs"
+	indexName             = "bundle/index"
 	admissionPrefix       = "bundle/admission/"
 	legacyAdmissionPrefix = "admission/"
 	manifestPrefix        = "manifest/"
@@ -26,6 +27,11 @@ const (
 	maxBundleEntries = 100_000
 	maxBundleRefs    = 1_024
 	maxRefsPayload   = 1 << 20
+
+	// The metadata prefix is refs (at most 1 MiB), admission, and their
+	// canonical Local File Headers. Keep a fixed bound before allocating the
+	// single Open-time range buffer.
+	maxMetadataPrefixBytes = maxRefsPayload + 1_024
 )
 
 var (

@@ -63,6 +63,9 @@ func (r *Reader) verifyAndUpload(ctx context.Context, root store.ContentKey, cus
 	if decryptor == nil {
 		return fmt.Errorf("manifest bundle: decryptor is required")
 	}
+	if err := r.verifyContainer(ctx); err != nil {
+		return fmt.Errorf("manifest bundle: strict container verification: %w", err)
+	}
 	if !r.HasManifest(root) {
 		return fmt.Errorf("manifest bundle: root Manifest %s is absent", hex.EncodeToString(root[:]))
 	}
@@ -112,12 +115,11 @@ func (r *Reader) verifyAndUpload(ctx context.Context, root store.ContentKey, cus
 		}
 		clear(chunkRefs)
 	}()
-	validator := &getter{reader: r}
 	for _, manifestKey := range manifestKeys {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		blob, err := r.entryBlob(r.manifests[manifestKey])
+		blob, err := r.entryBlob(store.PartitionManifest, manifestKey, r.manifests[manifestKey])
 		if err != nil {
 			return err
 		}
@@ -136,7 +138,7 @@ func (r *Reader) verifyAndUpload(ctx context.Context, root store.ContentKey, cus
 		if err != nil {
 			return fmt.Errorf("manifest bundle: Manifest %s unseal key table: %w", hex.EncodeToString(manifestKey[:]), err)
 		}
-		if err := validator.ValidateManifest(manifestKey, manifest); err != nil {
+		if err := r.validateManifestClosure(manifestKey, manifest); err != nil {
 			clear(keys)
 			return err
 		}
@@ -228,7 +230,7 @@ func (r *Reader) verifyChunks(ctx context.Context, keys []store.ContentKey, refs
 				} else {
 					plain = plain[:reference.plainSize]
 				}
-				blob, err := r.entryBlob(r.chunks[key])
+				blob, err := r.entryBlob(store.PartitionChunk, key, r.chunks[key])
 				if err != nil {
 					fail(err)
 					continue
@@ -286,7 +288,7 @@ func (r *Reader) uploadManifest(ctx context.Context, target ExactStore, key stor
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	blob, err := r.entryBlob(r.manifests[key])
+	blob, err := r.entryBlob(store.PartitionManifest, key, r.manifests[key])
 	if err != nil {
 		return err
 	}

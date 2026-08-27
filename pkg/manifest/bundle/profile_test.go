@@ -45,7 +45,7 @@ func TestWriterMetadataOrderAndReaderRefsCopy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := []string{zr.File[0].Name, zr.File[1].Name, zr.File[2].Name}; !reflect.DeepEqual(got, []string{refsName, admissionName(admission), manifest.name}) {
+	if got := []string{zr.File[0].Name, zr.File[1].Name, zr.File[2].Name, zr.File[3].Name}; !reflect.DeepEqual(got, []string{refsName, admissionName(admission), manifest.name, indexName}) {
 		t.Fatalf("ZIP entry order = %v", got)
 	}
 	reader, err := NewReader(bytes.NewReader(output.Bytes()), int64(output.Len()))
@@ -188,8 +188,13 @@ func TestReaderRejectsMetadataOrderLegacyAndUnknownBundleEntries(t *testing.T) {
 func TestReaderRejectsCentralDirectoryPhysicalOrderMismatch(t *testing.T) {
 	data := rawZIP(t, []rawEntry{canonicalAdmissionEntry(t), canonicalManifestEntry(t)}, "")
 	mutated := reorderFirstTwoCentralRecords(t, data)
-	if _, err := NewReader(bytes.NewReader(mutated), int64(len(mutated))); err == nil {
-		t.Fatal("Central Directory order differing from local-header order was accepted")
+	reader, err := NewReader(bytes.NewReader(mutated), int64(len(mutated)))
+	if err != nil {
+		t.Fatalf("hot Reader unexpectedly read Central Directory order: %v", err)
+	}
+	defer reader.Close()
+	if err := reader.verifyContainer(context.Background()); err == nil {
+		t.Fatal("Central Directory order differing from local-header order was accepted by strict verification")
 	}
 }
 
@@ -214,7 +219,7 @@ func TestReaderRejectsGapAndHiddenLocalEntry(t *testing.T) {
 		gap  []byte
 	}{
 		{name: "arbitrary gap", gap: []byte{0}},
-		{name: "hidden local entry", gap: localPrefix(t, rawZIP(t, []rawEntry{{name: "hidden", data: []byte("x")}}, ""))},
+		{name: "hidden local entry", gap: localPrefix(t, rawZIPWithoutIndex(t, []rawEntry{{name: "hidden", data: []byte("x")}}, ""))},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mutated := insertBeforeSecondLocalEntry(t, valid, tc.gap)
@@ -259,6 +264,57 @@ func reorderFirstTwoCentralRecords(t *testing.T, data []byte) []byte {
 	}
 	mutated = append(mutated, data[eocd:]...)
 	return mutated
+}
+
+func mutateSecondCentralLocalOffset(t *testing.T, data []byte) []byte {
+	t.Helper()
+	start, eocd, records := centralRecords(t, data)
+	if len(records) < 2 {
+		t.Fatal("need two Central Directory records")
+	}
+	offset := binary.LittleEndian.Uint32(records[1][42:46])
+	binary.LittleEndian.PutUint32(records[1][42:46], offset+1)
+	mutated := append([]byte(nil), data[:start]...)
+	for _, record := range records {
+		mutated = append(mutated, record...)
+	}
+	return append(mutated, data[eocd:]...)
+}
+
+func TestStrictVerifierRejectsCentralDirectoryLocalOffsetMismatch(t *testing.T) {
+	data := rawZIP(t, []rawEntry{canonicalAdmissionEntry(t), canonicalManifestEntry(t)}, "")
+	mutated := mutateSecondCentralLocalOffset(t, data)
+	reader, err := NewReader(bytes.NewReader(mutated), int64(len(mutated)))
+	if err != nil {
+		t.Fatalf("hot Reader unexpectedly read Central Directory entry offsets: %v", err)
+	}
+	defer reader.Close()
+	if err := reader.verifyContainer(context.Background()); err == nil {
+		t.Fatal("strict verifier accepted a mismatched Central Directory Local Header offset")
+	}
+}
+
+func TestStrictVerifierRejectsCentralDirectoryInternalAttributes(t *testing.T) {
+	data := rawZIP(t, []rawEntry{canonicalAdmissionEntry(t), canonicalManifestEntry(t)}, "")
+	start, eocd, records := centralRecords(t, data)
+	if len(records) < 2 {
+		t.Fatal("need two Central Directory records")
+	}
+	binary.LittleEndian.PutUint16(records[1][36:38], 1)
+	mutated := append([]byte(nil), data[:start]...)
+	for _, record := range records {
+		mutated = append(mutated, record...)
+	}
+	mutated = append(mutated, data[eocd:]...)
+
+	reader, err := NewReader(bytes.NewReader(mutated), int64(len(mutated)))
+	if err != nil {
+		t.Fatalf("hot Reader unexpectedly read Central Directory attributes: %v", err)
+	}
+	defer reader.Close()
+	if err := reader.verifyContainer(context.Background()); err == nil {
+		t.Fatal("strict verifier accepted non-zero Central Directory internal attributes")
+	}
 }
 
 func localPrefix(t *testing.T, data []byte) []byte {

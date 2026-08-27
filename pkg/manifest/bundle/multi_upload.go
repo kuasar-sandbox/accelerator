@@ -54,6 +54,11 @@ func verifyAndUploadExactManifests(ctx context.Context, root ExactManifest, depe
 	if err != nil {
 		return err
 	}
+	for _, reader := range readers {
+		if err := reader.verifyContainer(ctx); err != nil {
+			return fmt.Errorf("manifest bundle: strict source container verification: %w", err)
+		}
+	}
 	if target != nil {
 		seenAdmissions := make(map[store.WriteAdmission]struct{}, len(readers))
 		for _, reader := range readers {
@@ -106,15 +111,15 @@ func verifyAndUploadExactManifests(ctx context.Context, root ExactManifest, depe
 		if err != nil {
 			return fmt.Errorf("manifest bundle: Manifest %s unseal key table: %w", hex.EncodeToString(selected.Key[:]), err)
 		}
+		if err := selected.Reader.validateManifestClosure(selected.Key, manifest); err != nil {
+			clear(keys)
+			return err
+		}
 		for index, entry := range manifest.Entries {
 			if entry.IsZero {
 				continue
 			}
 			chunkKey := store.ContentKey(entry.CiphertextHash)
-			if !selected.Reader.HasChunk(chunkKey) {
-				clear(keys)
-				return fmt.Errorf("%w: Manifest %s Chunk %d (%s) is absent from selected Bundle", ErrIncomplete, hex.EncodeToString(selected.Key[:]), index, hex.EncodeToString(chunkKey[:]))
-			}
 			reference := chunkReference{decryptKey: keys[index], plainSize: entry.Size}
 			if previous, ok := globalRefs[chunkKey]; ok && previous != reference {
 				clear(keys)

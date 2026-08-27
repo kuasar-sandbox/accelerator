@@ -130,6 +130,41 @@ func TestUploadExactManifestsPreflightsAllAdmissionsBeforePut(t *testing.T) {
 	}
 }
 
+func TestUploadExactManifestsStrictlyVerifiesEverySourceBeforeTargetContact(t *testing.T) {
+	dependency := newTestFixture(t, "DEPENDENCY")
+	root := newTestFixture(t, "ROOT")
+	defer dependency.reader.Close()
+	defer root.reader.Close()
+
+	// Reordering CD records does not affect the hot tail-index Reader, but the
+	// explicit verifier must reject it before exact upload contacts the Store.
+	mutated := reorderFirstTwoCentralRecords(t, root.data)
+	badRoot, err := NewReader(bytes.NewReader(mutated), int64(len(mutated)))
+	if err != nil {
+		t.Fatalf("hot Reader unexpectedly inspected Central Directory order: %v", err)
+	}
+	defer badRoot.Close()
+	target := &multiExactStore{accepted: map[store.Generation]store.WriteAdmission{
+		dependency.admission.Generation: dependency.admission,
+		root.admission.Generation:       root.admission,
+	}}
+	err = UploadExactManifests(
+		context.Background(),
+		ExactManifest{Key: root.root, Reader: badRoot},
+		[]ExactManifest{{Key: dependency.root, Reader: dependency.reader}},
+		root.customer,
+		root.decryptor,
+		target,
+		VerifyOptions{},
+	)
+	if err == nil || !strings.Contains(err.Error(), "strict source container verification") {
+		t.Fatalf("UploadExactManifests error = %v", err)
+	}
+	if events := target.snapshot(); len(events) != 0 {
+		t.Fatalf("target contacted before every source container passed strict verification: %v", events)
+	}
+}
+
 func TestUploadExactManifestsRejectsAdmissionAndSaltDomainMismatch(t *testing.T) {
 	source := newTestFixture(t, "SOURCE")
 	root := newTestFixture(t, "ROOT")
@@ -197,6 +232,16 @@ func TestVerifyExactManifestsIgnoresUnselectedObjectsButRequiresClosure(t *testi
 	err := VerifyExactManifests(context.Background(), ExactManifest{Key: fixture.root, Reader: incomplete}, nil, fixture.customer, fixture.decryptor, VerifyOptions{})
 	if !errors.Is(err, ErrIncomplete) {
 		t.Fatalf("VerifyExactManifests error = %v, want ErrIncomplete", err)
+	}
+	target := &multiExactStore{accepted: map[store.Generation]store.WriteAdmission{fixture.admission.Generation: fixture.admission}}
+	err = UploadExactManifests(context.Background(), ExactManifest{Key: fixture.root, Reader: incomplete}, nil, fixture.customer, fixture.decryptor, target, VerifyOptions{})
+	if !errors.Is(err, ErrIncomplete) {
+		t.Fatalf("UploadExactManifests error = %v, want ErrIncomplete", err)
+	}
+	for _, event := range target.snapshot() {
+		if event.kind == "put" {
+			t.Fatal("exact upload performed a Put before validating the selected closure")
+		}
 	}
 }
 
