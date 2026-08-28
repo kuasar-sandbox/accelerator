@@ -157,6 +157,14 @@ jq -e '
     and .ref == "refs/heads/main")
   ' <<<"$run_json" >/dev/null
 
+final_pr_json=$(gh api "repos/$repo/pulls/$pr")
+jq -e --arg base "$base_sha" --arg head "$head_sha" \
+  --arg integration "$integration_sha" '
+    .base.sha == $base
+    and .head.sha == $head
+    and .merge_commit_sha == $integration
+  ' <<<"$final_pr_json" >/dev/null
+
 printf 'base=%s\nhead=%s\nintegration=%s\nBMS=%s\n' \
   "$base_sha" "$head_sha" "$integration_sha" "$bms_run_url"
 ```
