@@ -114,6 +114,8 @@ field.
 The following read-only check records and verifies the current evidence:
 
 ```bash
+set -euo pipefail
+
 repo=kuasar-sandbox/accelerator
 pr=123
 
@@ -159,13 +161,19 @@ printf 'base=%s\nhead=%s\nintegration=%s\nBMS=%s\n' \
   "$base_sha" "$head_sha" "$integration_sha" "$bms_run_url"
 ```
 
-Run this check again immediately before merging. Any base, head, integration,
-or companion source-set change invalidates the old evidence. When those values
-are unchanged and a failure is confirmed to be transient infrastructure, the
-current workflow run may be rerun. When any value changed, do not rerun an old
-event: produce a new supported pull request event by updating/rebasing the head,
-or, when there is no code change, convert the pull request to draft and mark it
-Ready again. Do not restore or temporarily add `workflow_dispatch`.
+Run this check again immediately before merging. Any base, head, or integration
+change invalidates the old evidence. An exact-head success proves that finalize
+revalidated the admitted companion source set before publishing that status; a
+later companion update is not encoded in the primary integration SHA. If a
+companion changes after success, rerun the current workflow and wait for its new
+exact-head result instead of relying on the earlier run.
+
+When the primary base, head, and integration are unchanged and a failure is
+confirmed to be transient infrastructure, the current workflow run may also be
+rerun. When any primary value changed, do not rerun an old event: produce a new
+supported pull request event by updating/rebasing the head, or, when there is no
+code change, convert the pull request to draft and mark it Ready again. Do not
+restore or temporarily add `workflow_dispatch`.
 
 After review conversations are resolved and current exact-head evidence is
 successful, squash merge manually. Auto-merge, merge commits, and rebase merges
