@@ -1,9 +1,12 @@
 # accelerator
 
-内容加速层:内容寻址存储 + 分层缓存 + 收敛加密,为 microVM 沙箱提供
-镜像/快照的按需加载与跨租户去重。
-是 [kuasar-sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) 平台的存储/镜像
-基础设施,独立演进。
+面向镜像、快照和稀疏工件的数据访问与存储基础组件.它提供普通/稀疏数据表示、
+本地工件与共享文件引用、Manifest、FS/S3-compatible store、分层缓存、完整性与
+加密、OCI 拉取、EROFS 展平、按需读取和预取.
+
+内容寻址和去重是其中一种能力,共享范围由 salt 与部署安全域决定,不是组件的唯一
+价值.本仓是 [kuasar-sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) 平台的
+存储/镜像基础设施,也可以独立演进和使用.
 
 ## 导出面(下游 import 的薄客户端)
 
