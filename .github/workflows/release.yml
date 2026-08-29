@@ -138,7 +138,7 @@ jobs:
   cleanup:
     needs: publish
     runs-on: [self-hosted, Linux, X64, kuasar-control]
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       actions: write
       contents: read

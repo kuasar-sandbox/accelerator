@@ -18,12 +18,22 @@ if ! install -d -m 0755 "$cache_root" 2>/dev/null \
   exec 9>"$cache_root/.download.lock"
 fi
 cache_archive="$cache_root/$ARCHIVE"
-flock 9
+CACHE_FILL_TIMEOUT=900
+CACHE_FILL_KILL_GRACE=10
+cache_fill_started=$SECONDS
+flock --timeout "$CACHE_FILL_TIMEOUT" 9 \
+  || { echo "install-gh-cli: timed out waiting for the shared cache lock" >&2; exit 1; }
 if ! printf '%s  %s\n' "$SHA256" "$cache_archive" | sha256sum --check --status; then
+  cache_fill_elapsed=$((SECONDS - cache_fill_started))
+  cache_fill_remaining=$((CACHE_FILL_TIMEOUT - cache_fill_elapsed - CACHE_FILL_KILL_GRACE))
+  [ "$cache_fill_remaining" -gt 0 ] \
+    || { echo "install-gh-cli: cache fill deadline expired" >&2; exit 1; }
   download_path="$(mktemp "$cache_root/$ARCHIVE.XXXXXX")"
   trap 'rm -f "$download_path"' EXIT
-  curl --fail --location --retry 3 --retry-max-time 240 \
-    --connect-timeout 20 --max-time 300 \
+  timeout --signal=TERM --kill-after="${CACHE_FILL_KILL_GRACE}s" \
+    "${cache_fill_remaining}s" \
+    curl --fail --location --retry 3 --retry-max-time "$cache_fill_remaining" \
+    --connect-timeout 20 --max-time "$cache_fill_remaining" \
     --silent --show-error --output "$download_path" \
     "https://github.com/cli/cli/releases/download/v${VERSION}/${ARCHIVE}"
   printf '%s  %s\n' "$SHA256" "$download_path" | sha256sum --check
