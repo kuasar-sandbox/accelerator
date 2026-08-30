@@ -58,7 +58,8 @@ func DialConnPool(addr string, cfg ConnPoolConfig) (*ConnPool, error) {
 		cfg.MaxSize = 1
 	}
 	// cfg.Timeout <= 0 stays 0 = no per-op deadline (SetOpDeadline
-	// no-ops on <=0, so ops are bounded only by the caller's context).
+	// clears any deadline rather than setting one when <=0, so ops
+	// are bounded only by the caller's context).
 	// The TCP/UDS *connect* still keeps a bounded fallback below — a
 	// dead listener must not hang the dial forever.
 	network, dialAddr := parseAddr(addr)
@@ -275,6 +276,11 @@ func (pc *PoolConn) Drain(pool cache.BlobPool) {
 
 func (pc *PoolConn) Ping(timeout time.Duration) error {
 	_ = pc.conn.SetDeadline(time.Now().Add(timeout))
+	// The ping deadline must not outlive this call: net.Conn deadlines
+	// are absolute timestamps that persist across ownership, so a
+	// connection returned to the pool afterwards must go back with a
+	// zero deadline, not the expired ping one.
+	defer func() { _ = pc.conn.SetDeadline(time.Time{}) }()
 	if err := pc.conn.WriteRequest(&wire.Request{Opcode: wire.OpcodePing}); err != nil {
 		return err
 	}
@@ -324,6 +330,11 @@ func (pc *PoolConn) SetOpDeadline(ctx context.Context, timeout time.Duration) {
 		}
 	}
 	if dl.IsZero() {
+		// No timeout budget: clear any deadline left over from a prior
+		// operation (e.g. a health-check Ping) rather than leaving it
+		// in place, since a stale absolute deadline would otherwise
+		// expire mid-flight and time out this unrelated operation.
+		_ = pc.conn.SetDeadline(time.Time{})
 		return
 	}
 	_ = pc.conn.SetDeadline(dl)
