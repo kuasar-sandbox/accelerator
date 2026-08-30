@@ -16,7 +16,7 @@ RocksDB / AWS SDK / Reed-Solomon 等重依赖:
 | 包 | 作用 |
 |---|---|
 | `pkg/sparse` | 平台统一稀疏模型:三态 `RunKind`(Hole/Zero/Data)+ 可执行 `Run` + `Source` 契约(`RunAt` 纯元数据解析,`Run.ReadAt` 在已解析区段内读取,`Source.ReadAt` 负责便利跨段读取,一次性源是一等公民),`ProbeHoles`(SEEK_HOLE)/`NewSource`/`Dense`;洞只来自权威元数据,禁止内容探洞 |
-| `pkg/manifest` (+ `codec`/`crypto`/`chunker`/`fetch`/`ingest`) | 分块 + 收敛加密 + 内容寻址的读写 SDK;`fetch.Stream` = `sparse.Source` + Close,manifest Data Run 额外实现 `fetch.ChunkRun`,layered 透传最终 serving Run;`fetch.OpenTarStream` 把本地 tarstream 工件零解包开成 Stream,`ingest.Ingest` 单趟消费任意 `sparse.Source` |
+| `pkg/manifest` (+ `codec`/`crypto`/`chunker`/`fetch`/`ingest`) | 分块 + 收敛加密 + 内容寻址的读写 SDK;`fetch.Stream` = `sparse.Source` + Close,manifest Data Run 额外实现 `fetch.ChunkRun`,layered 透传最终 serving Run,`fetch.ResolveChunkWindow`按最终可见性解析同一物理chunk在anchor两侧的连续窗口;`fetch.OpenTarStream` 把本地 tarstream 工件零解包开成 Stream,`ingest.Ingest` 单趟消费任意 `sparse.Source` |
 | `pkg/store` + `pkg/store/client` | 远端内容寻址存储代理的接口与客户端 |
 | `pkg/cache` + `pkg/cache/client` | 分层缓存的接口与客户端 |
 | `pkg/tarstream` | 单 payload 稀疏 tar 工件:`WriteTo` 写 GNU PAX sparse 1.0 + 空的 `.kuasar.sha256.<hex>` marker,边写边生成摘要;`SourceAt` 通过可选 `Digester` 零 payload 扫描读取身份;`ReadFrom` / `ReadSeekFrom` / `SourceFrom` 保持洞图精确往返与 GNU tar/archive-tar 互操作 |

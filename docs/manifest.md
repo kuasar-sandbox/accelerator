@@ -573,6 +573,7 @@ Stream (single manifest; callers use NewLayered for explicit top-to-bottom array
    │
    ├─ RunAt: resolve executable sparse.Run (Hole / Zero / Data)
    │     └─ manifest Data additionally implements fetch.ChunkRun
+   ├─ ResolveChunkWindow: expand a ChunkRun within final visibility
    ├─ Run.ReadAt: read one already-resolved visible run
    ├─ Stream.ReadAt: collect runs, then fetch visible Data concurrently
    │     └─ on-demand Getter → cache/store → verify → decrypt → bounded chunk cache
@@ -587,6 +588,14 @@ Stream (single manifest; callers use NewLayered for explicit top-to-bottom array
 不读取 payload,不调用 cache/store Get,也不校验、解密或改变一次性 source 的
 读取位置。manifest Data Run 保存首次解析得到的 chunk index,并额外实现
 `fetch.ChunkRun`;Hole、Zero 和 tar/file Data Run 只实现普通 `sparse.Run`。
+
+`fetch.ResolveChunkWindow(stream, anchor, maxBytes)`为需要复用一次物理chunk读取的
+调用方提供可选的双向元数据解析。`anchor`必须来自同一个最终组合`stream`的
+`RunAt`;当物理chunk不大于`maxBytes`时,helper返回包含anchor、由同一物理chunk
+服务的最大连续最终可见窗口。上层Hole透明,上层Data或Zero为硬边界,根Stream的
+`Size()`也是硬边界;同一下层chunk被opaque区段分开后不会跨区段合并。解析过程不
+调用payload Getter,不校验、解密或解压。超出上限或无法识别物理身份的包内
+`ChunkRun`保持原anchor不变,调用方仍可使用原有forward语义。
 
 `Stream.ReadAt` 先收集覆盖请求窗口的全部 Run,完成解析后再修改目标 buffer;
 随后只对 Data Run 并发调用 `Run.ReadAt`,Hole 和 Zero 直接填零。多层 Stream
