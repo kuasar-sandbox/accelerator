@@ -60,6 +60,8 @@ make test-e2e                  # 运行 test/e2e/run_all.sh;需要项目主仓�
 Reconcile Latest 工作流按 `main` 源码提交先后协调主线 Stable,同一提交才比较 SemVer。
 组件版本与平台聚合版本独立,
 平台始终按精确 Tag 选择本组件。
+同版本发布与删除共用完整 workflow mutation group;若 GitHub 合并 pending 请求,项目主仓
+协调器会把 cancelled 状态作为未完成操作自动重跑,不会把它当作发布或 GC 已完成。
 
 `deps/build-rocksdb.sh` 在 `build/<arch>/rocksdb/` 下编出无压缩的 `librocksdb.a`
 (约数分钟,冷启)。
