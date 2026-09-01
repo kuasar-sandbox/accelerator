@@ -281,6 +281,15 @@ func discoverDigest(ra io.ReaderAt, size int64, first *meta, dataStart int64) (c
 	if padding > size-expectedMarkerStart {
 		return zero, false, fmt.Errorf("%w: invalid payload padding", ErrInvalidCanonicalTarstream)
 	}
+	if padding > 0 {
+		var payloadPadding [512]byte
+		if err := readAtFull(ra, payloadPadding[:padding], expectedMarkerStart); err != nil {
+			return zero, false, fmt.Errorf("%w: read payload padding", ErrInvalidCanonicalTarstream)
+		}
+		if !isZeroBlock(payloadPadding[:padding]) {
+			return zero, false, fmt.Errorf("%w: invalid payload padding", ErrInvalidCanonicalTarstream)
+		}
+	}
 	expectedMarkerStart += padding
 
 	markerReader := io.NewSectionReader(ra, expectedMarkerStart, size-expectedMarkerStart)

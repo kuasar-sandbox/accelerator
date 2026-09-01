@@ -298,3 +298,30 @@ func TestCanonicalCarrierRejectsModifiedPayloadHeaderMetadata(t *testing.T) {
 		t.Fatalf("SourceFrom modified header error = %v", err)
 	}
 }
+
+func TestCanonicalCarrierRejectsNonzeroPayloadPadding(t *testing.T) {
+	body := []byte("payload")
+	var encoded bytes.Buffer
+	_, digest, err := WriteTo(context.Background(), &encoded, "snapshot", sparse.Dense(bytes.NewReader(body), uint64(len(body))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact := encoded.Bytes()
+	plan, err := makeWritePlan("snapshot", sparse.Dense(bytes.NewReader(body), uint64(len(body))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	paddingOffset := len(plan.prefix) + len(body)
+	artifact[paddingOffset] = 1
+
+	if _, _, err := SourceAt(bytes.NewReader(artifact), int64(len(artifact)), "snapshot", WithExpectedDigest(DigestScheme, digest)); !errors.Is(err, ErrInvalidCanonicalTarstream) {
+		t.Fatalf("SourceAt payload padding error = %v", err)
+	}
+	opened, _, err := SourceFrom(bytes.NewReader(artifact), "snapshot")
+	if err == nil {
+		_, err = opened.ReadAt(context.Background(), make([]byte, len(body)), 0)
+	}
+	if !errors.Is(err, ErrInvalidCanonicalTarstream) {
+		t.Fatalf("SourceFrom payload padding error = %v", err)
+	}
+}
