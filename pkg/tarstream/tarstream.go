@@ -81,9 +81,10 @@ func CarrierDigest(name string, src sparse.Source, options ...WriteOption) (stri
 	if !ok {
 		return "", "", fmt.Errorf("tarstream: source carrier does not provide a digest")
 	}
+	name = normalizeName(name)
 	plain, ok := provider.TarStreamDigest(name)
 	if !ok {
-		return "", "", fmt.Errorf("tarstream: source carrier cannot derive digest for %q", normalizeName(name))
+		return "", "", fmt.Errorf("tarstream: source carrier cannot derive digest for %q", name)
 	}
 	scheme, digest := externalDigest(opts.codec, plain)
 	return scheme, digestHex(digest), nil

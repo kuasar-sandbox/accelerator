@@ -294,6 +294,9 @@ func discoverDigest(ra io.ReaderAt, size int64, first *meta, dataStart int64) (c
 	if !strings.HasPrefix(marker.name, DigestMarkerPrefix) {
 		return zero, false, nil
 	}
+	if first.ordinal != 0 {
+		return zero, false, fmt.Errorf("%w: payload must be the first archive entry", ErrInvalidCanonicalTarstream)
+	}
 	if marker.logical != 40 || marker.stored != 40 || marker.mapLen != 0 {
 		return zero, false, fmt.Errorf("%w: invalid digest marker body", ErrInvalidCanonicalTarstream)
 	}
@@ -320,8 +323,21 @@ func discoverDigest(ra io.ReaderAt, size int64, first *meta, dataStart int64) (c
 	if !first.hasPayloadSize || first.payloadSize < 0 || uint64(first.payloadSize) != identity.payloadSize {
 		return zero, false, fmt.Errorf("%w: payload size metadata mismatch", ErrInvalidCanonicalTarstream)
 	}
-	if _, _, dense := prefixExtents(first.extents, first.payloadSize, first.logical); !dense {
+	_, payloadPacked, dense := prefixExtents(first.extents, first.payloadSize, first.logical)
+	if !dense {
 		return zero, false, fmt.Errorf("%w: metadata tail contains a hole", ErrInvalidCanonicalTarstream)
+	}
+	tailSize := first.logical - first.payloadSize
+	tailHasher := newTailHasher(uint64(tailSize))
+	copied, err := io.Copy(tailHasher, io.NewSectionReader(ra, dataStart+payloadPacked, tailSize))
+	if err != nil || copied != tailSize {
+		return zero, false, fmt.Errorf("%w: read metadata tail", ErrInvalidCanonicalTarstream)
+	}
+	var tailDigest [32]byte
+	copy(tailDigest[:], tailHasher.Sum(nil))
+	composed := composeDigest(first.name, uint64(first.logical), uint64(first.payloadSize), identity.payload, tailDigest)
+	if composed != identity.digest {
+		return zero, false, ErrDigestMismatch
 	}
 	var trailer [1024]byte
 	if err := readAtFull(ra, trailer[:], markerEnd); err != nil {
@@ -386,6 +402,7 @@ func packedPrefix(extents []extent) []int64 {
 // meta describes the located entry.
 type meta struct {
 	name           string
+	ordinal        int
 	logical        int64           // logical file size
 	stored         int64           // stored entry size (map + packed data)
 	mapLen         int64           // sparse map bytes consumed from the stored region
@@ -568,6 +585,7 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 			}
 			return &meta{
 				name:        effName,
+				ordinal:     ordinal - 1,
 				logical:     realsize,
 				stored:      stored,
 				mapLen:      mapLen,
@@ -581,7 +599,7 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 		if err != nil {
 			return nil, err
 		}
-		m := &meta{name: effName, logical: stored, stored: stored, payloadSize: payloadSize, hasPayloadSize: hasPayloadSize}
+		m := &meta{name: effName, ordinal: ordinal - 1, logical: stored, stored: stored, payloadSize: payloadSize, hasPayloadSize: hasPayloadSize}
 		if stored > 0 {
 			m.extents = []extent{{Offset: 0, Size: stored}}
 		}

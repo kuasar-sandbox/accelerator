@@ -252,6 +252,9 @@ func sourceFromSequential(r io.Reader, name string, options readOptions) (sparse
 	if err != nil {
 		return nil, "", keyBoundCanonicalError(options, err)
 	}
+	if view.meta.ordinal != 0 {
+		return nil, "", keyBoundCanonicalError(options, fmt.Errorf("%w: payload must be the first archive entry", ErrInvalidCanonicalTarstream))
+	}
 	if geometry != nil {
 		packedSize := view.meta.stored - view.meta.mapLen
 		if tracked.read < 0 || packedSize < 0 || uint64(tracked.read) != geometry.packedStart || uint64(packedSize) != geometry.packedSize {
