@@ -9,8 +9,8 @@ import (
 )
 
 const (
-	DigestSchemeSHA256 = "sha256"
-	DigestSchemeHMAC   = "hmac"
+	DigestScheme     = "digest"
+	DigestSchemeHMAC = "hmac"
 )
 
 type WriteOption interface {
@@ -79,8 +79,8 @@ type expectedDigestOption struct {
 	digest string
 }
 
-// WithExpectedDigest requires the canonical artifact identity to match the
-// supplied scheme and 64-character lowercase hex digest.
+// WithExpectedDigest requires the carrier identity to match the supplied
+// generic digest qualifier and 64-character lowercase hexadecimal value.
 func WithExpectedDigest(scheme, digest string) ReadOption {
 	return expectedDigestOption{scheme: scheme, digest: digest}
 }
@@ -120,19 +120,26 @@ func parseReadOptions(options []ReadOption) (readOptions, error) {
 			return result, err
 		}
 	}
-	wantScheme := DigestSchemeSHA256
-	if result.codecSet {
-		wantScheme = DigestSchemeHMAC
-	}
-	if result.expectedSet && result.scheme != wantScheme {
-		return result, fmt.Errorf("%w: expected digest scheme is incompatible with codec policy", ErrInvalidOption)
+	if result.expectedSet {
+		switch result.scheme {
+		case DigestScheme:
+			if result.required {
+				return result, fmt.Errorf("%w: plaintext digest is forbidden by required policy", ErrInvalidOption)
+			}
+		case DigestSchemeHMAC:
+			if result.codec == nil {
+				return result, fmt.Errorf("%w: hmac digest requires a codec", ErrInvalidOption)
+			}
+		default:
+			return result, fmt.Errorf("%w: unsupported digest scheme", ErrInvalidOption)
+		}
 	}
 	return result, nil
 }
 
 func decodeDigest(scheme, digest string) ([32]byte, error) {
 	var result [32]byte
-	if scheme != DigestSchemeSHA256 && scheme != DigestSchemeHMAC {
+	if scheme != DigestScheme && scheme != DigestSchemeHMAC {
 		return result, fmt.Errorf("%w: unsupported digest scheme", ErrInvalidDigest)
 	}
 	if len(digest) != hex.EncodedLen(len(result)) || strings.ToLower(digest) != digest {
@@ -146,13 +153,13 @@ func decodeDigest(scheme, digest string) ([32]byte, error) {
 
 func externalDigest(codec Codec, plain [32]byte) (string, [32]byte) {
 	if codec == nil {
-		return DigestSchemeSHA256, plain
+		return DigestScheme, plain
 	}
 	return DigestSchemeHMAC, codec.KeyedDigest(plain)
 }
 
-func checkExpected(options readOptions, actual [32]byte) error {
-	if options.expectedSet && subtle.ConstantTimeCompare(options.expected[:], actual[:]) != 1 {
+func checkExpected(options readOptions, scheme string, actual [32]byte) error {
+	if options.expectedSet && (options.scheme != scheme || subtle.ConstantTimeCompare(options.expected[:], actual[:]) != 1) {
 		return ErrDigestMismatch
 	}
 	return nil

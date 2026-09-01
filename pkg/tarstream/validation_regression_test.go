@@ -98,7 +98,7 @@ func TestCanonicalMarkerRejectsPrecedingExtensionHeader(t *testing.T) {
 	if _, err := writer.Write([]byte("data")); err != nil {
 		t.Fatal(err)
 	}
-	markerName := SHA256MarkerPrefix + strings.Repeat("a", 64)
+	markerName := DigestMarkerPrefix + strings.Repeat("a", 64)
 	if err := writer.WriteHeader(&stdtar.Header{
 		Name:       markerName,
 		Mode:       0o644,
@@ -115,10 +115,10 @@ func TestCanonicalMarkerRejectsPrecedingExtensionHeader(t *testing.T) {
 		t.Fatalf("SourceAt extension-marker error = %v", err)
 	}
 	source, _, err := SourceFrom(bytes.NewReader(artifact.Bytes()), "")
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		_, err = source.ReadAt(context.Background(), make([]byte, 4), 0)
 	}
-	if _, err := source.ReadAt(context.Background(), make([]byte, 4), 0); !errors.Is(err, ErrInvalidCanonicalTarstream) {
+	if !errors.Is(err, ErrInvalidCanonicalTarstream) {
 		t.Fatalf("SourceFrom extension-marker error = %v", err)
 	}
 }

@@ -14,7 +14,7 @@ const (
 	envelopeHeaderSealed = 81
 	recordSize           = 4096
 	recordOverhead       = 17
-	canonicalSuffixSize  = 3 * 512
+	canonicalSuffixSize  = 4 * 512
 	maxCoalesceBytes     = 1 << 20
 )
 

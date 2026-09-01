@@ -97,7 +97,7 @@ func TestRefsCodecRejectsNonCanonicalInput(t *testing.T) {
 		"file://dir\\root.bundle",
 		"file://root.snapshot",
 		"file://root.bundle@manifest:" + digest,
-		"file://root.bundle@sha256:" + digest,
+		"file://root.bundle@digest:" + digest,
 		"file://root.bundle@hmac:" + digest,
 		"file://root\n.bundle",
 		"file://root\r.bundle",

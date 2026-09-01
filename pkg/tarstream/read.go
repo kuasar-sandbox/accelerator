@@ -136,12 +136,12 @@ func SourceAt(ra io.ReaderAt, size int64, name string, options ...ReadOption) (s
 			_ = records.Close()
 			return nil, "", fmt.Errorf("%w: inner tar layout does not match authenticated header", ErrMalformedEnvelope)
 		}
-		scheme, digest := externalDigest(opts.codec, result.plainDigest)
-		if err := checkExpected(opts, digest); err != nil {
+		scheme, digest := externalDigest(opts.codec, result.identity.digest)
+		if err := checkExpected(opts, scheme, digest); err != nil {
 			_ = records.Close()
 			return nil, "", err
 		}
-		return &encryptedDigestedSource{Source: result.source, records: records, scheme: scheme, digest: hex.EncodeToString(digest[:])}, result.name, nil
+		return &encryptedDigestedSource{Source: result.source, records: records, name: result.name, identity: result.identity, scheme: scheme, digest: hex.EncodeToString(digest[:])}, result.name, nil
 	}
 	if opts.required {
 		return nil, "", ErrPlaintextForbidden
@@ -156,11 +156,14 @@ func SourceAt(ra io.ReaderAt, size int64, name string, options ...ReadOption) (s
 		}
 		return result.source, result.name, nil
 	}
-	scheme, digest := externalDigest(opts.codec, result.plainDigest)
-	if err := checkExpected(opts, digest); err != nil {
+	// A plaintext carrier keeps its plaintext identity even when an auto-mode
+	// codec is available. The physical carrier, not ambient policy, supplies
+	// the digest value.
+	scheme, digest := externalDigest(nil, result.identity.digest)
+	if err := checkExpected(opts, scheme, digest); err != nil {
 		return nil, "", err
 	}
-	return &digestedSource{Source: result.source, scheme: scheme, digest: hex.EncodeToString(digest[:])}, result.name, nil
+	return &digestedSource{Source: result.source, name: result.name, identity: result.identity, scheme: scheme, digest: hex.EncodeToString(digest[:])}, result.name, nil
 }
 
 // keyBoundCanonicalError prevents parser diagnostics derived from decrypted or
@@ -186,12 +189,12 @@ func keyBoundCanonicalError(options readOptions, err error) error {
 }
 
 type plainAtResult struct {
-	source      sparse.Source
-	name        string
-	meta        *meta
-	dataStart   int64
-	plainDigest [32]byte
-	hasDigest   bool
+	source    sparse.Source
+	name      string
+	meta      *meta
+	dataStart int64
+	identity  carrierIdentity
+	hasDigest bool
 }
 
 func sourceAtPlain(ra io.ReaderAt, size int64, name string) (plainAtResult, error) {
@@ -210,32 +213,48 @@ func sourceAtPlain(ra io.ReaderAt, size int64, name string) (plainAtResult, erro
 		dataStart:    dataStart,
 		packedPrefix: packedPrefix(m.extents),
 	})
-	digest, ok, err := discoverDigest(ra, size, m, dataStart)
+	identity, ok, err := discoverDigest(ra, size, m, dataStart)
 	if err != nil {
 		return plainAtResult{}, err
 	}
-	return plainAtResult{source: src, name: m.name, meta: m, dataStart: dataStart, plainDigest: digest, hasDigest: ok}, nil
+	return plainAtResult{source: src, name: m.name, meta: m, dataStart: dataStart, identity: identity, hasDigest: ok}, nil
 }
 
 // digestedSource adds the optional, already-parsed artifact identity without
 // changing sparse.Source or performing I/O from Digest.
 type digestedSource struct {
 	sparse.Source
-	scheme string
-	digest string
+	name     string
+	identity carrierIdentity
+	scheme   string
+	digest   string
 }
 
 func (s *digestedSource) Digest() (string, string) { return s.scheme, s.digest }
+func (s *digestedSource) TarStreamDigest(name string) ([32]byte, bool) {
+	return s.identity.digest, normalizeName(name) == s.name
+}
+func (s *digestedSource) PayloadCommitment() (uint64, [32]byte, bool) {
+	return s.identity.payloadSize, s.identity.payload, true
+}
 
 type encryptedDigestedSource struct {
 	sparse.Source
-	records *recordReaderAt
-	scheme  string
-	digest  string
+	records  *recordReaderAt
+	name     string
+	identity carrierIdentity
+	scheme   string
+	digest   string
 }
 
 func (s *encryptedDigestedSource) Digest() (string, string) { return s.scheme, s.digest }
-func (s *encryptedDigestedSource) Close() error             { return s.records.Close() }
+func (s *encryptedDigestedSource) TarStreamDigest(name string) ([32]byte, bool) {
+	return s.identity.digest, normalizeName(name) == s.name
+}
+func (s *encryptedDigestedSource) PayloadCommitment() (uint64, [32]byte, bool) {
+	return s.identity.payloadSize, s.identity.payload, true
+}
+func (s *encryptedDigestedSource) Close() error { return s.records.Close() }
 
 func encryptedMagicAt(ra io.ReaderAt, size int64) (bool, error) {
 	if size < int64(len(envelopeMagic)) {
@@ -248,11 +267,11 @@ func encryptedMagicAt(ra io.ReaderAt, size int64) (bool, error) {
 	return magic == envelopeMagic, nil
 }
 
-// discoverDigest recognizes the strict two-entry artifact shape. A normal tar
+// discoverDigest recognizes the strict payload-plus-marker artifact shape. A normal tar
 // without a marker is not an error; a reserved marker that is present but
 // malformed is. All scans skip stored payload bytes with Seek.
-func discoverDigest(ra io.ReaderAt, size int64, first *meta, dataStart int64) ([32]byte, bool, error) {
-	var zero [32]byte
+func discoverDigest(ra io.ReaderAt, size int64, first *meta, dataStart int64) (carrierIdentity, bool, error) {
+	var zero carrierIdentity
 	packedSize := first.stored - first.mapLen
 	if dataStart < 0 || packedSize < 0 || dataStart > size || packedSize > size-dataStart {
 		return zero, false, fmt.Errorf("%w: invalid payload bounds", ErrInvalidCanonicalTarstream)
@@ -261,6 +280,15 @@ func discoverDigest(ra io.ReaderAt, size int64, first *meta, dataStart int64) ([
 	padding := (512 - first.stored%512) % 512
 	if padding > size-expectedMarkerStart {
 		return zero, false, fmt.Errorf("%w: invalid payload padding", ErrInvalidCanonicalTarstream)
+	}
+	if padding > 0 {
+		var payloadPadding [512]byte
+		if err := readAtFull(ra, payloadPadding[:padding], expectedMarkerStart); err != nil {
+			return zero, false, fmt.Errorf("%w: read payload padding", ErrInvalidCanonicalTarstream)
+		}
+		if !isZeroBlock(payloadPadding[:padding]) {
+			return zero, false, fmt.Errorf("%w: invalid payload padding", ErrInvalidCanonicalTarstream)
+		}
 	}
 	expectedMarkerStart += padding
 
@@ -272,27 +300,59 @@ func discoverDigest(ra io.ReaderAt, size int64, first *meta, dataStart int64) ([
 		}
 		return zero, false, err
 	}
-	if !strings.HasPrefix(marker.name, SHA256MarkerPrefix) {
+	if !strings.HasPrefix(marker.name, DigestMarkerPrefix) {
 		return zero, false, nil
 	}
-	if marker.logical != 0 || marker.stored != 0 || marker.mapLen != 0 {
-		return zero, false, fmt.Errorf("%w: digest marker is not empty", ErrInvalidCanonicalTarstream)
+	if first.ordinal != 0 {
+		return zero, false, fmt.Errorf("%w: payload must be the first archive entry", ErrInvalidCanonicalTarstream)
+	}
+	if marker.logical != 40 || marker.stored != 40 || marker.mapLen != 0 {
+		return zero, false, fmt.Errorf("%w: invalid digest marker body", ErrInvalidCanonicalTarstream)
 	}
 	markerLength, err := markerReader.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return zero, false, err
 	}
-	markerEnd := expectedMarkerStart + markerLength
+	markerEnd := expectedMarkerStart + markerLength + 512
 	if markerLength != 512 || markerEnd > size || size-markerEnd != int64(len(zeroBlock2)) {
 		return zero, false, fmt.Errorf("%w: digest marker must be the final entry", ErrInvalidCanonicalTarstream)
 	}
 	var markerBlock [512]byte
-	if err := readAtFull(ra, markerBlock[:], markerEnd-512); err != nil {
+	if err := readAtFull(ra, markerBlock[:], expectedMarkerStart); err != nil {
 		return zero, false, fmt.Errorf("%w: read digest marker", ErrInvalidCanonicalTarstream)
 	}
-	digest, err := parseCanonicalMarker(markerBlock[:])
+	var markerBody [512]byte
+	if err := readAtFull(ra, markerBody[:], expectedMarkerStart+512); err != nil {
+		return zero, false, fmt.Errorf("%w: read digest marker body", ErrInvalidCanonicalTarstream)
+	}
+	identity, err := parseCanonicalMarker(markerBlock[:], markerBody[:])
 	if err != nil {
 		return zero, false, err
+	}
+	if !first.hasPayloadSize || first.payloadSize < 0 || uint64(first.payloadSize) != identity.payloadSize {
+		return zero, false, fmt.Errorf("%w: payload size metadata mismatch", ErrInvalidCanonicalTarstream)
+	}
+	if !first.canonicalPayload {
+		return zero, false, fmt.Errorf("%w: non-canonical payload header metadata", ErrInvalidCanonicalTarstream)
+	}
+	_, payloadPacked, dense := prefixExtents(first.extents, first.payloadSize, first.logical)
+	if !dense {
+		return zero, false, fmt.Errorf("%w: metadata tail contains a hole", ErrInvalidCanonicalTarstream)
+	}
+	tailSize := first.logical - first.payloadSize
+	if tailSize > maxMetadataTailSize {
+		return zero, false, fmt.Errorf("%w: metadata tail size %d exceeds %d", ErrInvalidCanonicalTarstream, tailSize, maxMetadataTailSize)
+	}
+	tailHasher := newTailHasher(uint64(tailSize))
+	copied, err := io.Copy(tailHasher, io.NewSectionReader(ra, dataStart+payloadPacked, tailSize))
+	if err != nil || copied != tailSize {
+		return zero, false, fmt.Errorf("%w: read metadata tail", ErrInvalidCanonicalTarstream)
+	}
+	var tailDigest [32]byte
+	copy(tailDigest[:], tailHasher.Sum(nil))
+	composed := composeDigest(first.name, uint64(first.logical), uint64(first.payloadSize), identity.payload, tailDigest)
+	if composed != identity.digest {
+		return zero, false, ErrDigestMismatch
 	}
 	var trailer [1024]byte
 	if err := readAtFull(ra, trailer[:], markerEnd); err != nil {
@@ -301,7 +361,7 @@ func discoverDigest(ra io.ReaderAt, size int64, first *meta, dataStart int64) ([
 	if !isZeroBlock(trailer[:512]) || !isZeroBlock(trailer[512:]) {
 		return zero, false, fmt.Errorf("%w: invalid end-of-archive", ErrInvalidCanonicalTarstream)
 	}
-	return digest, true, nil
+	return identity, true, nil
 }
 
 func newSeqView(r io.Reader, name string) (*seqView, error) {
@@ -356,12 +416,16 @@ func packedPrefix(extents []extent) []int64 {
 
 // meta describes the located entry.
 type meta struct {
-	name    string
-	logical int64           // logical file size
-	stored  int64           // stored entry size (map + packed data)
-	mapLen  int64           // sparse map bytes consumed from the stored region
-	extents []extent        // data extents in logical offsets (dense: one run)
-	holes   []sparse.Extent // canonical hole map (nil = dense)
+	name             string
+	ordinal          int
+	logical          int64           // logical file size
+	stored           int64           // stored entry size (map + packed data)
+	mapLen           int64           // sparse map bytes consumed from the stored region
+	extents          []extent        // data extents in logical offsets (dense: one run)
+	holes            []sparse.Extent // canonical hole map (nil = dense)
+	payloadSize      int64
+	hasPayloadSize   bool
+	canonicalPayload bool
 }
 
 // locate scans entries until it finds the one named want (empty: the
@@ -392,6 +456,9 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 	longName := ""
 	sawZero := false
 	ordinal := 0
+	canonicalMeta := true
+	var paxHeader [512]byte
+	paxHeaderSeen := false
 	for {
 		if _, err := io.ReadFull(r, blk[:]); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -405,6 +472,9 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 			}
 			sawZero = true
 			continue
+		}
+		if sawZero {
+			canonicalMeta = false
 		}
 		sawZero = false
 		if string(blk[257:262]) != "ustar" {
@@ -426,18 +496,25 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 
 		switch typeflag {
 		case 'x': // PAX extended header for the next entry
-			recs, err := readPAX(r, size, padded)
+			recs, canonicalPAX, err := readPAX(r, size, padded)
 			if err != nil {
 				return nil, err
 			}
+			if paxHeaderSeen || !canonicalPAX {
+				canonicalMeta = false
+			}
+			paxHeader = blk
+			paxHeaderSeen = true
 			maps.Copy(pax, recs)
 			continue
 		case 'g': // global header: not interpreted
+			canonicalMeta = false
 			if err := skip(padded); err != nil {
 				return nil, err
 			}
 			continue
 		case 'L': // GNU longname: data is the next entry's name
+			canonicalMeta = false
 			if size > 1<<20 {
 				return nil, fmt.Errorf("tarstream: absurd GNU longname size %d", size)
 			}
@@ -451,6 +528,7 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 			longName = strings.TrimRight(string(data), "\x00")
 			continue
 		case 'K': // GNU longlink: irrelevant here
+			canonicalMeta = false
 			if err := skip(padded); err != nil {
 				return nil, err
 			}
@@ -483,8 +561,14 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 			stored = v
 		}
 		entryPAX := pax
+		entryCanonicalMeta := canonicalMeta
+		entryPAXHeader := paxHeader
+		entryPAXHeaderSeen := paxHeaderSeen
 		pax = map[string]string{}
 		longName = ""
+		canonicalMeta = true
+		paxHeader = [512]byte{}
+		paxHeaderSeen = false
 
 		regular := typeflag == '0' || typeflag == 0
 		matched := match(effName, ordinal, regular)
@@ -505,6 +589,7 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 			return nil, ErrUnsupportedEncoding
 		}
 
+		payloadValue, hasPayloadSize := entryPAX[payloadSizePAX]
 		if entryPAX["GNU.sparse.major"] == "1" && entryPAX["GNU.sparse.minor"] == "0" {
 			realsize, err := strconv.ParseInt(entryPAX["GNU.sparse.realsize"], 10, 64)
 			if err != nil {
@@ -530,22 +615,61 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 			if packedSize != stored-mapLen {
 				return nil, fmt.Errorf("tarstream: sparse extents do not match stored size")
 			}
+			payloadSize, err := parsePayloadSize(payloadValue, hasPayloadSize, realsize)
+			if err != nil {
+				return nil, err
+			}
+			holes := extentsToHoles(realsize, extents)
 			return &meta{
-				name:    effName,
-				logical: realsize,
-				stored:  stored,
-				mapLen:  mapLen,
-				extents: extents,
-				holes:   extentsToHoles(realsize, extents),
+				name:        effName,
+				ordinal:     ordinal - 1,
+				logical:     realsize,
+				stored:      stored,
+				mapLen:      mapLen,
+				extents:     extents,
+				holes:       holes,
+				payloadSize: payloadSize, hasPayloadSize: hasPayloadSize,
+				canonicalPayload: entryCanonicalMeta && entryPAXHeaderSeen && len(holes) > 0 &&
+					canonicalPayloadHeaders(blk[:], entryPAXHeader[:], entryPAX, effName, realsize, stored, payloadSize, true),
 			}, nil
 		}
 
-		m := &meta{name: effName, logical: stored, stored: stored}
+		payloadSize, err := parsePayloadSize(payloadValue, hasPayloadSize, stored)
+		if err != nil {
+			return nil, err
+		}
+		m := &meta{
+			name: effName, ordinal: ordinal - 1, logical: stored, stored: stored,
+			payloadSize: payloadSize, hasPayloadSize: hasPayloadSize,
+			canonicalPayload: entryCanonicalMeta && entryPAXHeaderSeen &&
+				canonicalPayloadHeaders(blk[:], entryPAXHeader[:], entryPAX, effName, stored, stored, payloadSize, false),
+		}
 		if stored > 0 {
 			m.extents = []extent{{Offset: 0, Size: stored}}
 		}
 		return m, nil
 	}
+}
+
+// canonicalPayloadHeaders recognizes the deterministic transport metadata
+// emitted by payloadPrefix. The carrier identity commits to the logical name,
+// size, extents, and bytes; this check prevents uncommitted tar ownership or
+// permission metadata from changing extraction semantics under that identity.
+func canonicalPayloadHeaders(block, paxBlock []byte, paxRecords map[string]string, name string, logical, stored, payloadSize int64, sparseEncoding bool) bool {
+	want := makePayloadHeaders(name, logical, stored, payloadSize, sparseEncoding)
+	return maps.Equal(paxRecords, want.records) &&
+		bytes.Equal(paxBlock, want.paxHeader[:]) && bytes.Equal(block, want.payloadHeader[:])
+}
+
+func parsePayloadSize(raw string, present bool, logical int64) (int64, error) {
+	if !present {
+		return logical, nil
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < 0 || value > logical {
+		return 0, fmt.Errorf("tarstream: invalid %s %q", payloadSizePAX, raw)
+	}
+	return value, nil
 }
 
 // readSparseMap parses the GNU PAX sparse 1.0 map that prefixes the
@@ -609,34 +733,36 @@ func readSparseMap(r io.Reader, realsize int64) ([]extent, int64, error) {
 }
 
 // readPAX reads and parses a PAX extended header's records.
-func readPAX(r io.Reader, size, padded int64) (map[string]string, error) {
+func readPAX(r io.Reader, size, padded int64) (map[string]string, bool, error) {
 	if size < 0 || padded < size || size > 1<<20 {
-		return nil, fmt.Errorf("tarstream: absurd PAX header size %d", size)
+		return nil, false, fmt.Errorf("tarstream: absurd PAX header size %d", size)
 	}
 	data := make([]byte, padded)
 	if _, err := io.ReadFull(r, data); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	data = data[:size]
+	paddingZero := isZeroBlock(data[size:])
+	raw := data[:size]
+	data = raw
 	recs := map[string]string{}
 	for len(data) > 0 {
 		sp := bytes.IndexByte(data, ' ')
 		if sp <= 0 {
-			return nil, fmt.Errorf("tarstream: malformed PAX record")
+			return nil, false, fmt.Errorf("tarstream: malformed PAX record")
 		}
 		n, err := strconv.Atoi(string(data[:sp]))
 		if err != nil || n <= sp || int64(n) > int64(len(data)) || data[n-1] != '\n' {
-			return nil, fmt.Errorf("tarstream: malformed PAX record length")
+			return nil, false, fmt.Errorf("tarstream: malformed PAX record length")
 		}
 		kv := data[sp+1 : n-1]
 		eq := bytes.IndexByte(kv, '=')
 		if eq < 0 {
-			return nil, fmt.Errorf("tarstream: malformed PAX record (no =)")
+			return nil, false, fmt.Errorf("tarstream: malformed PAX record (no =)")
 		}
 		recs[string(kv[:eq])] = string(kv[eq+1:])
 		data = data[n:]
 	}
-	return recs, nil
+	return recs, paddingZero && bytes.Equal(raw, encodePAX(recs)), nil
 }
 
 // ustarName joins the ustar prefix and name fields.
