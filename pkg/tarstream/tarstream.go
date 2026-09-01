@@ -46,7 +46,12 @@ import (
 // hexadecimal characters.
 const DigestMarkerPrefix = ".kuasar.digest."
 
-const payloadSizePAX = "KUASAR.payload.size"
+const (
+	payloadSizePAX = "KUASAR.payload.size"
+	// Identity reuse is intentionally O(metadata tail), with a fixed ceiling
+	// above the maximum canonical E/S metadata carried today.
+	maxMetadataTailSize = 64 << 20
+)
 
 // Digester is an optional capability implemented by sources opened from a
 // complete Kuasar artifact. Digest performs no I/O and does not recompute
@@ -93,7 +98,7 @@ func CarrierDigest(name string, src sparse.Source, options ...WriteOption) (stri
 // ComposeDigest derives the plaintext carrier identity from a previously
 // authenticated payload commitment and a replacement dense tail.
 func ComposeDigest(name string, totalSize, payloadSize uint64, payloadCommitment [32]byte, tail []byte) ([32]byte, error) {
-	if payloadSize > totalSize || uint64(len(tail)) != totalSize-payloadSize {
+	if payloadSize > totalSize || uint64(len(tail)) != totalSize-payloadSize || uint64(len(tail)) > maxMetadataTailSize {
 		return [32]byte{}, ErrInvalidDigest
 	}
 	tailHash := newTailHasher(uint64(len(tail)))

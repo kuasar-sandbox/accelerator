@@ -142,6 +142,9 @@ func makeWritePlan(name string, src sparse.Source) (*writePlan, error) {
 	if !tailDense {
 		return nil, fmt.Errorf("tarstream: %s: metadata tail [%d,%d) contains a hole", name, payloadSize, size)
 	}
+	if size-payloadSize > maxMetadataTailSize {
+		return nil, fmt.Errorf("tarstream: %s: metadata tail size %d exceeds %d", name, size-payloadSize, maxMetadataTailSize)
+	}
 
 	var sparseMap []byte
 	stored := size
@@ -196,49 +199,58 @@ func makeWritePlan(name string, src sparse.Source) (*writePlan, error) {
 // payloadPrefix renders all canonical bytes before the packed payload. The
 // sparse map, when present, is part of this prefix.
 func payloadPrefix(name string, logical, stored int64, sparseMap []byte, payloadSize int64) []byte {
-	ustarName := name
-	recs := map[string]string{
-		"path":         name,
-		"size":         strconv.FormatInt(stored, 10),
-		payloadSizePAX: strconv.FormatInt(payloadSize, 10),
-	}
-	if sparseMap != nil {
-		// GNU mangles the ustar name of sparse entries; readers
-		// recover the real one from GNU.sparse.name. "0" where GNU
-		// writes its pid keeps output deterministic.
-		ustarName = path.Join(path.Dir(name), "GNUSparseFile.0", path.Base(name))
-		recs["path"] = ustarName
-		recs["GNU.sparse.major"] = "1"
-		recs["GNU.sparse.minor"] = "0"
-		recs["GNU.sparse.name"] = name
-		recs["GNU.sparse.realsize"] = strconv.FormatInt(logical, 10)
-	}
-
+	headers := makePayloadHeaders(name, logical, stored, payloadSize, sparseMap != nil)
 	var prefix bytes.Buffer
-	pax := encodePAX(recs)
-	xhdr := ustarBlock(rawHeader{
-		name:     "PaxHeaders.0/" + truncateStr(path.Base(name), 80),
-		mode:     0o644,
-		size:     int64(len(pax)),
-		typeflag: 'x',
-	})
-	prefix.Write(xhdr[:])
-	prefix.Write(pax)
-	if pad := (512 - len(pax)%512) % 512; pad > 0 {
+	prefix.Write(headers.paxHeader[:])
+	prefix.Write(headers.pax)
+	if pad := (512 - len(headers.pax)%512) % 512; pad > 0 {
 		prefix.Write(zeroBlock[:pad])
 	}
-
-	dhdr := ustarBlock(rawHeader{
-		name:     truncateStr(ustarName, 100),
-		mode:     0o644,
-		size:     stored,
-		typeflag: '0',
-	})
-	prefix.Write(dhdr[:])
+	prefix.Write(headers.payloadHeader[:])
 	if sparseMap != nil {
 		prefix.Write(sparseMap)
 	}
 	return prefix.Bytes()
+}
+
+type payloadHeaders struct {
+	records       map[string]string
+	pax           []byte
+	paxHeader     [512]byte
+	payloadHeader [512]byte
+}
+
+// makePayloadHeaders is the single canonical transport-header definition used
+// by both the encoder and the identity validator.
+func makePayloadHeaders(name string, logical, stored, payloadSize int64, sparseEncoding bool) payloadHeaders {
+	ustarName := name
+	records := map[string]string{
+		"path":         name,
+		"size":         strconv.FormatInt(stored, 10),
+		payloadSizePAX: strconv.FormatInt(payloadSize, 10),
+	}
+	if sparseEncoding {
+		// GNU mangles the ustar name of sparse entries; readers recover the
+		// real name from GNU.sparse.name. "0" replaces GNU's pid.
+		ustarName = path.Join(path.Dir(name), "GNUSparseFile.0", path.Base(name))
+		records["path"] = ustarName
+		records["GNU.sparse.major"] = "1"
+		records["GNU.sparse.minor"] = "0"
+		records["GNU.sparse.name"] = name
+		records["GNU.sparse.realsize"] = strconv.FormatInt(logical, 10)
+	}
+	pax := encodePAX(records)
+	return payloadHeaders{
+		records: records,
+		pax:     pax,
+		paxHeader: ustarBlock(rawHeader{
+			name: "PaxHeaders.0/" + truncateStr(path.Base(name), 80), mode: 0o644,
+			size: int64(len(pax)), typeflag: 'x',
+		}),
+		payloadHeader: ustarBlock(rawHeader{
+			name: truncateStr(ustarName, 100), mode: 0o644, size: stored, typeflag: '0',
+		}),
+	}
 }
 
 // emitPlan writes the planned canonical plaintext stream exactly once. The

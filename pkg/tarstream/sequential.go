@@ -113,6 +113,10 @@ func (v *sequentialVerifier) finish() error {
 		v.err = ErrDigestMismatch
 		return v.err
 	}
+	if !v.meta.canonicalPayload {
+		v.err = fmt.Errorf("%w: non-canonical payload header metadata", ErrInvalidCanonicalTarstream)
+		return v.err
+	}
 	recomputed := v.identity.finish(v.meta.name, uint64(v.meta.logical), uint64(v.meta.payloadSize))
 	if subtle.ConstantTimeCompare(recomputed.payload[:], declared.payload[:]) != 1 ||
 		subtle.ConstantTimeCompare(recomputed.digest[:], declared.digest[:]) != 1 {
@@ -264,6 +268,9 @@ func sourceFromSequential(r io.Reader, name string, options readOptions) (sparse
 	payloadExtents, payloadPacked, tailDense := prefixExtents(view.meta.extents, view.meta.payloadSize, view.meta.logical)
 	if !view.meta.hasPayloadSize || !tailDense {
 		return nil, "", fmt.Errorf("%w: invalid payload boundary", ErrInvalidCanonicalTarstream)
+	}
+	if tailSize := view.meta.logical - view.meta.payloadSize; tailSize > maxMetadataTailSize {
+		return nil, "", fmt.Errorf("%w: metadata tail size %d exceeds %d", ErrInvalidCanonicalTarstream, tailSize, maxMetadataTailSize)
 	}
 	identity := newIdentityAccumulator(
 		uint64(view.meta.payloadSize), payloadExtents, payloadPacked, view.meta.logical-view.meta.payloadSize,

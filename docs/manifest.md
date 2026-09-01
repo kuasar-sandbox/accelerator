@@ -656,7 +656,10 @@ canonical tarstream 的plaintext结构为payload、
 payload boundary;marker body记录boundary和payload commitment,完整读取时再用payload
 bytes复验。完整carrier或只替换dense metadata tail的派生source可通过
 `CarrierDigest`直接给出identity,不需要先把payload编码到`io.Discard`。未传codec时
-对外identity为`digest:<plainDigest>`。传入customer-key-backed codec时,完整结构进入
+对外identity为`digest:<plainDigest>`。可派生的dense metadata tail上限为64 MiB,
+writer和reader使用同一边界并在hash前拒绝超限声明。Payload的PAX/ustar权限、属主和
+时间等transport metadata固定为canonical编码,不能在identity不变时改写。传入
+customer-key-backed codec时,完整结构进入
 encrypted tarstream v1,对外 identity 固定为:
 
 ```text
