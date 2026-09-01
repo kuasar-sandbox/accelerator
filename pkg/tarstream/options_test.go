@@ -103,19 +103,29 @@ func TestTarstreamRejectsCodecContractViolations(t *testing.T) {
 func TestExpectedDigestOptionValidation(t *testing.T) {
 	for _, option := range []ReadOption{
 		WithExpectedDigest("hmac-sha256", string(bytes.Repeat([]byte{'a'}, 64))),
-		WithExpectedDigest(DigestSchemeSHA256, "ABC"),
-		WithExpectedDigest(DigestSchemeSHA256, string(bytes.Repeat([]byte{'g'}, 64))),
+		WithExpectedDigest(DigestScheme, "ABC"),
+		WithExpectedDigest(DigestScheme, string(bytes.Repeat([]byte{'g'}, 64))),
 	} {
 		if _, err := parseReadOptions([]ReadOption{option}); !errors.Is(err, ErrInvalidDigest) {
 			t.Fatalf("invalid expected digest error = %v", err)
 		}
 	}
-	codec := &optionTestCodec{}
-	if _, err := parseReadOptions([]ReadOption{WithCodec(codec, false), WithExpectedDigest(DigestSchemeSHA256, string(bytes.Repeat([]byte{'a'}, 64)))}); !errors.Is(err, ErrInvalidOption) {
-		t.Fatalf("codec/SHA-256 expected scheme error = %v", err)
+	valid := WithExpectedDigest(DigestScheme, string(bytes.Repeat([]byte{'a'}, 64)))
+	if _, err := parseReadOptions([]ReadOption{WithCodec(&optionTestCodec{}, false), valid}); err != nil {
+		t.Fatalf("auto-mode plaintext digest: %v", err)
 	}
-	if _, err := parseReadOptions([]ReadOption{WithExpectedDigest(DigestSchemeHMAC, string(bytes.Repeat([]byte{'a'}, 64)))}); !errors.Is(err, ErrInvalidOption) {
-		t.Fatalf("unkeyed/HMAC expected scheme error = %v", err)
+	if _, err := parseReadOptions([]ReadOption{valid}); err != nil {
+		t.Fatalf("plaintext digest: %v", err)
+	}
+	keyed := WithExpectedDigest(DigestSchemeHMAC, string(bytes.Repeat([]byte{'a'}, 64)))
+	if _, err := parseReadOptions([]ReadOption{WithCodec(&optionTestCodec{}, true), keyed}); err != nil {
+		t.Fatalf("keyed digest: %v", err)
+	}
+	if _, err := parseReadOptions([]ReadOption{keyed}); !errors.Is(err, ErrInvalidOption) {
+		t.Fatalf("keyed digest without codec error = %v", err)
+	}
+	if _, err := parseReadOptions([]ReadOption{WithCodec(&optionTestCodec{}, true), valid}); !errors.Is(err, ErrInvalidOption) {
+		t.Fatalf("plaintext digest under required policy error = %v", err)
 	}
 }
 
@@ -130,6 +140,6 @@ func TestPlaintextExpectedDigest(t *testing.T) {
 	}
 	wrong := string(bytes.Repeat([]byte{'0'}, 64))
 	if _, _, err := SourceAt(bytes.NewReader(artifact.Bytes()), int64(artifact.Len()), "", WithExpectedDigest(scheme, wrong)); !errors.Is(err, ErrDigestMismatch) {
-		t.Fatalf("wrong expected SHA-256 error = %v", err)
+		t.Fatalf("wrong expected digest error = %v", err)
 	}
 }

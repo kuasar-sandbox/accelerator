@@ -2,44 +2,40 @@ package tarstream
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
 
 type trackedPlainReader struct {
-	r           io.Reader
-	hash        hash.Hash
-	hashEnabled bool
-	read        int64
+	r    io.Reader
+	read int64
 }
 
 func newTrackedPlainReader(r io.Reader) *trackedPlainReader {
-	return &trackedPlainReader{r: r, hash: sha256.New(), hashEnabled: true}
+	return &trackedPlainReader{r: r}
 }
 
 func (r *trackedPlainReader) Read(dst []byte) (int, error) {
 	n, err := r.r.Read(dst)
 	if n > 0 {
-		if r.hashEnabled {
-			_, _ = r.hash.Write(dst[:n])
-		}
 		r.read += int64(n)
 	}
 	return n, err
 }
 
 type sequentialVerifier struct {
-	reader  *trackedPlainReader
-	meta    *meta
-	options readOptions
-	done    bool
-	err     error
+	reader    *trackedPlainReader
+	meta      *meta
+	options   readOptions
+	identity  *identityAccumulator
+	encrypted bool
+	done      bool
+	err       error
 }
 
 func (v *sequentialVerifier) finish() error {
@@ -63,7 +59,6 @@ func (v *sequentialVerifier) finish() error {
 			return v.err
 		}
 	}
-	v.reader.hashEnabled = false
 	var marker [512]byte
 	if _, err := io.ReadFull(v.reader, marker[:]); err != nil {
 		if errors.Is(err, ErrAuthentication) || errors.Is(err, ErrMalformedEnvelope) {
@@ -73,7 +68,16 @@ func (v *sequentialVerifier) finish() error {
 		v.err = fmt.Errorf("%w: missing digest marker", ErrInvalidCanonicalTarstream)
 		return v.err
 	}
-	plainDigest, err := parseCanonicalMarker(marker[:])
+	var markerBody [512]byte
+	if _, err := io.ReadFull(v.reader, markerBody[:]); err != nil {
+		if errors.Is(err, ErrAuthentication) || errors.Is(err, ErrMalformedEnvelope) {
+			v.err = err
+			return v.err
+		}
+		v.err = fmt.Errorf("%w: invalid digest marker body", ErrInvalidCanonicalTarstream)
+		return v.err
+	}
+	declared, err := parseCanonicalMarker(marker[:], markerBody[:])
 	if err != nil {
 		v.err = err
 		return v.err
@@ -105,21 +109,29 @@ func (v *sequentialVerifier) finish() error {
 		}
 		return v.err
 	}
-	var recomputed [32]byte
-	copy(recomputed[:], v.reader.hash.Sum(nil))
-	if subtle.ConstantTimeCompare(recomputed[:], plainDigest[:]) != 1 {
+	if !v.meta.hasPayloadSize || v.meta.payloadSize < 0 || uint64(v.meta.payloadSize) != declared.payloadSize {
 		v.err = ErrDigestMismatch
 		return v.err
 	}
-	_, external := externalDigest(v.options.codec, recomputed)
-	if err := checkExpected(v.options, external); err != nil {
+	recomputed := v.identity.finish(v.meta.name, uint64(v.meta.logical), uint64(v.meta.payloadSize))
+	if subtle.ConstantTimeCompare(recomputed.payload[:], declared.payload[:]) != 1 ||
+		subtle.ConstantTimeCompare(recomputed.digest[:], declared.digest[:]) != 1 {
+		v.err = ErrDigestMismatch
+		return v.err
+	}
+	var codec Codec
+	if v.encrypted {
+		codec = v.options.codec
+	}
+	scheme, external := externalDigest(codec, recomputed.digest)
+	if err := checkExpected(v.options, scheme, external); err != nil {
 		v.err = err
 	}
 	return v.err
 }
 
-func parseCanonicalMarker(block []byte) ([32]byte, error) {
-	var zero [32]byte
+func parseCanonicalMarker(block, body []byte) (carrierIdentity, error) {
+	var zero carrierIdentity
 	if len(block) != 512 || string(block[257:262]) != "ustar" || !validHeaderChecksum(block) {
 		return zero, fmt.Errorf("%w: invalid digest marker header", ErrInvalidCanonicalTarstream)
 	}
@@ -128,14 +140,19 @@ func parseCanonicalMarker(block []byte) ([32]byte, error) {
 		return zero, fmt.Errorf("%w: digest marker is not a regular file", ErrInvalidCanonicalTarstream)
 	}
 	size, err := parseNumeric(block[124:136])
-	if err != nil || size != 0 {
-		return zero, fmt.Errorf("%w: digest marker is not empty", ErrInvalidCanonicalTarstream)
+	if err != nil || size != 40 || len(body) != 512 {
+		return zero, fmt.Errorf("%w: invalid digest marker body", ErrInvalidCanonicalTarstream)
 	}
 	digest, ok := parseDigestMarker(normalizeName(ustarName(block)))
 	if !ok {
 		return zero, fmt.Errorf("%w: invalid digest marker", ErrInvalidCanonicalTarstream)
 	}
-	return digest, nil
+	if !isZeroBlock(body[40:]) {
+		return zero, fmt.Errorf("%w: nonzero digest marker padding", ErrInvalidCanonicalTarstream)
+	}
+	identity := carrierIdentity{digest: digest, payloadSize: binary.BigEndian.Uint64(body[:8])}
+	copy(identity.payload[:], body[8:40])
+	return identity, nil
 }
 
 func validHeaderChecksum(block []byte) bool {
@@ -241,7 +258,15 @@ func sourceFromSequential(r io.Reader, name string, options readOptions) (sparse
 			return nil, "", fmt.Errorf("%w: inner tar layout does not match authenticated header", ErrMalformedEnvelope)
 		}
 	}
-	verifier := &sequentialVerifier{reader: tracked, meta: &view.meta, options: options}
+	payloadExtents, payloadPacked, tailDense := prefixExtents(view.meta.extents, view.meta.payloadSize, view.meta.logical)
+	if !view.meta.hasPayloadSize || !tailDense {
+		return nil, "", fmt.Errorf("%w: invalid payload boundary", ErrInvalidCanonicalTarstream)
+	}
+	identity := newIdentityAccumulator(
+		uint64(view.meta.payloadSize), payloadExtents, payloadPacked, view.meta.logical-view.meta.payloadSize,
+	)
+	view.src = io.TeeReader(view.src, identity)
+	verifier := &sequentialVerifier{reader: tracked, meta: &view.meta, options: options, identity: identity, encrypted: geometry != nil}
 	view.finish = verifier.finish
 	if view.meta.stored-view.meta.mapLen == 0 {
 		if err := view.finishNow(); err != nil {

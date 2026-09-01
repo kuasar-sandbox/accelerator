@@ -13,8 +13,9 @@ const (
 
 // Ref is the canonical logical reference shared by manifest-backed and local
 // file-backed data. DigestScheme and Digest carry one optional identity
-// qualifier: @sha256, @hmac, or @manifest. The latter selects a root Manifest
-// from a multi-Manifest Bundle; callers that open tarstreams must reject it.
+// qualifier: @digest, @hmac, or @manifest. @digest is the plaintext carrier
+// identity, @hmac is its keyed external identity, and @manifest selects a root
+// Manifest from a multi-Manifest Bundle.
 // Location is the logical name from an optional @location qualifier. Host
 // paths for locations are deliberately not part of Ref.
 type Ref struct {
@@ -27,7 +28,7 @@ type Ref struct {
 
 // ParseRef parses one manifest or file reference. A manifest reference always
 // contains exactly one content key. File qualifiers, when present, have the
-// fixed order @sha256|@hmac|@manifest then @location.
+// fixed order @digest|@hmac|@manifest then @location.
 func ParseRef(raw string) (Ref, error) {
 	var ref Ref
 	switch {
@@ -39,6 +40,9 @@ func ParseRef(raw string) (Ref, error) {
 		ref = Ref{Scheme: RefSchemeManifest, Path: HexKey(key)}
 	case strings.HasPrefix(raw, RefSchemeFile+"://"):
 		value := strings.TrimPrefix(raw, RefSchemeFile+"://")
+		if strings.Contains(value, "@sha256:") {
+			return ref, fmt.Errorf("file ref: unsupported identity qualifier @sha256")
+		}
 		if i := strings.LastIndex(value, "@location:"); i >= 0 {
 			ref.Location = value[i+len("@location:"):]
 			if ref.Location == "" {
@@ -46,11 +50,11 @@ func ParseRef(raw string) (Ref, error) {
 			}
 			value = value[:i]
 		}
-		sha := strings.LastIndex(value, "@sha256:")
+		digest := strings.LastIndex(value, "@digest:")
 		hmac := strings.LastIndex(value, "@hmac:")
 		manifest := strings.LastIndex(value, "@manifest:")
 		qualifierCount := 0
-		for _, position := range []int{sha, hmac, manifest} {
+		for _, position := range []int{digest, hmac, manifest} {
 			if position >= 0 {
 				qualifierCount++
 			}
@@ -58,9 +62,9 @@ func ParseRef(raw string) (Ref, error) {
 		if qualifierCount > 1 {
 			return ref, fmt.Errorf("file ref: multiple identity qualifiers")
 		}
-		if i := max(sha, hmac, manifest); i >= 0 {
-			qualifier := "@sha256:"
-			ref.DigestScheme = "sha256"
+		if i := max(digest, hmac, manifest); i >= 0 {
+			qualifier := "@digest:"
+			ref.DigestScheme = "digest"
 			switch i {
 			case hmac:
 				qualifier = "@hmac:"
@@ -75,7 +79,7 @@ func ParseRef(raw string) (Ref, error) {
 			}
 			value = value[:i]
 		}
-		if strings.Contains(value, "@sha256:") || strings.Contains(value, "@hmac:") ||
+		if strings.Contains(value, "@digest:") || strings.Contains(value, "@hmac:") ||
 			strings.Contains(value, "@manifest:") || strings.Contains(value, "@location:") {
 			return ref, fmt.Errorf("file ref: duplicate or out-of-order qualifier")
 		}
@@ -109,7 +113,7 @@ func (r Ref) Validate() error {
 			return fmt.Errorf("file ref: digest scheme and digest must be set together")
 		}
 		if r.Digest != "" {
-			if r.DigestScheme != "sha256" && r.DigestScheme != "hmac" && r.DigestScheme != "manifest" {
+			if r.DigestScheme != "digest" && r.DigestScheme != "hmac" && r.DigestScheme != "manifest" {
 				return fmt.Errorf("file ref: unsupported identity scheme %q", r.DigestScheme)
 			}
 			if len(r.Digest) != 64 || strings.ToLower(r.Digest) != r.Digest {

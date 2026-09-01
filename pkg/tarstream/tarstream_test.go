@@ -4,7 +4,6 @@ import (
 	stdtar "archive/tar"
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -188,8 +187,11 @@ func TestStdlibOracle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("digest marker: %v", err)
 	}
-	if marker.Size != 0 || !strings.HasPrefix(marker.Name, SHA256MarkerPrefix) {
+	if marker.Size != 40 || !strings.HasPrefix(marker.Name, DigestMarkerPrefix) {
 		t.Fatalf("digest marker = %q/%d", marker.Name, marker.Size)
+	}
+	if body, err := io.ReadAll(tr); err != nil || len(body) != 40 {
+		t.Fatalf("digest marker body = %d bytes, err=%v", len(body), err)
 	}
 	if _, err := tr.Next(); err != io.EOF {
 		t.Errorf("expected payload + marker archive, next = %v", err)
@@ -866,7 +868,7 @@ func (r *countingReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	return n, err
 }
 
-func TestArtifactDigestIsPrefixHashAndMetadataOnly(t *testing.T) {
+func TestArtifactDigestIsCarrierMetadataOnly(t *testing.T) {
 	logical := bytes.Repeat([]byte("payload-"), 1<<20)
 	var buf bytes.Buffer
 	scheme, digest, err := WriteTo(context.Background(), &buf, "image", sparse.Dense(bytes.NewReader(logical), uint64(len(logical))))
@@ -874,11 +876,9 @@ func TestArtifactDigestIsPrefixHashAndMetadataOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	archive := buf.Bytes()
-	markerOffset := len(archive) - 512 - len(zeroBlock2)
-	sum := sha256.Sum256(archive[:markerOffset])
 	tagged := scheme + ":" + digest
-	if want := fmt.Sprintf("sha256:%x", sum[:]); tagged != want {
-		t.Fatalf("digest = %q, want %q", tagged, want)
+	if !strings.HasPrefix(tagged, DigestScheme+":") {
+		t.Fatalf("digest = %q", tagged)
 	}
 
 	cr := &countingReaderAt{ReaderAt: bytes.NewReader(archive)}
@@ -921,15 +921,15 @@ func TestSourceAtDigestCapabilityIsOptional(t *testing.T) {
 }
 
 func TestSourceAtRejectsInvalidDigestMarker(t *testing.T) {
-	valid := SHA256MarkerPrefix + strings.Repeat("a", 64)
+	valid := DigestMarkerPrefix + strings.Repeat("a", 64)
 	tests := []struct {
 		name    string
 		markers []stdtar.Header
 		bodies  []string
 	}{
-		{name: "invalid-name", markers: []stdtar.Header{{Name: SHA256MarkerPrefix + "bad", Mode: 0o444}}},
+		{name: "invalid-name", markers: []stdtar.Header{{Name: DigestMarkerPrefix + "bad", Mode: 0o444}}},
 		{name: "nonempty", markers: []stdtar.Header{{Name: valid, Mode: 0o444, Size: 1}}, bodies: []string{"x"}},
-		{name: "duplicate", markers: []stdtar.Header{{Name: valid, Mode: 0o444}, {Name: SHA256MarkerPrefix + strings.Repeat("b", 64), Mode: 0o444}}},
+		{name: "duplicate", markers: []stdtar.Header{{Name: valid, Mode: 0o444}, {Name: DigestMarkerPrefix + strings.Repeat("b", 64), Mode: 0o444}}},
 		{name: "nonfinal", markers: []stdtar.Header{{Name: valid, Mode: 0o444}, {Name: "extra", Mode: 0o644}}},
 	}
 	for _, tc := range tests {

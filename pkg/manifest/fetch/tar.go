@@ -15,7 +15,7 @@ var fadvise = unix.Fadvise
 
 // tarFileStream is a local tarstream artifact as a Stream: the
 // platform's at-rest container for images, snapshot bundles and
-// overlays (one sparse payload plus an empty digest marker). The envelope's hole map drives
+// overlays (one sparse payload plus its digest marker metadata). The envelope's hole map drives
 // RunAt; ReadAt is offset arithmetic over the packed region via
 // *os.File.ReadAt (pread), meeting Stream's concurrent random-access
 // contract. Nothing is unpacked.
@@ -68,6 +68,20 @@ func OpenTarStream(path string, options ...tarstream.ReadOption) (Stream, error)
 }
 
 func (s *tarFileStream) Digest() (string, string) { return s.digestScheme, s.digest }
+func (s *tarFileStream) TarStreamDigest(name string) ([32]byte, bool) {
+	provider, ok := s.Source.(tarstream.IdentityProvider)
+	if !ok {
+		return [32]byte{}, false
+	}
+	return provider.TarStreamDigest(name)
+}
+func (s *tarFileStream) PayloadCommitment() (uint64, [32]byte, bool) {
+	provider, ok := s.Source.(tarstream.IdentityProvider)
+	if !ok {
+		return s.Size(), [32]byte{}, false
+	}
+	return provider.PayloadCommitment()
+}
 func (s *tarFileStream) Close() error {
 	if s.sourceCloser != nil {
 		if err := s.sourceCloser.Close(); err != nil {

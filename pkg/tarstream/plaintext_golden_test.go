@@ -22,10 +22,10 @@ func TestPlaintextWriteGolden(t *testing.T) {
 		wantArtifact string
 		wantDigest   string
 	}{
-		{name: "dense", body: []byte("hello"), wantLen: 3584, wantArtifact: "c62a59a4c823dded3d9dae58c26c32b46b90bddcd251c761b313aebdeee0bd2a", wantDigest: "07229965d664d8814acac7566dddf8bce2dceabaf0f01e08c2c867e247e56d50"},
-		{name: "empty", wantLen: 3072, wantArtifact: "cf050789196f8d7323f416612172613c86f75c4d017d591e5abc070ad2e3890b", wantDigest: "5cf5d14f26c0b4a26a3fb367370d1a6bf5a2734d298e2425b9dd4a30443df025"},
-		{name: "hole", body: make([]byte, 8192), holes: []sparse.Extent{{Offset: 0, Size: 8192}}, wantLen: 3584, wantArtifact: "db1c978f874851b35e47781715f25c97e78548db76f0e9d325ec6725ec858e67", wantDigest: "0e05d11945eca0faba1bce258636ec41be5781d0c63acd4dd9e5ecc9bc39beaa"},
-		{name: "sparse/image", body: sparseBody[:], holes: []sparse.Extent{{Offset: 4096, Size: 8192}}, wantLen: 11776, wantArtifact: "28c77eacb535d820e57a0f63f825b9e51c8601db20d1b6c3cb4986c0a594fcec", wantDigest: "0b53dddf972680d23957f95ff7ebbfadd9c317c334840db7ff262d57f79b5d9d"},
+		{name: "dense", body: []byte("hello"), wantLen: 4096, wantArtifact: "f1d5e23dc117b29dc95c3d44cd68d67b12a90c24799edd48e41f64c3246bf927", wantDigest: "8a9ec06ea9f3218f043b8dae59191c883b3a06d31d163d0cd25c91b2bc930939"},
+		{name: "empty", wantLen: 3584, wantArtifact: "5991713edcaa3c5f133db162ceffa14bec1352f5fcd838846ccfea0b25260d87", wantDigest: "af1b0d75a63812f2bc96e4d14a45844b1770ba3db5e69009fade484410ea8bbc"},
+		{name: "hole", body: make([]byte, 8192), holes: []sparse.Extent{{Offset: 0, Size: 8192}}, wantLen: 4096, wantArtifact: "27b0fdbaee752eec7119f57a20c77054605913ef4a29019ccfa4670cf97f6d85", wantDigest: "036c9ca07fd3de9a1131b8787140038cf7d6f6eb2d2b4bbc9cfb765c45d8fe4c"},
+		{name: "sparse/image", body: sparseBody[:], holes: []sparse.Extent{{Offset: 4096, Size: 8192}}, wantLen: 12288, wantArtifact: "fc1bfe14c397aac3f9064a34c971266af34d40a18efdc55ad104f2330f3320ce", wantDigest: "e342a173270c8d2119b0ef290bc52d2fc092bdeb07eda5691a01d1f54ea94125"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -38,8 +38,8 @@ func TestPlaintextWriteGolden(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if scheme != DigestSchemeSHA256 || digest != tc.wantDigest {
-				t.Fatalf("digest = %s:%s, want sha256:%s", scheme, digest, tc.wantDigest)
+			if scheme != DigestScheme || digest != tc.wantDigest {
+				t.Fatalf("digest = %s:%s, want digest:%s", scheme, digest, tc.wantDigest)
 			}
 			if artifact.Len() != tc.wantLen {
 				t.Fatalf("artifact length = %d, want %d", artifact.Len(), tc.wantLen)

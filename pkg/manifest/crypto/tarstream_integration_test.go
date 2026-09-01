@@ -81,8 +81,8 @@ func TestEncryptedTarStreamWireStructureAndRandomization(t *testing.T) {
 	codec, _ := NewTarStreamCodec(key)
 	artifact, scheme, digest := writeTarArtifact(t, codec, "golden", []byte("hello"), nil)
 	again, againScheme, againDigest := writeTarArtifact(t, codec, "golden", []byte("hello"), nil)
-	if len(artifact) != 3747 {
-		t.Fatalf("artifact length = %d, want 3747", len(artifact))
+	if len(artifact) != 4259 {
+		t.Fatalf("artifact length = %d, want 4259", len(artifact))
 	}
 	if !bytes.Equal(artifact[:8], []byte{0x89, 'K', 'T', 'S', 'E', 'N', 'C', '\n'}) ||
 		binary.BigEndian.Uint16(artifact[8:10]) != 1 || binary.BigEndian.Uint16(artifact[10:12]) != 48 ||
@@ -186,8 +186,8 @@ func TestEncryptedTarStreamRoundTripAndIdentity(t *testing.T) {
 		t.Fatal("required mode changed identity or failed to randomize physical output")
 	}
 
-	plaintext, plainScheme, _ := writeTarArtifact(t, nil, "image", body, holes)
-	if plainScheme != tarstream.DigestSchemeSHA256 {
+	plaintext, plainScheme, plainDigest := writeTarArtifact(t, nil, "image", body, holes)
+	if plainScheme != tarstream.DigestScheme {
 		t.Fatalf("plaintext scheme = %q", plainScheme)
 	}
 	plainSource, _, err := tarstream.SourceAt(bytes.NewReader(plaintext), int64(len(plaintext)), "", tarstream.WithCodec(codec, false))
@@ -196,10 +196,10 @@ func TestEncryptedTarStreamRoundTripAndIdentity(t *testing.T) {
 	}
 	plainDigester := plainSource.(tarstream.Digester)
 	gotScheme, gotDigest := plainDigester.Digest()
-	if gotScheme != scheme || gotDigest != digest {
-		t.Fatalf("key-bound plaintext identity = %s:%s, want %s:%s", gotScheme, gotDigest, scheme, digest)
+	if gotScheme != plainScheme || gotDigest != plainDigest || gotDigest == digest {
+		t.Fatalf("plaintext carrier identity = %s:%s, want %s:%s and distinct from encrypted %s", gotScheme, gotDigest, plainScheme, plainDigest, digest)
 	}
-	plainSequential, _, err := tarstream.SourceFrom(streamReaderOnly{bytes.NewReader(plaintext)}, "", tarstream.WithCodec(codec, false), tarstream.WithExpectedDigest(scheme, digest))
+	plainSequential, _, err := tarstream.SourceFrom(streamReaderOnly{bytes.NewReader(plaintext)}, "", tarstream.WithCodec(codec, false), tarstream.WithExpectedDigest(plainScheme, plainDigest))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -592,7 +592,7 @@ func TestEncryptedTarStreamDoesNotExposePlainDigest(t *testing.T) {
 	if scheme != tarstream.DigestSchemeHMAC || digest == plainDigest {
 		t.Fatalf("key-bound identity = %s:%s, plain digest %s", scheme, digest, plainDigest)
 	}
-	if bytes.Contains(encrypted, []byte(tarstream.SHA256MarkerPrefix)) || bytes.Contains(encrypted, []byte(plainDigest)) {
+	if bytes.Contains(encrypted, []byte(tarstream.DigestMarkerPrefix)) || bytes.Contains(encrypted, []byte(plainDigest)) {
 		t.Fatal("encrypted bytes expose the inner marker or plain digest")
 	}
 	if !bytes.Contains(plaintext, []byte(plainDigest)) {

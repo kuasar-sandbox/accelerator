@@ -1,9 +1,11 @@
 // Package tarstream packages one sparse-capable byte source as a tar artifact
 // and reads it back without materializing anything. WriteTo emits a
 // sparse.Source's logical view with its hole map as a GNU PAX sparse 1.0 entry
-// (including its trailing (size,0) sentinel extent), then appends an empty
-// .kuasar.sha256.<hex> marker naming the SHA256 of all physical tar bytes before
-// its own header. ReadFrom / ReadSeekFrom return the logical view with the exact
+// (including its trailing (size,0) sentinel extent), then appends a
+// .kuasar.digest.<hex> marker naming the carrier-provided logical identity.
+// The marker also retains the payload commitment needed to derive a new
+// identity after replacing an E/S metadata tail. ReadFrom / ReadSeekFrom return
+// the logical view with the exact
 // hole map; SourceFrom opens it as a sparse.Source for pipelines. A size-bounded
 // SourceAt exposes the marker through the optional Digester capability without
 // rereading payload bytes. WithCodec places the complete canonical stream,
@@ -32,16 +34,19 @@ package tarstream
 import (
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
 
-// SHA256MarkerPrefix is the reserved name prefix of the empty metadata entry
-// that terminates a Kuasar tarstream artifact. The suffix is exactly 64
-// lowercase hexadecimal characters.
-const SHA256MarkerPrefix = ".kuasar.sha256."
+// DigestMarkerPrefix is the reserved name prefix of the metadata entry that
+// terminates a Kuasar tarstream artifact. The suffix is exactly 64 lowercase
+// hexadecimal characters.
+const DigestMarkerPrefix = ".kuasar.digest."
+
+const payloadSizePAX = "KUASAR.payload.size"
 
 // Digester is an optional capability implemented by sources opened from a
 // complete Kuasar artifact. Digest performs no I/O and does not recompute
@@ -50,12 +55,65 @@ type Digester interface {
 	Digest() (scheme string, digest string)
 }
 
+// IdentityProvider is implemented by a complete carrier or a deterministic
+// logical source that can provide its tarstream identity without reading the
+// payload. The returned digest is the plaintext canonical identity; writers
+// apply the configured keyed mapping before exposing it in a ref.
+type IdentityProvider interface {
+	TarStreamDigest(name string) (digest [32]byte, ok bool)
+	// PayloadCommitment always returns the logical boundary before an optional dense
+	// metadata tail. ok reports whether digest contains a carrier-declared
+	// commitment that can be reused without reading that payload. A full carrier
+	// read verifies the declaration against the payload bytes.
+	PayloadCommitment() (size uint64, digest [32]byte, ok bool)
+}
+
+// CarrierDigest returns the public identity the tarstream carrier will emit
+// for src under the supplied write policy. It performs no payload I/O: src
+// must be an opened carrier or a deterministic carrier-derived source that
+// implements IdentityProvider.
+func CarrierDigest(name string, src sparse.Source, options ...WriteOption) (string, string, error) {
+	opts, err := parseWriteOptions(options)
+	if err != nil {
+		return "", "", err
+	}
+	provider, ok := src.(IdentityProvider)
+	if !ok {
+		return "", "", fmt.Errorf("tarstream: source carrier does not provide a digest")
+	}
+	plain, ok := provider.TarStreamDigest(name)
+	if !ok {
+		return "", "", fmt.Errorf("tarstream: source carrier cannot derive digest for %q", normalizeName(name))
+	}
+	scheme, digest := externalDigest(opts.codec, plain)
+	return scheme, digestHex(digest), nil
+}
+
+// ComposeDigest derives the plaintext carrier identity from a previously
+// authenticated payload commitment and a replacement dense tail.
+func ComposeDigest(name string, totalSize, payloadSize uint64, payloadCommitment [32]byte, tail []byte) ([32]byte, error) {
+	if payloadSize > totalSize || uint64(len(tail)) != totalSize-payloadSize {
+		return [32]byte{}, ErrInvalidDigest
+	}
+	tailHash := newTailHasher(uint64(len(tail)))
+	_, _ = tailHash.Write(tail)
+	var tailDigest [32]byte
+	copy(tailDigest[:], tailHash.Sum(nil))
+	return composeDigest(normalizeName(name), totalSize, payloadSize, payloadCommitment, tailDigest), nil
+}
+
+type carrierIdentity struct {
+	digest      [32]byte
+	payload     [32]byte
+	payloadSize uint64
+}
+
 func parseDigestMarker(name string) ([32]byte, bool) {
 	var digest [32]byte
-	if !strings.HasPrefix(name, SHA256MarkerPrefix) {
+	if !strings.HasPrefix(name, DigestMarkerPrefix) {
 		return digest, false
 	}
-	hexDigest := strings.TrimPrefix(name, SHA256MarkerPrefix)
+	hexDigest := strings.TrimPrefix(name, DigestMarkerPrefix)
 	if len(hexDigest) != 64 || strings.ToLower(hexDigest) != hexDigest {
 		return digest, false
 	}
@@ -64,6 +122,8 @@ func parseDigestMarker(name string) ([32]byte, bool) {
 	}
 	return digest, true
 }
+
+func digestHex(digest [32]byte) string { return hex.EncodeToString(digest[:]) }
 
 // Reader is the sequential logical view of the file inside a tar
 // stream: Read yields the logical bytes, holes reading as zeros.

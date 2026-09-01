@@ -3,7 +3,7 @@ package tarstream
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -24,12 +24,13 @@ import (
 // sweep precedes any data read (sparse law 1), so one-pass sources
 // work. The plaintext envelope metadata is fixed and deterministic (mode 0644,
 // uid/gid 0, epoch mtime): the entry is a transport vessel, not a
-// filesystem snapshot. After the payload it appends one empty
-// .kuasar.sha256.<hex> entry. The returned digest covers every physical tar
-// byte before that marker header and is computed while the payload is written.
-// With no codec the emitted bytes are the historical plaintext format. With a
-// codec the complete canonical stream, including marker and trailer, is placed
-// inside encrypted v1 records.
+// filesystem snapshot. After the payload it appends one
+// .kuasar.digest.<hex> entry. The returned carrier digest commits to the
+// payload name, logical size, authoritative sparse map, payload bytes, and the
+// dense E/S metadata tail declared by IdentityProvider. It is computed while the
+// payload is written.
+// With a codec the complete canonical stream, including marker and trailer,
+// is placed inside encrypted v1 records.
 func WriteTo(ctx context.Context, w io.Writer, name string, src sparse.Source, options ...WriteOption) (scheme string, digest string, err error) {
 	opts, err := parseWriteOptions(options)
 	if err != nil {
@@ -69,16 +70,19 @@ func WriteTo(ctx context.Context, w io.Writer, name string, src sparse.Source, o
 }
 
 type writePlan struct {
-	name          string
-	logical       int64
-	stored        int64
-	sparseMap     []byte
-	extents       []extent
-	prefix        []byte
-	packedStart   int64
-	packedSize    int64
-	payloadPad    int
-	plaintextSize int64
+	name           string
+	logical        int64
+	stored         int64
+	sparseMap      []byte
+	extents        []extent
+	prefix         []byte
+	packedStart    int64
+	packedSize     int64
+	payloadPad     int
+	plaintextSize  int64
+	payloadSize    int64
+	payloadPacked  int64
+	payloadExtents []extent
 }
 
 func makeWritePlan(name string, src sparse.Source) (*writePlan, error) {
@@ -86,7 +90,7 @@ func makeWritePlan(name string, src sparse.Source) (*writePlan, error) {
 	if name == "" {
 		return nil, fmt.Errorf("tarstream: empty entry name")
 	}
-	if strings.HasPrefix(name, SHA256MarkerPrefix) {
+	if strings.HasPrefix(name, DigestMarkerPrefix) {
 		return nil, fmt.Errorf("tarstream: entry name %q uses reserved digest marker prefix", name)
 	}
 	if src.Size() > 1<<62 {
@@ -126,6 +130,18 @@ func makeWritePlan(name string, src sparse.Source) (*writePlan, error) {
 		}
 		dataSize += e.Size
 	}
+	payloadSize := size
+	if provider, ok := src.(IdentityProvider); ok {
+		declared, _, _ := provider.PayloadCommitment()
+		if declared > uint64(size) {
+			return nil, fmt.Errorf("tarstream: %s: payload size %d exceeds logical size %d", name, declared, size)
+		}
+		payloadSize = int64(declared)
+	}
+	payloadExtents, payloadPacked, tailDense := prefixExtents(extents, payloadSize, size)
+	if !tailDense {
+		return nil, fmt.Errorf("tarstream: %s: metadata tail [%d,%d) contains a hole", name, payloadSize, size)
+	}
 
 	var sparseMap []byte
 	stored := size
@@ -154,33 +170,37 @@ func makeWritePlan(name string, src sparse.Source) (*writePlan, error) {
 		stored = int64(len(sparseMap)) + dataSize
 	}
 
-	prefix := payloadPrefix(name, size, stored, sparseMap)
+	prefix := payloadPrefix(name, size, stored, sparseMap, payloadSize)
 	payloadPad := int((512 - stored%512) % 512)
 	plaintextSize := int64(len(prefix)) + dataSize + int64(payloadPad) + canonicalSuffixSize
 	if plaintextSize < 0 || plaintextSize > 1<<62 {
 		return nil, fmt.Errorf("tarstream: %s: artifact size overflows", name)
 	}
 	return &writePlan{
-		name:          name,
-		logical:       size,
-		stored:        stored,
-		sparseMap:     sparseMap,
-		extents:       extents,
-		prefix:        prefix,
-		packedStart:   int64(len(prefix)),
-		packedSize:    dataSize,
-		payloadPad:    payloadPad,
-		plaintextSize: plaintextSize,
+		name:           name,
+		logical:        size,
+		stored:         stored,
+		sparseMap:      sparseMap,
+		extents:        extents,
+		prefix:         prefix,
+		packedStart:    int64(len(prefix)),
+		packedSize:     dataSize,
+		payloadPad:     payloadPad,
+		plaintextSize:  plaintextSize,
+		payloadSize:    payloadSize,
+		payloadPacked:  payloadPacked,
+		payloadExtents: payloadExtents,
 	}, nil
 }
 
 // payloadPrefix renders all canonical bytes before the packed payload. The
 // sparse map, when present, is part of this prefix.
-func payloadPrefix(name string, logical, stored int64, sparseMap []byte) []byte {
+func payloadPrefix(name string, logical, stored int64, sparseMap []byte, payloadSize int64) []byte {
 	ustarName := name
 	recs := map[string]string{
-		"path": name,
-		"size": strconv.FormatInt(stored, 10),
+		"path":         name,
+		"size":         strconv.FormatInt(stored, 10),
+		payloadSizePAX: strconv.FormatInt(payloadSize, 10),
 	}
 	if sparseMap != nil {
 		// GNU mangles the ustar name of sparse entries; readers
@@ -225,11 +245,13 @@ func payloadPrefix(name string, logical, stored int64, sparseMap []byte) []byte 
 // destination may be the caller's plaintext writer or the encrypted record
 // writer. Data extents are read once; Zero extents are synthesized.
 func emitPlan(ctx context.Context, w io.Writer, plan *writePlan, src sparse.Source) ([32]byte, error) {
-	h := sha256.New()
-	payloadWriter := io.MultiWriter(w, h)
-	if err := writeFull(payloadWriter, plan.prefix); err != nil {
+	identity := newIdentityAccumulator(
+		uint64(plan.payloadSize), plan.payloadExtents, plan.payloadPacked, plan.logical-plan.payloadSize,
+	)
+	if err := writeFull(w, plan.prefix); err != nil {
 		return [32]byte{}, err
 	}
+	payloadWriter := io.MultiWriter(w, identity)
 	if len(plan.extents) > 0 {
 		buf := make([]byte, copyBufSize)
 		for _, e := range plan.extents {
@@ -239,26 +261,32 @@ func emitPlan(ctx context.Context, w io.Writer, plan *writePlan, src sparse.Sour
 		}
 	}
 	if plan.payloadPad > 0 {
-		if err := writeFull(payloadWriter, zeroBlock[:plan.payloadPad]); err != nil {
+		if err := writeFull(w, zeroBlock[:plan.payloadPad]); err != nil {
 			return [32]byte{}, err
 		}
 	}
-	var plainDigest [32]byte
-	copy(plainDigest[:], h.Sum(nil))
-	hexDigest := hex.EncodeToString(plainDigest[:])
+	computed := identity.finish(plan.name, uint64(plan.logical), uint64(plan.payloadSize))
+	hexDigest := hex.EncodeToString(computed.digest[:])
 	marker := ustarBlock(rawHeader{
-		name:     SHA256MarkerPrefix + hexDigest,
+		name:     DigestMarkerPrefix + hexDigest,
 		mode:     0o444,
+		size:     40,
 		typeflag: '0',
 	})
 	if err := writeFull(w, marker[:]); err != nil {
+		return [32]byte{}, err
+	}
+	var markerBody [512]byte
+	binary.BigEndian.PutUint64(markerBody[:8], computed.payloadSize)
+	copy(markerBody[8:40], computed.payload[:])
+	if err := writeFull(w, markerBody[:]); err != nil {
 		return [32]byte{}, err
 	}
 	// End of archive: two zero blocks.
 	if err := writeFull(w, zeroBlock2[:]); err != nil {
 		return [32]byte{}, err
 	}
-	return plainDigest, nil
+	return computed.digest, nil
 }
 
 const copyBufSize = 256 << 10

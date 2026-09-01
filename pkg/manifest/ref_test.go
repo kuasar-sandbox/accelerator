@@ -32,8 +32,8 @@ func TestParseRef(t *testing.T) {
 		},
 		{
 			name:     "digested located file",
-			raw:      "file://base.image@sha256:" + digest + "@location:build.1",
-			want:     Ref{Scheme: RefSchemeFile, Path: "base.image", DigestScheme: "sha256", Digest: digest, Location: "build.1"},
+			raw:      "file://base.image@digest:" + digest + "@location:build.1",
+			want:     Ref{Scheme: RefSchemeFile, Path: "base.image", DigestScheme: "digest", Digest: digest, Location: "build.1"},
 			portable: true,
 		},
 		{
@@ -82,19 +82,22 @@ func TestParseRefRejectsInvalid(t *testing.T) {
 		"file://root.snapshot@location:.bad",
 		"file://root.snapshot@location:x@location:y",
 		"file://root.snapshot@location:",
-		"file://base.image@sha256:",
+		"file://base.image@digest:",
 		"file://base.image@hmac:",
 		"file://base.image@manifest:",
-		"file://base.image@location:x@sha256:" + digest,
+		"file://base.image@location:x@digest:" + digest,
 		"file://base.image@location:x@hmac:" + digest,
 		"file://base.image@location:x@manifest:" + digest,
-		"file://base.image@sha256:" + digest + "@hmac:" + digest,
-		"file://base.image@sha256:" + digest + "@manifest:" + digest,
+		"file://base.image@digest:" + digest + "@digest:" + digest,
+		"file://base.image@digest:" + digest + "@hmac:" + digest,
+		"file://base.image@digest:" + digest + "@manifest:" + digest,
 		"file://base.image@hmac:" + digest + "@manifest:" + digest,
 		"file://base.image@hmac:" + digest + "@hmac:" + digest,
 		"file://base.image@manifest:" + digest + "@manifest:" + digest,
-		"file://base.image@sha256:" + strings.Repeat("A", 64),
+		"file://base.image@manifest:" + digest + "@hmac:" + digest,
+		"file://base.image@digest:" + strings.Repeat("A", 64),
 		"file://base.image@manifest:" + strings.Repeat("A", 64),
+		"file://base.image@sha256:" + digest,
 	} {
 		t.Run(raw, func(t *testing.T) {
 			if _, err := ParseRef(raw); err == nil {
@@ -108,7 +111,7 @@ func TestRefValidateDigestFieldsTogether(t *testing.T) {
 	base := Ref{Scheme: RefSchemeFile, Path: "base.image"}
 	for _, ref := range []Ref{
 		{Scheme: base.Scheme, Path: base.Path, Digest: strings.Repeat("a", 64)},
-		{Scheme: base.Scheme, Path: base.Path, DigestScheme: "sha256"},
+		{Scheme: base.Scheme, Path: base.Path, DigestScheme: "digest"},
 		{Scheme: base.Scheme, Path: base.Path, DigestScheme: "unknown", Digest: strings.Repeat("a", 64)},
 	} {
 		if err := ref.Validate(); err == nil {

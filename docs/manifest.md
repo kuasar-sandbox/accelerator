@@ -74,9 +74,9 @@ flag 实参处停止解析)。
 `pkg/manifest` 同时提供 canonical ref parser。`manifest://` 只允许一个 64 位
 小写十六进制 content key;多层组合必须由调用方传入显式 ref 数组并使用
 `fetch.NewLayered`,不再使用 `manifest://k1:k2`。文件引用为
-`file://<path>[@sha256:<digest>|@hmac:<digest>|@manifest:<key>][@location:<name>]`;
+`file://<path>[@digest:<digest>|@hmac:<digest>|@manifest:<key>][@location:<name>]`;
 三个 identity qualifier 互斥。`@manifest` 选择 Manifest Bundle 中的根 Manifest，
-tarstream opener 必须拒绝它；反之 Bundle opener 必须拒绝 `@sha256/@hmac`。带
+tarstream opener 必须拒绝它；反之 Bundle opener 必须拒绝 `@digest/@hmac`。带
 location 时 path 必须是 basename,location 匹配
 `[A-Za-z0-9][A-Za-z0-9._-]*`,只保存逻辑名称,不携带宿主目录。允许数字开头以直接
 容纳 UUIDv7 sandbox/build ID。
@@ -651,20 +651,22 @@ retained buffer 为 2 MiB,异常大 buffer 用后丢弃。slot 和 weighted byte
 
 ### 4.9 本地 immutable tarstream 加密
 
-canonical tarstream 的 plaintext 结构保持为 payload、空
-`.kuasar.sha256.<plainDigest>` marker 和两个 trailer block。未传 codec 时,
-`tarstream.WriteTo` 的输出与旧格式逐 byte 相同,对外 identity 为
-`sha256:<plainDigest>`。传入 customer-key-backed codec 时,完整结构进入
+canonical tarstream 的plaintext结构为payload、
+`.kuasar.digest.<plainDigest>` marker body和两个trailer block。Payload PAX记录
+payload boundary;marker body记录boundary和payload commitment,完整读取时再用payload
+bytes复验。完整carrier或只替换dense metadata tail的派生source可通过
+`CarrierDigest`直接给出identity,不需要先把payload编码到`io.Discard`。未传codec时
+对外identity为`digest:<plainDigest>`。传入customer-key-backed codec时,完整结构进入
 encrypted tarstream v1,对外 identity 固定为:
 
 ```text
 hmac = HMAC-SHA256(customerKey, plainDigestRaw32Bytes)
 ```
 
-scheme 名为 `hmac`,不派生 identity key,不加入 domain prefix。marker 中的
-`plainDigest` 位于密文内,不得用于 key-bound 文件名、ref、日志或错误。
-`@hmac:<digest>` 只是 identity scheme,不表示输入的物理编码;`auto` 读取历史
-plaintext 时同样返回 `hmac`。
+scheme名为`hmac`,不派生identity key,不加入domain prefix。marker中的
+`plainDigest`和payload commitment位于密文内,不得用于plaintext文件名、ref、日志或
+错误。物理carrier决定identity scheme:`auto`读取plaintext返回`@digest`,读取
+encrypted carrier返回`@hmac`;两者不做隐式转换。
 
 v1 固定 AES-256-GCM 和 4096-byte 独立认证 record,不提供算法或 record size 协商。
 文件由 48-byte clear prefix、81-byte authenticated header 和连续 authenticated
@@ -698,9 +700,9 @@ path 不预读全部 data records,也不扫描并重算完整 plaintext digest�
 使用不同派生 key,所以跨 artifact splice 的 donor data record 会在该 record 被
 实际读取时认证失败;未被 fast open 读取的 donor record 不会提前触发错误。
 
-`SourceFrom` 是 full-validation path。完整消费时它解密全部 records,重算 marker
-前 plaintext tar bytes 的 SHA-256,验证空 marker、恰好两个 trailer blocks、
-expected `sha256|hmac` 和 outer EOF。跨 artifact record splice 会在顺序读取到
+`SourceFrom` 是 full-validation path。完整消费时它解密全部records,按权威sparse map
+重算payload/tail commitment与carrier identity,验证marker body、恰好两个trailer blocks、
+expected `digest|hmac` 和outer EOF。跨artifact record splice会在顺序读取到
 该 record 时以 authentication failure 失败。
 调用方主动停止消费时,尚未读取部分不具备完整验证结论;任何发布、上传或转换
 路径必须消费全部 Data extents并传播终点错误。
@@ -808,7 +810,7 @@ file://<basename>.bundle
 file://<basename>.bundle@location:<name>
 ```
 
-它禁止 `@manifest/@sha256/@hmac`、`manifest://`、绝对路径、目录分隔符和非
+它禁止 `@manifest/@digest/@hmac`、`manifest://`、绝对路径、目录分隔符和非
 `.bundle` 文件名。payload 必须是有效 UTF-8、仅 LF 换行且最后一行也以 LF 结束；
 禁止 BOM、CR、空行、注释、首尾空白和重复 ref。Writer 保留调用方顺序，不排序；
 最多 1024 项、1 MiB。空路径通过省略 entry 表达。`WriterOptions.Refs` 在

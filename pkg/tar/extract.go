@@ -240,10 +240,10 @@ func (x *extractor) entry(hdr *stdtar.Header) error {
 }
 
 func reservedDigestMarker(hdr *stdtar.Header, name string) bool {
-	if hdr.Typeflag != stdtar.TypeReg || hdr.Size != 0 || !strings.HasPrefix(name, tarstream.SHA256MarkerPrefix) {
+	if hdr.Typeflag != stdtar.TypeReg || hdr.Size != 40 || !strings.HasPrefix(name, tarstream.DigestMarkerPrefix) {
 		return false
 	}
-	hexDigest := strings.TrimPrefix(name, tarstream.SHA256MarkerPrefix)
+	hexDigest := strings.TrimPrefix(name, tarstream.DigestMarkerPrefix)
 	if len(hexDigest) != 64 || strings.ToLower(hexDigest) != hexDigest {
 		return false
 	}
