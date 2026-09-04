@@ -1,85 +1,114 @@
+[English](README.md) | [简体中文](README_zh.md)
+
 # accelerator
 
-面向镜像、快照和稀疏工件的数据访问与存储基础组件.它提供普通/稀疏数据表示、
-本地工件与共享文件引用、Manifest、FS/S3-compatible store、分层缓存、完整性与
-加密、OCI 拉取、EROFS 展平、按需读取和预取.
+`accelerator` is the **data access, storage, encryption, and cache infrastructure** for images, snapshots, and sparse artifacts in [Kuasar Sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox).
 
-内容寻址和去重是其中一种能力,共享范围由 salt 与部署安全域决定,不是组件的唯一
-价值.本仓是 [kuasar-sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) 平台的
-存储/镜像基础设施,也可以独立演进和使用.
+It provides reusable sparse-data and artifact abstractions, local and shared-file access, Manifest-backed content organization, filesystem and S3-compatible stores, layered caches, integrity and encryption, OCI retrieval, deterministic EROFS image flattening, on-demand fetch, and prefetch.
 
-## 导出面(下游 import 的薄客户端)
+Content addressing and deduplication are available capabilities, not the component's only purpose. Their sharing scope is controlled by deployment security domains and key material. A deployment can use direct files for snapshots, Manifest/object storage for large-scale distribution, or a combination of both.
 
-下游项目(`sandboxer` 等)只 import 以下 **纯 Go、无 CGO** 的包,不会引入
-RocksDB / AWS SDK / Reed-Solomon 等重依赖:
+## Data paths
 
-| 包 | 作用 |
-|---|---|
-| `pkg/sparse` | 平台统一稀疏模型:三态 `RunKind`(Hole/Zero/Data)+ 可执行 `Run` + `Source` 契约(`RunAt` 纯元数据解析,`Run.ReadAt` 在已解析区段内读取,`Source.ReadAt` 负责便利跨段读取,一次性源是一等公民),`ProbeHoles`(SEEK_HOLE)/`NewSource`/`Dense`;洞只来自权威元数据,禁止内容探洞 |
-| `pkg/manifest` (+ `codec`/`crypto`/`chunker`/`fetch`/`ingest`) | 分块 + 收敛加密 + 内容寻址的读写 SDK;`fetch.Stream` = `sparse.Source` + Close,manifest Data Run 额外实现 `fetch.ChunkRun`,layered 透传最终 serving Run,`fetch.ResolveChunkWindow`按最终可见性解析同一物理chunk在anchor两侧的连续窗口;`fetch.OpenTarStream` 把本地 tarstream 工件零解包开成 Stream,`ingest.Ingest` 单趟消费任意 `sparse.Source` |
-| `pkg/store` + `pkg/store/client` | 远端内容寻址存储代理的接口与客户端 |
-| `pkg/cache` + `pkg/cache/client` | 分层缓存的接口与客户端 |
-| `pkg/tarstream` | 单 payload 稀疏 tar 工件:`WriteTo` 写 GNU PAX sparse 1.0 + `.kuasar.digest.<hex>` carrier marker,边写边校验identity;marker保留payload boundary/commitment,使metadata-tail替换可用O(tail)工作量推导新identity;`SourceAt` 通过可选 `Digester` 零payload扫描读取身份;`ReadFrom` / `ReadSeekFrom` / `SourceFrom` 保持洞图精确往返与 GNU tar/archive-tar 互操作 |
-| `pkg/{flatten,image,remote,tar}` | OCI/目录 → EROFS 展平的公共实现:`flatten` 负责源模型与导出,`image` 负责 RuntimeConfig 投影,`remote` 负责 OCI registry 拉取/referrer/cache,`tar` 负责展平结果解包 |
+| Data path | Typical use | Characteristics |
+| --- | --- | --- |
+| Local files | Standalone nodes, local NVMe, temporary or node-affine artifacts | Direct file semantics and a short access path |
+| Shared filesystems | NAS, NFS, or another consistently mounted filesystem | Native file access shared across nodes; no mandatory chunk conversion |
+| Manifest and object storage | Large-scale distribution, remote persistence, migration, and tiered caching | Content-addressed objects, metadata-described sparse ranges, and on-demand reads |
 
-重后端(`*/server`、`pkg/cache/{rocks,redisstore,ec}`、`pkg/store/{fs,s3}`)只在 `cmd/` 与守护进程内
-编译,不进入下游闭包。`flatten-ctl` 二进制随 `guest-runtime` 的
-`runtime-vX.Y.Z` 发布,但其导入的
-展平公共包仍在本仓维护,供 CLI、测试和运行时读取 config 的代码复用。
+These paths expose common logical data and reference semantics to downstream components. `sandboxer` can therefore consume an image or snapshot without making the lifecycle API specific to one physical backend.
 
-## 二进制
+## Public Go surface
 
-| 二进制 | 说明 | 链接 |
-|---|---|---|
-| `manifest-ctl` | 本地分块/加密/去重 + manifest 读写 CLI | 纯 Go |
-| `store-ctl` | 内容寻址存储代理(fs / S3-compatible object storage backend + generation) | 纯 Go |
-| `cache-ctl` | 分层缓存守护进程(local / shard / tiered + EC) | CGO,静态链 librocksdb |
+The downstream import surface is kept small and mostly pure Go, so consumers such as `sandboxer` do not pull storage-server, object-storage SDK, erasure-coding, or database implementations into their binaries.
 
-**CGO 仅 `cache-ctl`**(librocksdb);其余两个二进制与全部导出面均 `CGO_ENABLED=0`。
+| Package | Purpose |
+| --- | --- |
+| `pkg/sparse` | Authoritative Hole/Zero/Data representation and sparse random/sequential reads |
+| `pkg/manifest` and subpackages | Content organization, chunking, encryption, ingest, fetch, and prefetch |
+| `pkg/store` and `pkg/store/client` | Content-store protocol and client |
+| `pkg/cache` and `pkg/cache/client` | Cache protocol, local/sharded/tiered composition, and clients |
+| `pkg/tarstream` | Sparse local transport artifact with identity and integrity metadata |
+| `pkg/flatten`, `pkg/image`, `pkg/remote`, `pkg/tar` | OCI/directory retrieval, image configuration, and EROFS flattening primitives |
 
-## 构建
+Heavy server backends remain behind component binaries and server packages.
+
+## Binaries
+
+| Binary | Purpose | Build model |
+| --- | --- | --- |
+| `manifest-ctl` | Ingest, inspect, fetch, and transform Manifest-backed artifacts | Pure Go |
+| `store-ctl` | Filesystem or S3-compatible content-store service and administration | Pure Go |
+| `cache-ctl` | Local, sharded, tiered, and erasure-coded cache service | Uses the backend dependencies selected by the current source tree |
+
+`flatten-ctl` is published with the `guest-runtime` Runtime release unit, while its shared image-flattening implementation is maintained here.
+
+## Storage security
+
+The component supports integrity verification and encryption for data that enters protected artifact and Manifest paths. Platform identity credentials and content-protection keys are separate concerns. Key scope, salt, and deployment security domains determine where encrypted content may be shared or deduplicated.
+
+Do not interpret content encryption as a claim that every threat model leaks no metadata, or that all tenant-private data should be globally deduplicated. Deployments must choose a sharing domain appropriate for the data classification and trust boundary. Direct local or shared-file paths can also apply the project's documented local artifact protection policy.
+
+## Build and test
 
 ```bash
-make manifest-ctl store-ctl     # 两个纯 Go 二进制
-make cache-ctl                  # 自动 make deps-rocksdb 编出 librocksdb.a 再 CGO 静态链
-make build                      # 全部三个
-make build TARGET_ARCH=aarch64  # 交叉编译(别名 amd64 / arm64)
-make vet                        # 校验薄客户端面(无需 librocksdb)
-make test                       # 单元测试(含 rocks,需 librocksdb);e2e 见各 docs;zot 拉取 e2e 为 make e2e
-make test-e2e                  # 运行 test/e2e/run_all.sh;需要项目主仓组装的完整 BIN
+make manifest-ctl store-ctl     # pure-Go command-line services
+make cache-ctl                  # build the cache service and its current backend dependencies
+make build                      # all component binaries
+make build TARGET_ARCH=aarch64  # cross-compile; amd64/arm64 aliases are accepted
+make vet                        # validate the thin downstream-facing Go surface
+make test                       # unit tests and backend tests
+make test-e2e                   # component owner suite; requires the assembled project BIN
 ```
 
-独立版本通过仓库 `main` 上受信任的 `Release` workflow 发布为 `vX.Y.Z`;发布件
-`accelerator-vX.Y.Z-linux-x86_64.tar.gz` 包含三个服务二进制及性能/分析辅助脚本。
-本仓文档与 `test/e2e/` 不进入组件包,由项目主仓聚合所选 tag 的源码并只放入
-`platform-release-vX.Y.Z.tar.gz`。
-本地可用 `make release VERSION=vX.Y.Z` 生成并校验相同布局的 release bundle。
-当前 Release 只发布已完成全量构建与 BMS 验证的 Linux x86_64 目标。项目主仓的
-每日协调器显式传入源码分支和精确 SHA;组件 `main` 用于主线,`release/vX.Y.x`
-用于对应组件维护线。Preview 和维护分支 Stable 不更新 GitHub Latest;独立的幂等
-Reconcile Latest 工作流按 `main` 源码提交先后协调主线 Stable,同一提交才比较 SemVer。
-组件版本与平台聚合版本独立,
-平台始终按精确 Tag 选择本组件。
-同版本发布与删除共用完整 workflow mutation group;若 GitHub 合并 pending 请求,项目主仓
-协调器会把 cancelled 状态作为未完成操作自动重跑,不会把它当作发布或 GC 已完成。
+Go and native prerequisites vary by target. The current source tree documents and builds any native cache dependencies through repository scripts. Real object-storage tests must use explicit test credentials or a local S3-compatible service; ordinary unit and local-filesystem tests must not require production cloud credentials.
 
-`deps/build-rocksdb.sh` 在 `build/<arch>/rocksdb/` 下编出无压缩的 `librocksdb.a`
-(约数分钟,冷启)。
+## Running independently
 
-## 私网 / 离线构建
+The three services can be deployed independently of the full platform:
 
-本仓自包含、无跨仓 Go 依赖,`GOPROXY` 指向内网镜像即可 `go build`。组织级多仓
-协同开发见根 `go.work`([kuasar-sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox))。
+- use `manifest-ctl` to ingest or fetch sparse artifacts;
+- run `store-ctl` with a filesystem root or an S3-compatible endpoint;
+- run `cache-ctl` in a local, sharded, or tiered topology;
+- use the exported packages in another Go service without importing heavy backends.
 
-## 文档
+Configuration examples must use local paths, documentation-reserved endpoints, and placeholder credentials. Production deployments should use protected endpoints, explicit resource budgets, durable authoritative storage, and observability appropriate to the selected cache topology.
 
-- [docs/manifest.md](docs/manifest.md) — 二进制清单:分块 / 收敛加密 / 密钥表 / 读写 SDK。
-- [docs/store.md](docs/store.md) — 内容寻址存储:分代目录布局 / fs·S3-compatible object storage backend / GC。
-- [docs/cache.md](docs/cache.md) — 三层缓存 + 纠删码:local / shard / tiered 与旁路填充。
-- [docs/cache-redis.md](docs/cache-redis.md) — Redis-compatible UDS/TCP 后端、取消语义与外部 Dragonfly 部署示例。
-OCI/目录 → EROFS 确定性展平 CLI 见 `guest-runtime/docs/flatten.md`。
+## Release model
+
+This repository publishes independent component versions named `vX.Y.Z`. The x86_64 component archive contains the three service binaries and the documented operational/performance helper scripts selected by the release contract. Component design documents and E2E sources are collected from the selected tag into the project platform archive.
+
+The project repository publishes aggregate versions named `release-vX.Y.Z`, selecting exact versions of `accelerator` and the other release units, validating their assets, and running cross-component tests. Aggregate and component version numbers are independent.
+
+See the [project release documentation](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release.md) and the [latest Stable aggregate release](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest).
+
+## Documentation
+
+Detailed design and reference documents are currently maintained primarily in Chinese:
+
+- [`docs/manifest.md`](docs/manifest.md) — sparse manifests, ingest/fetch, chunking, encryption, key tables, and public SDKs;
+- [`docs/store.md`](docs/store.md) — filesystem and S3-compatible stores, generation layout, integrity, and garbage collection;
+- [`docs/cache.md`](docs/cache.md) — local, sharded, tiered, and erasure-coded caches;
+- [`docs/cache-redis.md`](docs/cache-redis.md) — Redis-compatible UDS/TCP backend and external-service deployment examples.
+
+OCI/directory-to-EROFS CLI usage is documented with [`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime) because `flatten-ctl` is part of the Runtime release unit.
+
+The English README contains the complete public component entry path. Translating every detailed design document is not required to build or contribute to the component.
+
+## Project boundaries
+
+- MicroVM lifecycle and snapshot execution belong to [`sandboxer`](https://github.com/kuasar-sandbox/sandboxer);
+- network allocation and forwarding belong to [`connector`](https://github.com/kuasar-sandbox/connector);
+- the guest kernel, runtime image, and `flatten-ctl` release artifact belong to [`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime);
+- node and cluster orchestration belong to [`orchestrator`](https://github.com/kuasar-sandbox/orchestrator);
+- system-level design, shared BMS, demos, and aggregate releases belong to [`kuasar-sandbox/kuasar-sandbox`](https://github.com/kuasar-sandbox/kuasar-sandbox).
+
+## Contributing and security
+
+Read the repository-specific [contribution guide](CONTRIBUTING.md) and the [organization contribution guide](https://github.com/kuasar-sandbox/.github/blob/main/CONTRIBUTING.md). Changes to public data formats or downstream package contracts require linked companion pull requests and exact-source project validation.
+
+Do not report vulnerabilities or real storage credentials in public issues. Use the [Kuasar Sandbox Security Policy](https://github.com/kuasar-sandbox/kuasar-sandbox/security/policy) and GitHub private vulnerability reporting.
 
 ## License
 
-本仓库的项目原创内容采用 [Apache License 2.0](LICENSE).
-贡献授权说明见 [CONTRIBUTING.md](CONTRIBUTING.md).
+Original project content is licensed under the [Apache License 2.0](LICENSE). Preserve the license, attribution, NOTICE, and source obligations of native libraries, vendored code, generated code, formats, and third-party tools included in source or release assets.
