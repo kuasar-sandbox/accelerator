@@ -58,7 +58,6 @@ make build                      # all component binaries
 make build TARGET_ARCH=aarch64  # cross-compile; amd64/arm64 aliases are accepted
 make vet                        # validate the thin downstream-facing Go surface
 make test                       # unit tests and backend tests
-make e2e                        # OCI/Zot retrieval and flattening coverage where documented
 make test-e2e                   # component owner suite; requires the assembled project BIN
 ```
 
@@ -106,7 +105,7 @@ The English README contains the complete public component entry path. Translatin
 
 ## Contributing and security
 
-Read the [organization contribution guide](https://github.com/kuasar-sandbox/.github/blob/main/CONTRIBUTING.md). Changes to public data formats or downstream package contracts require linked companion pull requests and exact-source project validation.
+Read the repository-specific [contribution guide](CONTRIBUTING.md) and the [organization contribution guide](https://github.com/kuasar-sandbox/.github/blob/main/CONTRIBUTING.md). Changes to public data formats or downstream package contracts require linked companion pull requests and exact-source project validation.
 
 Do not report vulnerabilities or real storage credentials in public issues. Use the [Kuasar Sandbox Security Policy](https://github.com/kuasar-sandbox/kuasar-sandbox/security/policy) and GitHub private vulnerability reporting.
 
