@@ -84,16 +84,16 @@ See the [project release documentation](https://github.com/kuasar-sandbox/kuasar
 
 ## Documentation
 
-Detailed design and reference documents are currently maintained primarily in Chinese:
+Manifest, Store and Cache have complete English and Chinese editions. Existing English backend guides remain available:
 
-- [`docs/manifest.md`](docs/manifest.md) — sparse manifests, ingest/fetch, chunking, encryption, key tables, and public SDKs;
-- [`docs/store.md`](docs/store.md) — filesystem and S3-compatible stores, generation layout, integrity, and garbage collection;
-- [`docs/cache.md`](docs/cache.md) — local, sharded, tiered, and erasure-coded caches;
+- [Manifest — English](docs/manifest.md) / [Chinese](docs/manifest_zh.md) — sparse manifests, ingest/fetch, chunking, encryption, key tables, and public SDKs;
+- [Store — English](docs/store.md) / [Chinese](docs/store_zh.md) — filesystem and S3-compatible stores, generation layout, integrity, and garbage collection;
+- [Cache — English](docs/cache.md) / [Chinese](docs/cache_zh.md) — local, sharded, tiered, and erasure-coded caches;
 - [`docs/cache-redis.md`](docs/cache-redis.md) — Redis-compatible UDS/TCP backend and external-service deployment examples.
 
 OCI/directory-to-EROFS CLI usage is documented with [`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime) because `flatten-ctl` is part of the Runtime release unit.
 
-The English README contains the complete public component entry path. Translating every detailed design document is not required to build or contribute to the component.
+The README provides the public component entry path; the complete design guides contain formats, operating limits, failure behavior and measurement requirements.
 
 ## Project boundaries
 

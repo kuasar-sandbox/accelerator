@@ -1,106 +1,108 @@
-# manifest — 内容寻址存储的统一出入口
+[English](manifest.md) | [简体中文](manifest_zh.md)
 
-`manifest-ctl` 是数据进出"内容寻址存储"的统一入口。任何字节流(EROFS
-镜像、内存快照、磁盘镜像、用户文件)经 manifest-ctl `store` 写入后,产出
-一个**Manifest** —— 一份包含 chunk 元数据 + 加密的密钥表的小型二进制文
-件。Manifest 是后续读取(`load`)与跨节点引用(`manifest://<key>`)的
-唯一句柄。
+<a id="manifest--内容寻址存储的统一出入口"></a>
 
-## 1. 概述
+# manifest — the interface to content-addressed storage
 
-### 1.1 模块定位
+`manifest-ctl` is the entry and exit point for content-addressed data. Image, memory-snapshot, disk and user-file bytes can be ingested through the sparse-source API; the CLI `store` command specifically accepts a **tarstream artifact**, not an arbitrary raw file. Ingest produces a **Manifest**: a compact binary object containing chunk metadata and a sealed table of chunk keys. Its content key is the handle for later `load` operations and `manifest://<key>` references. Local Manifest Bundles provide another carrier for the same objects (§4.10).
 
-```
-   ┌─ input source ──┐      ┌─ manifest-ctl store ──────────────────┐      ┌─ output ──────────┐
-   │  sparse.Source  │ ───► │  chunker (data segments)              │ ───► │  Manifest         │
-   │  (file/stdin/   │      │      ↓                                │      │  (binary file or  │
-   │   tar stream)   │      │  Snappy candidate → RAW/Snappy        │      │   stdout)         │
-   └─────────────────┘      │      ↓ encrypt                        │      └───────────────────┘
-                            │  store-ctl Put(chunk_hash) ───────────┼───►  chunk bytes land in
-                            └───────────────────────────────────────┘      store-ctl backend
-```
+<a id="1-概述"></a>
 
-读取方向相反:`manifest-ctl load` 从 Manifest 取 chunk 列表 → 经 cache-ctl
-(若配置)穿到 store-ctl `Get` → 解密 → 输出由 `crypto.local` 决定编码的
-tarstream 工件。
+## 1. Overview
 
-### 1.2 设计原则
+<a id="11-模块定位"></a>
 
-- **写入路径**:`sparse.Source → chunker → Snappy/RAW 选择 → encrypt → store.Put → Manifest`
-  (Hole 段记为 manifest 空洞、不读取;Zero 段合成零字节过 chunker、免取数)
-- **读取路径**:`Manifest → fetch → decrypt → io.Writer`
-- **去重单位**:chunk(可变长 FastCDC 或固定长度)
-- **跨用户隔离**:salt 区分 dedup 域,加密 + content-addressing 让 store 只
-  见密文
+### 1.1 Role
 
-### 1.3 不做什么
-
-- 不直接管理后端字节(委派给 [`store_zh.md`](store_zh.md));
-- 不维护缓存(委派给 [`cache.md`](cache.md));
-- 不感知 docker / OCI / EROFS 等高层格式(它只看字节流);
-- 不做 ACL —— customer key 的物理保护是用户责任。
-
-## 2. 命令行接口
-
-### 2.1 公共 flag
-
-```
-Global Flags:
-  --manifest-config string    清单配置 YAML 路径(覆盖 MANIFEST_CONFIG 环境变量)
+```mermaid
+flowchart TD
+  S["Sparse source: file, stdin or tarstream"] --> C["Chunk data; record holes"]
+  C --> E["Choose RAW or Snappy; encrypt"]
+  E --> P["Store chunk objects"]
+  E --> M["Build index and seal key table"]
+  P --> M
+  M --> O["Store Manifest; return content key"]
 ```
 
-`--manifest-config` 与 `MANIFEST_CONFIG` 至少需要一项指向有效 YAML;两者
-都缺则命令报错(`config generate` 子命令除外)。配置文件 schema 见 §3.1。
+The read direction reverses this flow: `load` gets the Manifest, resolves its chunk list, fetches through the configured cache or directly from store, decrypts and emits a tarstream artifact encoded according to `crypto.local`. A configured cache is the selected remote read path; this does not imply automatic direct-store retry on cache errors.
 
-### 2.2 子命令一览
+<a id="12-设计原则"></a>
 
-| 命令 | 功能 |
+### 1.2 Principles
+
+- **Write path:** `sparse.Source → chunker → Snappy/RAW selection → encrypt → store.Put → Manifest`. Hole runs are recorded without reading them. Zero runs synthesize zero bytes for chunking without fetching a payload.
+- **Read path:** `Manifest → fetch → decrypt → io.Writer`.
+- **Deduplication unit:** a variable-length FastCDC chunk or a fixed-size chunk.
+- **Deduplication domains:** salt separates convergent-key domains. Chunk payloads are stored as ciphertext; the Manifest's index/geometry and sealed key-table container are not wholly encrypted. Salt separation and encryption do not implement tenant authorization (§4.4–4.5).
+
+<a id="13-不做什么"></a>
+
+### 1.3 Non-goals
+
+- Managing backend bytes directly: this belongs to [store](store.md).
+- Maintaining a cache: this belongs to [cache](cache.md).
+- Understanding Docker, OCI, EROFS or other high-level payload formats: the data layer handles bytes and sparse geometry.
+- Implementing ACLs: the caller/deployment protects customer keys, endpoints and references.
+
+<a id="2-命令行接口"></a>
+
+## 2. Command-line interface
+
+<a id="21-公共-flag"></a>
+
+### 2.1 Shared flag
+
+```text
+Shared flag on subcommands that accept configuration:
+  --manifest-config string    Manifest YAML path; overrides MANIFEST_CONFIG
+```
+
+Commands that use configuration require either `--manifest-config` or `MANIFEST_CONFIG` to name a valid YAML file. **Exceptions:** `config generate`, local-file/stdin `info`, and local-file `diff` do not need a configuration file. See §3.1 for the schema. The flag belongs after the subcommand, not before it.
+
+<a id="22-子命令一览"></a>
+
+### 2.2 Subcommands
+
+| Command | Purpose |
 |---|---|
-| `store`         | 写入数据 → 自动上传 manifest 并返回 hex content key |
-| `load`          | 按 manifest key 读取明文数据 |
-| `get-manifest`  | 按 hex key 取回 Manifest 原始字节(debug 用) |
-| `info`          | 打印本地 Manifest 文件摘要(无需 customer key) |
-| `verify`        | 通过 fetch 路径端到端验证 store 中 manifest 可用 |
-| `diff`          | 比较两个本地 Manifest 的 chunk 重叠度(去重率分析) |
-| `config show`   | 打印解析后的配置 YAML |
-| `config generate` | 输出带注释的配置模板 |
+| `store` | Ingest data, upload the resulting Manifest, and return its hex content key. |
+| `load` | Read the plaintext logical data selected by a Manifest key, wrapped in a tarstream artifact. |
+| `get-manifest` | Fetch raw Manifest bytes by hex key, chiefly for inspection. |
+| `info` | Print Manifest metadata without unsealing its key table. |
+| `verify` | Verify the stored Manifest and all nonzero chunks through the fetch path. |
+| `diff` | Compare chunk overlap between two local Manifest files. |
+| `config show` | Print parsed configuration as YAML. |
+| `config generate` | Print a commented configuration template. |
 
-输入 / manifest key 均为**位置参数**(匿名):`store` 的数据源、`info`
-的 manifest 来源省略或 `-` = stdin;`load` / `get-manifest` / `verify`
-以及 `info` 的 key 可带可选 `manifest://` 前缀(`manifest://<hex>` 与
-裸 `<hex>` 等价)。位置参数须置于 flags 之后(Go stdlib flag 在首个非
-flag 实参处停止解析)。
+Data sources and Manifest keys are **positional arguments**. Omitting the `store` input or the `info` source, or passing `-`, selects stdin. `load`, `get-manifest` and `verify` accept either a bare 64-character lowercase hex key or `manifest://<key>`. **Remote `info` requires the `manifest://` prefix**; a bare hex argument there is treated as a local filename. Put flags before positional arguments: Go's standard `flag` parser stops at the first non-flag argument.
 
-`pkg/manifest` 同时提供 canonical ref parser。`manifest://` 只允许一个 64 位
-小写十六进制 content key;多层组合必须由调用方传入显式 ref 数组并使用
-`fetch.NewLayered`,不再使用 `manifest://k1:k2`。文件引用为
-`file://<path>[@digest:<digest>|@hmac:<digest>|@manifest:<key>][@location:<name>]`;
-三个 identity qualifier 互斥。`@manifest` 选择 Manifest Bundle 中的根 Manifest，
-tarstream opener 必须拒绝它；反之 Bundle opener 必须拒绝 `@digest/@hmac`。带
-location 时 path 必须是 basename,location 匹配
-`[A-Za-z0-9][A-Za-z0-9._-]*`,只保存逻辑名称,不携带宿主目录。允许数字开头以直接
-容纳 UUIDv7 sandbox/build ID。
+`pkg/manifest` also exposes a canonical reference parser. A `manifest://` reference contains exactly one 64-character lowercase hexadecimal content key. Compose layers using an explicit reference array and `fetch.NewLayered`; `manifest://k1:k2` is not supported.
 
-### 2.3 `manifest-ctl store` — 数据写入
+File references have this form:
 
+```text
+file://<path>[@digest:<digest>|@hmac:<digest>|@manifest:<key>][@location:<name>]
 ```
-manifest-ctl store [flags] <path|->        # <path|-> 省略或 - = stdin
+
+The three identity qualifiers are mutually exclusive. `@manifest` selects a root Manifest in a Manifest Bundle and must be rejected by a tarstream opener; a Bundle opener must reject `@digest` and `@hmac`. With a location, the path must be a basename. The location must match `[A-Za-z0-9][A-Za-z0-9._-]*` and carries a logical name, not a host directory. A leading digit is allowed so UUIDv7 sandbox/build IDs can be used directly.
+
+<a id="23-manifest-ctl-store--数据写入"></a>
+
+### 2.3 `manifest-ctl store` — ingest
+
+```text
+manifest-ctl store [flags] <path|->        # omitted input or "-" means stdin
 
 Flags:
-  --extra-salt string         额外 salt 字节,叠加到 store 提供的 opaque salt
-  --no-progress               禁用进度输出
+  --extra-salt string         Extra salt bytes mixed into the store's opaque salt
+  --no-progress              Suppress live progress
 ```
 
-输入是 **tarstream 工件**(平台镜像/快照的统一容器):size 与洞图都在信封里,
-stdin 与文件都通过 `SourceFrom` 单遍完整验证,不物化中间文件;洞永远来自信封
-元数据,不做文件系统探测或内容零扫描。`crypto.local=off|auto|required` 分别对应
-plaintext-only、兼容 plaintext/encrypted、encrypted-only;ingest 结果发布前会验证
-inner digest、marker、trailer 和 outer EOF。
+The input is a **tarstream artifact**, the platform container for images and snapshots. Its envelope carries size and holes. Files and stdin use the same one-pass, fully validating `SourceFrom` path, without an intermediate materialization. Holes come from envelope metadata, never filesystem probing or zero-content scanning. `crypto.local=off|auto|required` respectively accepts plaintext only, plaintext or encrypted carriers, and encrypted carriers only. Before publishing the Manifest, ingest must finish validation of the inner digest, marker, trailer and outer EOF.
 
-stdout 输出一行 64 字符 hex —— 这是上传后的 manifest content key。stderr
-是人类可读的摘要(默认开,`--no-progress` 关):
+Stdout contains one 64-character hex line: the uploaded Manifest content key. Stderr contains live progress and a human-readable final summary. **`--no-progress` suppresses live progress, not the final summary.** An illustrative summary is:
 
-```
+```text
 image size:   10.0 GiB
 stored bytes: 1.0 GiB
 chunks:       stored=2048 dedup=18432 zero=0
@@ -109,84 +111,83 @@ manifest:     encoding=raw logical=1.8 MiB stored=1.8 MiB
 manifest key: a1b2c3d4...
 ```
 
-示例:
+Examples assume a valid configuration and customer key. `disk.img` and `snap.bin` below are already tarstream artifacts, despite their filenames; abbreviated keys elsewhere in this guide are placeholders for complete keys.
 
 ```bash
-# 文件 → manifest key
+# Artifact file → Manifest key
 MKEY=$(manifest-ctl store disk.img)
 
-# stdin → manifest key
+# Artifact stdin → Manifest key
 cat disk.img | manifest-ctl store > disk.key
 
-# docker save → 展平 → 入库(典型管道)
+# Docker archive → flatten → ingest; upload-only stdout is the Manifest key
 docker save myapp:v1 | flatten-ctl export --upload > app.key
 
-# 额外 salt(隔离 dedup 域;flags 在位置参数前)
+# Extra salt narrows the deduplication domain; flags precede the input
 manifest-ctl store --extra-salt "tenant-xyz" snap.bin
 
-# 切换分块 / 加密模式 → 改 YAML
+# Change chunking or crypto policy through YAML
 ```
 
-### 2.4 `manifest-ctl load` — 数据读取
+<a id="24-manifest-ctl-load--数据读取"></a>
 
-```
+### 2.4 `manifest-ctl load` — read data
+
+```text
 manifest-ctl load [flags] <hex|manifest://hex>
 
 Args:
-  <hex|manifest://hex>        要加载的 manifest content key(必填;可带可选
-                              manifest:// 前缀)
+  <hex|manifest://hex>        Required Manifest content key
 Flags:
-  --output string             输出路径 (default "-", stdout;终端拒写)
-  --name string               产物 tar 条目名 (default "image")
-  --offset uint               窗口起始偏移
-  --length uint               窗口长度 (0 = 余下全部)
-  --no-progress               禁用进度输出
+  --output string            Output path (default "-", stdout; refuses a terminal)
+  --name string              Payload tar entry name (default "image")
+  --offset uint              Start of the logical window
+  --length uint              Window length (0 = the remaining bytes)
+  --no-progress              Suppress live progress
 ```
 
-输出是 **tarstream 工件**:manifest 空洞无损进信封洞图(没有"落洞还是填零"
-的策略问题,原 `--hole` 旗标随之取消),IsZero chunk 由写出端本地合成零字节、
-不取数。`crypto.local=off` 输出 byte-compatible plaintext,`auto|required` 输出
-encrypted v1。要 raw 字节用 `flatten-ctl tar extract` 解包。
+The output is a **tarstream artifact**. Manifest holes pass losslessly into its envelope map, so there is no choice between filling and preserving holes; the old `--hole` flag was removed. The writer synthesizes IsZero chunks locally without fetching them. `crypto.local=off` emits the compatible plaintext format; `auto|required` emit encrypted v1. Use `flatten-ctl tar extract` to obtain raw payload bytes.
 
 ```bash
-# 全量还原为工件(flags 在位置参数前)
+# Reconstruct the full artifact; flags precede the key
 manifest-ctl load --output disk.img a1b2c3d4...
 
-# 窗口切片(切片本身也是合法工件)
+# A window is also emitted as a valid artifact
 manifest-ctl load --offset 4096 --length 65536 --output slice.img a1b2c3d4...
 
-# 也可带 manifest:// 前缀
+# The manifest:// prefix is also accepted
 manifest-ctl load --output disk.img manifest://a1b2c3d4...
 ```
 
-### 2.5 `manifest-ctl get-manifest` — 取回 manifest 字节
+<a id="25-manifest-ctl-get-manifest--取回-manifest-字节"></a>
 
-把 manifest 原始字节从 store 拿出来(主要用于 debug 或 `info`/`diff` 离
-线场景)。
+### 2.5 `manifest-ctl get-manifest` — retrieve Manifest bytes
 
-```
+Fetch the raw Manifest object, mainly for debugging or offline `info`/`diff`. Retrieval follows the configured cache/store path.
+
+```text
 manifest-ctl get-manifest [--output -|FILE] <hex|manifest://hex>
 ```
 
 ```bash
-# 拿出来直接看(也可直接 `manifest-ctl info manifest://<hex>`)
+# Inspect fetched bytes; alternatively use info manifest://<hex>
 manifest-ctl get-manifest a1b2c3d4... | manifest-ctl info -
 
-# 存档
+# Save the physical Manifest verbatim
 manifest-ctl get-manifest --output disk.manifest a1b2c3d4...
 ```
 
 ### 2.6 `manifest-ctl info`
 
-读取 manifest 并打印摘要。位置参数三选一:本地 manifest 文件路径、`-`
-(或省略)= stdin、或 `manifest://<hex>`(从 store 取回 manifest 字节,
-此时需 `--manifest-config`)。前两者无需 customer key、无需 store 连接。
+Read and summarize a Manifest from one of three sources: a local path, stdin (`-` or omitted), or `manifest://<hex>` through the configured remote reader. Local/stdin inspection needs neither a configuration, customer key nor store connection. Remote metadata retrieval needs configuration and connectivity but does not unseal the customer-key-protected key table.
 
-```
+```text
 manifest-ctl info [--manifest-config <path>] <file|-|manifest://hex>
 ```
 
-```
+Illustrative output:
+
+```text
 version:       1
 image size:    10.0 GiB (10737418240 bytes)
 chunk mode:    cdc
@@ -195,46 +196,43 @@ zero chunks:   0 (0 B)
 holes:         0 (0 B)
 min chunk:     128.0 KiB    (configured)
 max chunk:     1.0 MiB    (configured)
-avg chunk:     524.0 KiB
+avg chunk:     512.0 KiB
 
 size distribution (data chunks):
        min(N)          P1          P5         P25         P50         P75         P95         P99      max(N)
   63.5K(1)       128.0K      256.0K      384.0K      512.0K      640.0K      896.0K        1.0M     1.0M(412)
   (max == configured max — 412/20480 (2.0%) chunks are forced CDC cuts)
-key table:     655380 bytes (sealed)
-manifest size: 1887436 bytes
+key table:     655389 bytes (sealed)
+manifest size: 1802334 bytes
 ```
 
-`min chunk` / `max chunk` 标 `(configured)` 是因为它们来自 Manifest 头里记录的
-**配置值**,不是实测;实测分布在下面的百分位表里(只统计非 zero 的数据 chunk,
-`min(N)` / `max(N)` 括号内是取到该极值的 chunk 数;最后一行仅当实测最大值正好
-等于配置上限时出现,提示有多少 chunk 是被 CDC 强制切的)。
+The minimum/maximum marked `(configured)` are the bounds stored in the Manifest header, not measured extremes. The percentile distribution below covers nonzero data chunks. Parentheses in `min(N)`/`max(N)` count chunks at each observed extreme. The final diagnostic appears only when the measured maximum equals the configured cap, identifying forced-size CDC cuts.
 
-查看 store 中的 manifest 直接 `manifest-ctl info manifest://<hex>`,等价于
-`get-manifest … | info -` 管道。
+`manifest-ctl info manifest://<hex>` is the direct equivalent of `get-manifest … | info -` for remote inspection.
 
 ### 2.7 `manifest-ctl verify`
 
-通过 fetch 路径逐 chunk 端到端解密,验证 store 中的 manifest 全可用。
+Fetch and decrypt every nonzero chunk to verify the entire Manifest's availability and content. This command forces physical SHA-256 checking even if ordinary reads disable it.
 
-```
-manifest-ctl verify [--no-progress] a1b2c3d4...        # 或 manifest://a1b2c3d4...
+```text
+manifest-ctl verify [--no-progress] a1b2c3d4...        # or manifest://a1b2c3d4...
 ```
 
-```
+```text
 verified: 20480  skipped(zero): 0  holes: 0  failed: 0  total chunks: 20480
 ```
 
-### 2.8 `manifest-ctl diff` — 去重率分析
+<a id="28-manifest-ctl-diff--去重率分析"></a>
 
-```
+### 2.8 `manifest-ctl diff` — deduplication analysis
+
+```text
 manifest-ctl diff <manifest-a> <manifest-b>
 ```
 
-两个参数都是本地 manifest 文件(用 `get-manifest` 取回);diff 不需要打开
-store。
+Both arguments are local Manifest files, which can be obtained with `get-manifest`. `diff` neither opens a store nor loads a configuration or customer key.
 
-```
+```text
 manifest A:  10.0 GiB, 20480 chunks (20480 unique)
 manifest B:  10.1 GiB, 20512 chunks (20512 unique)
 shared:      18432 chunks (9.0 GiB)
@@ -245,33 +243,35 @@ dedup ratio: 45.0%
 
 ### 2.9 `manifest-ctl config`
 
-```
+```text
 manifest-ctl config show     [--manifest-config <path>]
 manifest-ctl config generate
 ```
 
-`generate` 输出带注释的清单配置模板;`show` 打印加载后的有效配置(YAML)。
+`generate` prints a commented template. `show` prints the loaded configuration as YAML; it does not prove that all backend connections and deferred constructors will succeed.
 
-## 3. 配置
+<a id="3-配置"></a>
+
+## 3. Configuration
 
 ### 3.1 manifest-config.yaml
 
 ```yaml
 manifest:
-  key: "0a1b2c3d..."              # 32 字节 hex 客户密钥;Manifest 内嵌的密钥表用它密封
-  verify_content: true             # 普通读取是否复验 physical Manifest/Chunk SHA-256;缺省 true
-  # write_generation: G3           # 可选;指定写入 generation
+  key: "0a1b2c3d..."              # Placeholder: a 32-byte hex customer key seals the key table
+  verify_content: true           # Recheck physical Manifest/Chunk SHA-256; default true
+  # write_generation: G3         # Optional write generation
 store:
-  endpoint: 127.0.0.1:7100        # 远端读写必填;离线 Bundle 可省略:host:port 或 Unix socket
-                                  # (/run/sandbox/store.sock 或 unix:///...);须与 store-ctl listen 一致
-  pool: 4                         # 客户端并行 grpc.ClientConn 数 (round-robin)
-  timeout: 5s                     # 单次 store RPC 超时
+  endpoint: 127.0.0.1:7100        # Required for remote writes/direct-store reads; optional for offline Bundles
+                                 # TCP host:port or UDS (/run/sandbox/store.sock or unix:///...)
+  pool: 4                        # Independent grpc.ClientConn instances, round-robin
+  timeout: 5s                    # Per-store-RPC timeout
 cache:
-  endpoint: 127.0.0.1:7070        # 空 = 跳过 cache 层、直接走 store;同支持 Unix socket 路径
+  endpoint: 127.0.0.1:7070        # Empty selects direct store; otherwise use cache wire; UDS also accepted
   pool: 4
   timeout: 2s
 chunker:
-  mode: cdc                       # cdc | fixed
+  mode: cdc                      # cdc | fixed
   cdc:
     min: 128KiB
     avg: 512KiB
@@ -279,403 +279,257 @@ chunker:
   fixed:
     size: 512KiB
 crypto:
-  chunk: aes                      # aes(唯一支持)
-  manifest: aes                   # aes(唯一支持)
-  local: off                      # off | auto | required;缺省 off
+  chunk: aes                     # Only supported value
+  manifest: aes                  # Only supported value
+  local: off                     # off | auto | required; default off
 ```
 
-字段说明:
+Fields:
 
-- `manifest.key` — 客户密钥,**Manifest 中密钥表的密封密钥**。**不参与
-  chunk 加密或寻址**。loss → 整个 Manifest 不可读。可留空,改由
-  `$MANIFEST_KEY` 环境变量提供——这是密钥的**主要交付方式**,且 `$MANIFEST_KEY`
-  存在时**覆盖**此处 YAML 的值(密钥懒解析、不写回 Config,故不会被
-  `config show` 回显)。两者皆空时,真正用到密封/解封的命令才报错。
-- `manifest.verify_content` — 缺省 `true`。普通 Bundle/cache/store Fetcher、
-  `GetManifestBlob` 和 `CheckManifest` 都用同一策略：`true` 时在解析 Manifest
-  前复验 `SHA256(physical Manifest) == requested key`，首次读取 Chunk 时复验
-  `SHA256(physical Chunk) == CiphertextHash`；`false` 时 ContentKey 只作 locator，
-  不执行这两次完整对象扫描。关闭后进程只记录一次清晰 WARNING；Manifest
-  envelope/geometry、key table GCM、Chunk format/长度、解密/解压等结构检查仍然
-  执行。`manifest-ctl verify`、Bundle full verify/upload/export 和对象修复始终
-  强制开启 SHA 校验，不受该字段影响。
-- `manifest.write_generation` — 可选写入 generation。有 `store.endpoint` 时，
-  留空调用 `AdmitWrite()` 选择当前最新项，非空调用
-  `AdmitWriteFor(generation)`，generation 已移除则失败；Store RPC 失败不会降级为
-  本地派生。无 Store 的离线 Bundle writer 在字段留空时使用普通 generation 名
-  `NONE`，显式配置时使用该值，两者都调用公共
-  `store.SaltForGeneration` 派生 salt。`NONE` 不是保留字或协议特殊值。
-- `store.endpoint` — manifest-ctl 不直接读写持久层;所有 chunk / Manifest
-  I/O 通过这个 gRPC 客户端打到 store-ctl 守护进程。取 `host:port`(TCP)或一个
-  Unix socket(裸路径 `/run/sandbox/store.sock` 会被规范化为 gRPC 的
-  `unix:///run/sandbox/store.sock`,显式 `unix:` 形式原样透传)——与 store-ctl
-  的 `listen` 同址(同机经 socket 免 TCP 栈)。
-- `cache.endpoint` — 空则 manifest-ctl `load` 路径直走 store gRPC;非空则
-  通过 wire 协议穿 cache-ctl。同样接受 `host:port` 或 Unix socket 路径
-  (`unix://path` 或裸 `/path`),与 cache-ctl 的 `listen` 同址。
-- `chunker.mode` — `cdc`(FastCDC,变长)或 `fixed`(固定大小)。详见 §4.1。
-- `crypto.chunk` / `crypto.manifest` — chunk 与 Manifest 的加密算法,均仅支持
-  `aes`(§4.3 / §4.4);其它值在构造时即被拒绝。
-- `crypto.local` — 本地存储兼容/强制 policy,不是算法选择。`off` 不启用本地
-  codec,`auto` 同时接受历史 plaintext 与加密格式,`required` 只接受加密格式。
-  缺省为 `off`。
+- `manifest.key` is the customer key that **seals the Manifest's key table**; it does not derive the chunk encryption key. Losing it prevents unsealing that Manifest's table. It may be omitted from YAML and supplied through **nonempty `MANIFEST_KEY`**, the primary delivery mechanism. A nonempty environment value overrides YAML; an empty one falls back to YAML. The key is resolved lazily and not written back into Config, so `config show` does not echo the environment-provided key. **A key explicitly stored in YAML remains in Config and can be printed by `show`.** If both sources are empty, operations needing the key fail.
+- `manifest.verify_content` defaults to `true`. Ordinary Bundle/cache/store Fetchers, `GetManifestBlob` and `CheckManifest` share the policy. When enabled, they check `SHA256(physical Manifest) == requested key` before parsing and `SHA256(physical Chunk) == CiphertextHash` when first reading a chunk. When disabled, ContentKey is a locator and those complete-object hash scans are skipped. The process emits one clear warning. Envelope/geometry checks, key-table GCM authentication, chunk format/length validation, decryption and decompression remain. Chunk AES-CTR itself is not authenticated encryption; disabling the physical hash check removes that chunk-content integrity check. `manifest-ctl verify`, full Bundle verify/upload/export and object repair always force SHA verification.
+- `manifest.write_generation` optionally selects a write generation. With `store.endpoint`, empty means `AdmitWrite()` selects the latest admitted generation; a value uses `AdmitWriteFor(generation)` and fails if it was removed. A Store RPC failure does not fall back to local derivation. An offline Bundle writer without Store uses the ordinary generation name `NONE` when unset, or the explicit value otherwise; both derive salt with public `store.SaltForGeneration`. `NONE` is neither reserved nor a special protocol value.
+- `store.endpoint` points at the store-ctl gRPC service for remote object I/O. It accepts TCP `host:port` or a Unix socket. Bare `/run/sandbox/store.sock` is normalized to `unix:///run/sandbox/store.sock`; an explicit `unix:` target is passed through. Match store-ctl's `listen` address. Same-host UDS avoids TCP transport; local Bundle object I/O follows the separate Bundle reader/writer contract.
+- `cache.endpoint`: empty selects direct-store reads; nonempty selects cache-ctl's wire protocol. It accepts `host:port`, explicit Unix targets or a bare socket path, matching cache-ctl's `listen`. This is source selection at construction, not error-triggered failover around a configured cache.
+- `chunker.mode` is `cdc` (FastCDC) or `fixed`; see §4.1.
+- `crypto.chunk` and `crypto.manifest` each accept only `aes`; other values fail when the crypto objects are constructed (§4.3–4.4).
+- `crypto.local` is a local-format compatibility/enforcement policy, not an algorithm selector. `off` does not enable the local codec; `auto` reads legacy plaintext or encrypted carriers; `required` accepts only encrypted carriers. The default is `off`.
 
-### 3.2 加载顺序
+<a id="32-加载顺序"></a>
 
-**配置文件**的来源只有 CLI flag 与对应环境变量两种,**没有自动查找**:
+### 3.2 Loading order
 
-```
---manifest-config FILE     ┐
-                           ├─ precedence: flag > env; error when both absent
-MANIFEST_CONFIG            ┘   (except `config generate`)
-```
+The **configuration filename** comes only from the CLI flag or its environment variable; there is **no automatic discovery**:
 
-**customer key 是例外**:它可以来自配置文件的 `manifest.key`,**也可以**来自
-`$MANIFEST_KEY` 环境变量,且后者存在时覆盖前者(§3.1)——所以即便共享的
-MANIFEST_CONFIG 不含 key,命令仍能拿到密钥。
+| Source | Precedence |
+|---|---|
+| `--manifest-config FILE` | First, when nonempty. |
+| `MANIFEST_CONFIG` | Used when the flag is empty. |
+| Neither | Error for commands that need configuration; §2.1 lists the exceptions. |
 
-除文件外,`pkg/manifest.ParseConfig` 还支持从**内存 YAML 字节**装配 Config
-(例如经 config-socket 投递给 sandbox-ctl),endpoint / crypto 等参数无需落盘;
-customer key 通常由调用方单独设到 `Config.Manifest.Key`。
+The **customer key** has a separate precedence rule: nonempty `MANIFEST_KEY` overrides `manifest.key` from YAML. Thus a shared config file can omit the key while the command receives it separately.
 
-无单字段 CLI override —— 切换分块或加密模式直接改 YAML。
+`pkg/manifest.ParseConfig` also accepts **in-memory YAML bytes**, for example configuration delivered to sandbox-ctl over a config socket. Endpoint and crypto settings need not be written to disk. A caller may set the key separately in `Config.Manifest.Key`; the environment override still applies when `CustomerKey()` is used.
 
-## 4. 设计
+There are no per-field command-line overrides for chunker or crypto settings. Change the YAML to change those settings.
 
-### 4.1 chunking
+<a id="4-设计"></a>
 
-把字节流切成可去重单位。两种模式:
+## 4. Design
+
+### 4.1 Chunking
+
+Chunking divides the logical byte stream into deduplicable units. Two modes are available.
 
 #### FastCDC (cdc)
 
-变长内容定义分块,基于 rolling hash + Gear 表选择切点。
+Variable-length, content-defined chunking selects boundaries using a rolling hash and Gear table.
 
-| 参数 | 默认 | 说明 |
+| Parameter | Default | Meaning |
 |---|---|---|
-| `min` | 128 KiB | 切点的最小长度;小于此值不切 |
-| `avg` | 512 KiB | 期望平均长度;Gear mask 按此值设置 |
-| `max` | 1 MiB   | 切点的最大长度;到此强制切 |
+| `min` | 128 KiB | Minimum cut length; the final fragment of a data segment may be shorter. |
+| `avg` | 512 KiB | Target average length used to derive the Gear masks. |
+| `max` | 1 MiB | Maximum length; reaching it forces a cut. |
 
-三个尺寸(以及 fixed 的 `size`)都必须是 4 KiB(page)的整数倍,否则配置
-解析报错。
+These sizes and fixed `size` must be multiples of 4 KiB. The chunker constructor validates them; merely parsing YAML is not equivalent to constructing a valid chunker. The Manifest ingester also enforces the canonical 64 MiB maximum decoded chunk size.
 
-性质:对**插入/删除**有局部性 —— 在文件中段插入若干字节,只影响附近若干
-个 chunk 的边界,其余 chunk 边界与之前一致 → dedup 命中率高。
+Content-defined boundaries can regain alignment after insertions/deletions and retain deduplication beyond the changed area. This implementation aligns cuts to 4 KiB boundaries; the amount of boundary disturbance depends on the edit, alignment, sparse segmentation and content. It does not guarantee that any arbitrary byte insertion changes only a fixed small number of chunks.
 
 #### Fixed-size (fixed)
 
-固定大小切分(默认 512 KiB)。性质:实现简单,但对插入/删除**无**局部
-性 —— 在中段插入几字节后,后续所有 chunk 都偏移,几乎全 miss。仅作 perf
-基线对比用,生产推荐 cdc。
+Fixed-size chunks default to 512 KiB. The layout is simple and predictable, but insertions/deletions that shift later fixed boundaries can substantially reduce deduplication. This is useful as a performance baseline and for predictable layouts; CDC is the default for content reuse. Relative speed and hit rate depend on the workload.
 
-切换模式只需改 YAML `chunk.mode`,不影响 manifest-ctl 命令。
+Change YAML `chunker.mode` to select the mode; the command-line interface is unchanged.
 
-### 4.2 收敛加密(convergent encryption)
+<a id="42-收敛加密convergent-encryption"></a>
 
-目标:**相同明文 + 相同 salt 生成相同密文**,允许跨用户在 store 上做去
-重;同时 store 永远只见密文。
+### 4.2 Convergent encryption
 
-#### Key 派生
+The invariant is **same plaintext + same salt → same ciphertext**, allowing objects within a shared deduplication domain to reuse stored chunk bytes. Chunk payloads are encrypted; this is not a claim that every Manifest field is secret or that a store cannot infer repeated content.
 
+<a id="key-派生"></a>
+
+#### Key derivation
+
+```text
+salt = server_salt (+ extra_salt mixing)   # §4.5
+key  = SHA256(salt || plaintext)          # convergent key
 ```
-salt = server_salt (+ extra_salt mixing)   # 见 §4.5
-key  = SHA256(salt || plaintext)           # convergent key
-```
 
-AES-CTR 的 IV 取全零。key 始终由**原始 plaintext**派生,而固定 canonical
-encoder 又保证同一 plaintext 只对应一个 RAW 或 Snappy payload,因此同一 `(key,
-IV=0)` 不会加密两个不同 payload。由 `salt + plaintext` 决定 chunk 的密钥,
-同 salt 域内同 plaintext 必然产出同 physical object;同 object → 同
-ContentKey(= `SHA256(object)`)→ store 上同一份字节。
+AES-CTR uses an all-zero IV. The key is derived from the **original plaintext**, while the fixed canonical encoder selects one RAW or Snappy payload for that plaintext. Thus the supported canonical writer does not encrypt two different encoded payloads with the same derived key/IV pair. Under the hash assumptions, identical plaintext in one salt domain produces the same physical object, the same `ContentKey = SHA256(object)`, and one stored byte sequence.
 
-这个不变量要求 Go Snappy 版本、`snappy.Encode`、收益门槛和 format byte 固定。当前
-项目尚未发布,本格式直接替换旧开发格式且 reader 不兼容旧对象。首次使用前必须
-清空旧 salt domain 或换 generation salt,并禁止旧/new writer 混写。以后若改变
-encoder 输出或门槛,必须更换 salt/key domain,不能只换 format byte。
+This requires the Go Snappy version, `snappy.Encode`, benefit threshold and format rules to stay fixed. The current reader rejects the older development layout. Do not mix incompatible writers within a salt/key domain. A future change to encoder output or thresholds requires domain separation and an explicitly reviewed migration; changing the format byte alone is insufficient. Verify the selected release's reader/writer compatibility and preserve existing assets and rollback data rather than treating an old “not yet released” note as permission to delete a live salt domain.
 
-canonical encoder 固定为 `github.com/golang/snappy` v1.0.0 的 block API。相同
-输入的 encoded bytes 由 amd64、amd64 `noasm` 与 arm64 golden 共同约束；这项
-逐字节一致性优先于更高压缩比。`klauspost/compress/s2` 的标准及 Snappy-compatible
-encoder 会因架构实现产生不同 block bytes，因此不用于 canonical 写路径。
+The canonical encoder is the block API in **`github.com/golang/snappy` v1.0.0**. Golden tests constrain identical encoded bytes across amd64, amd64 `noasm` and arm64. Byte-for-byte consistency takes precedence over a higher compression ratio. The standard and Snappy-compatible `klauspost/compress/s2` encoders can produce different block bytes across architecture implementations, so they are not used for canonical writes.
 
 #### Content key
 
-Chunk 上传时,`SHA256(physical_object)` 是 store 的寻址键;Manifest 上传时同样
-按 `SHA256(physical_envelope)`。Salt **不参与寻址** —— 寻址完全由物理字节哈希决定,
-保留 salt 的隔离性,但允许 store 端以单一 KV 视图存储(详见 [`store_zh.md`](store_zh.md))。
+Chunks use `SHA256(physical_object)` as the store key; Manifests use `SHA256(physical_envelope)`. Salt is not separately concatenated into the address calculation. It changes encrypted object bytes, which changes their physical hash. Store can therefore expose one content-key KV view while preserving distinct encrypted objects for different salt domains. See [store](store.md).
 
-### 4.3 加密模式 — chunk
+<a id="43-加密模式--chunk"></a>
 
-YAML `crypto.chunk` 仅支持 `aes`;任何其它值在构造时即被拒绝(无明文回退)。
-每个非零 chunk 固定执行 Go Snappy block `snappy.Encode`。仅当同时满足以下 canonical
-门槛才选 Snappy,否则选 RAW；这不是配置项：
+### 4.3 Chunk encryption format
+
+YAML `crypto.chunk` accepts only `aes`; all other values fail at construction, with no plaintext fallback.
+
+Every nonzero chunk is encoded as a Go Snappy block candidate. Snappy is selected only if both canonical conditions hold; these are not configuration options:
 
 ```text
 saved = rawSize - encodedSize
 Snappy iff saved >= 4 KiB AND encodedSize * 4 <= rawSize * 3
 ```
 
-物理格式：
+The implementation evaluates this rule without overflowing adversarial integer lengths.
 
-| format byte | payload | physical object |
+| Format byte | Payload | Physical object |
 |---|---|---|
-| `0x01` (`AESRaw`) | 原始 plaintext | `[0x01] || AES-256-CTR(key, IV=0, plaintext)` |
-| `0x02` (`AESSnappy`) | `snappy.Encode(plaintext)` | `[0x02] || AES-256-CTR(key, IV=0, snappy_block)` |
+| `0x01` (`AESRaw`) | Original plaintext. | `[0x01] || AES-256-CTR(key, IV=0, plaintext)` |
+| `0x02` (`AESSnappy`) | `snappy.Encode(plaintext)`. | `[0x02] || AES-256-CTR(key, IV=0, snappy_block)` |
 
-chunk key 是收敛密钥 `SHA256(salt‖plaintext)`,由加密层内部派生(调用方只
-传 salt、不传 key),故 (key, IV=0) 对不同明文不复用、CTR keystream 不重用。
-format byte 未加密但被 physical ContentKey 覆盖。Manifest entry 仍只记录原始
-plaintext size 与完整 physical hash,不增加 codec 字段。unknown format、长度不
-匹配、损坏、截断或不满足固定收益门槛的 Snappy object 一律失败,没有兼容探测或
-fallback。
+The encryption layer derives `SHA256(salt || plaintext)` internally; its caller passes salt, not a chunk key. Distinct plaintexts receive distinct keys under the hash assumptions, avoiding intentional CTR keystream reuse within the canonical contract. The format byte is cleartext but included in the physical ContentKey.
 
-### 4.4 加密模式 — Manifest
+The Manifest entry records the original plaintext size and the complete physical hash; it does not add a codec field. Unknown formats, inconsistent lengths, truncation, invalid Snappy blocks and Snappy objects that violate the fixed benefit threshold fail. There is no format guessing or fallback. With physical SHA verification enabled, changed object bytes fail hash validation; AES-CTR and structural checks alone do not authenticate all possible plaintext corruption when that verification is disabled.
 
-Manifest 中**密钥表 (key table)** 是一段编码了所有 chunk 加密 key 的二进
-制:
+<a id="44-加密模式--manifest"></a>
 
-| 模式 | 行为 |
+### 4.4 Manifest encryption format
+
+The Manifest's **key table** encodes all nonzero chunks' encryption keys.
+
+| Mode | Behavior |
 |---|---|
-| `aes` | AES-GCM(`manifest.key`, key_table) — customer key 解密 |
+| `aes` | AES-GCM seals the key table with `manifest.key` and Manifest AAD; the customer key is required to unseal it. |
 
-只要 `manifest.key` 不泄露,**chunk 在 store 上永远不可读**(密文),即
-使 store 后端被入侵,store 自己也无法解密。
+This protects the key table, not the entire Manifest index. A store holding only the objects does not obtain the customer key from them. However, the chunk key is derived from salt and plaintext independently of that customer key. An actor with the relevant salt and a plausible plaintext guess can derive a candidate chunk key and test the corresponding object. Same-domain deduplication also reveals equality. Therefore “the customer key never leaks” alone is not a universal guarantee that stored chunk contents cannot be inferred. Protect key/salt access, references and service authorization according to the deployment's trust boundary.
 
-### 4.5 Salt 与 dedup 域
+<a id="45-salt-与-dedup-域"></a>
 
-Salt 隔离 dedup 域 —— 同样的明文用不同 salt 派生不同 key → 不同 ciphertext
-→ 不同 ContentKey → store 上是两份。
+### 4.5 Salt and deduplication domains
 
-实际 salt 由两部分组合:
+Different salts derive different chunk keys from the same plaintext, yielding different ciphertext, physical ContentKeys and stored objects.
 
-- `server_salt` — 每次 ingest 调一次 `store-ctl AdmitWrite()`，取得 generation
-  与 opaque salt；全部 chunk 和最终 manifest Put 复用该 admission。切换写入
-  generation 后，新 ingest 使用新的 salt，已开始的 ingest 不会跨代。
-- `extra_salt` — `--extra-salt <bytes>` flag(§2.3),叠加到上面。
+The effective salt combines:
 
-最终:
+- **`server_salt`:** each ingest obtains one write admission from store, carrying a generation and opaque salt. Default writes call `AdmitWrite()`; an explicit write generation uses `AdmitWriteFor`. All chunks and the final Manifest reuse the admission. A generation change affects newly admitted ingests, not already admitted work.
+- **`extra_salt`:** optional bytes from `--extra-salt` (§2.3), mixed into the admitted salt.
 
-```
-final_salt = server_salt                                                       # extra_salt 为空
-final_salt = SHA256("accelerator-extra-salt-v1" || server_salt || extra_salt)  # extra_salt 非空
+```text
+final_salt = server_salt                                                   # empty extra_salt
+final_salt = SHA256("accelerator-extra-salt-v1" || server_salt || extra_salt) # nonempty extra_salt
 ```
 
-`extra_salt` 用于在同一 store salt 域内做更细粒度隔离(例如多租户)。
+`extra_salt` creates a narrower deduplication domain within one store generation, for example per tenant. This is domain separation, not an ACL.
 
-### 4.6 Manifest 二进制格式
+<a id="46-manifest-二进制格式"></a>
 
-Manifest 的当前 Version1 physical envelope 是：
+### 4.6 Manifest binary format
+
+The current Version1 **physical envelope** is:
 
 ```text
 [4 bytes "MANI"][1 byte encoding][payload]
 
 encoding 0x00 (RAW): payload = logical manifest bytes after magic
-encoding 0x01 (Snappy):  payload = snappy.Encode(logical manifest bytes after magic)
+encoding 0x01 (Snappy): payload = snappy.Encode(logical manifest bytes after magic)
 ```
 
-RAW/Snappy 使用与 Chunk 相同的固定 4 KiB + 75% 收益门槛。reader 不接受旧的
-`[MANI][Version1]...` 表示。Snappy decode 前先调用 `snappy.DecodedLen`,完整 logical
-manifest（含 magic）硬限制为 64 MiB；encoded length、table offset/length 和所有
-整数加法均先做边界检查，并拒绝不满足固定收益门槛的 Snappy envelope。RAW 直接在
-envelope payload 上解析,不为重建旧布局复制
-完整 Manifest；Snappy 只保留一个有界 decoded buffer。
+RAW/Snappy uses the same fixed minimum-4-KiB-saving and maximum-75%-encoded-size threshold as chunks. The reader does not accept the old `[MANI][Version1]...` physical representation.
 
-envelope 内的 logical Manifest 是一段紧凑二进制(整数 little-endian；magic 本身
-是字节串 `MANI`)：
+Before Snappy allocation/decode, the reader calls `snappy.DecodedLen`. The complete logical Manifest, including magic, is limited to **64 MiB**. Encoded length, table offsets/lengths and integer additions are bounds checked. A Snappy envelope violating the benefit threshold is rejected. RAW parses directly from the envelope payload without copying a complete Manifest to rebuild the old layout; Snappy retains one bounded decoded buffer.
 
-```
-   ┌──────────────── header (64 B) ───────────────┐
-   │  magic            "MANI"   4 B               │
-   │  version          u8       1 B               │
-   │  chunk_mode       u8       1 B               │   1 = cdc  /  2 = fixed
-   │  image_size       u64      8 B               │
-   │  chunk_count      u32      4 B               │
-   │  chunk_min/max    u32 × 2  8 B               │   configured bounds
-   │  key_table off/len, hole_count, holes off    │
-   │  (reserved padding to 64 B)                  │
-   ├──────── chunk index (56 B per entry) ────────┤   sorted by image_offset
-   │  image_offset     u64                        │
-   │  plain_len        u32                        │
-   │  flags            u32                        │   bit0 = zero-chunk
-   │  cipher_hash      32 B                       │   store addressing key
-   ├──────── hole extents (16 B per hole) ────────┤   entries + holes tile
-   │  offset u64 / size u64                       │   [0, image_size) exactly
-   ├───────────── key table ──────────────────────┤   sealed with the customer key
-   │  AES-GCM( manifest.key,                      │
-   │           [ key_0[32], key_1[32], … ] )      │
-   └──────────────────────────────────────────────┘
-```
+The logical layout uses little-endian integers; magic itself is the byte string `MANI`.
 
-零 chunk(明文全零,flags bit0)不加密、不入库、不占密钥表条目,读取时本地
-合成零字节;hole 是外部声明的"无数据"区间(文件系统空洞等),与数据 chunk
-无重叠、无缝隙地铺满整个镜像。
+| Region | Layout |
+|---|---|
+| Header, 64 B | `magic[4]`, `version u8`, `chunk_mode u8`, reserved padding; `image_size u64`, `chunk_count u32`, configured `chunk_min/max u32 × 2`; key-table offset/length, hole count and hole-table offset; reserved bytes to 64 B. Chunk mode 1 = CDC, 2 = fixed. |
+| Chunk index, 56 B per entry | `image_offset u64`, `plain_len u32`, `flags u32` (bit 0 = zero chunk), `cipher_hash[32]`, **8 reserved zero bytes**. Entries are sorted by image offset. |
+| Holes, 16 B per extent | `offset u64`, `size u64`. Data entries and holes exactly tile `[0, image_size)`. |
+| Key table | Customer-key-sealed AES-GCM table of nonzero chunk keys: `key_0[32], key_1[32], ...`. |
 
-按 key 获取时先验证 `SHA256(physical envelope) == requested ManifestKey`,再解析
-envelope。随后解析 header → 二分查找 chunk index 定位 offset → 用 `manifest.key`
-解密 key table 得每 chunk 的对称 key → store/cache.Get(cipher_hash) → 解
-密 → 写入 io.Writer。
+All-zero chunks (flag bit 0) are neither encrypted nor stored and have no key-table entry; reads synthesize zero bytes locally. A Hole is an externally declared absence of data, distinct from an all-zero data chunk. Data chunks and holes cover the image without overlaps or gaps.
 
-### 4.7 写路径(细节)
+For ordinary reads with `manifest.verify_content=true`, the physical envelope hash is checked against the requested Manifest key before parsing. The reader parses the header/index, finds the requested chunk by binary search, unseals the key table, fetches the chunk by `cipher_hash` through cache/store, decrypts and writes the logical bytes. Disabling ordinary verification changes the hash-check step as described in §3.1; explicit verify paths always force it.
 
-```
-sparse.Source                ← holes recorded & skipped; zero runs synthesized
-   │
-   ▼
-chunker (cdc | fixed)        ← split per configured mode
-   │  → plaintext_chunk[i]
-   ▼
-crypto.derive(salt, plain)
-   │  → key = SHA256(salt || original plain)
-   ▼
-Go Snappy candidate + fixed benefit rule
-   │  → RAW or Snappy payload
-   ▼
-AES-CTR + format byte
-   │  → physical object + SHA-256
-   ▼
-returned physical hash       ← ContentKey (ingest does not hash it again)
-   │
-   ▼
-store-ctl Put(admission, partition=chunk, key=ContentKey, size, ciphertext)
-	│  server checks Exists first → dedup hit skips upload (SendAndClose)
-	│  else stream-write directly to chunk/{generation}/aa/bb/<hash>
-   ▼
-manifest.append(chunk_meta, key)   ← accumulate index + key table
-   │
-   ▼
-seal(manifest.key, key_table)
-   ↓
-logical Manifest → RAW/Snappy physical envelope
-   │
-   ▼
-store-ctl Put(same admission, partition=manifest, size, manifest)
-```
+<a id="47-写路径细节"></a>
 
-上图按单个 chunk 画顺序流,但 derive/encrypt/`Put` 那一段是**并发**执行的:
-ingest 用一个有界 worker pool,并发度取 store 客户端连接池大小(`store.pool`
-——round-robin RPC 调度下真正能同时在途的 `Put` 数就是它)。chunk 切分仍按
-文件顺序、manifest 索引按文件顺序组装、进度回调串行化,所以产物字节序不变;
-后端不暴露连接池信息时回退为串行。这把入库吞吐从"串行单 `Put` 往返"提升到
-"池并发往返",对多 GiB snapshot `--upload` 影响显著(实测见
-`kuasar-sandbox/docs/perf.md` §2.4)。
+### 4.7 Write path in detail
 
-### 4.8 读路径(细节)
+The stages below describe one logical chunk; encryption and upload run concurrently across chunks as explained afterward.
 
-```
-manifest key
-   │
-   ├─ on-demand Getter: Get(partition=manifest)
-   ▼
-parse index + unseal key table
-   │
-   ▼
-Stream (single manifest; callers use NewLayered for explicit top-to-bottom arrays)
-   │
-   ├─ RunAt: resolve executable sparse.Run (Hole / Zero / Data)
-   │     └─ manifest Data additionally implements fetch.ChunkRun
-   ├─ ResolveChunkWindow: expand a ChunkRun within final visibility
-   ├─ Run.ReadAt: read one already-resolved visible run
-   ├─ Stream.ReadAt: collect runs, then fetch visible Data concurrently
-   │     └─ on-demand Getter → cache/store → verify → decrypt → bounded chunk cache
-   │
-   └─ optional Prefetcher.Prefetch
-         └─ prefetch Getter → cache/store → Release
-```
+| Stage | Operation |
+|---|---|
+| Sparse input | Record and skip Hole runs; synthesize Zero runs without fetching data. |
+| Chunking | Split contiguous non-hole segments using CDC or fixed mode. |
+| Key derivation | `key = SHA256(salt || original_plaintext)`. |
+| Encoding | Compute a Go Snappy candidate and select RAW/Snappy by the fixed rule. |
+| Encryption | AES-CTR plus the format byte produces a physical object and its SHA-256. |
+| Address | Reuse the crypto layer's returned physical hash as ContentKey; ingest does not hash it again. |
+| Chunk upload | `store-ctl Put(admission, partition=chunk, key=ContentKey, size, ciphertext)`. The server checks existence first; a dedup hit can finish without uploading the body. Otherwise the fs backend writes under `chunk/{generation}/aa/bb/<hash>`; other backends follow their own storage layout. |
+| Metadata | Append chunk metadata and its key in logical order. |
+| Seal | Seal the key table with the customer key and Manifest AAD. |
+| Envelope | Encode logical Manifest bytes as the canonical RAW/Snappy physical envelope. |
+| Publication | Put the Manifest under the **same admission**, in the Manifest partition. |
 
-`Stream.RunAt` 返回不可变的 `sparse.Run`,其逻辑范围为
-`[Offset(), End())`,`Run.ReadAt` 使用相对 `Offset()` 的 inner offset,且拒绝
-跨越 `End()`。`RunAt` 只查询 sparse map、manifest index 或 tar extent map,
-不读取 payload,不调用 cache/store Get,也不校验、解密或改变一次性 source 的
-读取位置。manifest Data Run 保存首次解析得到的 chunk index,并额外实现
-`fetch.ChunkRun`;Hole、Zero 和 tar/file Data Run 只实现普通 `sparse.Run`。
+The derive/encode/encrypt/Put work uses a **bounded worker pool**, with worker count obtained from the store writer's `PoolSize()` capability. The standard store client's pool is configured by `store.pool`; a writer that does not expose this capability uses one worker. This is an ingest implementation limit, not a claim that one gRPC connection can have only one RPC in flight.
 
-`fetch.ResolveChunkWindow(stream, anchor, maxBytes)`为需要复用一次物理chunk读取的
-调用方提供可选的双向元数据解析。`anchor`必须来自同一个最终组合`stream`的
-`RunAt`;当物理chunk不大于`maxBytes`时,helper返回包含anchor、由同一物理chunk
-服务的最大连续最终可见窗口。上层Hole透明,上层Data或Zero为硬边界,根Stream的
-`Size()`也是硬边界;同一下层chunk被opaque区段分开后不会跨区段合并。解析过程不
-调用payload Getter,不校验、解密或解压。超出上限或无法识别物理身份的包内
-`ChunkRun`保持原anchor不变,调用方仍可使用原有forward语义。
+Chunking remains sequential, the index is assembled in source order and progress callbacks are serialized. Out-of-order upload completion does not reorder the Manifest. Reproducible Manifest bytes additionally require the same sparse input, chunker/codec settings, salt/admission and customer-key/AAD inputs; concurrency alone does not establish cross-configuration determinism. Bounded parallel upload can overlap backend round trips for multi-GiB snapshots. The [project performance guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf.md) describes measurement; no throughput improvement is guaranteed without a recorded workload and run.
 
-`Stream.ReadAt` 先收集覆盖请求窗口的全部 Run,完成解析后再修改目标 buffer;
-随后只对 Data Run 并发调用 `Run.ReadAt`,Hole 和 Zero 直接填零。多层 Stream
-采用 top-to-bottom 可见性:Data 和 Zero 遮挡下层,只有 Hole 或超出层大小才继续
-向下。每个 upper Hole 会先收紧 bound,命中后直接返回最终 child Run,因此嵌套
-overlay 不丢失 `ChunkRun` 能力,下层 chunk 也不能越过任一上层重新出现内容的
-位置。部分读(`--offset` / `--length`)只触发涉及窗口的物理 chunks,不会扫描或
-物化完整镜像。
+<a id="48-读路径细节"></a>
 
-支持预取的 Stream 额外实现 `fetch.Prefetcher`。`Prefetch(ctx)` 遍历整个逻辑
-Stream,只对最终可见且实现包内 prefetch 能力的 `ChunkRun` 调用完整物理
-chunk 的 cache Get;普通 Data Run、Hole 和 Zero 都是 no-op。成功命中后立即
-Release,不读取 Blob、不校验、不解密、不 pin。预取作用于当前组合 Stream 的
-完整可见视图,不再提供按 manifest key 选择叶子的接口。
+### 4.8 Read path in detail
 
-同一 Fetcher 的 manifest metadata、普通 ReadAt 和所有 Stream 共用一个底层
-Getter 与请求调度器。on-demand 请求从不等待已开始的 prefetch;存在任意
-on-demand 时不再准入新的 prefetch,且每个 Fetcher 最多一个 prefetch Get 在
-途。已开始的 prefetch 不抢占,可与后来到达的 on-demand 短暂重叠。不同
-Fetcher 相互独立,调度器不创建后台 goroutine,也不拥有底层 Getter 生命周期。
+| Interface/stage | Responsibility |
+|---|---|
+| Manifest key | An on-demand Getter fetches the Manifest partition object. |
+| Metadata | Parse the index and unseal the key table. |
+| Stream | One Manifest creates one Stream; callers use `NewLayered` for explicit top-to-bottom layer arrays. |
+| `RunAt` | Resolve an executable sparse Run (Hole, Zero or Data). Manifest Data additionally implements `fetch.ChunkRun`. |
+| `ResolveChunkWindow` | Optionally expand one physical chunk within the final visible view. |
+| `Run.ReadAt` | Read one already-resolved visible run. |
+| `Stream.ReadAt` | Collect runs, then fetch visible Data concurrently through the on-demand Getter, verify/decrypt and use the bounded plaintext chunk cache. |
+| Optional `Prefetcher.Prefetch` | Use the prefetch Getter to warm cache/store objects, then Release immediately. |
 
-每个 manifest Stream 内部维护独立的解密 chunk cache,仅服务 on-demand 部分读。
-cache key 包含 `CiphertextHash`、chunk decrypt key 和 plaintext size,因此同一
-Stream 内重复物理内容可以复用,不同密钥或逻辑大小不会错误别名。cache 同时受
-`32 entries` 和 `32 MiB` 两个硬预算约束,按 LRU 淘汰;entry 自最后一次命中起空闲
-`5s` 后过期。每个 Stream 只保留一个指向最早到期 entry 的 timer,即使后续没有
-读请求也会主动回收陈旧数据,不为每个 entry 创建 timer 或常驻扫描 goroutine。
+`Stream.RunAt` returns an immutable `sparse.Run` spanning `[Offset(), End())`. `Run.ReadAt` takes an offset relative to `Offset()` and rejects reads across `End()`. `RunAt` consults only sparse maps, the Manifest index or tar extent metadata. It does not read payloads, invoke cache/store Get, verify/decrypt bytes, or advance a one-shot source. Manifest Data Runs retain the initially resolved chunk index and implement `fetch.ChunkRun`; Hole, Zero and tar/file Data Runs implement only the ordinary sparse Run interface.
 
-同一 cache key 的并发 miss 合并为一次 Get、SHA-256 校验、解密和可选 Snappy
-decode,不同 key 仍可并行加载。加载失败不进入 cache;等待者如果自身 context 仍有效会重新尝试,不会
-永久继承首个加载者的取消。partial miss 只分配一个 plaintext-sized cache buffer,
-在 immutable Blob 仍存活时直接写入该 buffer；不复制或修改 ciphertext。淘汰、TTL
-到期和 `Close()` 都会清零明文;正在复制
-的 entry 先从 LRU 移除,待最后一个 reader 释放后再清零。
+`fetch.ResolveChunkWindow(stream, anchor, maxBytes)` offers optional bidirectional metadata resolution for callers that want to reuse one physical-chunk read. The anchor must come from `RunAt` on that same final composed stream. If the physical chunk fits `maxBytes`, the helper returns the largest contiguous final-visible window containing the anchor and served by that chunk. An upper Hole is transparent; upper Data and Zero are hard boundaries, as is the root Stream's `Size()`. Portions of a lower chunk separated by opaque upper content are never merged across that content.
 
-冷态完整物理 chunk 读取保持直通路径,避免一次性顺序扫描污染 cache;已有 cache
-命中仍可服务完整读取。单个 plaintext chunk 超过 `32 MiB` 时同样直通且不准入。
-RAW 整块由 AES 直接写 caller buffer,没有 plaintext allocation 或额外整块 copy；
-RAW 超大 partial 按 CTR block/offset 直接解密请求范围。Snappy 整块把 encrypted payload
-解到有界 encoded scratch,校验 `DecodedLen == entry.Size`,再直接 decode 到 caller
-buffer；Snappy 超大 partial 因 block format 限制必须完整 decode 到有界临时 plaintext
-后复制范围。
+Resolution does not call a payload Getter, verify, decrypt or decompress. An over-limit chunk or a package ChunkRun whose physical identity cannot be resolved retains the original anchor, so the caller can continue using forward-only semantics.
 
-Snappy encoded scratch 使用显式 size class free-list,不是无峰值保证的 `sync.Pool`。
-encode/decode 分别有独立的 `max(1, GOMAXPROCS)` CPU slot、192 MiB active byte budget
-和 64 MiB retained budget（每方向合计最多 256 MiB codec-owned scratch）；常用最大
-retained buffer 为 2 MiB,异常大 buffer 用后丢弃。slot 和 weighted byte admission
-都响应调用方 context；RAW 读取不获取 decode slot。没有后台 goroutine。
+`Stream.ReadAt` first collects all runs covering the requested window, before modifying the destination buffer. It then concurrently calls `Run.ReadAt` only for Data; Hole and Zero fill with zeros. Layered Streams apply top-to-bottom visibility: Data and Zero hide lower layers; only Hole or being beyond a layer's size permits fallthrough. Each upper Hole tightens the bound before returning the final child Run. Nested overlays retain ChunkRun capability, and a lower chunk cannot cross a position where any upper layer becomes visible again. A partial read (`--offset`/`--length`) fetches only physical chunks needed for that window, without scanning/materializing the whole image.
 
-`Prefetch` 仍只执行完整物理 chunk 的 cache Get 并立即 Release,不校验、解密或
-填充上述明文 cache。因此 Prefetch 与 on-demand ReadAt 可以各自产生 Get,而重复
-的 on-demand 部分读由 Stream 内部合并和复用。
+A Stream supporting prefetch also implements `fetch.Prefetcher`. `Prefetch(ctx)` traverses the complete logical Stream and invokes full-physical-chunk cache Get only for finally visible ChunkRuns implementing the package's prefetch capability. Ordinary Data, Hole and Zero are no-ops. A successful Get is immediately Released without reading the Blob, verifying, decrypting or pinning it. Prefetch operates on the current composed Stream's full visible view; there is no longer a manifest-key API for selecting a leaf to prefetch.
 
-### 4.9 本地 immutable tarstream 加密
+Within one Fetcher, Manifest metadata reads, ordinary ReadAt calls and all Streams share a Getter and request scheduler. On-demand requests never wait for an already-started prefetch. While any on-demand operation is present, no new prefetch is admitted; at most one prefetch Get is in flight per Fetcher. A started prefetch is not preempted and can briefly overlap a later on-demand operation. Different Fetchers are independent. The scheduler creates no background goroutine and does not own the underlying Getter's lifetime.
 
-canonical tarstream 的plaintext结构为payload、
-`.kuasar.digest.<plainDigest>` marker body和两个trailer block。Payload PAX记录
-payload boundary;marker body记录boundary和payload commitment,完整读取时再用payload
-bytes复验。完整carrier或只替换dense metadata tail的派生source可通过
-`CarrierDigest`直接给出identity,不需要先把payload编码到`io.Discard`。未传codec时
-对外identity为`digest:<plainDigest>`。可派生的dense metadata tail上限为64 MiB,
-writer和reader使用同一边界并在hash前拒绝超限声明。Payload的PAX/ustar权限、属主和
-时间等transport metadata固定为canonical编码,不能在identity不变时改写。传入
-customer-key-backed codec时,完整结构进入
-encrypted tarstream v1,对外 identity 固定为:
+Each Manifest Stream has an independent decrypted-chunk cache for on-demand partial reads. Its key includes `CiphertextHash`, the chunk decryption key and plaintext size: repeated physical content within that Stream can be reused without aliasing different keys or logical sizes. Both **32 entries** and **32 MiB** are hard cache-admission limits, with LRU eviction. An entry expires after **5 seconds** idle since its last hit. Each Stream keeps one timer for the earliest expiry, actively reclaiming stale data even when reads stop, without one timer per entry or a resident scanning goroutine.
+
+Concurrent misses for one cache key coalesce into one Get, SHA verification, decryption and optional Snappy decode; different keys can load concurrently. Failed loads are not cached. Waiters with a still-valid context may retry rather than permanently inheriting the first loader's cancellation. A partial miss allocates one plaintext-sized cache buffer and writes directly into it while the immutable Blob remains alive; ciphertext is neither copied nor modified. Eviction, expiry and `Close()` clear plaintext. An entry currently being copied is removed from the LRU first and cleared after its last reader releases it.
+
+A cold, full-physical-chunk read uses a direct path so a one-off sequential scan does not pollute the cache; an existing cache hit may still serve a full read. Plaintext chunks larger than 32 MiB also bypass cache admission. RAW full reads decrypt AES directly into the caller's buffer, without an extra plaintext allocation or full-chunk copy. Oversized RAW partial reads seek the CTR block/offset and decrypt only the requested range.
+
+For Snappy full reads, encrypted payload is decrypted into bounded encoded scratch, `DecodedLen == entry.Size` is checked, then decode writes into the caller's buffer. Oversized Snappy partial reads must decode the whole block into bounded temporary plaintext and copy the requested range because the block format does not support arbitrary-range decode.
+
+Snappy scratch uses explicit size-class free lists, not a `sync.Pool` with no retained-byte ceiling. Encode and decode have separate `max(1, GOMAXPROCS)` CPU-slot limits, **192 MiB active-byte budgets** and **64 MiB retained budgets**, totaling at most 256 MiB of codec-owned scratch per direction. The largest normally retained buffer is 2 MiB; larger buffers are discarded after use. Slot and weighted-byte admission honor caller cancellation. RAW reads do not take a decode slot. There is no background goroutine for scratch management.
+
+Prefetch still performs only full physical-object cache Get and immediate Release. It neither verifies/decrypts nor populates the plaintext cache. Thus prefetch and on-demand ReadAt may each issue a Get, while repeated on-demand partial reads are coalesced and reused inside the Stream.
+
+<a id="49-本地-immutable-tarstream-加密"></a>
+
+### 4.9 Local immutable tarstream encryption
+
+A canonical plaintext tarstream contains the payload, a `.kuasar.digest.<plainDigest>` marker body and exactly two trailer blocks. Payload PAX records define its boundary; the marker body records that boundary and the payload commitment. Full reads recompute the commitment from payload bytes.
+
+A complete carrier, or a derived source replacing only its dense metadata tail, can report identity through `CarrierDigest` without first encoding the payload into `io.Discard`. Without a codec, the public identity is `digest:<plainDigest>`. A derived dense metadata tail is limited to **64 MiB**; readers and writers share this limit and reject oversized declarations before hashing. Payload PAX/ustar transport metadata, including mode, ownership and timestamps, uses fixed canonical encoding and cannot change while retaining the same identity.
+
+With a customer-key-backed codec, the complete structure is encoded as encrypted tarstream v1. Its public identity is exactly:
 
 ```text
 hmac = HMAC-SHA256(customerKey, plainDigestRaw32Bytes)
 ```
 
-scheme名为`hmac`,不派生identity key,不加入domain prefix。marker中的
-`plainDigest`和payload commitment位于密文内,不得用于plaintext文件名、ref、日志或
-错误。物理carrier决定identity scheme:`auto`读取plaintext返回`@digest`,读取
-encrypted carrier返回`@hmac`;两者不做隐式转换。
+The scheme is named `hmac`. It does not derive a separate identity key or add a domain prefix. The marker's plaintext digest and payload commitment remain inside ciphertext and must not be used in plaintext filenames, references, logs or errors. The physical carrier determines the identity scheme: `auto` returns `@digest` for a plaintext carrier and `@hmac` for an encrypted one, without implicit conversion.
 
-v1 固定 AES-256-GCM 和 4096-byte 独立认证 record,不提供算法或 record size 协商。
-文件由 48-byte clear prefix、81-byte authenticated header 和连续 authenticated
-records 组成。prefix 的 `[0:16]` 是 magic、version、prefix size 和 reserved 字段,
-`[16:48]` 是每次写入由 `crypto/rand` 生成的 32-byte artifact salt。codec 对每个
-artifact 仅执行一次以下派生并构造一个 AES-256-GCM 实例:
+V1 fixes **AES-256-GCM** and independently authenticated **4096-byte records**. It negotiates neither algorithm nor record size. The file comprises a **48-byte clear prefix**, an **81-byte authenticated header**, then authenticated records. Prefix bytes `[0:16]` hold magic, version, prefix size and reserved fields; `[16:48]` hold a fresh 32-byte artifact salt from `crypto/rand`. Once per artifact, the codec derives a key and constructs one AES-256-GCM instance:
 
 ```text
 artifactKey = HMAC-SHA256(
@@ -684,37 +538,23 @@ artifactKey = HMAC-SHA256(
 )
 ```
 
-header 使用 sequence 0;data record `i` 使用 sequence `i+1`;12-byte GCM nonce 是
-`0x00000000 || uint64BE(sequence)`。record wire 是 1-byte AES-GCM flag 后跟 GCM
-ciphertext 和 16-byte tag,因此仍保持 17-byte overhead,不存储逐 record nonce。
-header 绑定完整 plaintext 大小、packed payload 起点/大小和 record geometry;
-每个 record 的 AAD 绑定包含 salt 的完整 prefix、authenticated header、record
-index 与实际 plaintext 长度。写入先完成 sparse metadata sweep 和布局规划,再单遍
-读取 Data extents;不会生成 plaintext staging 或 spool 文件。
+The header uses sequence 0; data record `i` uses `i+1`. The 12-byte GCM nonce is `0x00000000 || uint64BE(sequence)`. Each wire record consists of a one-byte AES-GCM flag, ciphertext and a 16-byte tag: **17 bytes of overhead**, with no separately stored per-record nonce.
 
-随机 salt 使同一 customer key 和 plaintext 的两次写入具有不同物理 ciphertext,
-但 logical identity 仍严格保持
-`HMAC-SHA256(customerKey, plainDigestRaw32Bytes)`,所以 scheme、文件名和 dedup key
-不变。
+The header binds total plaintext size, packed-payload start/size and record geometry. Each record's AAD binds the complete prefix including salt, authenticated header, record index and actual plaintext length. Writing first sweeps sparse metadata and plans layout, then reads Data extents once; it does not create a plaintext staging/spool file.
 
-`SourceAt` 从 prefix 读取 salt、绑定 artifact codec,认证 header 及覆盖
-marker/trailer 的 suffix records,随后按 record index O(1) 随机解密。这个 fast
-path 不预读全部 data records,也不扫描并重算完整 plaintext digest。不同 artifact
-使用不同派生 key,所以跨 artifact splice 的 donor data record 会在该 record 被
-实际读取时认证失败;未被 fast open 读取的 donor record 不会提前触发错误。
+Random artifact salt makes two writes of the same plaintext/customer key produce different physical ciphertext. The logical identity nevertheless remains exactly `HMAC-SHA256(customerKey, plainDigestRaw32Bytes)`, preserving the scheme, filename and logical deduplication key.
 
-`SourceFrom` 是 full-validation path。完整消费时它解密全部records,按权威sparse map
-重算payload/tail commitment与carrier identity,验证marker body、恰好两个trailer blocks、
-expected `digest|hmac` 和outer EOF。跨artifact record splice会在顺序读取到
-该 record 时以 authentication failure 失败。
-调用方主动停止消费时,尚未读取部分不具备完整验证结论;任何发布、上传或转换
-路径必须消费全部 Data extents并传播终点错误。
+`SourceAt` reads prefix salt, binds the artifact codec, authenticates the header and suffix records covering marker/trailer, then decrypts records by index for O(1) random access. This fast path does not pre-read all data records or recompute the complete plaintext digest. Different artifacts use different derived keys, so a spliced donor record fails authentication **when that record is actually read**. A donor record outside the fast-open read set does not cause an early error.
 
-### 4.10 多 Manifest ZIP Bundle
+`SourceFrom` is the full-validation path. Complete consumption decrypts every record, recomputes payload/tail commitments and carrier identity using the authoritative sparse map, and verifies the marker body, exactly two trailer blocks, expected `digest|hmac` and outer EOF. A cross-artifact record splice fails when sequential consumption reaches it.
 
-本地 Manifest 快照使用带强制尾部索引的标准 ZIP64。当前 profile 直接要求
-`bundle/index`，没有旧格式探测、无索引兼容或 Central Directory fallback。所有新
-Bundle 的物理布局为：
+If a caller stops early, no full-validation conclusion applies to unread data. Publishing, uploading and converting paths must consume all Data extents and propagate terminal validation errors.
+
+<a id="410-多-manifest-zip-bundle"></a>
+
+### 4.10 Multi-Manifest ZIP Bundles
+
+Local Manifest snapshots use a standard ZIP container with ZIP64 support and a **mandatory tail index**. The current profile requires `bundle/index` directly: no legacy-format probing, unindexed compatibility or Central Directory fallback.
 
 ```text
 [0]     bundle/refs                                            # optional
@@ -724,244 +564,177 @@ Bundle 的物理布局为：
 [last]  bundle/index                                           # required
 
         Central Directory
-        ZIP64 EOCD + locator                                    # when required
+        ZIP64 EOCD + locator                                   # when required
         EOCD with an empty comment
 ```
 
-Manifest/Chunk payload 仍是现有 physical object 的原始字节。Chunk Local Entry 继续按
-Manifest 中首次逻辑出现的 ordinal 写出；只排序索引 record，不按 ContentKey 重排或
-缓存全部 Chunk payload。共享对象仍按 ContentKey 去重，ManifestKey、Chunk key 和对象
-physical bytes 均不改变。
+Manifest and Chunk payloads are the unchanged bytes of their existing physical objects. Chunk local entries are appended in the ordinal of first logical appearance in the Manifest. Only index records are sorted; the writer neither reorders Chunk payloads by ContentKey nor buffers all of them. Shared objects deduplicate by ContentKey. Manifest keys, chunk keys and physical object bytes do not change.
 
-全部 Local Entry 固定为 `zip.Store`、flags 0、无 data descriptor、无 local extra，
-comment、时间、权限和平台字段也固定。`bundle/index` 必须恰好一个并且是最后一个
-Local Entry；其 payload 最后 256 bytes 与真实 Central Directory 紧邻。Bundle 不使用
-ZIP Deflate、ZIP encryption、整文件 SHA/HMAC、外层加密、自定义 pack、root entry 或
-JSON/YAML metadata。旧 `admission/*`、旧的无索引 Bundle、重复或未知 entry、目录、
-非法 key/admission 与截断均 fail closed。
+Every local entry uses `zip.Store`, flags 0, no data descriptor and no local extra. Comments, timestamps, permissions and platform fields are fixed. Exactly one `bundle/index` must be the final local entry; its last 256 payload bytes immediately precede the real Central Directory.
+
+A Bundle uses no ZIP Deflate, ZIP encryption, whole-file SHA/HMAC, outer encryption, custom pack format, root entry or JSON/YAML metadata. Old `admission/*` names, old unindexed Bundles, duplicate/unknown entries, directory entries, invalid keys/admissions and truncation are rejected by the appropriate profile/verification path. Ordinary open intentionally defers some object/container checks; it is not the strict full-container verifier (§4.10.4).
 
 #### 4.10.1 `bundle/index` v1
 
-索引 payload 依次是 Chunk section、Manifest section 和固定 footer。两个 section 各自
-按 ContentKey 严格递增，partition 由 section 隐含；重复或未排序 key 非法。每条 record
-固定 48 bytes，以 little-endian 显式编码：
+The index payload is **Chunk section, Manifest section, fixed footer**, in that order. Each section is strictly increasing by ContentKey; its partition is implicit in its section. Duplicate or unsorted keys are invalid. Every record is exactly 48 bytes, explicitly little-endian:
 
-| byte range | field | encoding |
+| Byte range | Field | Encoding |
 |---|---|---|
-| `[0,32)` | ContentKey | 原始 32 bytes |
-| `[32,40)` | payload DataOffset | `uint64`，对象 payload 的 archive 绝对 offset |
-| `[40,44)` | payload Size | `uint32` |
-| `[44,48)` | ZIP CRC32 | `uint32` |
+| `[0,32)` | ContentKey | Raw 32 bytes. |
+| `[32,40)` | Payload DataOffset | `uint64`, absolute payload offset in the archive. |
+| `[40,44)` | Payload Size | `uint32`. |
+| `[44,48)` | ZIP CRC32 | `uint32`. |
 
-`DataOffset` 不是 Local Header offset。`DataOffset + Size` 必须 checked-add 且完整位于
-metadata prefix 之后、`bundle/index` Local Header 之前。Manifest/Chunk 的 individual
-size 继续受各自 codec 上限约束。整个 ZIP 最多 100,000 个 entry；两个索引 section
-合计最多 99,998 records，index payload 最多 4,800,160 bytes。
+DataOffset is **not** a Local Header offset. `DataOffset + Size` must use checked addition and lie entirely after the metadata prefix and before the `bundle/index` Local Header. Individual Manifest/Chunk sizes remain subject to their codec limits.
 
-footer 固定 256 bytes；除 magic 和 digest 外的整数均为 little-endian：
+The ZIP is limited to **100,000 entries**. The two index sections together allow at most **99,998 object records**, and the index payload is bounded by **4,800,160 bytes**. Both limits apply; an optional refs entry also consumes a ZIP entry.
 
-| byte range | field |
+The footer is exactly 256 bytes. Integers are little-endian; magic and digests are raw bytes.
+
+| Byte range | Field |
 |---|---|
-| `[0,16)` | magic `KUASARBNDLINDEX1` |
-| `[16,18)` | version，固定 `1` |
-| `[18,20)` | footer size，固定 `256` |
-| `[20,22)` | record size，固定 `48` |
-| `[22,24)` | reserved，必须全零 |
-| `[24,32)` | index payload absolute offset |
-| `[32,40)` | index payload total size |
-| `[40,48)` | `bundle/index` Local Header absolute offset |
-| `[48,56)` | metadata prefix end offset |
-| `[56,64)` | Manifest section absolute offset |
-| `[64,72)` | Manifest record count |
-| `[72,80)` | Manifest section size |
-| `[80,112)` | SHA-256 of the exact encoded Manifest section bytes |
-| `[112,120)` | Chunk section absolute offset |
-| `[120,128)` | Chunk record count |
-| `[128,136)` | Chunk section size |
-| `[136,168)` | SHA-256 of the exact encoded Chunk section bytes |
-| `[168,252)` | reserved，必须全零 |
-| `[252,256)` | CRC32C/Castagnoli of footer bytes `[0,252)` |
+| `[0,16)` | Magic `KUASARBNDLINDEX1`. |
+| `[16,18)` | Version, fixed at `1`. |
+| `[18,20)` | Footer size, fixed at `256`. |
+| `[20,22)` | Record size, fixed at `48`. |
+| `[22,24)` | Reserved, all zero. |
+| `[24,32)` | Absolute index-payload offset. |
+| `[32,40)` | Total index-payload size. |
+| `[40,48)` | Absolute `bundle/index` Local Header offset. |
+| `[48,56)` | Metadata-prefix end offset. |
+| `[56,64)` | Absolute Manifest-section offset. |
+| `[64,72)` | Manifest record count. |
+| `[72,80)` | Manifest-section size. |
+| `[80,112)` | SHA-256 of exact encoded Manifest-section bytes. |
+| `[112,120)` | Absolute Chunk-section offset. |
+| `[120,128)` | Chunk record count. |
+| `[128,136)` | Chunk-section size. |
+| `[136,168)` | SHA-256 of exact encoded Chunk-section bytes. |
+| `[168,252)` | Reserved, all zero. |
+| `[252,256)` | CRC32C/Castagnoli of footer bytes `[0,252)`. |
 
-section size 必须精确等于 `count * 48`。Chunk section 从 index payload 起点开始，
-Manifest section 必须紧随其后，footer 又必须紧随 Manifest section；三者不能重叠、留
-gap 或覆盖 footer。若 `directoryOffset` 是 EOCD/ZIP64 EOCD 声明的真实 Central
-Directory 起点，则必须同时满足：
+Each section's size must equal exactly `count * 48`. The Chunk section starts at the index-payload beginning; the Manifest section follows immediately, followed immediately by the footer. They may neither overlap, leave gaps nor cover footer bytes.
+
+If `directoryOffset` is the real Central Directory start declared by EOCD/ZIP64 EOCD, both equalities must hold:
 
 ```text
 indexPayloadOffset + indexPayloadSize == directoryOffset
 footerOffset + 256 == directoryOffset
 ```
 
-section SHA-256 和 footer CRC32C 只用于发现索引损坏，不是签名或认证。对象内容安全仍
-由 Manifest ContentKey、Chunk decrypt/authentication 及 `manifest.verify_content`
-合同承担。
+Section SHA-256 and footer CRC32C detect index corruption; they are not signatures or authentication. Object-content protection follows the Manifest ContentKey, sealed key-table/decryption contract and `manifest.verify_content` policy. Chunk AES-CTR must not be described as authenticated encryption by itself.
 
-Writer 不依赖 `archive/zip.Writer` 的内部 flush 位置，而是按 canonical Local Header
-布局维护逻辑 `nextOffset`：`dataOffset = nextOffset + 30 + len(name)`。Finalize 先检查
-root Manifest，再分别排序并编码 Chunk/Manifest records，写出最后的 `bundle/index`，
-最后才由标准 ZIP writer 写 Central Directory/ZIP64/EOCD。严格 verifier 和测试会把
-每个 record 的 offset、size、CRC 与实际 CD/LFH/data range 交叉核对。
+The writer does not depend on `archive/zip.Writer`'s internal flush position. It maintains a logical `nextOffset` from canonical Local Header layout: `dataOffset = nextOffset + 30 + len(name)`. Finalize first checks the root Manifest, then sorts/encodes Chunk and Manifest records, writes the final `bundle/index`, and lets the standard ZIP writer emit Central Directory/ZIP64/EOCD. Strict verification and tests cross-check each record's offset, size and CRC against actual CD/LFH/data ranges.
 
-#### 4.10.2 metadata prefix 与 Reader I/O
+<a id="4102-metadata-prefix-与-reader-io"></a>
 
-`bundle/refs` 存在时必须非空并作为第一个物理 Local File Header；admission 必须紧随
-其后，否则 admission 必须是第一个 entry。admission payload 为空。`bundle/refs`
-一行一个 canonical、按文件顺序搜索的 Bundle file ref：
+#### 4.10.2 Metadata prefix and Reader I/O
+
+If present, `bundle/refs` must be nonempty and the first physical Local File Header. Admission follows immediately. Without refs, admission is first. The admission payload is empty.
+
+Refs are canonical Bundle file references searched in file order, one per line:
 
 ```text
 file://<basename>.bundle
 file://<basename>.bundle@location:<name>
 ```
 
-它禁止 `@manifest/@digest/@hmac`、`manifest://`、绝对路径、目录分隔符和非
-`.bundle` 文件名。payload 必须是有效 UTF-8、仅 LF 换行且最后一行也以 LF 结束；
-禁止 BOM、CR、空行、注释、首尾空白和重复 ref。Writer 保留调用方顺序，不排序；
-最多 1024 项、1 MiB。空路径通过省略 entry 表达。`WriterOptions.Refs` 在
-`NewWriter` 写出任何 byte 前完成验证；Writer 创建后 refs/admission 均不可变。
-`Reader.Refs()` 返回副本。
-preflight 只需发现 location/admission 时可使用 `OpenMetadata`/`ReadMetadata`；该入口
-只验证连续 Local Header metadata prefix，不读取尾部、索引、Central Directory 或
-对象。即使某个文件的 prefix 可被该 preflight 解析，也不会证明它是可消费的 Bundle，
-更不构成无索引兼容；真正消费 Manifest/Chunk 必须使用 `Open`/`NewReader`，后者强制
-要求合法 v1 索引。
+Refs prohibit `@manifest`, `@digest`, `@hmac`, `manifest://`, absolute paths, directory separators and filenames lacking the `.bundle` suffix. The payload must be valid UTF-8 using LF only, including a final LF. BOM, CR, empty lines, comments, surrounding whitespace and duplicate references are forbidden.
 
-普通 `Open`/`NewReader` 不调用 `archive/zip.NewReader`，也不读取 Central Directory、
-对象 Local Header、Chunk index 或对象 payload。ReaderAt 远端路径的打开顺序固定为：
+The writer preserves caller order without sorting. The limits are **1024 refs** and **1 MiB**. An empty list is represented by omitting the entry. `WriterOptions.Refs` is validated before `NewWriter` writes any byte. Refs and admission are immutable after construction; `Reader.Refs()` returns a copy.
 
-1. 从 EOF 读取 EOCD；ZIP64 时再各读取一次 locator 和 ZIP64 EOCD，得到真实
-   `directoryOffset`，但不读取该 offset 开始的 CD bytes。
-2. 从 `directoryOffset - 256` 读取 footer，验证 magic/version/checksum 和全部 section
-   bounds。
-3. 固定读取并验证 `bundle/index` 自己的 canonical Local Header。
-4. 按 footer 的 `metadataPrefixEnd` 一次连续读取 metadata prefix，并在内存中解析
-   refs/admission。
-5. 一次连续读取 Manifest section，验证 digest、排序、重复、size/range 后建立 O(1)
-   只读 map；Chunk section 保持未读。
+A preflight needing only location/admission may use `OpenMetadata`/`ReadMetadata`. It validates only the contiguous Local Header metadata prefix, without reading the tail, index, Central Directory or objects. Successful prefix parsing proves neither that the Bundle is consumable nor that unindexed Bundles are supported. Actual Manifest/Chunk consumption requires `Open`/`NewReader`, which require a valid v1 index.
 
-因此 ZIP32 `Open` 是 5 次固定 range read，ZIP64 是 7 次；次数不随 Chunk 数增长。
-文件打开仍优先使用 read-only mmap；ReaderAt 对象 payload 回退路径使用按
-4 KiB～2 MiB 分级、每个 Reader 最多保留 32 MiB 的有界 buffer pool。
+Ordinary `Open`/`NewReader` neither invokes `archive/zip.NewReader` nor reads Central Directory bytes, object Local Headers, the Chunk index or object payload. The remote ReaderAt opening sequence is fixed:
 
-#### 4.10.3 source selection、Chunk preparation 与普通 restore
+1. Read EOCD from EOF. For ZIP64, also read the locator and ZIP64 EOCD once each, obtaining the real directoryOffset without reading the CD bytes at that offset.
+2. Read the footer at `directoryOffset - 256`; verify magic, version, checksum and all section bounds.
+3. Read and verify the index entry's own canonical Local Header.
+4. Read the metadata prefix contiguously using `metadataPrefixEnd`, then parse refs/admission in memory.
+5. Read the complete Manifest section once, validate its digest, sort order, uniqueness, sizes and ranges, and build an O(1) read-only lookup map. Leave the Chunk section unread.
 
-一个 Bundle 从首版容纳根内存 Manifest、根/数据盘当前层 Manifest，以及必要时
-收编的父层 Manifest。全部对象共用 admission entry 中的同一完整
-`store.WriteAdmission`。`bundle.Writer` 在构造前取得一次 admission；后续多个
-`Ingest` 只读取这份固定值。共享 Chunk 按 ContentKey 只写一份。Chunk 编码仍可
-并行，但实现通过有界 ordinal reorder 等待逻辑顺序并串行 append ZIP，不产生无界
-完成队列。
+Thus the specified ZIP32 ReaderAt open uses **five fixed range reads**; ZIP64 uses **seven**. The count does not grow with Chunk count. Local file opening prefers read-only mmap. The ReaderAt object-payload fallback uses a bounded per-Reader buffer pool with 4 KiB–2 MiB size classes and at most **32 MiB retained**.
 
-配置层用 `Config.NewBundleIngester` 装配该 writer；此入口固定不混入
-`extra_salt`，保证 Chunk key 始终属于 recorded admission 的 canonical salt domain，
-从而可在 exact upload 时逐对象验证且无需重写。
+<a id="4103-source-selectionchunk-preparation-与普通-restore"></a>
 
-读侧仅在 `Fetcher.OpenManifest` 按以下顺序选择来源：
+#### 4.10.3 Source selection, Chunk preparation and ordinary restore
+
+A Bundle can hold the root memory Manifest, current root/data-disk layer Manifests and, when needed, incorporated parent-layer Manifests. All objects share the complete `store.WriteAdmission` recorded in the admission entry. The caller obtains one admission before constructing `bundle.Writer`; subsequent Ingest calls read that fixed value. Shared chunks are written once per ContentKey.
+
+Chunk encoding can run concurrently, but bounded ordinal reordering waits for logical order and appends ZIP bytes serially, avoiding an unbounded completion queue.
+
+`Config.NewBundleIngester` connects the writer to the configured ingest path. This entry point deliberately adds **no extra salt**: chunk keys must belong to the recorded admission's canonical salt domain so exact upload can verify/copy each object without rewriting it.
+
+The read side chooses a source **only at `Fetcher.OpenManifest`**, in this order:
 
 ```text
-当前 Bundle -> bundle/refs[0] -> bundle/refs[1] -> ... -> 默认 remote Cache/Store
+current Bundle → bundle/refs[0] → bundle/refs[1] → ... → default remote Cache/Store
 ```
 
-路径和 `@location` 解析由调用方实现的 `bundle.SourceResolver` 完成；accelerator 只
-消费 Reader 中已经验证的 canonical ref。resolver 可用 `ErrSourceUnavailable`
-表达 sibling 不存在、location mapping 缺失或 located 文件不存在，此时尚未选源，
-可保留诊断并继续。文件存在但 profile/ZIP 损坏必须返回普通错误并 fail closed。
-引用 Bundle 自己的 `Refs()` 不参与搜索，路径必须由创建者提前展平。
+A caller-supplied `bundle.SourceResolver` resolves paths and locations. Accelerator consumes canonical references already validated by the Reader. A resolver may return `ErrSourceUnavailable` for a missing sibling, missing location mapping or missing located file. Source selection has not completed yet, so diagnostics may be retained while search continues. A present file with a corrupt profile/ZIP must return an ordinary error and fail closed. A referenced Bundle's own Refs are not recursively searched; the creator must flatten the search list.
 
-| Manifest 来源 | Manifest/Chunk Getter | 失败语义 |
+| Manifest source | Getter for its Manifest and chunks | Failure behavior |
 |---|---|---|
-| current 或首个 refs Bundle 命中 | 该 Bundle-only | Chunk index、对象读取、解析或解密错误直接失败，不再搜索 |
-| 所有 Bundle clean miss/unavailable | remote-only cache/store | Bundle 中碰巧同 key 的 Chunk 不参与 |
+| Current Bundle or first refs Bundle containing the key. | That Bundle only. | Chunk-index, object-read, parse or decrypt errors fail directly; no further search. |
+| All Bundles cleanly miss or are unavailable. | Remote cache/store only. | Coincidentally matching chunks in other Bundles are not used. |
 
-因此不存在对象级 Bundle fallback Getter；本地 Manifest 错误也不会改读后续
-Bundle/Store。current/refs source selection 只查询 Open 时已经加载的 Manifest map；
-clean miss 不读取 Chunk section。Bundle 一旦被选中，Reader 在返回 Stream 前一次连续
-读取完整 Chunk section，验证 digest/records/ranges 并建立 O(1) 只读 map。并发准备由
-`sync.Once` 合并为一次读取，错误或取消也由所有调用方共享。remote source 没有 Bundle
-Reader，因此不执行这一步。
+There is no per-object fallback Getter mixing Bundles. A corrupt local Manifest does not cause a retry from another Bundle or Store. Current/refs source selection only queries the Manifest maps loaded at Open; a clean miss does not read a Chunk section.
 
-准备完成后的 Manifest/Chunk `Get` 直接使用 record 中的 payload `DataOffset/Size`，只
-做一次目标 payload range read；不会读取索引、对象 Local Header 或 Central Directory。
-实际 Stream 的第一次 `Read` 因而不承担 O(Chunk records) 的索引初始化。外部
-root selector 必须通过 `OpenRootManifest`/`SelectRoot` 证明 root 物理存在于 current
-Bundle，不能从 refs 或 Store 间接取得。
+Once a Bundle is selected, its Reader loads the entire Chunk section contiguously **before returning a Stream**, validates its digest/records/ranges and builds an O(1) immutable map. `sync.Once` combines concurrent preparation into one read; its error or cancellation is shared by all callers. A remote source has no Bundle Reader and skips this preparation.
 
-普通 restore 不再预扫描 Manifest 的完整 Chunk closure。Manifest 声明一个缺失但本次
-不会读取的 Chunk 时，`Open` 和 `OpenManifest` 可以成功，已存在 Chunk 仍可读取；只有
-真正访问缺失 Chunk 时才失败，而且选定 source 后不得 fallback 到后续 Bundle 或 remote
-Store。`manifest.verify_content=false` 仍不会隐式执行 physical SHA 扫描；为 true 时的
-Manifest SHA、Chunk ContentKey/decrypt authentication 语义保持不变。
+After preparation, Manifest/Chunk Get uses the record's payload DataOffset/Size for one target-payload range read, without rereading the index, object Local Header or Central Directory. The Stream's first data read therefore does not pay an O(Chunk-record-count) initialization cost.
 
-#### 4.10.4 显式严格验证与 exact upload
+An external root selector must use `OpenRootManifest`/`SelectRoot` to prove that the root physically exists in the **current Bundle**. It may not obtain the root indirectly from refs or Store.
 
-单 Bundle full verify/upload 与多 source `VerifyExactManifests` /
-`UploadExactManifests` 均先运行显式 container verifier，不受
-`manifest.verify_content` 影响。它读取完整 Central Directory，并按 CD 原始顺序核对
-每个 Local Header、名称、method、flags、时间、attrs、extra、size、CRC 和连续 data
-range，证明没有重排、gap、隐藏/重叠 entry；随后要求 index 是 sole final entry，并把
-每个 Manifest/Chunk record 与 CD/LFH/data range 精确交叉校验，拒绝未索引对象、索引
-不存在对象和额外 metadata。普通 `Open`/`Get` 不承担这些 O(entries) 检查。
+Ordinary restore does **not** pre-scan the Manifest's complete chunk closure. A Manifest may name a missing chunk that the current workload never reads: Open/OpenManifest can succeed and present chunks remain readable. The missing chunk fails only when actually accessed, with no source fallback after selection.
 
-严格路径随后验证完整 closure 和对象内容。缺失但未访问的 Chunk 在 `FullVerify` 立即
-失败；exact upload 在任何 `Put` 前失败。多 source exact upload 固定执行：
+`manifest.verify_content=false` does not implicitly trigger physical SHA scans. When enabled, the Manifest and Chunk physical hashes and key-table authentication are checked according to the normal read contract. Neither case makes ordinary lazy restore equivalent to a complete availability verification.
 
-1. 调用方在 OpenManifest 层为每个逻辑 key 选择 current/refs Bundle；已经在目标
-   Store 严格存在的依赖不进入 Bundle upload plan。
-2. 在任何 admission 或 Put 前，对 plan 中每个实际 source 运行完整
-   CD/LFH/index container verifier。
-3. 在任何 Put 前，对全部实际 source recorded admissions 调用
-   `AdmitWriteFor(recorded.Generation)`；返回 Generation/Salt 必须逐字节相等。
-4. 强制验证每个选定 Manifest physical ContentKey、解析并用 customer key 解封 key
-   table，并证明该 Manifest 的完整 Chunk 闭包位于同一 source Bundle。
-5. 每个 source 中实际使用的唯一 Chunk 强制验证 physical ContentKey，解密/解压为
-   原明文，并要求 `DeriveKey(sourceAdmission.Salt, plaintext)` 等于 key table 中的
-   key；跨 Manifest 的同一 ContentKey 对应不同 key 或 plaintext size 时拒绝。
-6. 先并发上传全部 Chunk，再上传依赖 Manifest，最后发布调用方指定的 current root。
+<a id="4104-显式严格验证与-exact-upload"></a>
 
-每个对象使用其 source Bundle 的 recorded admission，不改投最新 generation，不
-重新 chunk、压缩、加密、seal key table 或改写上层 `snapshot.cfg`，因此 root
-ManifestKey 与 physical bytes 保持不变。任一 admission 预检、依赖验证或 Put 失败
-时根不会发布。`bundle/refs` 和 `bundle/admission/*` 不是 Store object，不上传。
-`FullVerify` 还拒绝未被任何本地 Manifest 引用的 Chunk；调用方解析
-snapshot-specific metadata 后可通过 `ExpectedManifests` 提交精确的本地可达
-Manifest 集，从而拒绝无关 Manifest，而无需让 accelerator 解释
-`snapshot.cfg`。
+#### 4.10.4 Explicit strict verification and exact upload
 
-## 5. 性能特征
+Single-Bundle full verify/upload and multi-source `VerifyExactManifests`/`UploadExactManifests` first run an explicit container verifier, regardless of `manifest.verify_content`.
 
-测量入口:`kuasar-sandbox/docs/perf.md` §2.1–2.2(冷/热 L1 状态下
-manifest:// 加载端到端时长)。
+It reads the complete Central Directory and, in its original order, checks every Local Header, name, method, flags, timestamp, attributes, extras, size, CRC and contiguous data range. This proves there are no reordered, hidden, overlapping or gapped entries. It requires the index to be the sole final entry and cross-checks every Manifest/Chunk record against CD/LFH/data ranges, rejecting unindexed objects, index references to nonexistent objects and extra metadata. Ordinary Open/Get does not perform these O(entry-count) checks.
 
-主要决定项:
+Strict paths then verify the full closure and object content. A missing but unaccessed chunk fails FullVerify immediately; exact upload fails before any Put. Multi-source exact upload follows this order:
 
-- chunk 模式(cdc 命中率高于 fixed,但分块本身略慢);
-- 固定 RAW/Snappy 选择与 AES（不可压缩内容保持 RAW；可压缩内容减少 hash/AES/wire bytes）；
-- store 端点延迟(本地 fs vs 远端 S3-compatible object storage,详见 [`store_zh.md`](store_zh.md))。
+1. The caller selects the current/refs Bundle for each logical Manifest key at OpenManifest level. Dependencies already strictly verified in the destination Store do not enter the Bundle upload plan.
+2. Before any admission or Put, run the complete CD/LFH/index container verifier on every actual source in that plan.
+3. Before any Put, call `AdmitWriteFor(recorded.Generation)` for all actual source admissions. Returned Generation and Salt must match the recorded bytes exactly.
+4. Force verification of every selected Manifest's physical ContentKey, parse it, unseal its table with the customer key, and prove its entire chunk closure resides in that same source Bundle.
+5. For every actually used unique chunk in each source, force physical ContentKey verification, decrypt/decompress to original plaintext, and require `DeriveKey(sourceAdmission.Salt, plaintext)` to equal the table's key. Reject one ContentKey associated with inconsistent keys or plaintext sizes across Manifests.
+6. Upload all chunks concurrently first, then dependency Manifests, and publish the caller-specified current root last.
 
-可重复 microbenchmark 为 `BenchmarkCompressionCandidates`（raw、Go Snappy、S2、S2
-Better、Zstd SpeedFastest 控制组）、`BenchmarkAESChunkCanonicalCodec` 和
-`BenchmarkManifestAESPhysicalRead`。生产实现只使用 Go Snappy；benchmark 候选不会
-进入配置或协商面。codec benchmark 另报告 `scratch-misses/op`,用于确认 warm
-size class 没有每次重新分配 payload-sized buffer。
+Each object uses its source Bundle's recorded admission. Upload neither redirects objects to the newest generation nor rechunks, recompresses, re-encrypts, reseals the table or rewrites upper-level `snapshot.cfg`. Root ManifestKey and physical bytes remain unchanged. Failure in admission preflight, dependency verification or Put prevents final root publication. Refs and admission entries are container metadata, not Store objects, and are not uploaded.
 
-Bundle 尾索引的 4K/20K/100K Chunk 打开成本由 `BenchmarkBundleOpen4K`、
-`BenchmarkBundleOpen20K` 和 `BenchmarkBundleOpen100K` 报告；Open 只加载
-Manifest index，不读取 Chunk index、Central Directory、对象 Local Header 或对象
-payload。`BenchmarkBundlePrepareChunks4K/20K` 报告选源后的单次 Chunk section
-准备，`BenchmarkBundleGetAfterPrepare` 报告纯 O(1) lookup + payload read，
-`BenchmarkBundleOpenHighRTT20K` 注入固定 ReaderAt RTT 并报告 `read-calls/op` 与
-`read-bytes/op`。`BenchmarkVerifyContent` 分别报告 Manifest open 与冷态
-1 MiB Chunk read 在 `verify_content=true|false` 下的差异。
-`BenchmarkManifestSourceSearch` 报告 refs 为 0/1/8/32 时的 clean miss 与尾部 remote
-fallback 成本；`BenchmarkMetadataOpen4K` / `BenchmarkMetadataOpen20K` 证明 prefix-only
-metadata 读取不随 Chunk 数增长。
+FullVerify also rejects chunks unreferenced by any local Manifest. After parsing snapshot-specific metadata, the caller can supply `ExpectedManifests` as the exact locally reachable Manifest set, rejecting unrelated Manifests without making accelerator interpret `snapshot.cfg`.
+
+<a id="5-性能特征"></a>
+
+## 5. Performance characteristics
+
+The [project performance guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf.md) provides the measurement context for end-to-end `manifest://` loads with cold/warm L1. Record actual revisions, workload and cache state; document structure or benchmark names alone are not fresh measurements.
+
+The principal variables are:
+
+- Chunk mode: CDC can improve reuse after content changes but costs chunking work; its advantage over fixed mode is workload-dependent.
+- Fixed RAW/Snappy selection and AES: incompressible data stays RAW; compressible data reduces physical hash/AES/wire bytes.
+- Store latency and backend behavior, such as local fs versus remote S3-compatible object storage; see [store](store.md).
+
+Repeatable microbenchmarks include `BenchmarkCompressionCandidates` (RAW, Go Snappy, S2, S2 Better and Zstd SpeedFastest controls), `BenchmarkAESChunkCanonicalCodec` and `BenchmarkManifestAESPhysicalRead`. Only Go Snappy enters the production codec; benchmark candidates are not configuration or negotiation options. Codec benchmarks also report `scratch-misses/op` to determine whether a warm size class reuses payload-sized buffers.
+
+Bundle tail-index opening cost at 4K/20K/100K chunks is reported by `BenchmarkBundleOpen4K`, `BenchmarkBundleOpen20K` and `BenchmarkBundleOpen100K`. Open loads only the Manifest index, not the Chunk index, Central Directory, object Local Headers or payloads. `BenchmarkBundlePrepareChunks4K/20K` measures one-time selected-source Chunk-section preparation. `BenchmarkBundleGetAfterPrepare` measures O(1) lookup plus payload reading.
+
+`BenchmarkBundleOpenHighRTT20K` injects a fixed ReaderAt RTT and reports `read-calls/op` and `read-bytes/op`. `BenchmarkVerifyContent` compares Manifest open and cold 1 MiB chunk reads with verification enabled/disabled.
+
+`BenchmarkManifestSourceSearch` measures clean misses and final remote fallback with 0/1/8/32 refs. `BenchmarkMetadataOpen4K`/`BenchmarkMetadataOpen20K` measure prefix-only metadata opening and its independence from chunk count. Benchmark fixture names do not override container entry limits.
 
 ## 6. See Also
 
-- [`store_zh.md`](store_zh.md) — manifest-ctl 通过 gRPC 把字节落到 store-ctl
-- [`cache.md`](cache.md) — `load` 路径可选穿 cache-ctl 加速;cache-ctl 自身
-  以 manifest 同款客户端从 store 取 chunk
-- `guest-runtime/docs/flatten.md` — 镜像展平后经 `flatten-ctl export --upload`
-  入库
-- `sandboxer/docs/sandbox.md` — 沙箱通过 `manifest://<key>` 引用磁盘
-  base 与快照
-- `kuasar-sandbox/docs/kuasar-sandbox.md` §4.1–4.4 — Manifest 抽象在系统中的位置
+- [store](store.md): manifest-ctl writes remote bytes through store-ctl gRPC.
+- [cache](cache.md): optional acceleration for reads; cache-ctl can use the same store client as its origin.
+- [guest-runtime flatten](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten.md): image flattening followed by `flatten-ctl export --upload`.
+- [sandboxer](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox.md): disk bases and snapshots referenced with Manifest keys.
+- [system architecture](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox.md): the Manifest abstraction in the overall platform.

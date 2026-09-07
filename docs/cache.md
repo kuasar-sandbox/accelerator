@@ -1,197 +1,195 @@
-# cache — 分层内容缓存
+[English](cache.md) | [简体中文](cache_zh.md)
 
-`cache-ctl` 是项目里**跨 sandbox 共享**的内容缓存层。它把客户端反复
-读取的 chunk 在节点本地与节点间集群里重复使用,把远端 S3-compatible
-object storage 的热路径收敛到本地 RocksDB BlockCache。同一份二进制,
-通过 YAML 配置切换三种运行形态(`local` / `shard` / `tiered`),
-适配不同部署场景。
+<a id="cache--分层内容缓存"></a>
 
-## 1. 概述
+# cache — tiered content caching
 
-### 1.1 解决的问题
+`cache-ctl` is the platform's content cache **shared across sandboxes**. It reuses frequently read chunks on one node and across a shard cluster, reducing reads from remote S3-compatible object storage. Embedded deployments can serve hot content from RocksDB BlockCache; a Redis-compatible external backend is also available. One binary supports three YAML-selected modes: `local`, `shard` and `tiered`.
 
-Agent 应用的镜像(1–5 GiB)和内存快照(~512 MiB)存储在远端 S3-compatible
-object storage,直接拉取的延迟和带宽不可承受——万级并发同时拉取,聚合
-带宽超过网络承载。
+<a id="1-概述"></a>
 
-| 维度 | 无缓存 | 有缓存 |
-|---|---|---|
-| 镜像冷启动 | 秒级(全量拉取) | <500 ms(按需加载,缓存命中单次 IO) |
-| 快照恢复 | 数百 ms | <80 ms(L1/L2 命中) |
-| 网络带宽 | 线性增长 | 仅首次 miss 产生远端流量 |
-| 远端对象存储成本 | 随并发线性增长 | 流量降 >99% |
+## 1. Overview
 
-99.9% 整体命中率(L1 内存 + L2 磁盘联合)意味着每 1000 次缓存查询最多 1
-次穿透到远端对象存储。5 TiB 磁盘容量范围内,任何请求最多 1 次随机 IO
-(Index 与 Bloom Filter 全部常驻内存)。
+<a id="11-解决的问题"></a>
 
-### 1.2 设计原则
+### 1.1 Problem
 
-- **数据面**:自定义 wire 协议(39 B 请求头 / 8 B 响应头,6 个 opcode)。
-- **控制面**:`health_listen` 独立端口同时跑两个 gRPC 服务——标准 `grpc.health.v1.Health`
-  探活,以及 `cac.cache.v1.Info`(`Get` 拉运行时计数快照)。
-- **监听地址**:`listen` / `health_listen` 均取 `host:port`(TCP)或一个 Unix
-  socket 路径(`/run/sandbox/cache.sock` 或 `unix:///...`;为 socket 时启动清死
-  socket、chmod 0600)。数据面客户端 `cache.endpoint` 填同址即可;控制面经 socket
-  时,`ping` / `info --endpoint` 用 `unix:///` 形式。
-- **本地存储**:进程内 RocksDB,或通过 UDS/TCP 访问 Redis-compatible server;
-  后者的配置、取消语义和外部 Dragonfly 部署示例见 [cache-redis.md](cache-redis.md)。
-- **写入语义**:强制准入,无应用层 LRU/SLRU。淘汰由 CompactionFilter 在
-  后台按 CMS 频率统计驱动。
-- **填充语义**:fill-aside,读路径上隐式回填上层。
+The original planning examples used 1–5 GiB images, roughly 512 MiB memory snapshots and tens of thousands of concurrent consumers. Fetching complete copies from remote object storage for every consumer can create substantial latency and aggregate bandwidth demand.
 
-## 2. 命令行接口
+The previous document presented the figures below without a reproducible workload/run attached to them. They are retained as **historical planning comparisons**, not measured guarantees of the current implementation:
+
+| Dimension | Previous uncached comparison | Previous cached target | Actual dependency/limit |
+|---|---|---|---|
+| Image cold start | Seconds for a complete pull. | <500 ms with demand loading/cache hits. | Required working set, image format, VM/runtime startup, cache state and backend latency. Demand loading does not itself require a cache hit. |
+| Snapshot restore | Hundreds of milliseconds. | <80 ms on L1/L2 hits. | Snapshot/workload, fault count, storage/network and host behavior. |
+| Network traffic | Increasing with consumers. | Remote traffic only on the first miss. | Reuse can reduce remote reads, but eviction, concurrent misses, failed fills and new content can cause repeated origin reads. |
+| Remote object-storage cost | Increasing with consumers. | >99% traffic reduction. | Actual request/byte hit ratios and provider pricing; no fixed reduction is guaranteed. |
+
+A measured 99.9% aggregate hit ratio corresponds to about one miss per thousand queries **on average** over that measurement, not a maximum of one in every group of a thousand. A 5 TiB working set does not imply every request needs at most one random I/O. Index/filter residency, SST/blob reads, false positives and compaction all affect I/O (§4.4, §5).
+
+<a id="12-设计原则"></a>
+
+### 1.2 Principles
+
+- **Data plane:** a custom wire protocol with a 39-byte request header, 8-byte response header and six opcodes.
+- **Control plane:** `health_listen` serves both standard `grpc.health.v1.Health` probing and `cac.cache.v1.Info` (`Get` returns runtime counters) on a separate listener.
+- **Addresses:** `listen` and `health_listen` accept TCP `host:port` or a Unix socket such as `/run/sandbox/cache.sock` or `unix:///...`. Socket startup handles stale socket paths and sets mode 0600. The data client uses the same address in `cache.endpoint`; use a `unix:///` target for control-plane `ping`/`info --endpoint`.
+- **Physical cache backend:** embedded RocksDB or a Redis-compatible server over UDS/TCP. See [the Redis backend guide](cache-redis.md) for configuration, cancellation and an external Dragonfly deployment example.
+- **Writes:** no application-level frequency admission filter. Embedded disk eviction uses a CMS-driven RocksDB CompactionFilter; a Redis-compatible server owns its own eviction/capacity policy. Neither policy guarantees a write succeeds through storage/resource failures.
+- **Filling:** successful lower-tier reads asynchronously fill upper tiers.
+
+<a id="2-命令行接口"></a>
+
+## 2. Command-line interface
 
 ### 2.1 `cache-ctl serve`
 
-```
+```text
 cache-ctl serve --config FILE
 ```
 
-`--config` 与 `CACHE_CONFIG` 必有其一(flag 优先);两者皆缺则报错。
-YAML 示例见 §3。
+Either `--config` or `CACHE_CONFIG` is required; the flag takes precedence and both missing is an error. See §3 for YAML examples.
 
 ### 2.2 `cache-ctl config`
 
-```
+```text
 cache-ctl config show     [--config <path>]
 cache-ctl config generate
 ```
 
-`generate` 输出带注释模板(默认 tiered:rocksdb L1 + store origin)。
+`generate` prints a commented template, defaulting to a tiered configuration with embedded RocksDB L1 and a store origin.
 
-### 2.3 `cache-ctl object` — 完整对象操作
+<a id="23-cache-ctl-object--完整对象操作"></a>
 
-连 `local` 或 `tiered` 端点(数据端口,典型 7070):
+### 2.3 `cache-ctl object` — complete objects
 
-```
+Use a data endpoint, conventionally port 7070. The normal intended roles are local for writes and local/tiered for reads; local and shard currently both expose complete-object operations (§4.10).
+
+```text
 cache-ctl object get --endpoint host:port --namespace chunk --hash HEX
 cache-ctl object put --endpoint host:port --namespace chunk --hash HEX --value FILE|-
 ```
 
-`--endpoint` 与 `CACHE_ENDPOINT` 二选一;`get` 输出到 stdout;
-`--value -` 从 stdin 读。`put` 不可连 tiered(拒绝写,§3.1)。
+Supply `--endpoint` or `CACHE_ENDPOINT`. Get writes the value to stdout; `--value -` reads stdin. Tiered rejects Put (§3.1).
 
-### 2.4 `cache-ctl shard` — EC 分片操作
+<a id="24-cache-ctl-shard--ec-分片操作"></a>
 
-连 `shard` 端点:
+### 2.4 `cache-ctl shard` — EC shards
 
-```
+The intended endpoint is a shard daemon:
+
+```text
 cache-ctl shard get --endpoint host:port --namespace chunk --hash HEX
 cache-ctl shard put --endpoint host:port --namespace chunk --hash HEX --idx N --total M --value FILE|-
 ```
 
-`get` 不带分片编号——返回该 peer 实际持有的分片(`idx`/`total` 打到 stderr,
-分片数据到 stdout)。`put` 把裸分片数据按 `[idx][total]` 前缀封装后写入
-(`--total` 默认 5,须 `--idx < --total`),是单 peer 的调试入口;真实写入由
-fill-aside 经 `EncodePrefixed` 完成。
+Get does not supply a shard index: the peer returns the shard it actually holds, with idx/total printed to stderr and shard data to stdout. Put prefixes raw data with `[idx][total]`; total defaults to 5 and idx must be smaller than total. This is a single-peer debugging interface. Normal fill-aside writes use `EncodePrefixed`.
 
 ### 2.5 `cache-ctl ping` / `info`
 
-```
-cache-ctl ping --endpoint host:port            # gRPC 健康探测 (--endpoint 指向 health_listen)
-cache-ctl info --endpoint host:port [--json]   # 实时 stats(同 health_listen);--json 输出原始 JSON
-cache-ctl info --rocks-path PATH               # 离线只读打开 RocksDB,查看属性
+```text
+cache-ctl ping --endpoint host:port           # gRPC health listener
+cache-ctl info --endpoint host:port [--json]  # Runtime counters on the same listener
+cache-ctl info --rocks-path PATH             # Offline read-only RocksDB inspection
 ```
 
-`ping` / `info --endpoint` 都指向**控制面**端口(`health_listen`,典型 7071),
-**不是**数据端口,都不走 wire 协议。两者调不同 gRPC 服务:`ping` 调
-`grpc.health.v1.Health/Check`;`info --endpoint` 调 `cac.cache.v1.Info/Get`,把运行时
-计数快照拉回来(`--json` 输出原始 JSON,否则人类可读表格)。
-`info --rocks-path` 走 RocksDB secondary instance(只读并行打开),不打扰
-运行中的 cache-ctl。
+Ping and remote Info target the **control-plane `health_listen`**, conventionally 7071, not the data listener. They use different gRPC services: `grpc.health.v1.Health/Check` and `cac.cache.v1.Info/Get`. Info prints a table or raw JSON with `--json`.
+
+`info --rocks-path` opens RocksDB through **OpenDbForReadOnlyColumnFamilies**, not a secondary-instance API. Use remote Info to inspect a running daemon; offline read-only opening is intended for postmortem inspection and does not promise a coherent live view while another process modifies the files.
 
 ### 2.6 `cache-ctl bench`
 
-内置吞吐/延迟基准,通过 wire 协议向运行中的 cache-ctl 发压。用于快速
-smoke 验证;不替代 `test/scripts/bench_cache.sh`(后者加 taskset CPU 固
-定 + 参数扫描)。
+The built-in benchmark sends wire-protocol traffic to a running daemon for quick throughput/latency smoke checks. It does not replace [bench_cache.sh](../test/scripts/bench_cache.sh), which adds CPU affinity and parameter sweeps.
 
-```
+```text
 cache-ctl bench --endpoint host:port [flags]
 
 Flags:
-  --concurrency int         (default 8)
-  --duration duration       Go duration (default 10s)
-  --value-size int          (default 262144)  # 256 KiB
-  --mode string             "get" | "put" | "mixed";默认空,--prefill-endpoint 为空时解析为
-                            "mixed",否则强制 "get"(显式传 put/mixed + 独立 prefill 端点报错)
-  --namespace string        "chunk" | "manifest"
-  --prefill int             get/mixed 模式预写对象数 (default 1000)
-  --prefill-endpoint string 独立预写端点(默认同 --endpoint)
-  --info-endpoint value     Info gRPC 端点(HealthListen)，可重复；第一个端点同时用于 bench 目标预热判定
-  --access string           "seq" | "uniform" | "zipf" 读访问模式 (default "seq")
-  --zipf-s float            Zipf 偏斜指数 s (>1,越大越偏;仅 --access zipf) (default 1.1)
-  --cold-prefill int        额外只写 prefill 端点、不暖 bench 目标的冷 key 数(喂 L2-miss → L3)
-  --miss-ratio float        命中冷 key 的读比例 → L2 miss → 透传 origin/L3 (需 --cold-prefill>0 + --prefill-endpoint)
-  --timeout duration        客户端 per-op TCP deadline (default 10s;慢/卡 origin 大数据集 prefill 须调大)
-  --cpu-profile string      bench 窗口内写 CPU profile 到文件
-  --heap-profile string     bench 窗口结束后写 heap profile 到文件
-  --trace string            bench 窗口内写执行 trace 到文件
+  --concurrency int          (default 8)
+  --duration duration        Go duration (default 10s)
+  --value-size int           (default 262144; 256 KiB)
+  --mode string              get | put | mixed; empty defaults to mixed unless a
+                             separate prefill endpoint is set, which requires get
+  --namespace string         chunk | manifest
+  --prefill int              Objects prewritten for get/mixed (default 1000)
+  --prefill-endpoint string  Separate prefill endpoint (default: benchmark endpoint)
+  --info-endpoint value      Repeatable Info gRPC endpoint; the first also controls
+                             benchmark-target warmup checks
+  --access string            seq | uniform | zipf (default seq)
+  --zipf-s float             Zipf s > 1; larger is more skewed (default 1.1)
+  --cold-prefill int         Cold keys written only to prefill, not warmed at target
+  --miss-ratio float         Read share targeting cold keys; requires cold-prefill
+                             and a separate prefill endpoint
+  --timeout duration        Per-operation client deadline (default 10s)
+  --cpu-profile string      CPU-profile file for the measurement window
+  --heap-profile string     Heap-profile file written after the window
+  --trace string            Execution-trace file for the window
 ```
 
-#### 基准方法学(L2 内存/磁盘路径、L3 透传、aging)
+An explicit put/mixed mode with a separate prefill endpoint is an error. Increase the client timeout when an intentionally slow origin or large prefill requires it; a timeout does not convert a backend error into a clean cache miss.
 
-多机端到端压测见 `test/scripts/bench_cache_remote.sh`(部署 N shard + origin + tiered,跑并发扫);
-资源瓶颈归因配 `test/scripts/procmon.sh`(无依赖 /proc 采样 cpu/diskstats/net)+ `proc_analyze.py`。要点:
+<a id="基准方法学l2-内存磁盘路径l3-透传aging"></a>
 
-- **测「L2 命中(内存)」vs「L2 落盘」**靠工作集与 BlockCache(= `rocks.disk_bytes × mem_ratio`)之比控制:
-  工作集 ≪ BlockCache → 全 RAM 命中;工作集 ≫ BlockCache(调小 `mem_ratio`)→ shard rocksdb 真实磁盘随机读。
-- **`--access`**:`uniform` 把读均摊到整个工作集 → 暴露磁盘路径;`zipf` 模拟真实热点偏斜——但
-  **偏斜过强会把热集塞进 BlockCache、反而掩盖磁盘路径**,测盘须用 `uniform`(或工作集远大于 cache)。
-- **陷阱:EC tier 命中率 ≠ 命中 RAM**。EC hit% 只表示数据在 shard 集群里;BlockCache miss 时磁盘读
-  发生在 shard rocksdb 内部、对该计数不可见。**判定是否落盘必须看 shard 主机的磁盘 IOPS(procmon `rd_iops`)**,不能看 hit%。
-- **L3 透传建模**:`--cold-prefill N`(只写 origin、不暖 L2)+ `--miss-ratio f`,约 f 比例的读命中冷 key →
-  L2 miss → 透传 origin。冷池要 > 压测窗内的冷读次数,否则 read-through 把重复冷读暖回 L2、实测透传率低于注入值。
-- **测 aging/磁盘淘汰**:淘汰是频率式(见 §4.5,丢 `freq ≤ threshold` 的冷 key),**与 `disk_bytes` 容量无关**。
-  短压测(总 ops ≪ `freq.reset_after`)不会触发——sketch 不衰减、无「冷」key;须用长窗 + 偏斜访问让冷尾衰减到阈值。
-- **两个瓶颈区(结构性,与具体硬件无关)**:① 全 BlockCache 命中时,`value-size × EC 数据分片`扇入会先打满
-  **tiered 节点网卡**(吞吐随并发饱和、延迟按 Little 定律线性增);② 工作集溢出落盘时,**shard 磁盘随机读**
-  成为瓶颈,且经 EC `k`-of-`n` 同步等待放大尾延迟。两端 CPU 通常都不是瓶颈。容量规划核心 = 让热集驻留
-  BlockCache——命中与落盘的吞吐、p99 可差一个数量级。
+#### Benchmark methodology: L2 memory/disk, L3 and aging
 
-## 3. 配置
+[bench_cache_remote.sh](../test/scripts/bench_cache_remote.sh) deploys N shards, origin and tiered daemons for a multi-host concurrency sweep. Pair it with [procmon.sh](../test/scripts/procmon.sh), a dependency-free /proc CPU/diskstats/network sampler, and [proc_analyze.py](../test/scripts/proc_analyze.py) to attribute resource use.
 
-### 3.1 三形态对比
+- **L2 memory versus disk:** compare the working set with `rocks.disk_bytes × mem_ratio`, accounting for index/filter usage inside the BlockCache budget. A working set well below available cache can be RAM-hot; one much larger than it can exercise real random disk reads.
+- **Access distribution:** uniform reads spread over the working set and expose the disk path. Zipf models hot-content skew, but excessive skew can fit the effective hot set in RAM and conceal disk behavior. Use uniform access or a much larger working set when measuring disk.
+- **EC hit rate is not RAM hit rate:** an EC hit means the shard cluster supplied enough data. RocksDB BlockCache misses and disk reads occur below that counter. Inspect shard-host disk IOPS, such as procmon `rd_iops`, to establish that the workload actually reached disk.
+- **L3 modeling:** `--cold-prefill N` writes only to origin, while `--miss-ratio f` selects those cold keys for roughly fraction f of reads. Repeated cold keys warm through fill-aside, lowering the measured origin-read ratio. Size the cold pool larger than the expected cold reads during the window.
+- **Aging/eviction:** embedded eviction is frequency based (§4.5), not a disk_bytes quota. A short run with total operations far below reset_after may not exercise count-driven decay; the time-driven reset can still fire, and once-touched keys can already be at or below the eviction threshold. Use a long window and skewed access, observing actual sketch/compaction behavior rather than assuming short runs cannot evict.
+- **Possible bottlenecks:** RAM-hot shard reads can saturate coordinator network/copy/CPU resources; disk-heavy working sets can saturate shard random I/O and amplify quorum tails. EC collects approximately one object's worth of data across data shards, with parity/hedging/protocol overhead, not automatically `value-size × data_shards` full-object bytes. Neither “the NIC always bottlenecks first” nor “CPU is usually irrelevant” is hardware-independent. Measure network, disk, CPU, concurrency and latency together. Keeping a measured hot set resident can improve performance, but no fixed order-of-magnitude gain follows from the architecture alone.
 
-| 维度 | local | shard | tiered |
+<a id="3-配置"></a>
+
+## 3. Configuration
+
+<a id="31-三形态对比"></a>
+
+### 3.1 Mode comparison
+
+| Dimension | local | shard | tiered |
 |---|---|---|---|
-| 定位 | 单节点完整对象 KV | EC 分片 KV(集群成员) | 多级缓存代理 |
-| handler 后端 | embedded RocksDB / Redis-compatible | embedded RocksDB / Redis-compatible | TieredCache(§4.6) |
-| tier chain | 无 | 无 | 按 YAML `tiers:` 顺序 |
-| 写操作 | 直写所选 backend | 直写所选 backend | 拒绝(`StatusError`) |
-| 读操作 | 查 RocksDB | 查 RocksDB | 穿 tier chain,命中后 fill-aside |
-| origin 凭证 | 不需要 | 不需要 | 需要(L3 读权限) |
-| 典型部署 | 测试/调试/单节点 | L2 EC 集群 × 5 | 与 manifest-ctl 同节点(边车) |
+| Intended role | Complete-object KV on one node. | EC shard KV in a cluster. | Ordered multi-tier read proxy. |
+| Handler backend | Embedded RocksDB or Redis-compatible. | Embedded RocksDB or Redis-compatible. | TieredCache (§4.6). |
+| Tier chain | None. | None. | Exactly the YAML `tiers:` order. |
+| Writes | Direct to selected backend; object and shard operations. | Direct to selected backend; object and shard operations. | Rejected with StatusError. |
+| Reads | Selected backend. | Selected backend. | Traverse the chain on clean misses; asynchronously fill upper tiers on a hit. |
+| Origin dependency | None. | None. | Configured Store/upstream RPC access; remote object-store credentials stay with the service owning that backend. |
+| Typical deployment | Tests, debugging or one-node cache. | Five peers for unchanged RS(4+1). | Beside Manifest consumers as a node-local cache proxy. |
 
-### 3.2 local 模式
+<a id="32-local-模式"></a>
+
+### 3.2 Local mode
 
 ```yaml
 mode: local
 type: embedded
-listen: 0.0.0.0:7070           # wire 数据面;host:port 或 Unix socket(/run/sandbox/cache.sock 或 unix:///...)
-health_listen: 0.0.0.0:7071    # gRPC 健康检查(可省);同支持 Unix socket 路径
-stats_interval: 30s            # 周期自适应统计行(§6.6);缺省 30s,"0"/"off" 关闭
-rpc_timeout: ""                # 服务端每请求 wall-clock 上限。缺省/空/非法 = 0 =
-                               # 无 per-request deadline:请求只受客户端连接 /
-                               # 调用方取消约束。显式写 Go duration(如 "2s")才设上界
+listen: 0.0.0.0:7070           # Wire data; TCP or UDS (/run/sandbox/cache.sock or unix:///...)
+health_listen: 0.0.0.0:7071    # Optional gRPC Health + Info; UDS also accepted
+stats_interval: 30s           # Adaptive stats base period; "0"/"off" disables it
+rpc_timeout: ""               # Empty/invalid/nonpositive: no request context deadline
+                             # A positive Go duration sets the context budget, not a CGO interrupt
 
 freq:
-  counters: 8M                 # CMS sketch 4-bit 计数器数 (8M ≈ 4 MiB)
-  reset_after: 1M              # 每 1M 次 Touch 后 halving
-  reset_interval: 1h           # 低流量兜底:每小时 halving
-  evict_threshold: 1           # CompactionFilter 淘汰阈值
+  counters: 8M                # 4-bit CMS counters; about 4 MiB per active generation
+  reset_after: 1M             # Count-triggered rolling decay
+  reset_interval: 1h          # Time-triggered decay for low traffic
+  evict_threshold: 1          # Evict estimates at or below this threshold
   persist_interval: 5m
 
 rocks:
   path: /var/cache/accel-l1
-  disk_bytes: 1TiB             # BlockCache = disk_bytes × mem_ratio
-  mem_ratio: 0.01              # 1% → 10 GiB
+  disk_bytes: 1TiB            # Sizing input for BlockCache; not an enforced disk quota
+  mem_ratio: 0.01             # 1 TiB × 1% = 10.24 GiB
   direct_reads: true
   bloom_bits: 15
 ```
 
-### 3.3 shard 模式
+<a id="33-shard-模式"></a>
+
+### 3.3 Shard mode
 
 ```yaml
 mode: shard
@@ -209,7 +207,7 @@ freq:
 rocks:
   path: /mnt/ssd/accel-l2
   disk_bytes: 5TiB
-  mem_ratio: 0.08              # 8% → 400 GiB
+  mem_ratio: 0.08             # 5 TiB × 8% = 409.6 GiB
   direct_reads: true
   block_size: 128KiB
   bloom_bits: 15
@@ -217,7 +215,9 @@ rocks:
   max_background_jobs: 16
 ```
 
-### 3.4 tiered 模式
+<a id="34-tiered-模式"></a>
+
+### 3.4 Tiered mode
 
 ```yaml
 mode: tiered
@@ -231,9 +231,9 @@ freq:
   reset_interval: 1h
   persist_interval: 5m
 
-# tiers 数组的顺序即 tier chain 的查找顺序。最多一个 embedded。
+# YAML order is lookup order; at most one embedded tier
 tiers:
-  - type: embedded             # 进程内嵌 RocksDB (L1)
+  - type: embedded
     rocks:
       path: /var/cache/accel-l1
       disk_bytes: 1TiB
@@ -241,581 +241,575 @@ tiers:
       direct_reads: true
       bloom_bits: 15
 
-  - type: ec                   # EC 客户端 → shard 集群
+  - type: ec
     cluster:
-      data_shards: 4           # RS k=4(空/≤0 → 默认 4;见下「分片数自动收敛」)
-      parity_shards: 1         # RS m=1 → 总 5 分片,25% 开销(空/≤0 → 默认 1)
+      data_shards: 4          # Empty/nonpositive defaults to 4 before initial clamp
+      parity_shards: 1        # Empty/nonpositive defaults to 1; RS 4+1 has 25% parity overhead
       peers:
         - {id: l2-01, endpoint: 10.0.1.11:7070}
         - {id: l2-02, endpoint: 10.0.1.12:7070}
         - {id: l2-03, endpoint: 10.0.1.13:7070}
         - {id: l2-04, endpoint: 10.0.1.14:7070}
         - {id: l2-05, endpoint: 10.0.1.15:7070}
-      pool: 2                  # 每 peer 并行 TCP 连接数(wire)
+      pool: 2                 # Wire connections per peer
       timeout: 2s
 
 origin:
-  type: store                  # store | upstream(见下文「upstream 层」);cache-ctl 不直接访问文件系统
+  type: store                 # store or upstream; remote authoritative bytes use the service
   store:
-    endpoint: 10.0.1.50:7100   # store-ctl gRPC endpoint
-    pool: 4                    # 独立 grpc.ClientConn 数(round-robin)
+    endpoint: 10.0.1.50:7100   # store-ctl gRPC
+    pool: 4                   # Independent grpc.ClientConn instances, round-robin
     timeout: 2s
-  max_inflight: 16             # 到 origin 的最大并发 RPC 数
+  max_inflight: 16             # Maximum synchronous origin queries
 ```
 
-`origin.type: store` 把 cache-ctl 的 L3 fallback 指向一个 store-ctl 守护
-进程——所有 origin miss 都通过 gRPC `Get` 流式拉回。cache-ctl 进程**没有
-任何**文件系统读写权限,所有持久化都集中在 store-ctl。origin 另一合法值是
-`type: upstream`(指向另一台 cache-ctl wire 端点,见下「upstream 层」)。
+`origin.type: store` routes final origin reads through store-ctl gRPC Get. **This does not remove cache-ctl's filesystem access:** embedded RocksDB still reads/writes its cache directory. Only authoritative origin persistence belongs to store-ctl. The other origin type is `upstream`, pointing at another cache wire endpoint.
 
-#### 分片数自动收敛(clamp)
+<a id="分片数自动收敛clamp"></a>
 
-EC 每个对象恰好放 `data + parity` 个分片(一片一 peer,Maglev 定位),因此
-`data + parity` 不能超过 `len(peers)`——否则每次 Get 都在路由阶段失败
-("need N nodes but only M")。构造 EC tier 时(`data≤0→4`、`parity≤0→1` 默认补全
-之后)若发现 `data + parity > len(peers)=n`,自动把方案收敛到 n 个 peer 并打一条
-WARN,**优先保住 parity(容错)、缩小 data**:
+#### Initial shard-count clamp
 
-- `parity < n` → `data = n - parity`(保留配置的 parity);
-- `parity ≥ n` → `data = 1, parity = n-1`(parity 单独都放不下,退化为最大冗余;
-  `n == 1` 时即 `1+0`,无冗余单 peer 直通——分片缺失就是 miss,读写仍正常);
-- `data + parity ≤ n` 原样保留(每对象扇出小于 peer 数是合法且可能有意为之:
-  对象散布在 peer 子集上做负载均衡,每次 Get 读的分片更少 → EC 尾延迟放大更小)。
+Each object places `data + parity` shards on distinct peers selected by Maglev. That total must fit the peer count. Otherwise routing cannot return enough distinct nodes.
 
-#### upstream 层(可选)
+At EC construction, defaults are first applied (`data≤0 → 4`, `parity≤0 → 1`). If their sum exceeds `n = len(peers)`, construction logs a warning and reduces the scheme, preferring parity:
 
-`type: upstream` 把另一台 cache-ctl 作为 tier chain 的一层——典型用法
-是把同机房的 L2 聚合节点放在 embedded 之后、EC 之前,让热集群先在聚合
-节点上收敛,减少对 shard 集群的读压力。**upstream endpoint 指向的远端
-cache-ctl 必须运行在 `local` 模式**:tiered/shard 模式拒绝 Put,fill-aside
-backfill 第一次失败才会被 TieredCache 视作"该层 miss"静默吞掉——读链
-路仍可用,但 upstream tier 永远不被填充,等于退化成只读代理。loud failure
-点在第一次 backfill,不在启动握手。
+- If `parity < n`, use `data = n - parity`, preserving parity.
+- If `parity ≥ n`, use `data = 1, parity = n - 1`. With one peer this is `1+0`, no redundancy; absent data is a miss, but reads/writes remain supported.
+- If `data + parity ≤ n`, keep the scheme. Selecting only a subset of a larger peer set is valid, distributes objects and can reduce each object's fanout.
+
+A zero-peer configuration is invalid. To retain **4+1**, supply at least five peers initially. The clamp is a **construction-time** operation. SIGHUP updates membership, not the codec's data/parity scheme; reducing live membership below the existing total can produce routing errors (§4.9).
+
+<a id="upstream-层可选"></a>
+
+#### Optional upstream tier
+
+A `type: upstream` tier reads/writes complete objects through another cache-ctl wire endpoint. It can sit after an embedded tier and before EC, concentrating hot content in an aggregation node.
+
+For fill-aside, use a **writable complete-object endpoint**. Local is the intended role; current shard mode also exposes object operations (§4.10). Tiered rejects Put. If a read-only tiered endpoint is used as an intermediate upstream tier, reads may work, but async fill errors are discarded and do not populate it. They do not retroactively change the successful read into a miss, and there is no startup write-capability handshake or guaranteed loud first-fill error. A read-only endpoint can instead be an `origin.type: upstream`, which is read only by the proxy.
 
 ```yaml
 tiers:
   - type: embedded
     rocks: { path: /var/cache/accel-l1, disk_bytes: 1TiB, mem_ratio: 0.01 }
 
-  - type: upstream             # 远端必须是 local 模式
+  - type: upstream             # Use a writable complete-object backend for fill-aside
     endpoint: 10.0.1.50:7070
-    pool: 4                    # reader / writer 各自的 ConnPool
+    pool: 4                    # Separate reader/writer ConnPools
     timeout: 2s
 ```
 
-### 3.5 关键参数
+<a id="35-关键参数"></a>
 
-| 参数 | 说明 |
+### 3.5 Important parameters
+
+| Parameter | Meaning |
 |---|---|
-| `listen` | wire 数据面 TCP 监听 |
-| `health_listen` | gRPC 控制面监听,同端口跑两个服务:`grpc.health.v1.Health`(探活)+ `cac.cache.v1.Info`(`Get` 拉计数快照)。省略则两者都不启动 |
-| `stats_interval` | 周期自适应 stderr 统计行的基准周期(§6.6)。缺省/空 = 30s(默认开);`0`/`off` 关闭。有流量的周期打一行(吞吐/带宽/时延 p50/p99/max/并发/命中级联/rocks 量规),空闲周期静默 |
-| `freq.disable_eviction` | bool。关掉频率式 compaction-filter 淘汰:sketch 仍维护(供 stats),但 filter 永不挂载,任何 key 都不会按访问计数被淘汰。用于某台 local cache-ctl 充当下游 tiered 的 origin(bench 场景)——写入落一次就必须留住 |
-| `pool` | 到单个 peer 的并行 TCP 连接数。wire 是 sync request/response,单连接会把并发请求串行化 |
-| `max_inflight` | 到该 tier 的同步查询并发上限;`0` 表示不限制。异步 fill 使用各 backend 自身的连接池/并发控制。Redis tier 禁止设置,应使用 `redis.get_pool` / `redis.set_pool` |
-| `rpc_timeout` | 服务端每请求 wall-clock 上限。**缺省/空/非法 = 0 = 无 per-request deadline**:请求只受客户端连接 / 调用方取消约束,不强加任意值。显式设有限值时,超时返回 `StatusError`,TieredCache 视作该层 miss 继续下一层。卡死请求的可观测性改由 `CACHE_CTL_DEBUG` 追踪(§6.5) |
-| `timeout`(tier/origin) | 客户端对该 tier / origin 单次 RPC 的 wall-clock 上限。同 `rpc_timeout` 语义:缺省/空 = 0 = 不设上界,只受调用方 ctx / 连接约束 |
-| `pprof_listen` | 非空时另起一个 HTTP listener 暴露 `/debug/pprof/*`(如 `127.0.0.1:6060`)。**生产留空**;仅离线诊断临时开启(§6.4) |
+| `listen` | Wire data listener, TCP or Unix socket. |
+| `health_listen` | One gRPC listener for Health probes and Info counter snapshots; omitted means neither service starts. |
+| `stats_interval` | Adaptive stderr statistics base period (§6.6), default 30s. `0`/`off` disables it. Active windows print throughput, bandwidth, latency, concurrency, hit cascade and backend gauges; idle windows are silent. |
+| `freq.disable_eviction` | Embedded RocksDB frequency tracking continues, but the installed filter remains unarmed and preserves keys. Useful when a test local daemon serves as an origin. It does not turn cache storage into failure-proof authoritative persistence or control external Redis eviction. |
+| `pool` | Wire connections to one peer; each connection's synchronous request/response flow serializes its own requests. |
+| `max_inflight` | Synchronous tier-query concurrency, 0 for unlimited. Async fill uses backend pools/limits. Redis tiers reject this field; use their separate get_pool/set_pool. |
+| `rpc_timeout` | Server request context budget. Missing, empty, invalid or nonpositive means no per-request deadline. A positive duration cancels context-aware work; synchronous RocksDB CGO cannot be interrupted mid-operation. Timeout/errors are not universally converted into cache misses (§4.2). |
+| `timeout` | Client per-operation timeout. **An intermediate upstream tier (`tiers[].timeout`) and an EC cluster (`tiers[].cluster.timeout`) default to 2s** when empty/invalid/nonpositive. **Origin clients (`origin.store.timeout` and `origin.upstream.timeout`) default to 0**, bounded by caller/connection lifetime. Redis has its own validation/defaults and requires an explicitly supplied timeout to be positive and valid. |
+| `pprof_listen` | Optional HTTP `/debug/pprof/*` listener, for example 127.0.0.1:6060. Leave empty normally; enable temporarily for diagnostics (§6.4). |
 
-## 4. 设计
+<a id="4-设计"></a>
 
-### 4.1 总体架构
+## 4. Design
 
-```
-   ┌─ manifest-ctl ──────────────────────────────────────────────────────────────┐
-   │    load:    fetch  ── wire ObjectGet ───────────────┐                       │
-   │    store:   ingest ── store gRPC Put ──┐            │                       │
-   └────────────────────────────────────────┼────────────┼───────────────────────┘
-                                            │            │
-                              store gRPC    │            │  wire ObjectGet
-                                            ▼            ▼
-                       ┌─ store-ctl ──────────┐    ┌─ cache-ctl  tiered ──────────┐
-                       │   gRPC server        │    │   wire server                │
-                       │      │               │    │      │                       │
-                       │      ▼               │    │      ▼                       │
-                       │   fs / s3 backend    │    │   TieredCache                │
-                       │   __meta/generations │    │     tier 0   embedded  (L1)  │
-                       └──────────▲───────────┘    │     tier 1   ec ──────┐      │
-                                  │                │     origin ──┐        │      │
-                                  │                └──────────────┼────────┼──────┘
-                                  │  origin (gRPC Get)            │        │
-                                  └───────────────────────────────┘        │  wire ShardGet/Put × 5
-                                                                           ▼
-                                                              ┌─ cache-ctl  shard ──┐
-                                                              │   wire server       │   × 5 nodes
-                                                              │   RocksDB           │   (RS 4+1, Maglev)
-                                                              └─────────────────────┘
+<a id="41-总体架构"></a>
+
+### 4.1 Architecture
+
+```mermaid
+flowchart TD
+  M["Manifest ingest"] -->|"gRPC Put"| S["store-ctl: fs or S3 backend"]
+  F["Manifest fetch"] -->|"wire ObjectGet"| T["cache-ctl: tiered"]
+  T --> L["Embedded or Redis L1"]
+  T --> E["EC client"]
+  E --> P["Shard peers: RocksDB or Redis"]
+  T -->|"origin gRPC Get"| S
 ```
 
-cache-ctl 不参与写入路径——所有 Put 由 manifest-ctl → store-ctl 直接走;
-读路径上 fill-aside 由 TieredCache 在内存中隐式触发(不再走自己的 wire
-入口)。
+Manifest ingest writes directly to store-ctl, bypassing cache-ctl. Cache filling is a separate write path: successful reads trigger TieredCache's internal fill-aside calls, which do not loop through that same daemon's wire listener. Cache Put/ShardPut operations still exist for backend filling and explicit tooling.
 
-### 4.2 Wire 协议
+<a id="42-wire-协议"></a>
 
-数据面采用自定义二进制协议,替代 gRPC + protobuf,减少帧开销与 cgo 边界
-拷贝。
+### 4.2 Wire protocol
 
-#### 帧布局
+The data plane uses a compact binary protocol instead of gRPC/protobuf. It reduces framing/serialization work and supports Blob ownership across backend/response paths; this alone does not prove a universal throughput gain or eliminate every copy.
 
-所有整数 little-endian。
+<a id="帧布局"></a>
 
-```
-Request  (固定 39 B 头 + 可选 Value):
-  0   TotalLen     u32   整帧字节数
+#### Frame layout
+
+All integers are little-endian.
+
+```text
+Request (fixed 39-byte header + optional Value):
+  0   TotalLen     u32   Complete frame length in bytes
   4   Opcode       u8    0x01 ObjectGet / 0x02 ObjectPut
-                          0x03 ShardGet  / 0x04 ShardPut / 0x05 Ping
-                          0x06 CancelRequest(取消在途请求)
-  5   Namespace    u8    0x01 chunk / 0x02 manifest / 0x03 blob(Ping 忽略)
-  6   Flags        u8    保留
-  7   Hash         32 B  SHA256(ciphertext);Ping 时全 0
-  39  Value        可变  仅 Put 携带;Shard* 时 Value 首 2 B 为
-                          [idx][total] 前缀,后接 shard_data
+                         0x03 ShardGet / 0x04 ShardPut / 0x05 Ping
+                         0x06 CancelRequest
+  5   Namespace    u8    0x01 chunk / 0x02 manifest / 0x03 blob; ignored for Ping
+  6   Flags        u8    Reserved
+  7   Hash         32 B  Content key; zero for Ping
+  39  Value        ...   Put only; ShardPut value is [idx][total][shard_data]
 
-Response (固定 8 B 头 + 可选 ErrMsg + 可选 Value):
+Response (fixed 8-byte header + optional ErrMsg + optional Value):
   0   TotalLen     u32
   4   Status       u8    0x00 Hit / 0x01 Miss / 0x02 Error / 0x03 Cancelled
   5   Reserved     u8
-  6   ErrLen       u16   仅 Status=Error 时 > 0
-  8   ErrMsg       UTF-8 文本,仅 Error
-  +   Value        仅 Hit 时携带
+  6   ErrLen       u16   Error-message byte length
+  8   ErrMsg       ...   UTF-8 error text for Error
+  +   Value        ...   Value on Hit; ShardGet carries [idx][total][shard_data]
 ```
 
-| 常量 | 值 |
+| Constant | Value |
 |---|---|
-| `RequestHeaderSize`  | 39 B |
-| `ResponseHeaderSize` | 8 B |
-| `MaxFrameSize`       | 4 MiB |
+| `RequestHeaderSize` | 39 B. |
+| `ResponseHeaderSize` | 8 B. |
+| `MaxFrameSize` | 4 MiB. |
 
-`MaxFrameSize` 是单帧硬上限(头 + 载荷)。服务端与客户端读帧前均校验
-`TotalLen ≤ MaxFrameSize`,超限视作协议错误直接断连。
+MaxFrameSize covers the **whole frame**, including header and payload. Client/server validate TotalLen before accepting the rest of the frame; oversized frames are protocol errors and the connection is closed.
 
-#### 错误模型
+<a id="错误模型"></a>
 
-**没有** gRPC 风格的错误码枚举。任何可恢复错误(RocksDB 故障、ctx 超时、
-tier chain 全 miss、tiered 收到 Put)都返回 `StatusError` + 文本
-`ErrMsg`。客户端按语义做三类映射:
+#### Error model
 
-| Status | wire 客户端 | TieredCache |
+There is no gRPC-style catalog of application error codes. Backend failures and rejected operations use StatusError with text. A **clean final miss uses StatusMiss**, not StatusError.
+
+| Status/result | Wire client meaning | TieredCache behavior |
 |---|---|---|
-| `StatusHit` | `value, hit=true, nil` | 命中,fill-aside 上层并返回 |
-| `StatusMiss` | `nil, hit=false, nil` | 向下一层查询 |
-| `StatusError` | `nil, false, err(ErrMsg)` | **视作该层 miss**,继续下一层 |
+| StatusHit | Value, hit=true, no error. | Return the hit and fill upper tiers. |
+| StatusMiss | No value, hit=false, no error. | A clean layer miss proceeds to the next layer. |
+| StatusError | An error containing ErrMsg. | **Return the layer error immediately** and increment its error counter; no generic fallthrough. |
+| StatusCancelled | Cancellation. | Respect the cancellation/error path; do not treat it as proof of absent content. |
 
-把 `StatusError` 当成该层 miss,确保 tier chain 的可用性不被单层瞬时故障
-拉低——下一层只要能响应,读请求整体就能成功。
+Internally, `CacheHitMiss` is a negative-cache hit that ends lookup with a miss, while `CacheMiss` continues. Waiting for a concurrency semaphore causes lookup to restart at the first tier, because an upper tier may have filled while the request waited.
 
-#### 请求取消(CancelRequest / StatusCancelled)
+Individual backends can have their own quorum semantics. For example, insufficient usable EC shards may produce a clean miss, allowing origin lookup; routing, reconstruction and invalid-length errors can remain errors. This does **not** mean every transport error or malformed backend response is interchangeable with a miss. Redis timeout, EOF, protocol and server errors likewise are not ordinary tier fallthrough.
 
-客户端可在请求在途时发一个 `CancelRequest`(0x06)帧,服务端据此提前中止
-正在处理的请求并回 `StatusCancelled`(0x03):取消会 cancel 该请求的处理
-ctx(命中 ctx 的后端——tier chain 远端跳、origin IO——随之中断),已在该连接
-上排队的待处理请求也一并回 `StatusCancelled`。这是 EC hedge 取消慢 peer 的
-机制——`data` 个分片先到即可解码,其余在途 ShardGet 被取消,不必干等。
+<a id="请求取消cancelrequest--statuscancelled"></a>
 
-#### 不提供的操作
+#### Cancellation: CancelRequest / StatusCancelled
 
-- **Delete**:内容寻址下不删除,淘汰由 §4.4 频率 sketch + CompactionFilter
-  异步处理。
-- **AdminService**:无独立 admin RPC。运行时计数可通过控制面 `cac.cache.v1.Info/Get`
-  按需拉(pull-only,见 §1.2 / §6.3),另有默认开启的周期自适应 stderr 统计行
-  (§6.6,`stats_interval`);离线诊断用 `cache-ctl info --rocks-path` 直接打开
-  RocksDB(secondary instance 模式)。
-- **Streaming**:所有请求/响应都是 one-shot;Get/Put 的 value 上限由
-  `MaxFrameSize` 限制,超大对象必须在上层分片(EC tier 的职责)。
+A client can send CancelRequest (0x06) while an operation is in flight. The server cancels the handler context and responds with StatusCancelled (0x03), also cancelling pending queued requests on that connection. Context-aware remote hops and origin I/O can stop; synchronous RocksDB CGO cannot be interrupted in the middle of its call, so cancellation is not a universal instantaneous backend-stop guarantee.
 
-### 4.3 Key 编码与 opcode 分派
+EC uses this mechanism to cancel remaining foreground ShardGets once **data distinct valid shard indexes** have arrived. It need not wait for every peer to serve the read. A cancelled slow peer is unknown, not a confirmed miss; repair handles that distinction (§4.7).
 
-| Opcode | Wire Hash | RocksDB Key | Value | 说明 |
+<a id="不提供的操作"></a>
+
+#### Operations not provided
+
+- **Delete:** no wire deletion operation. Embedded cache eviction is asynchronous CMS/CompactionFilter work (§4.5); external Redis eviction belongs to that server. This says nothing about the separate store generation/GC API.
+- **AdminService:** no standalone admin RPC. Info/Get pulls counters (§1.2, §6.3); adaptive stderr statistics are normally enabled (§6.6). Offline diagnostics use read-only `info --rocks-path`, not a secondary-instance API.
+- **Streaming:** values are one-shot request/response payloads bounded by MaxFrameSize. EC subdivides storage among peers, but the complete-object response from tiered still must fit a wire frame. It does not make arbitrary-size objects transportable; choose upper-layer object/chunk sizes that fit or use an appropriate non-wire path.
+
+<a id="43-key-编码与-opcode-分派"></a>
+
+### 4.3 Key encoding and opcode dispatch
+
+| Opcode family | Wire Hash | RocksDB key | Value | Role |
 |---|---|---|---|---|
-| `ObjectGet/Put` | 32 B SHA256(ciphertext) | `hash[32]` | raw object | 完整对象 |
-| `ShardGet/Put`  | 32 B hash | `hash[32] + 0x00` (33 B) | `[1 idx][1 total][data]` | RS 分片 |
+| ObjectGet/Put | 32-byte content key; physical SHA-256 for Manifest/chunk objects. | `hash[32]`. | Raw stored object bytes. | Complete object. |
+| ShardGet/Put | The complete object's 32-byte key. | `hash[32] + 0x00`, 33 B. | `[idx:1][total:1][data]`. | RS shard. |
 
-Wire 帧头只携带 32 字节 `Hash`——Object 与 Shard 都不需要告诉服务端"哪
-个 idx",因为 Shard 的 idx/total 元数据写进了 Value 前缀。RocksDB 层通
-过 33 字节 ShardKey 与 32 字节 ObjectKey 在长度上天然隔离,共用 CF 也不
-冲突。
+The wire header always carries 32 hash bytes. A shard request does not assert which idx the peer should hold: idx/total travels in the value prefix. The 32-byte object and 33-byte shard keys cannot collide even within one RocksDB CF.
 
-把 shard 身份(idx, total)放进 Value 而不是 Key,是为了**集群成员变更
-时让幸存节点上的现有分片立即可用**——客户端不再需要"peer X 持有 idx Y"
-的位置假设。
+Placing shard identity in the value makes a surviving peer's existing shard discoverable after membership changes. A client uses the reported index rather than assuming a fixed peer-position-to-shard-index mapping. It still needs enough **distinct** valid indexes for the active coding scheme.
 
-### 4.4 RocksDB 调优
+<a id="44-rocksdb-调优"></a>
 
-| 参数 | 默认 | 说明 |
+### 4.4 RocksDB tuning
+
+| Parameter/option | Default | Meaning |
 |---|---|---|
-| `disk_bytes` | 1 TiB | 预期磁盘上限 |
-| `mem_ratio` | 0.01 | BlockCache = disk_bytes × mem_ratio(最小 64 MiB) |
-| `block_size` | 64 KiB | SST data block 粒度 |
-| `bloom_bits` | 15 | 每 key Bloom Filter 位数 → 假阳性 ~0.001% |
-| `compression` | none | 关闭(密文熵高,压缩无效) |
-| `use_direct_reads` | true | 绕过 OS Page Cache |
-| `write_buffer_bytes` | 256 MiB | memtable 大小 |
-| `max_background_jobs` | 8 | 后台 flush + compaction worker |
-| `compaction` | leveled | 读优化 |
-| `pin_l0_filter_and_index` | true | Bloom + Index 常驻 BlockCache |
+| `disk_bytes` | 1 TiB. | Sizing input, **not an enforced disk quota**. |
+| `mem_ratio` | 0.01. | Shared BlockCache budget = disk_bytes × mem_ratio, minimum 64 MiB. |
+| `block_size` | 64 KiB. | SST data-block size. |
+| `bloom_bits` | 15. | Bits per key for Bloom filters; actual false-positive behavior is not a fixed documented percentage. |
+| Compression | None. | Fixed RocksDB option; encrypted chunk values are already high-entropy. |
+| `direct_reads` | true. | Enables UseDirectReads for supported reads. |
+| `write_buffer_bytes` | 256 MiB. | Configured write-buffer sizing input. |
+| `max_background_jobs` | 8. | Used for maximum background compactions; the implementation separately allows two background flushes. |
+| Compaction | Leveled/default RocksDB behavior. | Data organization follows the underlying configured options. |
+| Pin L0 filters/indexes | true. | CacheIndexAndFilterBlocks plus PinL0FilterAndIndexBlocksInCache; this does not pin every level's metadata forever. |
 
-#### Column Family 隔离
+Index/filter blocks and data blocks share the configured BlockCache. Do not count them as independent guaranteed resident budgets or infer one-I/O reads for every key.
 
-chunk / manifest / blob 各用独立 CF:
+<a id="column-family-隔离"></a>
 
-- **chunk CF**:高频写入(fill-aside),大 value(256 KiB 级);
-- **manifest CF**:低频写入,value 几 KiB 到若干 MiB;
-- **blob CF**:任意内容寻址数据(store 的第三 partition,见 [`store_zh.md`](store_zh.md)
-  §4.6),机制同 chunk——同样的 BlobDB / Bloom / compaction filter,跟着
-  generation 一起淘汰。
+#### Column-family isolation
 
-独立 CF 让各类数据有独立 write buffer / Bloom / compaction 节奏,避免稀
-有的 manifest 写入干扰高频 chunk compaction。
+Chunk, Manifest and blob each have a separate CF:
 
-#### BlobDB 与写放大
+- **Chunk:** frequent fill-aside writes and comparatively large values, often hundreds of KiB.
+- **Manifest:** lower write frequency, values from KiB to several MiB.
+- **Blob:** arbitrary content-addressed data, store's third partition; see [store](store.md). It uses the same BlobDB/Bloom/compaction-filter mechanism as the other cache CFs.
 
-三个 CF 都启用 RocksDB BlobDB,固定参数(不暴露 YAML):
+Separate CFs isolate write-buffer, filter and compaction state, though they share process resources and BlockCache. Cache eviction is frequency based; cached blob values do not automatically follow store generation deletion because cache keys do not encode generation.
 
-- `min_blob_size = 4 KiB`:小于阈值的 value 内联到 SST,大于的旁路到独立
-  `.blob` 文件。
-- `blob_file_size = 256 MiB`:每个 blob 文件大小上限。
-- BlobDB GC 开启:后台回收无引用的 blob 文件。
+<a id="blobdb-与写放大"></a>
 
-命中 blob 的大 value 在 LSM 里只留 ~50 bytes 的 key + blob-ref。写入以顺
-序 append 为主,Compaction 只合并 key 层——写放大降至 1–3x(否则纯
-LSM 是 10–30x)。
+#### BlobDB and write amplification
+
+All three CFs enable RocksDB BlobDB with fixed options, not YAML knobs:
+
+- `min_blob_size = 4 KiB`: smaller values remain inline in SST; values at/above the threshold can reside in separate blob files.
+- `blob_file_size = 256 MiB`: target blob-file sizing.
+- Blob garbage collection is enabled to reclaim stale/unreferenced blob data.
+
+Large values leave a key/blob reference in the LSM; payloads are appended to blob files, reducing the amount of large-value data rewritten during ordinary key compaction. The old guide quoted roughly 50 bytes per key/reference and 1–3× versus 10–30× write amplification. Those are **unverified historical estimates**, not measured bounds: key sizes, RocksDB format, workload, compaction and blob GC determine actual amplification. Fetching a blob value can require additional I/O beyond locating its SST reference.
 
 #### DirectReads
 
-默认开启 `UseDirectReads`,绕过 OS Page Cache 直接从磁盘读。
+UseDirectReads defaults to true and bypasses the OS page cache for supported data reads.
 
-- **L1 边车部署**:与 manifest-ctl 同节点;DirectReads 使 L1 的 I/O 完
-  全自管(通过 BlockCache),不抢占节点其他进程的 Page Cache 份额。
-- **L2 专用节点**:BlockCache 已占节点 RAM 的 80%,DirectReads 避免 data
-  block 在 BlockCache + Page Cache 双重缓存。
+- **L1 beside Manifest consumers:** it reduces duplicated data caching between RocksDB BlockCache and the OS.
+- **Dedicated L2:** it can similarly reduce duplication when a large BlockCache is configured. The original 80%-of-node-RAM assumption is a deployment sizing choice, not a daemon rule.
 
-### 4.5 频率统计与磁盘淘汰
+It does not mean the process has zero page-cache use, completely self-contained I/O accounting, or no other native/write-buffer memory.
 
-5 TiB SSD 终究会满。Go 进程内维护一个 Count-Min Sketch(CMS),Get/Put
-时 `Touch(key)` 累加访问频率;RocksDB 后台 Compaction 时调用注册的
-CompactionFilter,filter 通过 CGO 回调 `ShouldEvict(key)` 查询 sketch——
-低于阈值(默认 1)的 key 被物理删除。
+<a id="45-频率统计与磁盘淘汰"></a>
 
+### 4.5 Frequency tracking and disk eviction
+
+Embedded RocksDB maintains a Go Count-Min Sketch. Get/Put touches the key; background compaction invokes the CGO-backed CompactionFilter, which asks ShouldEvict. An estimate **at or below** the threshold (default 1) removes the key.
+
+This is not capacity enforcement. disk_bytes does not make compaction evict enough to avoid a full disk. Monitor disk use, write failures and compaction behavior independently.
+
+```text
+On Get/Put:
+    sketch.Touch(key)            # Four rows of packed 4-bit counters
+
+On reset_after touches or reset_interval:
+    old active becomes previous; create a fresh active generation
+    Estimate(key) = active estimate + previous estimate / 2
+
+During background compaction on chunk, manifest and blob CFs:
+    if armed and sketch.ShouldEvict(key):
+        remove the key
 ```
-every Get/Put:
-    sketch.Touch(key)                   # O(1), 4-bit counter increment
 
-every reset_after Touches OR every reset_interval (first wins):
-    sketch.Reset()                      # halve all counters
+Touch hashes the key (O(key length), effectively fixed-size for cache keys). Reset rolls generations; it does not repeatedly halve one array in place. The older generation is discarded at the next rollover.
 
-RocksDB background compaction (filter on both chunk + manifest CF):
-    for each key in SST:
-        if sketch.ShouldEvict(key):
-            return Remove
-```
+<a id="恢复期保护"></a>
 
-#### 恢复期保护
+#### Recovery-time protection
 
-filter 在 DB Open 时挂到 CF Options,但此时 sketch 还没构造。CompactionFilter
-内部有 `armed` 门闩,Open 期间 `armed=false`,Filter() 返回 preserve——
-即使 startup 触发 recovery compaction 也不误删。sketch 构造完毕、从
-`__freq_sketch__` 保留 key 恢复状态后,调用 `Arm()` 开闸。
+The filter is attached before DB Open, while its sketch is absent and armed=false. Startup/recovery compaction therefore preserves keys. After constructing the sketch and **attempting** to restore the reserved `__freq_sketch__` record, the store installs/arms the filter, unless eviction is disabled.
 
-#### 冷启动保护
+<a id="冷启动保护"></a>
 
-进程重启后 CMS sketch 归零。如果不做保护,首次 Compaction 会把所有 key
-(频率 = 0 ≤ evict_threshold = 1)全部删除。
+#### Cold-start protection
 
-保护:定期(默认 5 分钟)将 CMS sketch 序列化到 RocksDB 保留 key
-`__freq_sketch__`。重启时自动恢复。
+Without restored frequency history, old keys have zero estimates and may be removed by compaction. To reduce that problem, the active CMS generation is serialized to the reserved RocksDB key, normally every five minutes and on orderly close. Restart restores the active generation; the previous rolling generation is deliberately not persisted.
 
-#### CMS 默认参数
+This is not an unconditional grace period or durable history guarantee. A missing, corrupt or unreadable checkpoint can leave a fresh sketch, after which the filter is still armed. Persist failures are logged. `freq.disable_eviction` keeps the filter unarmed when the deployment intentionally requires no frequency-based eviction.
 
-| 参数 | L1 | L2 |
+<a id="cms-默认参数"></a>
+
+#### CMS parameter profiles
+
+The following are the documented L1/L2 configuration profiles. L2 values must be configured; choosing shard mode does not itself select all of them.
+
+| Parameter | L1 profile | L2 profile |
 |---|---|---|
-| `counters` | 8M | 32M |
-| `reset_after` | 1M | 10M |
-| `reset_interval` | 1h | 6h |
-| `evict_threshold` | 1 | 1 |
-| `persist_interval` | 5m | 5m |
+| `counters` | 8M. | 32M. |
+| `reset_after` | 1M. | 10M. |
+| `reset_interval` | 1h. | 6h. |
+| `evict_threshold` | 1. | 1. |
+| `persist_interval` | 5m. | 5m. |
 
-#### 不做应用层 SLRU/LRU
+<a id="不做应用层-slrulru"></a>
 
-Go 进程**不**维护 SLRU、LRU 等队列:
+#### No application-level SLRU/LRU
 
-- 避免双重缓存(Go heap + RocksDB BlockCache,2× 内存浪费);
-- GC 压力(256 KiB chunk 在 Go heap 中频繁分配/释放,GC 暂停影响 P99);
-- RocksDB BlockCache 已提供 LRU 热度保护,CompactionFilter 提供磁盘淘汰。
+The cache application does not maintain a second payload SLRU/LRU in Go:
 
-Go 进程内存控制在 < 200 MiB(CMS sketch + 原子计数器 + wire 连接池)。
+- Avoid duplicating retained chunk payloads in Go heap and RocksDB BlockCache.
+- Reduce payload allocation/GC pressure that can affect latency tails.
+- Let RocksDB's BlockCache manage RAM reuse and the frequency filter manage embedded disk eviction.
 
-### 4.6 TieredCache 与读路径
+The old “Go memory <200 MiB” figure is not an implementation-enforced limit. CMS active/previous generations, transient reset/serialization buffers, wire pools, EC work and concurrency consume memory, while RocksDB's native allocations are outside Go heap. Redis backends follow their external server's memory policy.
 
-```
-manifest-ctl load
-   │
-   ▼
-fetch.Fetcher.OpenManifest() → Stream.ReadAt()
-   │
-   ├─ binary-search manifest index for chunk range
-   ├─ spawn N goroutines
-   │   └─ per goroutine:
-   │       ├─ client.ObjectGet(key) ─── wire ───► cache-ctl tiered
-   │       │                                    │
-   │       │                                    ▼
-   │       │                               TieredCache.Get(ctx, p, key)
-   │       │                                    │
-   │       │                                    ├─ tier 0: embedded.Get(key)
-   │       │                                    │   HIT → return ciphertext
-   │       │                                    ├─ tier 1: ec.Get(key)
-   │       │                                    │   5 × wire ShardGet
-   │       │                                    │   ≥4 arrive → RS Reconstruct
-   │       │                                    └─ origin: store.Get(key)
-   │       │                                        HIT → return + fill-aside upper tiers
-   │       ├─ crypto.Decrypt(key, ciphertext)
-   │       └─ send to result channel
-   │
-   └─ read result channel in order, write out
+<a id="46-tieredcache-与读路径"></a>
+
+### 4.6 TieredCache and the read path
+
+```mermaid
+flowchart TD
+  F["OpenManifest and Stream.ReadAt"] --> G["Resolve visible chunks; issue Gets"]
+  G --> L["L1 lookup"]
+  L -->|"hit"| D["Return ciphertext; verify and decrypt"]
+  L -->|"clean miss"| E["EC lookup: valid distinct shard quorum"]
+  E -->|"hit"| D
+  E -->|"clean miss"| O["Origin lookup"]
+  O -->|"hit"| D
+  L -->|"error"| X["Return error"]
+  E -->|"error"| X
+  O -->|"error"| X
 ```
 
-### 4.7 fill-aside
+Manifest Stream.ReadAt resolves the requested visible runs, fetches Data concurrently and writes their logical ranges. A lower-layer hit asynchronously fills upper cache tiers. For 4+1, EC fans out to five peers and can return once four distinct valid indexes suffice; full reconstruction is needed only when data shards are missing. Read ordering and chunk visibility follow [manifest](manifest.md), including layered sparse semantics.
 
-读路径上 layer i 命中时,回填所有**更上层**的 cache tier(序号 < i):
+### 4.7 Fill-aside
 
-```
-TieredCache.Get hit at layer i  (layer 0..N-1 = tiers, N = origin):
+A hit in layer i fills every cache tier above it; origin is layer N after N cache tiers.
+
+```text
+On a hit at layer i (tiers 0..N-1; origin N):
     upper = min(i, N)
-    for j := upper-1; j >= 0; j--:
-        startFill(j, partition, key, blob)   # async, fire-and-forget
+    for j = upper-1 down to 0:
+        startFill(j, partition, key, blob)   # asynchronous
 ```
 
-**Blob 生命周期**:startFill 不共用调用方的 blob,而是 **Clone** 出独立
-handle 给 fill goroutine,`defer cloned.Release()`。原 blob 由 Get 调用
-方持有直到外层 wire 响应写完。两者引用计数独立。
+**Blob ownership:** startFill clones an owned handle for the fill goroutine and defers its Release. The original handle belongs to the Get caller until its response has been written. Both handles reference the same immutable backing allocation; each has an independently owned reference, not an unrelated copy of the data.
 
-**异步、fire-and-forget**:读路径不等写完成。fill 默认**无 deadline**——
-goroutine 挂在 TieredCache 的 baseCtx 下,关停时 `Close()` 统一取消并回收(§6.2),
-卡死的 origin 不会泄漏 fill goroutine。测试和预热流程通过实际 Get/ShardGet
-确认数据已可读,不依赖内部 goroutine 是否暂时排空。**幂等**:重复 fill 无副作用(rocks Put 覆盖,wire ShardPut
-覆盖)。
+**Async behavior:** the read does not await fill completion. Fills use a context derived from TieredCache's base context, normally without a fill-specific deadline; Close cancels and joins them (§6.2). Backend cancellation capabilities and client timeouts still matter, especially synchronous RocksDB CGO. This is not an unconditional guarantee that any wedged backend can be interrupted.
 
-#### EC 分片缺失修复
+Tests and warmup must confirm availability with actual Get/ShardGet calls, not merely observe that fill goroutines briefly drained. Repeated fills of the same key/bytes are idempotent in the intended content-addressed usage: RocksDB or wire writes overwrite the same value. Fill errors are discarded by startFill and do not retroactively fail the successful read.
 
-```
-ec.Get(key):
-    5 × wire ShardGet, concurrent
-    ├─ 5 ok:           RS Reconstruct → HIT
-    ├─ 4 ok + 1 miss:  Reconstruct → HIT, backfill missing shard async
-    └─ 3 ok + 2 miss:  cannot rebuild → MISS; on origin HIT fill-aside
-                       re-encodes all 5 shards
-```
+<a id="ec-分片缺失修复"></a>
 
-### 4.8 强制准入语义
+#### Missing EC shard repair
 
-Put / PutShard 永远成功写入 RocksDB,**不**做 admission filter。
+For a healthy fixed 4+1 scheme:
 
-理由:在本系统中,Set 由 fill-aside 触发——每次写入都代表一个刚被读取
-的有效 chunk。引入 admission filter(如经典 W-TinyLFU)可能拒绝刚被读
-取的 chunk,导致下次读仍穿透到 L3——与"按需加载、逐步升温"目标矛盾。
+| Responses | Foreground result | Repair/fill |
+|---|---|---|
+| Five valid distinct indexes. | Hit; reconstruct only if needed for the data view. | No missing peer to repair. |
+| Four valid distinct indexes and one confirmed miss. | Reconstruct if necessary, then hit. | Async repair only when the missing-index/destination mapping is unambiguous. |
+| Fewer than four usable indexes. | Normally a clean EC miss; explicit routing/reconstruction/format errors remain errors. | On a later origin hit, fill-aside can re-encode all five shards. |
 
-空间回收靠 §4.5 频率统计 + CompactionFilter,不靠 admission。
+Foreground quorum cancellation leaves a peer **unknown**, not missing. A bounded follow-up probe can resolve unknown peers; repair writes only confirmed misses whose missing indexes map exactly to destinations. Transport errors, invalid prefixes, stale coding schemes and ambiguous mappings do not justify overwriting a peer's existing shard. Enough responses is insufficient if indexes are duplicated.
 
-### 4.9 EC 客户端
+<a id="48-强制准入语义"></a>
 
-EC 客户端只在 tiered 的 tier chain 中使用。
+### 4.8 Unconditional admission policy
 
-#### Reed-Solomon 4/5
+Put/PutShard has no application-level frequency admission filter. **This does not mean every write succeeds:** read-only mode, disk/resource failure, invalid input or backend errors can reject it.
 
-- 数据分片 k=4,校验分片 m=1,总 5 分片;
-- 任意 4 个分片可重建(容忍 1 节点故障);
-- 存储开销 25%(vs 三副本 200%),延迟分布改善 ~20%。
+A normal fill represents a chunk that was just read. An additional W-TinyLFU-style admission rejection could cause the next access to go to origin again, conflicting with progressive warming. Embedded space reclamation instead uses the frequency/compaction policy (§4.5), not admission. Redis-compatible backends own their own eviction decisions.
+
+<a id="49-ec-客户端"></a>
+
+### 4.9 EC client
+
+The EC client is used as a tier in tiered mode.
+
+<a id="reed-solomon-45"></a>
+
+#### Reed–Solomon 4/5
+
+- Four data shards and one parity shard, five total, unless initial configuration/clamping selects another scheme.
+- Any **four distinct valid indexes** can reconstruct the object in a consistent 4+1 scheme, tolerating one unavailable shard when the remaining data is intact.
+- Parity adds 25% relative to logical data, before length-prefix, padding and metadata overhead. Three complete replicas add 200%. The old claim of about 20% latency improvement was not tied to reproducible evidence and is not a current guarantee; quorum timing depends on topology and load.
 
 #### Padding
 
-原始 chunk 大小可能不被数据分片数(k)整除:
+The object size need not be divisible by the data-shard count k:
 
-1. 写入 4 字节 little-endian 长度前缀;
-2. Pad 到 k 的倍数;
-3. RS Split → k 个数据分片;
-4. 重建后按长度前缀截断。
+1. Prefix the object with a four-byte little-endian logical length.
+2. Pad the combined bytes to a multiple of k.
+3. RS Split into k data shards and produce parity.
+4. Reconstruct and truncate to the recorded length.
 
-#### Maglev 一致性哈希
+<a id="maglev-一致性哈希"></a>
 
-分片到节点的映射用 Maglev 查找表算法。与经典一致性哈希环对比:
+#### Maglev consistent hashing
 
-| 维度 | 经典环(150 VN) | Maglev |
+Shard placement uses the repository's [Maglev implementation](../pkg/maglev/maglev.go). The earlier comparison against a “150 virtual-node ring” combined unsupported complexity, balance and remapping figures. The source-backed comparison is:
+
+| Dimension | Classic ring | This Maglev table |
 |---|---|---|
-| 查找 | O(N × log ring) | O(M log M)(1 次哈希 + 表遍历) |
-| 均衡性 | ~8% 标准差 | ±1 表项(M=5 时 <0.01%) |
-| 增减节点重映射 | ~1/N | ~1/M(接近理论最小) |
-| 外部依赖 | 三方库 | 无——自实现 ~150 行 |
+| Lookup | Depends on the chosen ring implementation and number of replicas selected. | Hash the key once, then walk a **prebuilt** table until enough distinct peers have been found; allocate a seen array sized to peer count. This is not a per-query O(M log M) table build. |
+| Balance | Depends on virtual-node placement and workload. | Round-robin table construction gives member slot counts differing by at most one for the represented member set. That is table occupancy, not a guarantee of equal request/byte load or independent multi-peer placements. |
+| Membership changes | Depends on the scheme and selection policy. | Deterministic reconstruction reduces disruption, but actual changed key/peer sets must be measured; no universal 1/M movement guarantee. |
+| Dependency | Implementation-specific. | Local implementation in pkg/maglev. |
 
-| 参数 | 值 |
+| Parameter | Value |
 |---|---|
-| `TableSize` | 65537(质数) |
-| 哈希 | FNV-1a(标准库);构建 2 个独立 FNV,查找 1 次 FNV |
+| Table size | 65537, a prime. |
+| Hash | Standard-library FNV-1a; two domain-distinguished member hashes for table construction and one content-key hash for lookup. |
 
-#### 集群成员变更
+Member IDs are sorted before constructing the table, so reordering an otherwise identical valid configuration does not remap it. Configure unique, stable peer identities; shard index is not part of the routing key.
 
-EC router 持有 `atomic.Pointer[state]`,state = `(epoch, peers, maglev_table)`。
-epoch 单调递增,**只**由显式配置变更(YAML + SIGHUP)递增——连接池瞬时
-故障不改 epoch,不改 placement。这是防抖动核心保证:节点 50 ms 闪断不
-触发全局 placement 重算。
+<a id="集群成员变更"></a>
 
-加节点:编辑 YAML → `kill -HUP` → 新 Maglev 表生效。约 1/M 的 (key, idx)
-迁移到新节点,其他 peer 命中正常。
-减节点:同上。LocateN 不再返回被移除 peer。
+#### Membership changes
 
-**操作规程:一次只动 1 个 peer**。同时换 ≥2 个 peer 单 key miss 数超
-parity(RS(4+1) parity=1),读路径 fallthrough origin——正确但慢。
+The EC router publishes immutable `(epoch, peers, maglev_table)` snapshots through `atomic.Pointer`. New epochs must be strictly increasing. In the daemon, explicit YAML + SIGHUP reload drives changes; a short connection outage does not automatically increment the epoch or recompute placement.
 
-### 4.10 跨形态混发的行为
+A reload reads/validates YAML, checks that the tier structure is compatible, probes candidate EC peers, and applies the reachable set with a higher epoch. Invalid reloads and a candidate set with no reachable peers retain the old membership. Probing is connection readiness, not proof that every object/shard is present. Subsequent calls use the new snapshot; in-flight work can retain the previous one.
 
-wire handler 对所有 opcode 都响应,因此 `ObjectPut` 发到 shard 模式节点
-**不会**被协议层拦截,会真正写入该节点的 RocksDB。这是有意设计——
-`shard` 的语义是部署意图而非协议约束。真正需要防误写的是 tiered 模式,
-由 §3.1 表中"写操作:拒绝"分支兜底。
+To add/remove a peer, update YAML and send HUP, then inspect the logged membership and actual content availability. New routing excludes removed peers. Measure affected placements rather than assuming exactly 1/M of keys move. **Reload updates peers, not the constructed RS codec**, so retain enough reachable peers for its existing data+parity total; the initial clamp is not repeated during membership replacement.
 
-## 5. 内存预算
+Change **one peer at a time** for a 4+1 rollout, verify readiness and let repair/warming complete. Replacing two or more simultaneously can exhaust parity and cause misses/origin reads. Even a one-peer change is not a guarantee of zero impact; preexisting loss, membership filtering and origin failures matter.
 
-### 5.1 L1(tiered 进程内嵌 embedded tier)
+<a id="410-跨形态混发的行为"></a>
 
-| 区域 | 1 TiB / 1% ratio | 100 GiB / 1% ratio |
+### 4.10 Mixing operations across modes
+
+Current local and shard modes connect the same selected backend to both object and shard interfaces. Therefore ObjectPut to a shard daemon is accepted by the handler and can really write a complete object. This reflects a primary deployment role, not exclusive protocol permission.
+
+Tiered exposes only the object read chain. It rejects writes and shard operations. The protocol should not be mistaken for an authorization boundary; endpoint access belongs to the deployment.
+
+<a id="5-内存预算"></a>
+
+## 5. Memory budgeting
+
+<a id="51-l1tiered-进程内嵌-embedded-tier"></a>
+
+### 5.1 L1: an embedded tier inside a tiered process
+
+The old budgets below are retained for context, with their limits corrected:
+
+| Region | Old 1 TiB / 1% estimate | Old 100 GiB / 1% estimate | Current interpretation |
+|---|---|---|---|
+| Go heap | <200 MiB. | <200 MiB. | No enforced bound; pools, CMS, EC work, fill concurrency and request size contribute. |
+| Index + Bloom | ~5 GiB. | ~500 MiB. | Cached index/filter blocks share the configured BlockCache; these are not independently guaranteed pinned additions. |
+| BlockCache | 10 GiB. | 1 GiB. | Exact sizing inputs yield **10.24 GiB** and **1 GiB**, subject to the 64 MiB minimum. |
+| OS page cache | 0 with DirectReads. | 0. | DirectReads reduces supported data-read caching; it does not establish zero total page-cache usage. |
+| Total | <16 GiB. | <1.7 GiB. | These old totals are not valid hard process budgets. Include native/memtable, shared-cache, Go and operating-system usage from measurement. |
+
+The configured BlockCache is one major native-memory allowance, not a complete process limit. Account separately for memtables/write buffers, native metadata, BlobDB/compaction activity, wire payload pools, active/previous CMS generations and transient buffers. Avoid double-counting index/filter bytes that are already charged to the shared BlockCache.
+
+<a id="52-l2shard-专用节点"></a>
+
+### 5.2 L2: dedicated shard nodes
+
+The original example used a **500 GiB RAM / 5 TiB SSD** node:
+
+| Region | Old allocation estimate | Source-backed sizing/limit |
 |---|---|---|
-| Go heap | < 200 MiB | < 200 MiB |
-| RocksDB Index + Bloom (PinL0) | ~5 GiB | ~500 MiB |
-| RocksDB BlockCache | 10 GiB | 1 GiB |
-| OS Page Cache | 0(DirectReads) | 0 |
-| **总** | **< 16 GiB** | **< 1.7 GiB** |
+| Go heap | <50 MiB. | Workload-dependent; no code-enforced 50 MiB cap. |
+| Index + Bloom | ~50 GiB. | Not a separately guaranteed pinned region; cached metadata shares BlockCache. |
+| BlockCache | ~400 GiB. | `5 TiB × 0.08 = 409.6 GiB`, not exactly 400 GiB. |
+| Go runtime + wire buffers | ~10 GiB. | A planning allowance, not a measured or enforced bound. |
 
-### 5.2 L2(shard 专用节点)
+For the old key-count calculation, `5 TiB / 256 KiB = 20,971,520` complete-object equivalents. At 15 bits/key, the idealized Bloom bit count is about **37.5 MiB**; a hypothetical 30-byte index record per key adds **600 MiB**. These inputs do not derive “1 GiB Bloom per CF” or a 50 GiB pinned-metadata requirement. Real entries, object sizes, shard encoding, CF distribution and RocksDB overhead differ; account for actual keys in each CF rather than multiplying the entire dataset by every CF.
 
-500 GiB RAM / 5 TiB SSD 机型:
+L0 pinning and cached indexes/filters can reduce I/O but do not prove all metadata stays resident, zero-I/O misses or single-I/O hits. Bloom false positives, SST traversal and BlobDB payload reads remain possible. Validate memory and disk behavior on the actual workload, including cold reads and compaction.
 
-| 区域 | 预算 |
-|---|---|
-| Go heap | < 50 MiB |
-| RocksDB Index + Bloom (PinL0) | ~50 GiB |
-| RocksDB BlockCache | ~400 GiB |
-| Go runtime + wire 连接缓冲 | ~10 GiB |
+<a id="6-运维"></a>
 
-**Index/Bloom 常驻论证**:5 TiB / 256 KiB ≈ 20M keys,每 key Bloom 15 bits
-+ Index ~30 bytes ≈ 50 bytes/key → ~1 GiB Bloom + ~600 MiB Index per CF。
-两 CF 留余量 → 50 GiB 上限。Bloom 全内存确保 miss 路径零磁盘 IO;Index
-全内存确保 hit 路径单次 IO 直达 SST data block。
+## 6. Operations
 
-## 6. 运维
+<a id="61-启动"></a>
 
-### 6.1 启动
+### 6.1 Startup
 
 ```bash
-# shard 节点(L2 集群成员)
+# L2 shard peer
 cache-ctl serve --config /etc/cache/shard.yaml
 
-# tiered 节点(与 manifest-ctl 同节点)
+# Tiered proxy beside Manifest consumers
 cache-ctl serve --config /etc/cache/tiered.yaml
 ```
 
-### 6.2 信号处理
+<a id="62-信号处理"></a>
 
-`SIGINT` / `SIGTERM` 关闭序列:
+### 6.2 Signals and shutdown
 
-1. 若启用控制面,先把 gRPC health 状态置 `NOT_SERVING`(让编排器立刻
-   下线);
-2. wire server graceful stop:排空 in-flight,硬上限 5 s;
-3. gRPC 控制面 server graceful stop(Health + Info 同在该 server);
-4. tiered 模式调 `TieredCache.Close()` 取消在途 async fill;tier chain 反序
-   级联关闭(embedded → redis → ec → upstream),local/shard 模式下关闭所选 backend。
+SIGINT/SIGTERM trigger:
 
-### 6.3 运行时计数(pull-only)
+1. Stop the health monitor and, if enabled, mark gRPC health NOT_SERVING so orchestration can stop routing new work.
+2. Stop accepting wire connections and drain in-flight work, waiting up to five seconds in the wire GracefulStop.
+3. Gracefully stop the shared gRPC Health/Info server.
+4. In tiered mode, cancel/join asynchronous fills through TieredCache.Close, then close the origin and constructed tier resources through their registered cleanup. Tier resources close in **reverse YAML construction order**, not a fixed embedded→Redis→EC→upstream type order. Local/shard closes its selected backend.
 
-精确累计计数按需经控制面 `cac.cache.v1.Info/Get` 拉取(`health_listen` 端口,见
-§1.2)。`cache-ctl info --endpoint host:port` 即取一次快照(`--json` 出原始
-JSON,否则人类可读表格),含 server hits/misses/fills、各 tier 与 origin 计数、
-EC 各 peer 计数、embedded/local/shard 的 RocksDB CF 属性。bench 脚本用同一服务
-取 bench 窗口前后的 delta。日常**观察**则看 §6.6 的周期统计行(默认开),无需主
-动拉。
+The five-second wire-drain wait is not a five-second bound on the entire process shutdown: other cleanup and backend calls can take longer. SIGHUP reloads EC membership as described in §4.9.
 
-### 6.4 离线诊断
+<a id="63-运行时计数pull-only"></a>
+
+### 6.3 Runtime counters: pull-only
+
+Pull cumulative counters through `cac.cache.v1.Info/Get` on health_listen. `cache-ctl info --endpoint host:port` returns one snapshot, as a table or raw JSON. It includes server hits/misses/fills, tier/origin counters, EC peer counters and backend information, including embedded/local/shard RocksDB CF properties and Redis-specific gauges.
+
+Benchmark scripts compare snapshots before/after the window. Individual atomic counters are useful cumulative evidence; the entire multi-counter response is not a transactional point-in-time snapshot. For routine observation, use the adaptive statistics line (§6.6) without repeatedly pulling Info.
+
+<a id="64-离线诊断"></a>
+
+### 6.4 Offline inspection
 
 ```bash
 cache-ctl info --rocks-path /var/cache/accel-l1
 ```
 
-RocksDB secondary instance 模式打开 DB,输出 property(estimate-num-keys、
-disk usage、compaction stats)。**与运行中的 cache-ctl 共存**,不需停 daemon。
+The tool opens DB files through OpenDbForReadOnlyColumnFamilies and prints properties such as estimated keys, disk usage and compaction statistics. It is intended for offline/postmortem inspection; it is **not** a RocksDB secondary instance and does not promise a coherent concurrent view of a live writer. For a running service, use Info over gRPC.
 
-`pprof_listen` 非空时(§3.5)另起 `/debug/pprof/*` HTTP listener,可
-`go tool pprof` 抓 CPU / heap / goroutine。生产留空,仅排障临时开启。
+A nonempty pprof_listen starts an HTTP `/debug/pprof/*` listener. Use `go tool pprof` for CPU, heap or goroutine investigation. Leave it empty during normal operation and enable only for the diagnostic need.
 
-### 6.5 慢/卡请求追踪(`CACHE_CTL_DEBUG`)
+<a id="65-慢卡请求追踪cache_ctl_debug"></a>
 
-`rpc_timeout` 缺省不设上界(§3.5)后,卡死的后端不再 fail-fast 而是静默
-stall。env 门控的操作 tracer 把它变可观测:
+### 6.5 Slow/stalled request tracing: `CACHE_CTL_DEBUG`
+
+Without a configured request deadline, a blocked backend may wait until caller/connection cancellation. The environment-controlled tracer makes slow/in-flight work visible:
 
 ```bash
-CACHE_CTL_DEBUG=1 cache-ctl serve --config cache.yaml       # 开启
-CACHE_CTL_SLOW=2s CACHE_CTL_DEBUG=1 cache-ctl serve ...      # 自定慢阈值
+CACHE_CTL_DEBUG=1 cache-ctl serve --config cache.yaml
+CACHE_CTL_SLOW=2s CACHE_CTL_DEBUG=1 cache-ctl serve ...
 ```
 
-- `CACHE_CTL_DEBUG` truthy 时启用,否则零开销(每请求一次 atomic 读)
-- **只有超过慢阈值**(`CACHE_CTL_SLOW`,Go duration,默认 1 s)的请求打一行
-  (WARN);快请求静默——稳态吞吐/时延看 §6.6 的周期统计行,这里只盯异常长尾
-- 后台 reporter 周期 dump **仍在飞**且超阈值的请求(op 名 + 已卡时长),
-  卡死的 tier / origin 立即可见,不必等 deadline
-- 覆盖 wire 服务端请求处理(一次请求一个 op;tier 链遍历与 origin 回源都在其内)
+- A truthy CACHE_CTL_DEBUG enables tracing. Disabled tracing retains only its small enable-check overhead; “zero overhead” is not literal.
+- Only requests exceeding CACHE_CTL_SLOW, a Go duration defaulting to one second, generate slow-request WARN lines. Fast requests are silent; steady throughput/latency belongs to §6.6.
+- A background reporter periodically reports still-running operations beyond the threshold, with operation name and elapsed time. Visibility does not require waiting for a request deadline.
+- Coverage is the wire handler operation, including tier traversal and origin lookup inside that request.
 
-另有 `CACHE_CTL_TIMING=1`(进程启动时读)开启 EC.Get 的分阶段耗时日志
-(LocateN / fan-out / decode 各段 + 各分片到达偏移),按 1% 采样,默认关、热
-路径零开销。专测 EC hedge 的扇入与尾延迟,与上面的 `CACHE_CTL_DEBUG` 正交。
+Separately, **CACHE_CTL_TIMING=1**, read at process startup, enables sampled EC Get timing: LocateN, fanout, decode and shard arrival offsets. Sampling is 1%; it is disabled by default. This targets EC quorum/hedging tails and is independent of CACHE_CTL_DEBUG.
 
-两者生产默认关闭;与 `pprof_listen`(§6.4)互补——tracer 看"哪些请求慢/卡",
-pprof 看"卡在哪段代码"。
+Both normally stay disabled. They complement pprof: operation traces identify slow/stalled requests; profiles identify where time/resources are spent.
 
-### 6.6 周期自适应统计行(`stats_interval`)
+<a id="66-周期自适应统计行stats_interval"></a>
 
-daemon 默认每 30 s(`stats_interval`,§3)向 stderr 打一行运行时统计,**仿
-sandbox-ctl 的自适应输出**:有流量的周期打一行汇总,无流量的周期**静默**,启动
-后先以 2 s 快采样捕捉冷启突发,空闲两拍后退回基准周期。`stats_interval: 0`/`off`
-关闭。一行含:
+### 6.6 Adaptive statistics: `stats_interval`
 
-- **吞吐**:get / put 的每秒速率(自适应单位 1.2k/3.4M)
-- **带宽**:get 出向、put 入向字节速率(MiB/s)
-- **命中**:本周期 server `hit%`;tiered 模式附命中级联(`hits L0 88% L1 6%
-  origin 6%`,见各层命中占比)
-- **时延分布**:get / put 各自 p50 / p99 / max(窗口直方图,桶同 sandbox-ctl)
-- **并发**:`inflight`(在飞 get+put)、`conns`(当前 wire 连接数)
-- **RocksDB 量规**:各 CF 的 keys / live-data-size / 运行中 compaction 数
-- **错误**:本周期返回 `StatusError` 的请求数(`err`,0 时省略)
+The daemon normally emits runtime statistics to stderr on a **30-second base period**, following the same adaptive approach as sandbox-ctl. Active windows produce a summary, idle windows are silent. Startup uses two-second sampling to catch cold-start bursts, then returns to the base period after two idle samples. `stats_interval: 0`/`off` disables output.
 
-示例:
+A line contains:
 
-```
-cache stat tiered | get 5.1k/s 620MiB/s p50 40µs/p99 700µs/max 9ms · hit 94% · put 220/s 30MiB/s p50 1.1ms/p99 8ms/max 40ms | inflight 18 conns 6 | hits L0 88% L1 6% origin 6% | rocks chunk 1.2M keys/3.4GiB
+- **Throughput:** Get/Put operations per second with adaptive units such as 1.2k or 3.4M.
+- **Bandwidth:** outbound Get and inbound Put bytes per second.
+- **Hits:** window server hit ratio; tiered additionally reports the tier/origin hit cascade, such as `hits L0 88% L1 6% origin 6%`.
+- **Latency:** separate Get/Put p50, p99 and maximum from window histograms using the sandbox-ctl bucket scheme.
+- **Concurrency:** in-flight Get+Put and current wire connection counts.
+- **RocksDB gauges:** per-CF keys, live data size and running compactions, when applicable.
+- **Errors:** StatusError responses in the window, omitted when zero.
+
+Illustrative formatting:
+
+```text
+cache stat tiered | get 5.1k/s 620MiB/s p50 40µs/p99 700µs/max 9ms · hit 94% | inflight 18 conns 6 | hits L0 88% L1 6% origin 6% | rocks chunk 1.2M keys/3.4GiB
 ```
 
-与 §6.3 的 pull-only Info 互补:统计行给稳态全貌(默认开、自适应、低噪),Info
-给精确累计快照(bench / 脚本按需拉);与 §6.5 的 `CACHE_CTL_DEBUG` 正交(后者
-只打异常长尾)。
+This is a format example, not a fresh benchmark. In tiered mode, internal fill writes are not inbound wire Put operations; do not infer support for client Put from an illustrative statistics line.
 
-## 7. 性能特征
+Adaptive statistics give ongoing window-level visibility; Info provides cumulative values for scripts and benchmark deltas. CACHE_CTL_DEBUG instead focuses on abnormal long tails.
 
-延迟目标(实测基线与已采纳优化见 `kuasar-sandbox/docs/perf.md` §1):
+<a id="7-性能特征"></a>
 
-| 指标 | P50 | P99 |
+## 7. Performance characteristics
+
+The earlier latency figures were **targets**, not promises for every request or host:
+
+| Metric | Historical P50 target | Historical P99 target |
 |---|---|---|
-| L1 SSD hit | <500 µs | — |
-| L1 BlockCache hot hit | <100 µs | — |
-| L2 hit | 550 µs | <4 ms |
-| L3 hit (fs origin) | <50 ms | <200 ms |
+| L1 SSD hit | <500 µs. | — |
+| L1 BlockCache hot hit | <100 µs. | — |
+| L2 hit | 550 µs. | <4 ms. |
+| L3 hit, fs origin | <50 ms. | <200 ms. |
 
-命中率目标:L1 >65%,L2 >99.9%,L1+L2 联合 >99.95%。
+Historical hit-rate targets were L1 >65%, L2 >99.9%, and combined L1+L2 >99.95%. They are not configured guarantees. Define the counters, denominators, object sizes, concurrency and cache states before comparing measurements; conditional tier hit rates cannot simply be added into an aggregate ratio.
+
+Use the [project performance guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf.md) for the measurement framework. The [2026-07-17 backend A/B report](cache-backend-ab-2026-07-17.md) records specific source/binary revisions, workload, equal CPU budgets and RAM-hot results. It **does not qualify Dragonfly SSD tiering**; representative NVMe, active offload/defragmentation, near-full capacity and repair acceptance remain separate. Neither those limited measurements nor old target tables justify a universal latency/capacity claim.
 
 ## 8. See Also
 
-- [`store_zh.md`](store_zh.md) — tiered 模式 origin = `store`(store gRPC 客户端)或
-  `upstream`(另一台 cache-ctl);store 形态下 cache-ctl 自身**没有**任何文件系统
-  读写权限,所有持久化集中在 store-ctl;store-ctl 亦可经 `cache_listen` 以**只读**
-  方式直接讲本 wire 协议(chunk/manifest/blob,纯透传无 L1),省掉独立 cache-ctl
-- [`manifest.md`](manifest.md) — manifest-ctl 通过 wire ObjectGet 调 cache-ctl
-  tiered;Manifest 内 chunk hash = 这里的 wire Hash 字段
-- `kuasar-sandbox/docs/perf.md` §1 — cache 子系统实测延迟/吞吐基线与优化记录
-- 仓根 `README.md` / `Makefile` — 构建:`make cache-ctl`(CGO,自动
-  `deps-rocksdb` 后静态链 librocksdb;本仓唯一 CGO 二进制)
-- `kuasar-sandbox/docs/kuasar-sandbox.md` §4.5 — 缓存模型与命中率目标
+- [store](store.md): a tiered origin can use store-ctl gRPC or another cache wire endpoint. Embedded cache-ctl still has local filesystem I/O; authoritative origin persistence belongs to store-ctl. Its optional cache_listen exposes a **read-only** chunk/Manifest/blob wire interface with no L1, allowing direct wire reads without a separate cache daemon.
+- [manifest](manifest.md): the Fetcher uses wire ObjectGet when cache is configured; Manifest chunk hashes are the corresponding physical ContentKeys.
+- [project performance guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf.md): cache measurement and evidence limits.
+- [README](../README.md) / [Makefile](../Makefile): `make cache-ctl` builds the repository's CGO binary after deps-rocksdb, statically linking librocksdb.
+- [system architecture](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox.md): the cache model in the platform.

@@ -66,12 +66,14 @@ Commands:
   config         Inspect or generate the manifest config file.
 
 Configuration:
-  Every command (except 'config generate') reads a YAML config file
-  via --manifest-config <path> or the MANIFEST_CONFIG environment
-  variable. Flag wins; there is no auto-discovery.
+  Commands using remote data or configuration read YAML through
+  --manifest-config <path> or MANIFEST_CONFIG. Flag wins; no auto-discovery.
+  'config generate', local/stdin 'info', and local-file 'diff' need no config.
+  For remote 'info', use manifest://<hex>; bare hex is a local filename.
   The sensitive manifest.key may be omitted from the file and supplied
-  via the MANIFEST_KEY environment variable instead (MANIFEST_KEY also
-  overrides a manifest.key set in the file).
+  via nonempty MANIFEST_KEY instead (a nonempty value overrides the file).
+  'config show' does not echo the environment key, but can print a key
+  explicitly stored in YAML.
 `)
 }
 
