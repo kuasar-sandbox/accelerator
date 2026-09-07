@@ -223,17 +223,17 @@ func (s *WireServer) serveConn(c net.Conn) {
 	}
 }
 
-// GracefulStop stops accepting new connections, closes existing idle
-// connections, and waits for in-flight requests to complete (with a 5-second
-// hard deadline).
+// GracefulStop stops accepting connections, closes all tracked connections,
+// and waits at most five seconds for connection goroutines to exit. Active
+// handlers can be cancelled and their responses lost; this is not a guarantee
+// that in-flight requests drain successfully.
 func (s *WireServer) GracefulStop() {
 	s.closing.Store(true)
 	if s.listener != nil {
 		s.listener.Close()
 	}
-	// Force existing connections to exit their read loops by closing them.
-	// In-flight handlers will still finish writing the response because
-	// serveConn uses defer c.Close() (close is idempotent).
+	// Closing also interrupts active connection readers. serveConn cancels
+	// their handler, waits for cleanup, and can return without a response.
 	s.connsMu.Lock()
 	for c := range s.conns {
 		c.Close()

@@ -202,7 +202,7 @@ func cmdBench(args []string) {
 	concurrency := fs.Int("concurrency", 8, "number of parallel workers")
 	duration := fs.Duration("duration", 10*time.Second, "benchmark duration")
 	valueSize := fs.Int("value-size", 256*1024, "value size in bytes")
-	mode := fs.String("mode", "", "benchmark mode: get|put|mixed (default: mixed, or get when --prefill-endpoint is set)")
+	mode := fs.String("mode", "", "benchmark mode: get|put|mixed (default mixed; --prefill-endpoint changes empty/mixed to get)")
 	namespace := fs.String("namespace", "chunk", "namespace")
 	prefill := fs.Int("prefill", 1000, "number of objects to prefill for get/mixed modes")
 	cpuProfile := fs.String("cpu-profile", "", "write CPU profile to file (scoped to the bench window)")
@@ -218,8 +218,8 @@ func cmdBench(args []string) {
 
 	// Resolve --mode default based on whether a separate prefill
 	// endpoint was supplied. Empty --prefill-endpoint → mixed (today's
-	// behaviour). Non-empty → get only; fatal if the user explicitly
-	// asked for put/mixed against a separate target.
+	// behaviour). Non-empty → coerce empty/mixed to get, then reject any
+	// remaining mode other than get (including explicit put).
 	if *prefillEndpoint != "" {
 		if *mode == "" || *mode == "mixed" {
 			*mode = "get"
