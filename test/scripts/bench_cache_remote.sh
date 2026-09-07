@@ -28,9 +28,9 @@ set -euo pipefail
 #   REMOTE_DIR       remote install path (default: cache-bench, relative to $HOME)
 #   RESULTS_DIR      local output dir (default: build/test-results)
 #   VALUE_SIZE       bench value size bytes (default: 524288)
-#   PREFILL          number of keys (default: 500)
+#   PREFILL          number of warm keys (default: 8000)
 #   DURATION         bench duration per concurrency (default: 30s)
-#   CONCS            space-separated concurrencies (default: 1 2 4 8)
+#   CONCS            space-separated concurrencies (default: 4 16 64)
 #   EC_DATA          data shards (default: 4)
 #   EC_PARITY        parity shards (default: 1; total = EC_DATA+EC_PARITY)
 #   SSH_OPTS         extra ssh flags
@@ -43,7 +43,7 @@ set -euo pipefail
 #   start all        = shards + origin + tiered
 #   health           ping every daemon's health endpoint
 #   bench            run CONCS sweep from $BENCH_HOST, pull results
-#   report           render $RESULTS_DIR/README.md from pulled bench logs
+#   report           render complete README.md / README_zh.md from pulled logs
 #   stop             pkill cache-ctl serve on all hosts
 #   clean            stop + rm ~/$REMOTE_DIR/rocks-* + rm $RESULTS_DIR/*
 #   all              clean + deploy + start all + health + bench + report
@@ -473,7 +473,7 @@ cmd_bench() {
 }
 
 # cmd_report parses bench-c*.log files in $RESULTS_DIR and emits
-# $RESULTS_DIR/README.md. Grep-based parsing; adapt if bench output
+# $RESULTS_DIR/README.md and README_zh.md. Adapt parsing if bench output
 # format changes.
 cmd_report() {
     [ -d "$RESULTS_DIR" ] || die "$RESULTS_DIR does not exist (run 'bench' first)"
@@ -498,17 +498,16 @@ cmd_report() {
         bpo=$( grep -E '^\s*bytes/op:'   "$f" | awk '{print $2}')
         rows+="| $C | $ops | $thr ops/s | $bw MiB/s | $p50 us | $p99 | $p999 | ${errs:-0} | ${apo:-?} | ${bpo:-?} |"$'\n'
 
-        # L2 (EC tier) hit-rate + L3 (origin) fall-through — the core cache
-        # metrics this harness exists to measure. tier-0 row: hits misses
-        # fills errors hit%. origin row: hits(=L2-miss fall-through) misses.
+        # Current bench columns: layer type hits misses fills end-flight errors hit%.
+        # Origin hits are successful reads, not all origin attempts.
         local l2hit l2fills l3ft l3pct
-        l2hit=$(  grep -E '^[[:space:]]*tier-0\b' "$f" | awk '{print $7}')
-        l2fills=$(grep -E '^[[:space:]]*tier-0\b' "$f" | awk '{print $5}')
-        l3ft=$(   grep -E '^[[:space:]]*origin\b' "$f" | awk '{print $3}')
-        l3pct=$(awk -v a="${l3ft:-0}" -v b="${ops:-0}" 'BEGIN{if(b>0)printf "%.3f%%",100*a/b; else printf "-"}')
-        cache_rows+="| $C | ${l2hit:-?} | ${l2fills:-?} | ${l3ft:-0} | $l3pct |"$'\n'
+        l2hit=$(awk '$1 == "tier-0" {print $8; exit}' "$f")
+        l2fills=$(awk '$1 == "tier-0" {print $5; exit}' "$f")
+        l3ft=$(awk '$1 == "origin" {print $3; exit}' "$f")
+        l3pct=$(awk -v a="$l3ft" -v b="${ops:-0}" 'BEGIN{if(a!="" && b>0)printf "%.3f%%",100*a/b; else printf "-"}')
+        cache_rows+="| $C | ${l2hit:-?} | ${l2fills:-?} | ${l3ft:-?} | $l3pct |"$'\n'
 
-        # Extract peer rows (5 lines after 'ec peers:')
+        # Extract consecutive peer rows after 'ec peers:'.
         while IFS= read -r line; do
             peer_rows+="| $C | $line |"$'\n'
         done < <(awk '/ec peers:/{flag=1;next} flag && /^    s[0-9]/{print} flag && !/^    s[0-9]/{flag=0}' "$f" \
@@ -518,63 +517,131 @@ cmd_report() {
     # Topology diagram (simple, informative)
     local shard_count; shard_count=$(echo $SHARDS | wc -w)
 
-    {
-        cat <<EOF
-# Cache cluster bench report
+    # Render both complete editions from the same parsed rows.
+    local report_lang title generated topology_label workload topology_heading
+    local topology_columns bench_label results_heading cache_heading cache_note
+    local cache_columns peer_heading peer_columns artifacts_heading log_label
+    local cpu_label heap_label view_label isolation_note metadata_note
+    for report_lang in en zh; do
+        if [ "$report_lang" = en ]; then
+            out="$RESULTS_DIR/README.md"
+            title="Cache cluster bench report"
+            generated="Generated"
+            metadata_note="Topology and workload metadata come from this report invocation's environment; verify that they match the original benchmark configuration and logs. Profiles listed below are optional when collection failed."
+            topology_label="Configured topology"
+            workload="Workload (report environment)"
+            topology_heading="Topology"
+            topology_columns="Role | Host | Ports (data / health / pprof)"
+            bench_label="on-demand benchmark client"
+            results_heading="End-to-end results"
+            cache_heading="L2/L3 cache behavior"
+            cache_note="L2 hit rate is tier-0 hits / (hits + misses), excluding errors. Origin hits count successful origin reads; their share divides that count by total benchmark ops, not all origin attempts. Origin misses/errors are not included. These observations are not guaranteed to equal --miss-ratio: read-through warms repeated keys."
+            cache_columns="conc | L2 (EC) hit rate | L2 fills | Origin hits | Origin hits / ops"
+            peer_heading="Per-peer behavior"
+            peer_columns="conc | Peer counters (hits/misses/errors/cancelled/fills)"
+            artifacts_heading="Artifacts"
+            log_label="complete benchmark output"
+            cpu_label="benchmark-client CPU profile"
+            heap_label="benchmark-client heap profile"
+            view_label="Inspect"
+            isolation_note="This remote harness currently omits --key-salt. Concurrency rounds can reuse keys warmed by earlier rounds; they are not isolated cold-cache measurements unless the invocations use distinct salts or relevant cache state is reset."
+        else
+            out="$RESULTS_DIR/README_zh.md"
+            title="Cache 集群基准报告"
+            generated="生成时间"
+            metadata_note="拓扑和负载元数据来自本次 report 调用的环境变量，须核对是否与原基准配置和日志一致；下列 profile 在收集失败时可能不存在。"
+            topology_label="配置拓扑"
+            workload="负载（报告环境）"
+            topology_heading="拓扑"
+            topology_columns="角色 | 主机 | 端口（data / health / pprof）"
+            bench_label="按需运行的基准客户端"
+            results_heading="端到端结果"
+            cache_heading="L2/L3 缓存行为"
+            cache_note="L2 命中率为 tier-0 hits / (hits + misses)，不含 errors。Origin hits 只计 origin 成功读取；占比以其除以总 benchmark ops，并非全部 origin 尝试，未计 origin misses/errors。Read-through 会预热重复 key，故这些观测不保证等于 --miss-ratio。"
+            cache_columns="conc | L2(EC) 命中率 | L2 回填 | Origin 成功读取 | Origin hits / ops"
+            peer_heading="Per-peer 行为"
+            peer_columns="conc | Peer 计数（hits/misses/errors/cancelled/fills）"
+            artifacts_heading="工件"
+            log_label="完整 benchmark 输出"
+            cpu_label="benchmark 客户端 CPU profile"
+            heap_label="benchmark 客户端 heap profile"
+            view_label="查看"
+            isolation_note="此远端 harness 当前未传 --key-salt；并发度轮次可能复用前轮已预热的 key。调用未使用不同 salt 或未重置相关 cache 状态时，不能当作相互隔离的冷缓存测量。"
+        fi
+        {
+            cat <<EOF
+[English](README.md) | [简体中文](README_zh.md)
 
-- 生成时间：$timestamp
-- 拓扑：$shard_count-host EC (${EC_DATA}+${EC_PARITY}) + 1 origin (local) + 1 tiered client
-- 负载：value=$VALUE_SIZE B, prefill=$PREFILL, duration=$DURATION, concurrencies=($CONCS)
+# $title
 
-## 拓扑
+- $generated: $timestamp
+- $topology_label: $shard_count-host EC (${EC_DATA}+${EC_PARITY}) + 1 origin (local) + 1 tiered client
+- $workload: value=$VALUE_SIZE B, prefill=$PREFILL, duration=$DURATION, concurrencies=($CONCS)
 
-| 角色 | 主机 | 端口（data / health / pprof） |
+$metadata_note
+
+<a id="拓扑"></a>
+
+## $topology_heading
+
+| $topology_columns |
 |---|---|---|
 EOF
-        local i=0
-        for ip in $SHARDS; do
-            i=$((i + 1))
-            echo "| shard s$i | $ip | $SHARD_PORT / $SHARD_HEALTH / $SHARD_PPROF |"
-        done
-        cat <<EOF
+            local i=0
+            for ip in $SHARDS; do
+                i=$((i + 1))
+                echo "| shard s$i | $ip | $SHARD_PORT / $SHARD_HEALTH / $SHARD_PPROF |"
+            done
+            cat <<EOF
 | origin (local) | $ORIGIN_HOST | $LOCAL_PORT / $LOCAL_HEALTH / $LOCAL_PPROF |
 | tiered | $TIERED_HOST | $TIERED_PORT / $TIERED_HEALTH / $TIERED_PPROF |
-| bench client | $BENCH_HOST | (runs on-demand) |
+| bench client | $BENCH_HOST | $bench_label |
 
-## 端到端结果
+<a id="端到端结果"></a>
+
+## $results_heading
 
 | conc | ops | throughput | bandwidth | p50 | p99 | p99.9 | errors | allocs/op | bytes/op |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 $rows
 
-## L2/L3 缓存行为
+<a id="l2l3-缓存行为"></a>
 
-L2(EC tier)命中率 = 在 tiered 客户端 EC 层命中的比例；L3 透传 = L2 未命中、回落到 origin(L3)的读次数及其占总 ops 的比例（≈ \`--miss-ratio\` 注入率，因 read-through 把重复冷读暖入 L2 会略低）。
+## $cache_heading
 
-| conc | L2(EC) 命中率 | L2 回填(fills) | L3 透传次数 | L3 透传占比 |
+$cache_note
+
+$isolation_note
+
+| $cache_columns |
 |---:|---:|---:|---:|---:|
 $cache_rows
 
-## Per-peer 行为
+<a id="per-peer-行为"></a>
 
-| conc | peer 统计（hits/misses/errors/cancelled/fills） |
+## $peer_heading
+
+| $peer_columns |
 |---:|---|
 $peer_rows
 
-## 工件
+<a id="工件"></a>
 
-- \`bench-c{$(echo $CONCS | tr ' ' ',')}.log\` — 完整 bench 输出
-- \`bench-c{...}.cpu.pprof\` — bench 客户端 CPU profile
-- \`bench-c{...}.heap.pprof\` — bench 客户端 heap profile
+## $artifacts_heading
 
-查看：
+- \`bench-c*.log\` — $log_label
+- \`bench-c*.cpu.pprof\` — $cpu_label
+- \`bench-c*.heap.pprof\` — $heap_label
+
+$view_label:
 \`\`\`bash
 go tool pprof -top -cum $RESULTS_DIR/bench-c${CONCS%% *}.cpu.pprof
 go tool pprof -alloc_space -top $RESULTS_DIR/bench-c${CONCS%% *}.heap.pprof
 \`\`\`
 EOF
-    } > "$out"
-    log "report → $out"
+        } > "$out"
+        log "report -> $out"
+    done
 }
 
 cmd_stop() {
