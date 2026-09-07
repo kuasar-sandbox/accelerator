@@ -327,7 +327,7 @@ tiers:
 | `pool` | 到单个 peer 的并行 TCP 连接数。wire 是 sync request/response,单连接会把并发请求串行化 |
 | `max_inflight` | 到该 tier 的同步查询并发上限;`0` 表示不限制。异步 fill 使用各 backend 自身的连接池/并发控制。Redis tier 禁止设置,应使用 `redis.get_pool` / `redis.set_pool` |
 | `rpc_timeout` | 服务端请求 context 预算。缺省/空/非法/非正数不设 deadline;正 duration 可取消响应 context 的工作,不能中断同步 RocksDB CGO。超时/错误不普遍变成 cache miss(§4.2);慢请求可用 §6.5 tracer 观察 |
-| `timeout`(tier/origin) | 客户端每次操作超时。upstream/origin 可默认 0,受 caller/connection 生命周期约束;**EC cluster 空/非法/非正值默认 2s**。Redis 有独立默认与严格校验,显式值必须有效且为正 |
+| `timeout`(tier/origin) | 客户端每次操作超时。**中间 upstream tier 的 `tiers[].timeout` 与 EC 的 `tiers[].cluster.timeout` 在空/非法/非正值时默认 2s**；**origin 客户端的 `origin.store.timeout` 与 `origin.upstream.timeout` 默认 0**，受 caller/connection 生命周期约束。Redis 有独立默认与严格校验，显式值必须有效且为正 |
 | `pprof_listen` | 非空时另起一个 HTTP listener 暴露 `/debug/pprof/*`(如 `127.0.0.1:6060`)。**生产留空**;仅离线诊断临时开启(§6.4) |
 
 ## 4. 设计

@@ -311,7 +311,7 @@ tiers:
 | `pool` | Wire connections to one peer; each connection's synchronous request/response flow serializes its own requests. |
 | `max_inflight` | Synchronous tier-query concurrency, 0 for unlimited. Async fill uses backend pools/limits. Redis tiers reject this field; use their separate get_pool/set_pool. |
 | `rpc_timeout` | Server request context budget. Missing, empty, invalid or nonpositive means no per-request deadline. A positive duration cancels context-aware work; synchronous RocksDB CGO cannot be interrupted mid-operation. Timeout/errors are not universally converted into cache misses (§4.2). |
-| `timeout` | Client per-operation timeout. Upstream and origin paths can default to 0, bounded only by caller/connection lifetime. **EC cluster timeout defaults to 2s** when empty/invalid/nonpositive. Redis has its own validation/defaults and requires an explicitly supplied timeout to be positive and valid. |
+| `timeout` | Client per-operation timeout. **An intermediate upstream tier (`tiers[].timeout`) and an EC cluster (`tiers[].cluster.timeout`) default to 2s** when empty/invalid/nonpositive. **Origin clients (`origin.store.timeout` and `origin.upstream.timeout`) default to 0**, bounded by caller/connection lifetime. Redis has its own validation/defaults and requires an explicitly supplied timeout to be positive and valid. |
 | `pprof_listen` | Optional HTTP `/debug/pprof/*` listener, for example 127.0.0.1:6060. Leave empty normally; enable temporarily for diagnostics (§6.4). |
 
 <a id="4-设计"></a>

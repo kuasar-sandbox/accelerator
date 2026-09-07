@@ -54,7 +54,7 @@ type FreqConfig struct {
 
 // RocksConfig holds RocksDB parameters.
 //
-// BlobDB is always enabled on chunk and manifest CFs with fixed
+// BlobDB is always enabled on chunk, manifest and blob CFs with fixed
 // parameters (min_blob_size=4 KiB, blob_file_size=256 MiB) — there is
 // no YAML knob to disable or tune it. Large values bypass the LSM main
 // path automatically; small values (< 4 KiB) remain inline in the SST.
