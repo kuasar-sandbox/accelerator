@@ -141,6 +141,8 @@ Flags:
 
 #### 基准方法学(L2 内存/磁盘路径、L3 透传、aging)
 
+`test/scripts/bench_cache_remote.sh report` 从同一份解析行生成完整 `README.md` / `README_zh.md` 报告并带双向选择器。按当前输出读取 `end-flight`、`errors` 之后的 `hit%`；origin-hit 占比为 origin 成功读取数 / benchmark ops，不包括 origin misses/errors。缺失 cache counter 保持 unknown。Read-through 与不带 salt 的重复 key 会改变观测，不能假定等于 `--miss-ratio`。
+
 多机压测见 [bench_cache_remote.sh](../test/scripts/bench_cache_remote.sh),部署 N shards、
 origin 与 tiered 并扫并发。使用 [procmon.sh](../test/scripts/procmon.sh) 的无依赖
 /proc CPU/diskstats/net 采样及 [proc_analyze.py](../test/scripts/proc_analyze.py) 归因。
