@@ -56,7 +56,8 @@ make test-e2e                  # 运行 test/e2e/run_all.sh;需要项目主仓�
 本仓文档与 `test/e2e/` 不进入组件包,由项目主仓聚合所选 tag 的源码并只放入
 `platform-release-vX.Y.Z.tar.gz`。
 本地可用 `make release VERSION=vX.Y.Z` 生成并校验相同布局的 release bundle。
-当前 Release 只发布已完成全量构建与 BMS 验证的 Linux x86_64 目标。项目主仓的
+当前组件 Release 构建并打包 Linux x86_64 目标;项目聚合随后针对所选真实发布资产组合
+运行 BMS。组件打包成功不等于聚合验证通过。项目主仓的
 每日协调器显式传入源码分支和精确 SHA;组件 `main` 用于主线,`release/vX.Y.x`
 用于对应组件维护线。Preview 和维护分支 Stable 不更新 GitHub Latest;独立的幂等
 Reconcile Latest 工作流按 `main` 源码提交先后协调主线 Stable,同一提交才比较 SemVer。
@@ -75,11 +76,11 @@ Reconcile Latest 工作流按 `main` 源码提交先后协调主线 Stable,同�
 
 ## 文档
 
-- [docs/manifest.md](docs/manifest.md) — 二进制清单:分块 / 收敛加密 / 密钥表 / 读写 SDK。
+- [docs/manifest_zh.md](docs/manifest_zh.md) — 二进制清单:分块 / 收敛加密 / 密钥表 / 读写 SDK。
 - [docs/store_zh.md](docs/store_zh.md) — 内容寻址存储:分代目录布局 / fs·S3-compatible object storage backend / GC。
-- [docs/cache.md](docs/cache.md) — 三层缓存 + 纠删码:local / shard / tiered 与旁路填充。
+- [docs/cache_zh.md](docs/cache_zh.md) — 三层缓存 + 纠删码:local / shard / tiered 与旁路填充。
 - [docs/cache-redis.md](docs/cache-redis.md) — Redis-compatible UDS/TCP 后端、取消语义与外部 Dragonfly 部署示例。
-OCI/目录 → EROFS 确定性展平 CLI 见 `guest-runtime/docs/flatten.md`。
+OCI/目录 → EROFS 展平 CLI 见 [guest-runtime flatten](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten_zh.md);完整确定性还取决于所选输入、配置与工具链。
 
 ## License
 
