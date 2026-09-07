@@ -108,8 +108,8 @@ Flags:
   --concurrency int          (default 8)
   --duration duration        Go duration (default 10s)
   --value-size int           (default 262144; 256 KiB)
-  --mode string              get | put | mixed; empty defaults to mixed unless a
-                             separate prefill endpoint is set, which requires get
+  --mode string              get | put | mixed; empty defaults to mixed without
+                             prefill; with prefill, empty/mixed are changed to get
   --namespace string         chunk | manifest
   --prefill int              Objects prewritten for get/mixed (default 1000)
   --prefill-endpoint string  Separate prefill endpoint (default: benchmark endpoint)
@@ -120,13 +120,15 @@ Flags:
   --cold-prefill int         Cold keys written only to prefill, not warmed at target
   --miss-ratio float         Read share targeting cold keys; requires cold-prefill
                              and a separate prefill endpoint
+  --key-salt string          Isolate deterministic warm/cold/write key spaces
+                             (default empty; use a unique value per isolated run)
   --timeout duration        Per-operation client deadline (default 10s)
   --cpu-profile string      CPU-profile file for the measurement window
   --heap-profile string     Heap-profile file written after the window
   --trace string            Execution-trace file for the window
 ```
 
-An explicit put/mixed mode with a separate prefill endpoint is an error. Increase the client timeout when an intentionally slow origin or large prefill requires it; a timeout does not convert a backend error into a clean cache miss.
+With a separate prefill endpoint, both an omitted mode and explicit `--mode mixed` are changed to `get`; `put` and other modes are rejected. Inspect the reported effective mode before interpreting results. `--key-salt` participates in warm, cold, and write-key derivation: repeated or concurrent runs with the same salt reuse deterministic keys and can contaminate intended cold reads or overwrite prior writes. Use a unique salt for each isolated run. `test/scripts/bench_cache.sh` supplies a run/round/mode/concurrency salt; `test/scripts/bench_cache_remote.sh` currently does not pass `--key-salt`, so its concurrency sweep can reuse keys warmed by earlier rounds. Do not treat those later rounds as isolated cold-cache measurements without adding distinct salts at invocation or resetting the relevant cache state. Increase the client timeout when an intentionally slow origin or large prefill requires it; a timeout does not convert a backend error into a clean cache miss.
 
 <a id="基准方法学l2-内存磁盘路径l3-透传aging"></a>
 
@@ -717,11 +719,11 @@ cache-ctl serve --config /etc/cache/tiered.yaml
 SIGINT/SIGTERM trigger:
 
 1. Stop the health monitor and, if enabled, mark gRPC health NOT_SERVING so orchestration can stop routing new work.
-2. Stop accepting wire connections and drain in-flight work, waiting up to five seconds in the wire GracefulStop.
+2. Stop accepting wire connections and close all tracked connections, including active ones. The wire `GracefulStop` waits up to five seconds for connection goroutines. Closing a connection can cancel its handler and discard its response; it does not guarantee successful draining of in-flight requests.
 3. Gracefully stop the shared gRPC Health/Info server.
 4. In tiered mode, cancel/join asynchronous fills through TieredCache.Close, then close the origin and constructed tier resources through their registered cleanup. Tier resources close in **reverse YAML construction order**, not a fixed embedded→Redis→EC→upstream type order. Local/shard closes its selected backend.
 
-The five-second wire-drain wait is not a five-second bound on the entire process shutdown: other cleanup and backend calls can take longer. SIGHUP reloads EC membership as described in §4.9.
+Clients can observe cancellation, EOF, or another connection error during shutdown. Retry eligible operations against a healthy endpoint according to caller policy; loss of a response does not prove that a write was never applied. The five-second wire wait is not a five-second bound on the entire process shutdown: other cleanup and backend calls can take longer. SIGHUP reloads EC membership as described in §4.9.
 
 <a id="63-运行时计数pull-only"></a>
 

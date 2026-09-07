@@ -121,7 +121,7 @@ Flags:
   --duration duration       Go duration (default 10s)
   --value-size int          (default 262144)  # 256 KiB
   --mode string             "get" | "put" | "mixed";默认空,--prefill-endpoint 为空时解析为
-                            "mixed",否则强制 "get"(显式传 put/mixed + 独立 prefill 端点报错)
+                            "mixed"；有 prefill 时空值/显式 mixed 都改为 get，put 等其他值报错
   --namespace string        "chunk" | "manifest"
   --prefill int             get/mixed 模式预写对象数 (default 1000)
   --prefill-endpoint string 独立预写端点(默认同 --endpoint)
@@ -130,11 +130,14 @@ Flags:
   --zipf-s float            Zipf 偏斜指数 s (>1,越大越偏;仅 --access zipf) (default 1.1)
   --cold-prefill int        额外只写 prefill 端点、不暖 bench 目标的冷 key 数(喂 L2-miss → L3)
   --miss-ratio float        命中冷 key 的读比例 → L2 miss → 透传 origin/L3 (需 --cold-prefill>0 + --prefill-endpoint)
+  --key-salt string         隔离 deterministic warm/cold/write key 空间(默认空；独立 run 使用唯一值)
   --timeout duration        客户端 per-op TCP deadline (default 10s;慢/卡 origin 大数据集 prefill 须调大)
   --cpu-profile string      bench 窗口内写 CPU profile 到文件
   --heap-profile string     bench 窗口结束后写 heap profile 到文件
   --trace string            bench 窗口内写执行 trace 到文件
 ```
+
+使用独立 prefill endpoint 时，省略 mode 和显式 `--mode mixed` 都会变为 `get`，`put` 等其他 mode 才会被拒绝。解读结果前检查输出的 effective mode。`--key-salt` 参与 warm、cold 和 write key 派生；重复或并发 run 使用同一 salt 会复用 deterministic keys，可能污染原定 cold read 或覆盖旧写入。独立 run 应使用唯一 salt。`test/scripts/bench_cache.sh` 提供 run/round/mode/concurrency salt；`test/scripts/bench_cache_remote.sh` 当前未传入 `--key-salt`，其并发度扫描可能复用前轮已预热的 keys。调用时未加入不同 salt 或重置相关 cache 状态之前，不应把后续轮次当作相互隔离的冷缓存测量。刻意使用慢 origin 或较大 prefill 时可增加 client timeout；超时不把 backend error 转成 clean cache miss。
 
 #### 基准方法学(L2 内存/磁盘路径、L3 透传、aging)
 
@@ -749,13 +752,13 @@ cache-ctl serve --config /etc/cache/tiered.yaml
 SIGINT/SIGTERM 顺序:
 
 1. 停止 health monitor;若启用,设 gRPC health 为 NOT_SERVING,让编排停止新流量。
-2. 停止接收 wire 连接并 drain 在途工作;wire GracefulStop 最多等待 5 秒。
+2. 停止接收 wire 连接，关闭所有已登记连接，包括 active connection。Wire `GracefulStop` 最多等待 connection goroutine 5 秒；关闭连接可能取消 handler 并丢弃其响应，不保证在途请求成功排空。
 3. graceful stop 共用的 gRPC Health/Info server。
 4. tiered 通过 TieredCache.Close 取消/join async fills,随后按注册清理关闭 origin 和
    tier 资源。tiers 按 **YAML 构造的逆序**关闭,不是固定 embedded→Redis→EC→upstream
    类型顺序。local/shard 关闭所选 backend。
 
-wire drain 的 5 秒不等于整个进程关闭最多 5 秒,其他清理/backend 调用可能更久。
+关闭过程中，客户端可能看到 cancellation、EOF 或其他 connection error。应按 caller policy 向健康 endpoint 重试允许重试的操作；没有收到响应不证明写入从未生效。Wire wait 的 5 秒不等于整个进程关闭最多 5 秒，其他清理/backend 调用可能更久。
 SIGHUP 仅按 §4.9 更新 EC membership。
 
 ### 6.3 运行时计数(pull-only)
