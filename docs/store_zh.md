@@ -1,0 +1,352 @@
+[English](store.md) | [简体中文](store_zh.md)
+
+# store — 持久层读写代理
+
+`store-ctl` 向 `manifest-ctl` 和 cache origin 提供统一的持久层数据面。对象数据可
+位于本地/共享文件系统或 S3-compatible object storage；generation 列表则可独立
+来自主配置、普通文件或单独的 S3 object。
+
+## 1. 核心模型
+
+generation 只有一种表示：
+
+```go
+[]store.Generation // oldest -> newest
+```
+
+最后一项接收新写入，读取从最后一项向前查找。列表不按名称排序，也不自动去重。
+名称必须匹配 `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`；空列表、重复项、`.`、
+`..`、路径分隔符、控制字符和过长列表都会被拒绝。
+
+`AdmitWrite` / `AdmitWriteFor` 返回：
+
+```go
+type WriteAdmission struct {
+    Generation store.Generation
+    Salt       [32]byte
+}
+```
+
+它只是路由和加密派生信息，不是凭据。空请求的 `AdmitWrite` 选择当前列表最后一项；
+`AdmitWriteFor(generation)` 请求列表中仍存在的指定项。一次 manifest ingest 只调用
+一次 admission RPC，全部 chunk Put 和最后的 manifest Put 都复用同一个 admission。
+generation 仍在当前列表中时 admission 可继续写入；移出列表后，该 generation
+不再接受 Put，也不再参与 Get。
+
+generation salt 只有一个公共实现：
+
+```go
+salt, err := store.SaltForGeneration(generation)
+```
+
+Store server、离线 Manifest Bundle writer 和测试都调用它，不复制 derivation
+domain 常量。函数先执行 `ValidateGeneration`；`NONE` 等任何合法字符串都按普通
+generation 处理，没有保留值或特殊分支。
+
+## 2. 配置
+
+### 2.1 FS 数据后端
+
+```yaml
+listen: 127.0.0.1:7100
+backend: fs
+stats_interval: 30s
+cache_listen: ""
+fs:
+  root: /var/store
+  verify_content_key: true
+  direct_io: false
+```
+
+`direct_io` 缺省为 `false`，只影响对象 Get；generation 文件和主配置始终使用
+普通 I/O。
+
+### 2.2 S3 数据后端
+
+```yaml
+listen: 127.0.0.1:7100
+backend: s3
+s3:
+  endpoint: https://example-s3-endpoint
+  region: us-east-1
+  bucket: kuasar-store
+  path_style: true
+  prefix: production
+  access_key: ${S3_ACCESS_KEY}
+  secret_key: ${S3_SECRET_KEY}
+  verify_content_key: true
+  max_inflight: 64
+  op_timeout: 10s
+  max_object_size_bytes: 16777216
+```
+
+静态 AK/SK 必须成对出现；两者都为空时使用 AWS SDK 默认凭据链。字符串字段支持
+`${VAR}` 展开。`region` 缺省为 `us-east-1`，`path_style` 缺省为 `true`。
+
+### 2.3 Generation source
+
+`generations` 下必须且只能选择一种来源。
+
+主配置内列表：
+
+```yaml
+generations:
+  config:
+    - G1
+    - G2
+    - G3
+```
+
+文件：
+
+```yaml
+generations:
+  refresh_interval: 5s
+  file:
+    path: /var/store-meta/generations
+```
+
+独立 S3 object：
+
+```yaml
+generations:
+  refresh_interval: 5s
+  s3:
+    endpoint: https://example-s3-endpoint
+    region: us-east-1
+    bucket: kuasar-store-meta
+    key: production/__meta/generations
+    path_style: true
+    access_key: ${GENERATION_S3_ACCESS_KEY}
+    secret_key: ${GENERATION_S3_SECRET_KEY}
+```
+
+文件和 S3 object 都使用逐行文本格式，顺序为 oldest → newest。它们按
+`refresh_interval` 周期刷新；`SIGHUP` 也会立即刷新。config source 在
+`SIGHUP` 时重读主 YAML，但不会动态改变 backend、listen、凭据或其他配置。
+只有完整加载、解析和校验成功的新列表才会替换当前不可变 slice；失败时记录错误
+并继续使用上一份有效列表。启动时没有有效列表则拒绝启动。
+
+未配置 `generations` 时保持旧部署兼容：
+
+- FS：`<fs.root>/__meta/generations`
+- S3：`<s3.prefix>/__meta/generations`
+
+对象数据权限与 generation source 权限可以分离。例如数据节点可使用只读
+generation 凭据和对象读写凭据，而不需要修改 generation object 的权限。
+
+### 2.4 `verify_content_key`
+
+`true`（默认）时，服务端对本次上传流计算 SHA-256，digest 必须等于请求 key。
+校验失败只清理当前 writer 仍拥有的文件。已有目标的 dedup 仍只按 optional size
+或存在性判断，不重新读取、哈希已有对象。
+
+`false` 时不校验上传内容：
+
+- 提供 size：实际上传大小必须等于 size；已有目标大小相等即 dedup。
+- 未提供 size：已有普通文件/对象存在即 dedup；新上传不做预期大小校验。
+
+因此，同大小错误内容无法被识别；未提供大小时，残留或不完整文件也可能被视为
+存在。这是关闭内容校验后的明确取舍。
+
+## 3. RPC 与 Backend
+
+Store gRPC 提供：
+
+```protobuf
+rpc AdmitWrite(AdmitWriteRequest) returns (AdmitWriteResponse);
+rpc Get(GetRequest) returns (stream GetResponse);
+rpc Put(stream PutRequest) returns (PutResponse);
+```
+
+`AdmitWriteRequest.generation` 为空时保持选择最新可写 generation 的原语义；非空时
+先校验名称，再要求它仍在本请求读取的当前列表中，否则返回
+`FailedPrecondition`。成功响应始终返回该 generation 的 canonical
+`WriteAdmission`。官方 Go client 保留 `AdmitWrite(ctx)`，并新增
+`AdmitWriteFor(ctx, generation)`；Put wire 与 Backend 接口不变。
+
+`PutHeader` 包含 partition、32-byte key、generation 和真正有 presence 的
+`optional uint64 size`。零表示已知的空对象；字段缺席才表示大小未知。官方 Go
+client 接收完整 `[]byte`，所以总是发送 `uint64(len(data))`。服务端转换为
+`int64` 前检查溢出。
+
+数据 backend 只操作显式传入的单个 generation：
+
+```go
+type Backend interface {
+    Get(ctx context.Context, generation store.Generation,
+        partition store.Partition, key store.ContentKey) (bool, []byte, error)
+
+    Exists(ctx context.Context, generation store.Generation,
+        partition store.Partition, key store.ContentKey,
+        expectedSize *int64) (bool, error)
+
+    OpenPut(generation store.Generation, partition store.Partition,
+        key store.ContentKey, expectedSize *int64) (store.PutHandle, error)
+}
+```
+
+`OpenPut` 会复制 optional size，并固定 generation、partition 和 key。handle 在
+Commit 时不重读列表、不重新选择 generation 或目标路径；Commit 传入的 key 与
+绑定 key 不同会被拒绝。
+
+Server Put 顺序如下：
+
+1. 确认 admission generation 仍在本请求读取的当前列表中。
+2. 解析 optional size 并调用 `Exists`。
+3. 命中时立即返回 `is_new=false`，不接收 payload。
+4. miss 时调用 `OpenPut`，累计实际字节数。
+5. 提供 size 时，超过预期立即 Abort，EOF 时要求精确相等。
+6. 按配置完成流式 digest 校验并 Commit。
+
+FS `Exists` 只接受普通文件。已知 size 时必须完全相等；未知 size 时普通文件存在
+即可。NotExist 是 miss；symlink、目录、特殊文件、permission、EIO、ESTALE 等
+均返回错误。S3 使用调用方 context 执行 HEAD；NotFound 是 miss，其他远端错误
+原样传播，已知 size 时比较 Content-Length。
+
+gRPC Get 和内嵌 `cache_listen` 共用同一个反向查找入口。每个请求只读取一次
+generation slice：
+
+```go
+for i := len(generations) - 1; i >= 0; i-- {
+    found, data, err := backend.Get(ctx, generations[i], partition, key)
+    if err != nil || found {
+        return found, data, err
+    }
+}
+```
+
+## 4. FS direct-final-write
+
+对象路径为：
+
+```text
+<root>/<partition>/<generation>/<aa>/<bb>/<content-key>
+```
+
+`OpenPut` 直接创建该最终路径：
+
+1. 创建父目录并用 Lstat 检查目标。
+2. 目标按 optional size 规则有效时返回 no-op handle；其 Write 接收并丢弃数据，
+   Commit 返回 `isNew=false`。
+3. 已知 size 且现有普通文件大小不符时记录文件 identity；删除前再次 Lstat，只有
+   路径仍指向同一文件才删除，否则重新检查。
+4. 使用 `O_WRONLY | O_CREAT | O_EXCL` 和 `O_NOFOLLOW` 防护直接创建最终文件。
+   `EEXIST` 表示竞争，回到目标检查。
+
+直接写 handle 记录最终路径、创建后的 identity、generation、partition、key、
+optional size 和实际字节数。Write 直接写最终 fd，已知 size 时禁止越界。
+
+Abort、digest mismatch、长度错误以及 Write/Sync/Close 失败，都先检查路径是否仍
+指向 handle 创建的同一文件；只有 owner 才能删除。成功 Commit 执行文件 Sync、
+Close 和父目录同步，然后再次确认 identity。如果路径已被另一 writer 替换：
+
+- 替换目标满足 optional size/存在规则：loser 返回 `isNew=false`。
+- 替换目标仍无效、消失或无法确认：loser 返回错误。
+- loser 不删除另一 writer 的文件。
+
+该并发判定不依赖进程内全局锁，适用于多个 writer 竞争同一个 content key。
+
+### 4.1 可见性与故障边界
+
+direct-final-write 不提供 crash-atomic publication，也不作等价承诺：
+
+- 最终路径在写入期间可见，大小可能暂时不完整。
+- 官方 client 始终发送 size，因此未完成大小通常不会成为后续 Put 的 dedup hit。
+- manifest ingest 先完成全部 chunk Put，最后才发布 manifest；正常 reader 在引用
+  发布前不会请求新 chunk。
+- 崩溃留下的大小不一致文件可由后续同 size Put 识别并覆盖。
+- 恰好达到完整大小但尚未持久化的残留，仅凭大小无法区分。
+- 未提供 size 时，不完整文件也可能被当作存在。
+
+这些边界来自“最终路径直接写入且不增加额外对象完成标志”的设计选择。
+
+## 5. FS Direct I/O
+
+Linux `direct_io: true` 时，对象 Get 使用 `golang.org/x/sys/unix` 打开
+`O_DIRECT` fd，优先通过 `statx(STATX_DIOALIGN)` 获取 memory/offset alignment。
+buffer 地址、offset 和读取长度都按要求对齐，返回前裁剪为文件真实长度；实现处理
+空文件、小文件、非对齐长度、短读和 EOF。
+
+filesystem 不报告有效 alignment，或 open/read 返回 `EINVAL`、
+`EOPNOTSUPP`/unsupported 时，Get 返回明确错误，不静默切回 buffered I/O。
+非 Linux 构建也返回明确 unsupported。是否启用应按目标 NFS/SFS Turbo 环境的
+benchmark 决定：
+
+```bash
+go test -run '^$' -bench 'BenchmarkGet(Buffer|Direct)' -benchmem ./pkg/store/fs
+```
+
+## 6. Admin 命令
+
+```bash
+store-ctl init    --config FILE --generation G1
+store-ctl rollout --config FILE --generation G2
+store-ctl info    --config FILE
+store-ctl purge   --config FILE --generation G1
+store-ctl purge   --config FILE --all --confirm
+store-ctl serve   --config FILE
+```
+
+- `info` 从 generation source 读取 oldest → newest 列表，最后一项显示为当前写入代，
+  对象统计由显式 generation admin helper 完成。
+- `init`/`rollout` 修改 file 或 S3 source；config source 明确只读，需由配置系统更新。
+- `purge --generation` 拒绝最后一项，先从可写 source 移出 generation，再删除 FS/S3
+  数据。S3 source 更新使用 ETag `If-Match` CAS，冲突后重读并有界重试。
+- `purge --all` 是离线维护操作，仍要求 `--confirm`：执行前必须停止所有
+  `store-ctl serve` 进程并静默所有 writer。file/S3 source 会被移除；config source
+  下只清理对象数据，不修改主 YAML。source 缺失在运行中的 server 看来是刷新失败，
+  按设计会继续保留上一份有效列表，因此该命令不能用作在线写入撤销机制。
+
+典型在线 rollout：
+
+```text
+[G1] -> [G1, G2] -> [G2]
+```
+
+第一步刷新后，新 admission 使用 G2，已有 G1 admission 仍可完成，Get 按 G2、G1
+读取。确认旧 admission 已结束后，再把 G1 移出列表并清理其数据。整个过程无需
+重启 `store-ctl serve`。
+
+## 7. S3 数据面
+
+对象布局与 FS 一致：
+
+```text
+<prefix>/<partition>/<generation>/<aa>/<bb>/<content-key>
+```
+
+PutHandle 在内存中有界缓冲并以单次 PutObject 写入固定 key。`max_inflight` 限制
+并发 S3 调用；`op_timeout` 为空时只受调用方 context 控制；
+`max_object_size_bytes` 限制单对象大小。generation source 的 S3 endpoint、bucket、
+key 和凭据可与数据 backend 完全不同。
+
+## 8. `cache_listen` 与运维
+
+`cache_listen` 非空时，store-ctl 启动只读 cache wire server。ObjectGet 通过
+Server 的同一跨 generation 读取 helper 访问 chunk/manifest/blob；ObjectPut 和
+shard 操作被拒绝。它是无 L1 的透传入口；需要本地缓存时仍部署 cache-ctl tiered。
+
+`stats_interval` 缺省 30s，输出 get/put/admit 速率、带宽、dedup 比例、延迟、
+inflight 和错误数；`0`/`off` 可关闭。`STORE_CTL_DEBUG=1` 可启用慢 S3 操作追踪，
+`STORE_CTL_SLOW` 设置阈值。
+
+验证：
+
+```bash
+CGO_ENABLED=0 go test ./pkg/store/... ./pkg/manifest/... ./cmd/store-ctl
+CGO_ENABLED=1 go test -race ./pkg/store/... ./pkg/manifest/... ./cmd/store-ctl
+make store-ctl
+make manifest-ctl
+make vet
+make test-e2e
+```
+
+race detector 需要启用 CGO 并具备可用 C 工具链。上面的普通测试可以关闭 CGO，
+`go test -race` 则不能使用 `CGO_ENABLED=0`。
+
+## 9. See also
+
+- [`manifest.md`](manifest.md) — manifest ingest/fetch 与加密流程
+- [`cache.md`](cache.md) — tiered cache、origin 和 wire protocol
+- 仓库根目录 `README.md` / `Makefile` — 构建和完整测试入口

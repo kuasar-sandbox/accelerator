@@ -35,7 +35,7 @@ tarstream 工件。
 
 ### 1.3 不做什么
 
-- 不直接管理后端字节(委派给 [`store.md`](store.md));
+- 不直接管理后端字节(委派给 [`store_zh.md`](store_zh.md));
 - 不维护缓存(委派给 [`cache.md`](cache.md));
 - 不感知 docker / OCI / EROFS 等高层格式(它只看字节流);
 - 不做 ACL —— customer key 的物理保护是用户责任。
@@ -402,7 +402,7 @@ encoder 会因架构实现产生不同 block bytes，因此不用于 canonical �
 
 Chunk 上传时,`SHA256(physical_object)` 是 store 的寻址键;Manifest 上传时同样
 按 `SHA256(physical_envelope)`。Salt **不参与寻址** —— 寻址完全由物理字节哈希决定,
-保留 salt 的隔离性,但允许 store 端以单一 KV 视图存储(详见 [`store.md`](store.md))。
+保留 salt 的隔离性,但允许 store 端以单一 KV 视图存储(详见 [`store_zh.md`](store_zh.md))。
 
 ### 4.3 加密模式 — chunk
 
@@ -935,7 +935,7 @@ manifest:// 加载端到端时长)。
 
 - chunk 模式(cdc 命中率高于 fixed,但分块本身略慢);
 - 固定 RAW/Snappy 选择与 AES（不可压缩内容保持 RAW；可压缩内容减少 hash/AES/wire bytes）；
-- store 端点延迟(本地 fs vs 远端 S3-compatible object storage,详见 [`store.md`](store.md))。
+- store 端点延迟(本地 fs vs 远端 S3-compatible object storage,详见 [`store_zh.md`](store_zh.md))。
 
 可重复 microbenchmark 为 `BenchmarkCompressionCandidates`（raw、Go Snappy、S2、S2
 Better、Zstd SpeedFastest 控制组）、`BenchmarkAESChunkCanonicalCodec` 和
@@ -957,7 +957,7 @@ metadata 读取不随 Chunk 数增长。
 
 ## 6. See Also
 
-- [`store.md`](store.md) — manifest-ctl 通过 gRPC 把字节落到 store-ctl
+- [`store_zh.md`](store_zh.md) — manifest-ctl 通过 gRPC 把字节落到 store-ctl
 - [`cache.md`](cache.md) — `load` 路径可选穿 cache-ctl 加速;cache-ctl 自身
   以 manifest 同款客户端从 store 取 chunk
 - `guest-runtime/docs/flatten.md` — 镜像展平后经 `flatten-ctl export --upload`
