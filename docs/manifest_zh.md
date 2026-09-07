@@ -934,5 +934,5 @@ metadata 读取及其与 chunk 数的关系。benchmark fixture 名称不覆盖�
 - [store](store_zh.md):manifest-ctl 经 store-ctl gRPC 写入远端字节。
 - [cache](cache_zh.md):可选读取加速;cache-ctl 可用同款 store client 作为 origin。
 - [guest-runtime flatten](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten_zh.md):镜像展平后经 `flatten-ctl export --upload` 入库。
-- [sandboxer](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox.md):磁盘 base 与快照的 Manifest key 引用。
+- [sandboxer](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox_zh.md):磁盘 base 与快照的 Manifest key 引用。
 - [系统架构](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox_zh.md):Manifest 抽象在平台中的位置。

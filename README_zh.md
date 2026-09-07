@@ -79,10 +79,10 @@ Reconcile Latest 工作流按 `main` 源码提交先后协调主线 Stable,同�
 - [docs/manifest_zh.md](docs/manifest_zh.md) — 二进制清单:分块 / 收敛加密 / 密钥表 / 读写 SDK。
 - [docs/store_zh.md](docs/store_zh.md) — 内容寻址存储:分代目录布局 / fs·S3-compatible object storage backend / GC。
 - [docs/cache_zh.md](docs/cache_zh.md) — 三层缓存 + 纠删码:local / shard / tiered 与旁路填充。
-- [docs/cache-redis.md](docs/cache-redis.md) — Redis-compatible UDS/TCP 后端、取消语义与外部 Dragonfly 部署示例。
+- [docs/cache-redis.md（英文）](docs/cache-redis.md) — Redis-compatible UDS/TCP 后端、取消语义与外部 Dragonfly 部署示例。
 OCI/目录 → EROFS 展平 CLI 见 [guest-runtime flatten](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten_zh.md);完整确定性还取决于所选输入、配置与工具链。
 
 ## License
 
 本仓库的项目原创内容采用 [Apache License 2.0](LICENSE).
-贡献授权说明见 [CONTRIBUTING.md](CONTRIBUTING.md).
+贡献授权说明见 [CONTRIBUTING.md（英文）](CONTRIBUTING.md).

@@ -39,7 +39,7 @@ object storage 的读取。embedded 部署可从本地 RocksDB BlockCache 服务
   socket、chmod 0600)。数据面客户端 `cache.endpoint` 填同址即可;控制面经 socket
   时,`ping` / `info --endpoint` 用 `unix:///` 形式。
 - **本地存储**:进程内 RocksDB,或通过 UDS/TCP 访问 Redis-compatible server;
-  后者的配置、取消语义和外部 Dragonfly 部署示例见 [cache-redis.md](cache-redis.md)。
+  后者的配置、取消语义和外部 Dragonfly 部署示例见 [cache-redis.md（英文）](cache-redis.md)。
 - **写入语义**:无应用层频率准入过滤。embedded 淘汰由 RocksDB CompactionFilter
   按 CMS 驱动;外部 Redis server 管理自己的淘汰/容量。两者都不保证存储/资源故障时写入成功。
 - **填充语义**:fill-aside,读路径上隐式回填上层。
@@ -852,7 +852,7 @@ cache stat tiered | get 5.1k/s 620MiB/s p50 40µs/p99 700µs/max 9ms · hit 94% 
 不能简单相加为 aggregate ratio。
 
 [项目性能文档](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf_zh.md)
-给出测量框架;[2026-07-17 backend A/B](cache-backend-ab-2026-07-17.md) 有明确 source/
+给出测量框架;[2026-07-17 backend A/B（英文）](cache-backend-ab-2026-07-17.md) 有明确 source/
 binary revision、负载、等 CPU 预算和 RAM-hot 结果。它**未验收 Dragonfly SSD tiering**:
 代表性 NVMe、active offload/defragmentation、近满容量和 repair 仍需单独验收。
 有限测量和旧目标表都不支持普遍延迟/容量保证。
