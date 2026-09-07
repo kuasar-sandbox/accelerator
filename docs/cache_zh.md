@@ -137,7 +137,7 @@ Flags:
   --trace string            bench 窗口内写执行 trace 到文件
 ```
 
-使用独立 prefill endpoint 时，省略 mode 和显式 `--mode mixed` 都会变为 `get`，`put` 等其他 mode 才会被拒绝。解读结果前检查输出的 effective mode。`--key-salt` 参与 warm、cold 和 write key 派生；重复或并发 run 使用同一 salt 会复用 deterministic keys，可能污染原定 cold read 或覆盖旧写入。独立 run 应使用唯一 salt，仓库 benchmark scripts 也采用这一方式。刻意使用慢 origin 或较大 prefill 时可增加 client timeout；超时不把 backend error 转成 clean cache miss。
+使用独立 prefill endpoint 时，省略 mode 和显式 `--mode mixed` 都会变为 `get`，`put` 等其他 mode 才会被拒绝。解读结果前检查输出的 effective mode。`--key-salt` 参与 warm、cold 和 write key 派生；重复或并发 run 使用同一 salt 会复用 deterministic keys，可能污染原定 cold read 或覆盖旧写入。独立 run 应使用唯一 salt。`test/scripts/bench_cache.sh` 提供 run/round/mode/concurrency salt；`test/scripts/bench_cache_remote.sh` 当前未传入 `--key-salt`，其并发度扫描可能复用前轮已预热的 keys。调用时未加入不同 salt 或重置相关 cache 状态之前，不应把后续轮次当作相互隔离的冷缓存测量。刻意使用慢 origin 或较大 prefill 时可增加 client timeout；超时不把 backend error 转成 clean cache miss。
 
 #### 基准方法学(L2 内存/磁盘路径、L3 透传、aging)
 
