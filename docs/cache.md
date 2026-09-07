@@ -461,7 +461,7 @@ chunk / manifest / blob 各用独立 CF:
 
 - **chunk CF**:高频写入(fill-aside),大 value(256 KiB 级);
 - **manifest CF**:低频写入,value 几 KiB 到若干 MiB;
-- **blob CF**:任意内容寻址数据(store 的第三 partition,见 [`store.md`](store.md)
+- **blob CF**:任意内容寻址数据(store 的第三 partition,见 [`store_zh.md`](store_zh.md)
   §4.6),机制同 chunk——同样的 BlobDB / Bloom / compaction filter,跟着
   generation 一起淘汰。
 
@@ -809,7 +809,7 @@ cache stat tiered | get 5.1k/s 620MiB/s p50 40µs/p99 700µs/max 9ms · hit 94% 
 
 ## 8. See Also
 
-- [`store.md`](store.md) — tiered 模式 origin = `store`(store gRPC 客户端)或
+- [`store_zh.md`](store_zh.md) — tiered 模式 origin = `store`(store gRPC 客户端)或
   `upstream`(另一台 cache-ctl);store 形态下 cache-ctl 自身**没有**任何文件系统
   读写权限,所有持久化集中在 store-ctl;store-ctl 亦可经 `cache_listen` 以**只读**
   方式直接讲本 wire 协议(chunk/manifest/blob,纯透传无 L1),省掉独立 cache-ctl

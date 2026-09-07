@@ -76,7 +76,7 @@ Reconcile Latest 工作流按 `main` 源码提交先后协调主线 Stable,同�
 ## 文档
 
 - [docs/manifest.md](docs/manifest.md) — 二进制清单:分块 / 收敛加密 / 密钥表 / 读写 SDK。
-- [docs/store.md](docs/store.md) — 内容寻址存储:分代目录布局 / fs·S3-compatible object storage backend / GC。
+- [docs/store_zh.md](docs/store_zh.md) — 内容寻址存储:分代目录布局 / fs·S3-compatible object storage backend / GC。
 - [docs/cache.md](docs/cache.md) — 三层缓存 + 纠删码:local / shard / tiered 与旁路填充。
 - [docs/cache-redis.md](docs/cache-redis.md) — Redis-compatible UDS/TCP 后端、取消语义与外部 Dragonfly 部署示例。
 OCI/目录 → EROFS 确定性展平 CLI 见 `guest-runtime/docs/flatten.md`。
