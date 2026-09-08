@@ -13,21 +13,9 @@ object storage 的读取。embedded 部署可从本地 RocksDB BlockCache 服务
 
 ### 1.1 解决的问题
 
-旧规划以 1–5 GiB 镜像、约 512 MiB 内存快照及万级并发消费者为例。每个消费者都从
-远端 S3-compatible object storage 拉取完整副本,可能带来显著时延与聚合带宽需求。
+并发消费者常常读取相同的不可变 chunk。本地和分布式缓存减少重复回源，同时保持 Manifest/Store 的身份与完整性契约。复用程度取决于工作集、安全域、缓存容量和请求时序；并发 miss、淘汰或 fill 失败仍可能导致重复回源。
 
-原文没有为下表附上可复现负载与运行记录,因此保留为**历史规划比较**,不是当前实现保证:
-
-| 维度 | 旧无缓存比较 | 旧缓存目标 | 实际依赖与边界 |
-|---|---|---|---|
-| 镜像冷启动 | 全量拉取为秒级 | 按需加载/命中 <500 ms | 工作集、格式、VM/runtime 启动、cache 状态及后端延迟;按需加载不必然要求命中缓存 |
-| 快照恢复 | 数百 ms | L1/L2 命中 <80 ms | 快照/负载、fault 数、存储/网络与 Host |
-| 网络流量 | 随消费者增加 | 仅首次 miss 回源 | 复用可减少远端读取,但淘汰、并发 miss、fill 失败和新内容仍会重复回源 |
-| 对象存储成本 | 随消费者增加 | 流量降低 >99% | 取决于实际请求/字节命中率与服务计价,无固定降幅保证 |
-
-实测联合命中率 99.9% 表示测量窗口中**平均**约每千次查询一次 miss,不是任意一千次
-最多一次。5 TiB 工作集也不保证每次至多一个随机 I/O;Index/Filter 驻留、SST/blob 读取、
-假阳性与 compaction 均影响 I/O(§4.4、§5)。
+按需加载只读取消费者需要的范围，不要求所有工件都经过缓存或对象存储。端到端启动/恢复还包含 VMM/Guest 执行及数据访问时延。命中率是具有明确分母的观测平均值，不是逐请求上界；索引/filter 驻留、误报、SST/blob 读取和 compaction 都会影响磁盘 I/O。
 
 ### 1.2 设计原则
 
@@ -107,62 +95,10 @@ cache-ctl info --rocks-path PATH               # 离线只读打开 RocksDB,查�
 检查运行中 daemon 应用远端 Info;本地只读打开用于离线/故障后检查,不承诺其他进程修改
 DB 文件时得到一致 live view。
 
+
 ### 2.6 `cache-ctl bench`
 
-内置吞吐/延迟基准,通过 wire 协议向运行中的 cache-ctl 发压。用于快速
-smoke 验证;不替代 `test/scripts/bench_cache.sh`(后者加 taskset CPU 固
-定 + 参数扫描)。
-
-```
-cache-ctl bench --endpoint host:port [flags]
-
-Flags:
-  --concurrency int         (default 8)
-  --duration duration       Go duration (default 10s)
-  --value-size int          (default 262144)  # 256 KiB
-  --mode string             "get" | "put" | "mixed";默认空,--prefill-endpoint 为空时解析为
-                            "mixed"；有 prefill 时空值/显式 mixed 都改为 get，put 等其他值报错
-  --namespace string        "chunk" | "manifest"
-  --prefill int             get/mixed 模式预写对象数 (default 1000)
-  --prefill-endpoint string 独立预写端点(默认同 --endpoint)
-  --info-endpoint value     Info gRPC 端点(HealthListen)，可重复；第一个端点同时用于 bench 目标预热判定
-  --access string           "seq" | "uniform" | "zipf" 读访问模式 (default "seq")
-  --zipf-s float            Zipf 偏斜指数 s (>1,越大越偏;仅 --access zipf) (default 1.1)
-  --cold-prefill int        额外只写 prefill 端点、不暖 bench 目标的冷 key 数(喂 L2-miss → L3)
-  --miss-ratio float        命中冷 key 的读比例 → L2 miss → 透传 origin/L3 (需 --cold-prefill>0 + --prefill-endpoint)
-  --key-salt string         隔离 deterministic warm/cold/write key 空间(默认空；独立 run 使用唯一值)
-  --timeout duration        客户端 per-op TCP deadline (default 10s;慢/卡 origin 大数据集 prefill 须调大)
-  --cpu-profile string      bench 窗口内写 CPU profile 到文件
-  --heap-profile string     bench 窗口结束后写 heap profile 到文件
-  --trace string            bench 窗口内写执行 trace 到文件
-```
-
-使用独立 prefill endpoint 时，省略 mode 和显式 `--mode mixed` 都会变为 `get`，`put` 等其他 mode 才会被拒绝。解读结果前检查输出的 effective mode。`--key-salt` 参与 warm、cold 和 write key 派生；重复或并发 run 使用同一 salt 会复用 deterministic keys，可能污染原定 cold read 或覆盖旧写入。独立 run 应使用唯一 salt。`test/scripts/bench_cache.sh` 提供 run/round/mode/concurrency salt；`test/scripts/bench_cache_remote.sh` 当前未传入 `--key-salt`，其并发度扫描可能复用前轮已预热的 keys。调用时未加入不同 salt 或重置相关 cache 状态之前，不应把后续轮次当作相互隔离的冷缓存测量。刻意使用慢 origin 或较大 prefill 时可增加 client timeout；超时不把 backend error 转成 clean cache miss。
-
-#### 基准方法学(L2 内存/磁盘路径、L3 透传、aging)
-
-`test/scripts/bench_cache_remote.sh report` 从同一份解析行生成完整 `README.md` / `README_zh.md` 报告并带双向选择器。按当前输出读取 `end-flight`、`errors` 之后的 `hit%`；origin-hit 占比为 origin 成功读取数 / benchmark ops，不包括 origin misses/errors。缺失 cache counter 保持 unknown。Read-through 与不带 salt 的重复 key 会改变观测，不能假定等于 `--miss-ratio`。
-
-多机压测见 [bench_cache_remote.sh](../test/scripts/bench_cache_remote.sh),部署 N shards、
-origin 与 tiered 并扫并发。使用 [procmon.sh](../test/scripts/procmon.sh) 的无依赖
-/proc CPU/diskstats/net 采样及 [proc_analyze.py](../test/scripts/proc_analyze.py) 归因。
-
-- **L2 内存与磁盘**:比较工作集与 `rocks.disk_bytes × mem_ratio`,同时扣除共享
-  BlockCache 中 index/filter 占用。工作集远小于可用 cache 可全 RAM 命中;远大于它可触发磁盘随机读。
-- **访问分布**:`uniform` 均匀遍历,暴露磁盘;`zipf` 模拟热点。偏斜过大可能让
-  实际热集进入 RAM,掩盖磁盘路径;测盘用 uniform 或远大于 cache 的工作集。
-- **EC hit 不等于 RAM hit**:只证明 shard 集群提供足够数据,RocksDB 内部 BlockCache
-  miss/读盘不由该计数体现。看 shard 主机 `rd_iops` 等磁盘指标证明实际落盘。
-- **L3 建模**:`--cold-prefill N` 只写 origin,`--miss-ratio f` 让约 f 比例查询冷
-  key。重复冷 key 经 fill-aside 变热,会降低实测回源率;冷池应大于窗口内预期冷读次数。
-- **aging/淘汰**:embedded 是频率式淘汰,不是 disk_bytes 配额。短窗 ops 远小于
-  reset_after 可能不触发次数衰减,但时间重置仍可能发生,一次访问的 key 也可能已在
-  阈值以内。用长窗与偏斜访问,观察实际 sketch/compaction,不能假定短测必不淘汰。
-- **可能的瓶颈**:RAM-hot 读取可压满协调节点网络/拷贝/CPU,工作集落盘可压满 shard
-  随机 I/O 并放大 quorum 尾延迟。EC 的 data shards 合计约一个对象的数据,另有 parity、
-  hedge 与协议开销,不是固定 `value-size × data_shards` 个完整对象。
-  “网卡必先满”“CPU 通常不影响”不是与硬件无关的事实。联合测量网络、磁盘、CPU、
-  并发与时延;让实测热集驻留可能有益,但架构不自动带来固定数量级收益。
+基准命令、工作负载控制、隔离与破坏性测试保护、结果解释统一见 [性能验证](#71-后端与-wire-基准测试)。
 
 ## 3. 配置
 
@@ -702,40 +638,15 @@ tiered 仅提供 object read chain,拒绝 writes 和 shard operations。协议�
 
 ### 5.1 L1(tiered 进程内嵌 embedded tier)
 
-保留旧预算作为背景,同时修正其适用边界:
+配置的 BlockCache 是一项主要 native-memory 额度，不是完整进程上限。memtable/write buffer、native metadata、BlobDB/compaction、wire payload pool、active/previous CMS generation 与临时 buffer 需分别计入。缓存中的 index/filter block 共享 BlockCache，不能再次视为独立 pinned 区域重复计数。
 
-| 区域 | 旧 1 TiB / 1% 估算 | 旧 100 GiB / 1% 估算 | 当前解释 |
-|---|---|---|---|
-| Go heap | <200 MiB | <200 MiB | 无强制上限;pools、CMS、EC、fill 并发与请求大小均占用 |
-| Index + Bloom | ~5 GiB | ~500 MiB | cache 中的 index/filter 共用 BlockCache,不是独立保证 pin 的额外预算 |
-| BlockCache | 10 GiB | 1 GiB | 精确计算为 **10.24 GiB** 和 **1 GiB**,另受最小 64 MiB 限制 |
-| OS page cache | DirectReads 时 0 | 0 | 支持的数据读减少 page cache,但不保证总使用为零 |
-| 总计 | <16 GiB | <1.7 GiB | 旧值不是有效的进程硬预算;实测 native/memtable、共享 cache、Go 与 OS 使用 |
-
-BlockCache 是重要 native-memory allowance,不是完整进程上限。另计 memtables/write
-buffers、native metadata、BlobDB/compaction、wire payload pools、CMS active/previous
-及临时 buffers;已计入共享 BlockCache 的 index/filter 不再重复计算。
+按 embedded 后端契约（§4.4）的实际配置和最小值推导 cache 额度。Go heap、在飞 request/fill 并发、native 与 OS 内存都取决于负载。DirectReads 可减少受支持数据读取的 page cache，但不表示全进程 page-cache 用量为零。应测量整个进程/cgroup，而非把单项额度当作总量限制。
 
 ### 5.2 L2(shard 专用节点)
 
-旧例为 **500 GiB RAM / 5 TiB SSD** 节点:
+按节点实际物理 key、分片编码、CF 分布和对象大小分布规划 shard 内存。理想化 Bloom 位预算为 `实际 key 数 × 每 key 位数 / 8`；索引、逐 entry 与 native 开销分别测量。不能把整个逻辑数据集重复计入每个 CF，也不能把完整对象数等同于编码后的 shard key 数。
 
-| 区域 | 旧分配估算 | 源码支持的大小/边界 |
-|---|---|---|
-| Go heap | <50 MiB | 负载相关,无 50 MiB 强制上限 |
-| Index + Bloom | ~50 GiB | 非独立保证 pinned 区域;metadata 共用 BlockCache |
-| BlockCache | ~400 GiB | `5 TiB × 0.08 = 409.6 GiB`,不是精确 400 GiB |
-| Go runtime + wire buffers | ~10 GiB | 规划余量,不是实测或强制界限 |
-
-原 key 数计算:`5 TiB / 256 KiB = 20,971,520` 个完整对象等价值。按 15 bits/key,
-理想 Bloom bits 合计约 **37.5 MiB**;假设每 key index 为 30 B,再加 **600 MiB**。
-不能由这些输入推出“每 CF 1 GiB Bloom”或 50 GiB pinned metadata 要求。
-实际条目、对象大小、shard 编码、CF 分布及 RocksDB 开销不同,按每 CF 实际 key 统计,
-不把整个数据集机械乘以每个 CF。
-
-L0 pin 与 index/filter cache 可减少 I/O,但不证明所有 metadata 常驻、miss 零 I/O 或
-hit 单次 I/O。Bloom 假阳性、SST 遍历与 BlobDB payload 读取仍存在。用实际负载验证
-内存和磁盘行为,包括冷读与 compaction。
+L0 pinning 与 index/filter cache 可减少 I/O，但不证明所有 metadata 常驻、miss 零 I/O 或 hit 只有一次 I/O。Bloom 误报、SST 遍历和 BlobDB payload 读取仍可能发生。应在真实 cold read、fill、repair 和 compaction 期间验收内存与磁盘行为，保留运维余量，不照搬历史主机分配表。
 
 ## 6. 运维
 
@@ -838,23 +749,67 @@ cache stat tiered | get 5.1k/s 620MiB/s p50 40µs/p99 700µs/max 9ms · hit 94% 
 
 ## 7. 性能特征
 
-原文时延数字是**历史目标**,不是任意请求/Host 的保证:
+分别测量 local、shard 和 tiered 路径，记录源码/二进制版本、硬件、后端配置、对象大小、并发、缓存状态与失败。比较前明确计时边界及 hit/miss 分母；各层条件命中率不能简单相加。缓存拓扑本身不构成普遍时延、命中率或容量保证。
 
-| 指标 | 历史 P50 目标 | 历史 P99 目标 |
-|---|---|---|
-| L1 SSD hit | <500 µs | — |
-| L1 BlockCache hot hit | <100 µs | — |
-| L2 hit | 550 µs | <4 ms |
-| L3 hit,fs origin | <50 ms | <200 ms |
+证据要求和外部服务部署验证见 [项目性能方法](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf_zh.md) 与 [Redis-compatible 后端指南（英文）](cache-redis.md)，现有命令和保护措施完整保留在下方。
 
-历史命中目标为 L1 >65%、L2 >99.9%、联合 >99.95%,不是配置保证。
-比较测量前定义 counter、分母、对象大小、并发与 cache 状态;条件 tier hit rate
-不能简单相加为 aggregate ratio。
+<a id="26-cache-ctl-bench"></a>
+## 7.1 后端与 wire 基准测试
 
-[项目性能文档](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf_zh.md)
-给出测量框架；后端相关的部署与验证要求见
-[Redis-compatible 后端指南（英文）](cache-redis.md)。
-结果仅适用于被测硬件、工作负载、缓存状态和后端配置；历史目标表不构成普遍的时延或容量保证。
+内置吞吐/延迟基准,通过 wire 协议向运行中的 cache-ctl 发压。用于快速
+smoke 验证;不替代 `test/scripts/bench_cache.sh`(后者加 taskset CPU 固
+定 + 参数扫描)。
+
+```
+cache-ctl bench --endpoint host:port [flags]
+
+Flags:
+  --concurrency int         (default 8)
+  --duration duration       Go duration (default 10s)
+  --value-size int          (default 262144)  # 256 KiB
+  --mode string             "get" | "put" | "mixed";默认空,--prefill-endpoint 为空时解析为
+                            "mixed"；有 prefill 时空值/显式 mixed 都改为 get，put 等其他值报错
+  --namespace string        "chunk" | "manifest"
+  --prefill int             get/mixed 模式预写对象数 (default 1000)
+  --prefill-endpoint string 独立预写端点(默认同 --endpoint)
+  --info-endpoint value     Info gRPC 端点(HealthListen)，可重复；第一个端点同时用于 bench 目标预热判定
+  --access string           "seq" | "uniform" | "zipf" 读访问模式 (default "seq")
+  --zipf-s float            Zipf 偏斜指数 s (>1,越大越偏;仅 --access zipf) (default 1.1)
+  --cold-prefill int        额外只写 prefill 端点、不暖 bench 目标的冷 key 数(喂 L2-miss → L3)
+  --miss-ratio float        命中冷 key 的读比例 → L2 miss → 透传 origin/L3 (需 --cold-prefill>0 + --prefill-endpoint)
+  --key-salt string         隔离 deterministic warm/cold/write key 空间(默认空；独立 run 使用唯一值)
+  --timeout duration        客户端 per-op TCP deadline (default 10s;慢/卡 origin 大数据集 prefill 须调大)
+  --cpu-profile string      bench 窗口内写 CPU profile 到文件
+  --heap-profile string     bench 窗口结束后写 heap profile 到文件
+  --trace string            bench 窗口内写执行 trace 到文件
+```
+
+使用独立 prefill endpoint 时，省略 mode 和显式 `--mode mixed` 都会变为 `get`，`put` 等其他 mode 才会被拒绝。解读结果前检查输出的 effective mode。`--key-salt` 参与 warm、cold 和 write key 派生；重复或并发 run 使用同一 salt 会复用 deterministic keys，可能污染原定 cold read 或覆盖旧写入。独立 run 应使用唯一 salt。`test/scripts/bench_cache.sh` 提供 run/round/mode/concurrency salt；`test/scripts/bench_cache_remote.sh` 当前未传入 `--key-salt`，其并发度扫描可能复用前轮已预热的 keys。调用时未加入不同 salt 或重置相关 cache 状态之前，不应把后续轮次当作相互隔离的冷缓存测量。刻意使用慢 origin 或较大 prefill 时可增加 client timeout；超时不把 backend error 转成 clean cache miss。
+
+### 基准方法学(L2 内存/磁盘路径、L3 透传、aging)
+
+`test/scripts/bench_cache_remote.sh report` 从同一份解析行生成完整 `README.md` / `README_zh.md` 报告并带双向选择器。按当前输出读取 `end-flight`、`errors` 之后的 `hit%`；origin-hit 占比为 origin 成功读取数 / benchmark ops，不包括 origin misses/errors。缺失 cache counter 保持 unknown。Read-through 与不带 salt 的重复 key 会改变观测，不能假定等于 `--miss-ratio`。
+
+多机压测见 [bench_cache_remote.sh](../test/scripts/bench_cache_remote.sh),部署 N shards、
+origin 与 tiered 并扫并发。使用 [procmon.sh](../test/scripts/procmon.sh) 的无依赖
+/proc CPU/diskstats/net 采样及 [proc_analyze.py](../test/scripts/proc_analyze.py) 归因。
+
+- **L2 内存与磁盘**:比较工作集与 `rocks.disk_bytes × mem_ratio`,同时扣除共享
+  BlockCache 中 index/filter 占用。工作集远小于可用 cache 可全 RAM 命中;远大于它可触发磁盘随机读。
+- **访问分布**:`uniform` 均匀遍历,暴露磁盘;`zipf` 模拟热点。偏斜过大可能让
+  实际热集进入 RAM,掩盖磁盘路径;测盘用 uniform 或远大于 cache 的工作集。
+- **EC hit 不等于 RAM hit**:只证明 shard 集群提供足够数据,RocksDB 内部 BlockCache
+  miss/读盘不由该计数体现。看 shard 主机 `rd_iops` 等磁盘指标证明实际落盘。
+- **L3 建模**:`--cold-prefill N` 只写 origin,`--miss-ratio f` 让约 f 比例查询冷
+  key。重复冷 key 经 fill-aside 变热,会降低实测回源率;冷池应大于窗口内预期冷读次数。
+- **aging/淘汰**:embedded 是频率式淘汰,不是 disk_bytes 配额。短窗 ops 远小于
+  reset_after 可能不触发次数衰减,但时间重置仍可能发生,一次访问的 key 也可能已在
+  阈值以内。用长窗与偏斜访问,观察实际 sketch/compaction,不能假定短测必不淘汰。
+- **可能的瓶颈**:RAM-hot 读取可压满协调节点网络/拷贝/CPU,工作集落盘可压满 shard
+  随机 I/O 并放大 quorum 尾延迟。EC 的 data shards 合计约一个对象的数据,另有 parity、
+  hedge 与协议开销,不是固定 `value-size × data_shards` 个完整对象。
+  “网卡必先满”“CPU 通常不影响”不是与硬件无关的事实。联合测量网络、磁盘、CPU、
+  并发与时延;让实测热集驻留可能有益,但架构不自动带来固定数量级收益。
 
 ## 8. See Also
 

@@ -347,6 +347,6 @@ race detector 需要启用 CGO 并具备可用 C 工具链。上面的普通测�
 
 ## 9. See also
 
-- [`manifest.md`](manifest_zh.md) — manifest ingest/fetch 与加密流程
-- [`cache.md`](cache_zh.md) — tiered cache、origin 和 wire protocol
+- [manifest_zh.md](manifest_zh.md) — manifest ingest/fetch 与加密流程
+- [cache_zh.md](cache_zh.md) — tiered cache、origin 和 wire protocol
 - 仓库根目录 `README.md` / `Makefile` — 构建和完整测试入口

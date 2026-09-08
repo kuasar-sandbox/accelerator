@@ -11,21 +11,11 @@
 ## 1. Overview
 
 <a id="11-解决的问题"></a>
-
 ### 1.1 Problem
 
-The original planning examples used 1–5 GiB images, roughly 512 MiB memory snapshots and tens of thousands of concurrent consumers. Fetching complete copies from remote object storage for every consumer can create substantial latency and aggregate bandwidth demand.
+Concurrent consumers often read common immutable chunks. Local and distributed cache tiers reduce repeated origin reads while preserving the Manifest/Store identity and integrity contracts. Reuse depends on the working set, configured security domain, cache capacity and request timing: concurrent misses, eviction and failed fills can cause repeated origin access.
 
-The previous document presented the figures below without a reproducible workload/run attached to them. They are retained as **historical planning comparisons**, not measured guarantees of the current implementation:
-
-| Dimension | Previous uncached comparison | Previous cached target | Actual dependency/limit |
-|---|---|---|---|
-| Image cold start | Seconds for a complete pull. | <500 ms with demand loading/cache hits. | Required working set, image format, VM/runtime startup, cache state and backend latency. Demand loading does not itself require a cache hit. |
-| Snapshot restore | Hundreds of milliseconds. | <80 ms on L1/L2 hits. | Snapshot/workload, fault count, storage/network and host behavior. |
-| Network traffic | Increasing with consumers. | Remote traffic only on the first miss. | Reuse can reduce remote reads, but eviction, concurrent misses, failed fills and new content can cause repeated origin reads. |
-| Remote object-storage cost | Increasing with consumers. | >99% traffic reduction. | Actual request/byte hit ratios and provider pricing; no fixed reduction is guaranteed. |
-
-A measured 99.9% aggregate hit ratio corresponds to about one miss per thousand queries **on average** over that measurement, not a maximum of one in every group of a thousand. A 5 TiB working set does not imply every request needs at most one random I/O. Index/filter residency, SST/blob reads, false positives and compaction all affect I/O (§4.4, §5).
+On-demand loading reads the ranges a consumer needs; it does not require every artifact to use a cache or object store. End-to-end startup/restore also includes VMM/guest execution and data-access latency. Cache hit ratios are observed averages with explicit denominators, not per-request bounds. Index/filter residency, false positives, SST/blob reads and compaction affect disk I/O even for a cache deployment.
 
 <a id="12-设计原则"></a>
 
@@ -97,51 +87,10 @@ Ping and remote Info target the **control-plane `health_listen`**, conventionall
 
 `info --rocks-path` opens RocksDB through **OpenDbForReadOnlyColumnFamilies**, not a secondary-instance API. Use remote Info to inspect a running daemon; offline read-only opening is intended for postmortem inspection and does not promise a coherent live view while another process modifies the files.
 
+
 ### 2.6 `cache-ctl bench`
 
-The built-in benchmark sends wire-protocol traffic to a running daemon for quick throughput/latency smoke checks. It does not replace [bench_cache.sh](../test/scripts/bench_cache.sh), which adds CPU affinity and parameter sweeps.
-
-```text
-cache-ctl bench --endpoint host:port [flags]
-
-Flags:
-  --concurrency int          (default 8)
-  --duration duration        Go duration (default 10s)
-  --value-size int           (default 262144; 256 KiB)
-  --mode string              get | put | mixed; empty defaults to mixed without
-                             prefill; with prefill, empty/mixed are changed to get
-  --namespace string         chunk | manifest
-  --prefill int              Objects prewritten for get/mixed (default 1000)
-  --prefill-endpoint string  Separate prefill endpoint (default: benchmark endpoint)
-  --info-endpoint value      Repeatable Info gRPC endpoint; the first also controls
-                             benchmark-target warmup checks
-  --access string            seq | uniform | zipf (default seq)
-  --zipf-s float             Zipf s > 1; larger is more skewed (default 1.1)
-  --cold-prefill int         Cold keys written only to prefill, not warmed at target
-  --miss-ratio float         Read share targeting cold keys; requires cold-prefill
-                             and a separate prefill endpoint
-  --key-salt string          Isolate deterministic warm/cold/write key spaces
-                             (default empty; use a unique value per isolated run)
-  --timeout duration        Per-operation client deadline (default 10s)
-  --cpu-profile string      CPU-profile file for the measurement window
-  --heap-profile string     Heap-profile file written after the window
-  --trace string            Execution-trace file for the window
-```
-
-With a separate prefill endpoint, both an omitted mode and explicit `--mode mixed` are changed to `get`; `put` and other modes are rejected. Inspect the reported effective mode before interpreting results. `--key-salt` participates in warm, cold, and write-key derivation: repeated or concurrent runs with the same salt reuse deterministic keys and can contaminate intended cold reads or overwrite prior writes. Use a unique salt for each isolated run. `test/scripts/bench_cache.sh` supplies a run/round/mode/concurrency salt; `test/scripts/bench_cache_remote.sh` currently does not pass `--key-salt`, so its concurrency sweep can reuse keys warmed by earlier rounds. Do not treat those later rounds as isolated cold-cache measurements without adding distinct salts at invocation or resetting the relevant cache state. Increase the client timeout when an intentionally slow origin or large prefill requires it; a timeout does not convert a backend error into a clean cache miss.
-
-<a id="基准方法学l2-内存磁盘路径l3-透传aging"></a>
-
-#### Benchmark methodology: L2 memory/disk, L3 and aging
-
-[bench_cache_remote.sh](../test/scripts/bench_cache_remote.sh) deploys N shards, origin and tiered daemons for a multi-host concurrency sweep. Its `report` subcommand emits complete `README.md` / `README_zh.md` reports with reciprocal selectors from the same parsed rows. It reads the current `hit%` column after `end-flight` and `errors`; origin-hit share counts successful origin reads divided by benchmark ops, excluding origin misses/errors. Missing cache counters remain unknown. Read-through and reused unsalted keys mean these observations need not equal `--miss-ratio`. Pair it with [procmon.sh](../test/scripts/procmon.sh), a dependency-free /proc CPU/diskstats/network sampler, and [proc_analyze.py](../test/scripts/proc_analyze.py) to attribute resource use.
-
-- **L2 memory versus disk:** compare the working set with `rocks.disk_bytes × mem_ratio`, accounting for index/filter usage inside the BlockCache budget. A working set well below available cache can be RAM-hot; one much larger than it can exercise real random disk reads.
-- **Access distribution:** uniform reads spread over the working set and expose the disk path. Zipf models hot-content skew, but excessive skew can fit the effective hot set in RAM and conceal disk behavior. Use uniform access or a much larger working set when measuring disk.
-- **EC hit rate is not RAM hit rate:** an EC hit means the shard cluster supplied enough data. RocksDB BlockCache misses and disk reads occur below that counter. Inspect shard-host disk IOPS, such as procmon `rd_iops`, to establish that the workload actually reached disk.
-- **L3 modeling:** `--cold-prefill N` writes only to origin, while `--miss-ratio f` selects those cold keys for roughly fraction f of reads. Repeated cold keys warm through fill-aside, lowering the measured origin-read ratio. Size the cold pool larger than the expected cold reads during the window.
-- **Aging/eviction:** embedded eviction is frequency based (§4.5), not a disk_bytes quota. A short run with total operations far below reset_after may not exercise count-driven decay; the time-driven reset can still fire, and once-touched keys can already be at or below the eviction threshold. Use a long window and skewed access, observing actual sketch/compaction behavior rather than assuming short runs cannot evict.
-- **Possible bottlenecks:** RAM-hot shard reads can saturate coordinator network/copy/CPU resources; disk-heavy working sets can saturate shard random I/O and amplify quorum tails. EC collects approximately one object's worth of data across data shards, with parity/hedging/protocol overhead, not automatically `value-size × data_shards` full-object bytes. Neither “the NIC always bottlenecks first” nor “CPU is usually irrelevant” is hardware-independent. Measure network, disk, CPU, concurrency and latency together. Keeping a measured hot set resident can improve performance, but no fixed order-of-magnitude gain follows from the architecture alone.
+Benchmark commands, workload controls, isolation/destructive-test safeguards and interpretation are maintained together in [performance validation](#71-backend-and-wire-benchmarks).
 
 <a id="3-配置"></a>
 
@@ -664,37 +613,18 @@ Tiered exposes only the object read chain. It rejects writes and shard operation
 ## 5. Memory budgeting
 
 <a id="51-l1tiered-进程内嵌-embedded-tier"></a>
-
 ### 5.1 L1: an embedded tier inside a tiered process
 
-The old budgets below are retained for context, with their limits corrected:
+The configured BlockCache is one major native-memory allowance, not a complete process limit. Account separately for memtables/write buffers, native metadata, BlobDB/compaction activity, wire payload pools, active/previous CMS generations and transient buffers. Cached index/filter blocks share the configured BlockCache; do not count them again as independently pinned memory.
 
-| Region | Old 1 TiB / 1% estimate | Old 100 GiB / 1% estimate | Current interpretation |
-|---|---|---|---|
-| Go heap | <200 MiB. | <200 MiB. | No enforced bound; pools, CMS, EC work, fill concurrency and request size contribute. |
-| Index + Bloom | ~5 GiB. | ~500 MiB. | Cached index/filter blocks share the configured BlockCache; these are not independently guaranteed pinned additions. |
-| BlockCache | 10 GiB. | 1 GiB. | Exact sizing inputs yield **10.24 GiB** and **1 GiB**, subject to the 64 MiB minimum. |
-| OS page cache | 0 with DirectReads. | 0. | DirectReads reduces supported data-read caching; it does not establish zero total page-cache usage. |
-| Total | <16 GiB. | <1.7 GiB. | These old totals are not valid hard process budgets. Include native/memtable, shared-cache, Go and operating-system usage from measurement. |
-
-The configured BlockCache is one major native-memory allowance, not a complete process limit. Account separately for memtables/write buffers, native metadata, BlobDB/compaction activity, wire payload pools, active/previous CMS generations and transient buffers. Avoid double-counting index/filter bytes that are already charged to the shared BlockCache.
+Derive the cache allowance from the actual sizing configuration and minimum size in the embedded-backend contract (§4.4). Go heap, in-flight request/fill concurrency and native/OS memory are workload-dependent. DirectReads can reduce supported data-read page caching but does not imply zero process-wide page-cache use. Measure the whole process/cgroup rather than treating one allowance as an enforced total.
 
 <a id="52-l2shard-专用节点"></a>
-
 ### 5.2 L2: dedicated shard nodes
 
-The original example used a **500 GiB RAM / 5 TiB SSD** node:
+Size shard nodes from their actual physical keys, shard coding, CF distribution and object-size distribution. An idealized Bloom bit budget is `actual keys × bits per key / 8`; index and per-entry/native overhead are separate and should be measured. Do not multiply the entire logical dataset by every CF or equate complete-object count with encoded shard-key count.
 
-| Region | Old allocation estimate | Source-backed sizing/limit |
-|---|---|---|
-| Go heap | <50 MiB. | Workload-dependent; no code-enforced 50 MiB cap. |
-| Index + Bloom | ~50 GiB. | Not a separately guaranteed pinned region; cached metadata shares BlockCache. |
-| BlockCache | ~400 GiB. | `5 TiB × 0.08 = 409.6 GiB`, not exactly 400 GiB. |
-| Go runtime + wire buffers | ~10 GiB. | A planning allowance, not a measured or enforced bound. |
-
-For the old key-count calculation, `5 TiB / 256 KiB = 20,971,520` complete-object equivalents. At 15 bits/key, the idealized Bloom bit count is about **37.5 MiB**; a hypothetical 30-byte index record per key adds **600 MiB**. These inputs do not derive “1 GiB Bloom per CF” or a 50 GiB pinned-metadata requirement. Real entries, object sizes, shard encoding, CF distribution and RocksDB overhead differ; account for actual keys in each CF rather than multiplying the entire dataset by every CF.
-
-L0 pinning and cached indexes/filters can reduce I/O but do not prove all metadata stays resident, zero-I/O misses or single-I/O hits. Bloom false positives, SST traversal and BlobDB payload reads remain possible. Validate memory and disk behavior on the actual workload, including cold reads and compaction.
+L0 pinning and cached indexes/filters can reduce I/O but do not prove all metadata stays resident, zero-I/O misses or single-I/O hits. Bloom false positives, SST traversal and BlobDB payload reads remain possible. Validate memory and disk behavior under actual cold reads, fills, repair and compaction, leaving operating margin rather than copying a historical host allocation.
 
 <a id="6-运维"></a>
 
@@ -792,21 +722,58 @@ This is a format example, not a fresh benchmark. In tiered mode, internal fill w
 Adaptive statistics give ongoing window-level visibility; Info provides cumulative values for scripts and benchmark deltas. CACHE_CTL_DEBUG instead focuses on abnormal long tails.
 
 <a id="7-性能特征"></a>
-
 ## 7. Performance characteristics
 
-The earlier latency figures were **targets**, not promises for every request or host:
+Measure local, shard and tiered paths separately, recording source/binary revisions, hardware, backend configuration, object sizes, concurrency, cache state and failures. Define timing boundaries and hit/miss denominators before comparing measurements. Conditional per-tier hit rates cannot simply be added. No universal latency, hit-rate or capacity guarantee follows from a cache topology.
 
-| Metric | Historical P50 target | Historical P99 target |
-|---|---|---|
-| L1 SSD hit | <500 µs. | — |
-| L1 BlockCache hot hit | <100 µs. | — |
-| L2 hit | 550 µs. | <4 ms. |
-| L3 hit, fs origin | <50 ms. | <200 ms. |
+Use the [project performance methodology](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf.md) and [Redis-compatible backend guide](cache-redis.md) for evidence and external-service deployment validation. Existing commands and safeguards follow below.
 
-Historical hit-rate targets were L1 >65%, L2 >99.9%, and combined L1+L2 >99.95%. They are not configured guarantees. Define the counters, denominators, object sizes, concurrency and cache states before comparing measurements; conditional tier hit rates cannot simply be added into an aggregate ratio.
+<a id="26-cache-ctl-bench"></a>
+## 7.1 Backend and wire benchmarks
 
-Use the [project performance guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf.md) for the measurement framework. For backend-specific deployment and validation considerations, see the [Redis-compatible backend guide](cache-redis.md). Results apply only to the tested hardware, workload, cache state and backend configuration; historical target tables do not establish universal latency or capacity guarantees.
+The built-in benchmark sends wire-protocol traffic to a running daemon for quick throughput/latency smoke checks. It does not replace [bench_cache.sh](../test/scripts/bench_cache.sh), which adds CPU affinity and parameter sweeps.
+
+```text
+cache-ctl bench --endpoint host:port [flags]
+
+Flags:
+  --concurrency int          (default 8)
+  --duration duration        Go duration (default 10s)
+  --value-size int           (default 262144; 256 KiB)
+  --mode string              get | put | mixed; empty defaults to mixed without
+                             prefill; with prefill, empty/mixed are changed to get
+  --namespace string         chunk | manifest
+  --prefill int              Objects prewritten for get/mixed (default 1000)
+  --prefill-endpoint string  Separate prefill endpoint (default: benchmark endpoint)
+  --info-endpoint value      Repeatable Info gRPC endpoint; the first also controls
+                             benchmark-target warmup checks
+  --access string            seq | uniform | zipf (default seq)
+  --zipf-s float             Zipf s > 1; larger is more skewed (default 1.1)
+  --cold-prefill int         Cold keys written only to prefill, not warmed at target
+  --miss-ratio float         Read share targeting cold keys; requires cold-prefill
+                             and a separate prefill endpoint
+  --key-salt string          Isolate deterministic warm/cold/write key spaces
+                             (default empty; use a unique value per isolated run)
+  --timeout duration        Per-operation client deadline (default 10s)
+  --cpu-profile string      CPU-profile file for the measurement window
+  --heap-profile string     Heap-profile file written after the window
+  --trace string            Execution-trace file for the window
+```
+
+With a separate prefill endpoint, both an omitted mode and explicit `--mode mixed` are changed to `get`; `put` and other modes are rejected. Inspect the reported effective mode before interpreting results. `--key-salt` participates in warm, cold, and write-key derivation: repeated or concurrent runs with the same salt reuse deterministic keys and can contaminate intended cold reads or overwrite prior writes. Use a unique salt for each isolated run. `test/scripts/bench_cache.sh` supplies a run/round/mode/concurrency salt; `test/scripts/bench_cache_remote.sh` currently does not pass `--key-salt`, so its concurrency sweep can reuse keys warmed by earlier rounds. Do not treat those later rounds as isolated cold-cache measurements without adding distinct salts at invocation or resetting the relevant cache state. Increase the client timeout when an intentionally slow origin or large prefill requires it; a timeout does not convert a backend error into a clean cache miss.
+
+<a id="基准方法学l2-内存磁盘路径l3-透传aging"></a>
+
+### Benchmark methodology: L2 memory/disk, L3 and aging
+
+[bench_cache_remote.sh](../test/scripts/bench_cache_remote.sh) deploys N shards, origin and tiered daemons for a multi-host concurrency sweep. Its `report` subcommand emits complete `README.md` / `README_zh.md` reports with reciprocal selectors from the same parsed rows. It reads the current `hit%` column after `end-flight` and `errors`; origin-hit share counts successful origin reads divided by benchmark ops, excluding origin misses/errors. Missing cache counters remain unknown. Read-through and reused unsalted keys mean these observations need not equal `--miss-ratio`. Pair it with [procmon.sh](../test/scripts/procmon.sh), a dependency-free /proc CPU/diskstats/network sampler, and [proc_analyze.py](../test/scripts/proc_analyze.py) to attribute resource use.
+
+- **L2 memory versus disk:** compare the working set with `rocks.disk_bytes × mem_ratio`, accounting for index/filter usage inside the BlockCache budget. A working set well below available cache can be RAM-hot; one much larger than it can exercise real random disk reads.
+- **Access distribution:** uniform reads spread over the working set and expose the disk path. Zipf models hot-content skew, but excessive skew can fit the effective hot set in RAM and conceal disk behavior. Use uniform access or a much larger working set when measuring disk.
+- **EC hit rate is not RAM hit rate:** an EC hit means the shard cluster supplied enough data. RocksDB BlockCache misses and disk reads occur below that counter. Inspect shard-host disk IOPS, such as procmon `rd_iops`, to establish that the workload actually reached disk.
+- **L3 modeling:** `--cold-prefill N` writes only to origin, while `--miss-ratio f` selects those cold keys for roughly fraction f of reads. Repeated cold keys warm through fill-aside, lowering the measured origin-read ratio. Size the cold pool larger than the expected cold reads during the window.
+- **Aging/eviction:** embedded eviction is frequency based (§4.5), not a disk_bytes quota. A short run with total operations far below reset_after may not exercise count-driven decay; the time-driven reset can still fire, and once-touched keys can already be at or below the eviction threshold. Use a long window and skewed access, observing actual sketch/compaction behavior rather than assuming short runs cannot evict.
+- **Possible bottlenecks:** RAM-hot shard reads can saturate coordinator network/copy/CPU resources; disk-heavy working sets can saturate shard random I/O and amplify quorum tails. EC collects approximately one object's worth of data across data shards, with parity/hedging/protocol overhead, not automatically `value-size × data_shards` full-object bytes. Neither “the NIC always bottlenecks first” nor “CPU is usually irrelevant” is hardware-independent. Measure network, disk, CPU, concurrency and latency together. Keeping a measured hot set resident can improve performance, but no fixed order-of-magnitude gain follows from the architecture alone.
 
 ## 8. See Also
 
