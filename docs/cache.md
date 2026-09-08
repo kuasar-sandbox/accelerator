@@ -806,7 +806,7 @@ The earlier latency figures were **targets**, not promises for every request or 
 
 Historical hit-rate targets were L1 >65%, L2 >99.9%, and combined L1+L2 >99.95%. They are not configured guarantees. Define the counters, denominators, object sizes, concurrency and cache states before comparing measurements; conditional tier hit rates cannot simply be added into an aggregate ratio.
 
-Use the [project performance guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf.md) for the measurement framework. The [2026-07-17 backend A/B report](cache-backend-ab-2026-07-17.md) records specific source/binary revisions, workload, equal CPU budgets and RAM-hot results. It **does not qualify Dragonfly SSD tiering**; representative NVMe, active offload/defragmentation, near-full capacity and repair acceptance remain separate. Neither those limited measurements nor old target tables justify a universal latency/capacity claim.
+Use the [project performance guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf.md) for the measurement framework. For backend-specific deployment and validation considerations, see the [Redis-compatible backend guide](cache-redis.md). Results apply only to the tested hardware, workload, cache state and backend configuration; historical target tables do not establish universal latency or capacity guarantees.
 
 ## 8. See Also
 

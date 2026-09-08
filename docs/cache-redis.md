@@ -8,9 +8,8 @@ or a direct TCP connection for all physical cache roles:
 - `mode: tiered`, `type: redis`: a node-local complete-object tier.
 
 The Accelerator configuration and implementation refer only to the Redis
-protocol. Dragonfly is one evaluated external server when the working set must
-extend to local NVMe; it is not a separate backend type or an Accelerator
-release component.
+protocol. Dragonfly is one example of a separately managed external server,
+not a separate backend type or an Accelerator release component.
 
 ## Configuration
 
@@ -166,9 +165,6 @@ or tiered instance can refill after restart. For RS(4+1), restart at most one
 shard peer at a time and rate-limit repair while that peer is cold.
 
 ## Backend A/B benchmark
-
-The current BMS hot-path result and deployment decision are recorded in
-[`cache-backend-ab-2026-07-17.md`](cache-backend-ab-2026-07-17.md).
 
 The repository's existing cache wire benchmark can select the physical store
 without changing its client workload:

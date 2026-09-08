@@ -852,10 +852,9 @@ cache stat tiered | get 5.1k/s 620MiB/s p50 40µs/p99 700µs/max 9ms · hit 94% 
 不能简单相加为 aggregate ratio。
 
 [项目性能文档](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf_zh.md)
-给出测量框架;[2026-07-17 backend A/B（英文）](cache-backend-ab-2026-07-17.md) 有明确 source/
-binary revision、负载、等 CPU 预算和 RAM-hot 结果。它**未验收 Dragonfly SSD tiering**:
-代表性 NVMe、active offload/defragmentation、近满容量和 repair 仍需单独验收。
-有限测量和旧目标表都不支持普遍延迟/容量保证。
+给出测量框架；后端相关的部署与验证要求见
+[Redis-compatible 后端指南（英文）](cache-redis.md)。
+结果仅适用于被测硬件、工作负载、缓存状态和后端配置；历史目标表不构成普遍的时延或容量保证。
 
 ## 8. See Also
 
