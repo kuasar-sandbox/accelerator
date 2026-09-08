@@ -1,3 +1,5 @@
+//go:build !no_rocksdb
+
 package rocks
 
 import (
@@ -41,6 +43,9 @@ type impl struct {
 	wo       *grocksdb.WriteOptions
 	readOnly bool
 }
+
+// Compile-time assertion that impl satisfies Interface.
+var _ Interface = (*impl)(nil)
 
 // Open creates or opens a RocksDB store at the given path in read-write
 // mode. The sketch is constructed internally from freqCfg and persisted
