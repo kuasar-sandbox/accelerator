@@ -13,7 +13,9 @@ import (
 // Info gRPC service.
 //
 // Obtained via Open (read-write) or OpenReadOnly (read-only — Fill /
-// FillShard return ErrReadOnly on such instances).
+// FillShard return ErrReadOnly on such instances). Under the no_rocksdb
+// build tag both constructors return ErrNotCompiled and the interface
+// exists only to keep the public API shape stable.
 type Interface interface {
 	cache.Tier
 	cache.ShardTier
@@ -23,6 +25,3 @@ type Interface interface {
 	// disk-usage, mem-usage, ...) for each user column family.
 	AllStats() []CFStats
 }
-
-// Compile-time assertion that impl satisfies Interface.
-var _ Interface = (*impl)(nil)

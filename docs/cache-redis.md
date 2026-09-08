@@ -237,3 +237,14 @@ currently requires Linux 5.19 or newer with `io_uring`. Capacity and latency
 acceptance must include active offload/defragmentation and near-full disk
 states; the systemd sample is deployment scaffolding, not a performance
 qualification result.
+
+## Build without RocksDB
+
+`make cache-ctl NO_ROCKSDB=1` builds the normal `cache-ctl` artifact with
+RocksDB support compiled out (`CGO_ENABLED=0`, `-tags no_rocksdb`). Only
+the RocksDB implementation files in `pkg/cache/rocks` carry the build tag;
+the rest of the codebase is unaware of it. `rocks.Open` returns a
+`not compiled` error in this build, so configs selecting `type: embedded`
+fail at daemon startup with an error naming the tag. The default
+`make cache-ctl` artifact is unchanged. `make test-no-rocksdb` compiles,
+vets, and tests the tagged surface without any `librocksdb` present.

@@ -54,6 +54,7 @@ Do not interpret content encryption as a claim that every threat model leaks no 
 ```bash
 make manifest-ctl store-ctl     # pure-Go command-line services
 make cache-ctl                  # build the cache service and its current backend dependencies
+make cache-ctl NO_ROCKSDB=1     # build cache-ctl without RocksDB (-tags no_rocksdb, CGO_ENABLED=0)
 make build                      # all component binaries
 make build TARGET_ARCH=aarch64  # cross-compile; amd64/arm64 aliases are accepted
 make vet                        # validate the thin downstream-facing Go surface
