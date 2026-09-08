@@ -232,6 +232,10 @@ manifest-ctl diff <manifest-a> <manifest-b>
 
 Both arguments are local Manifest files, which can be obtained with `get-manifest`. `diff` neither opens a store nor loads a configuration or customer key.
 
+`shared` and `only in A/B` count distinct nonzero ContentKeys, not repeated entry positions. Their byte totals sum each unique chunk's logical size once, not compressed/encrypted Store bytes. Zero entries and holes are excluded from these sets; image size, raw entry count and holes remain separately reported. Conflicting logical sizes for the same ContentKey, within or across inputs, are rejected.
+
+The CLI's `dedup ratio` is `1 - |A ∪ B| / (|A| + |B|)`, with zero for an empty denominator. Pairwise overlap (Jaccard), used by the warm-pool workload, is instead `shared / (shared + onlyA + onlyB)`. Neither is a universal VM-memory saving guarantee. Illustrative output:
+
 ```text
 manifest A:  10.0 GiB, 20480 chunks (20480 unique)
 manifest B:  10.1 GiB, 20512 chunks (20512 unique)

@@ -238,6 +238,10 @@ manifest-ctl diff <manifest-a> <manifest-b>
 两个参数均为本地 Manifest 文件(可用 `get-manifest` 取回);diff 不打开 store,
 也不加载配置或 customer key。
 
+`shared` 与 `only in A/B` 统计不同的非零 ContentKey，不按重复 entry 位置累计。对应字节总数对每个唯一 chunk 的逻辑大小只求和一次，不是压缩/加密后的 Store 字节数。零条目与 hole 不进入这些集合；镜像大小、原始 entry 数和 hole 仍独立报告。同一 ContentKey 在单个输入内或两个输入间具有冲突的逻辑大小时拒绝比较。
+
+CLI 的 `dedup ratio` 为 `1 - |A ∪ B| / (|A| + |B|)`，分母为空时取零。warm-pool 工作负载使用的成对重叠度（Jaccard）则为 `shared / (shared + onlyA + onlyB)`。两者都不保证通用的 VM 内存节省。以下仅为示例输出：
+
 ```
 manifest A:  10.0 GiB, 20480 chunks (20480 unique)
 manifest B:  10.1 GiB, 20512 chunks (20512 unique)
