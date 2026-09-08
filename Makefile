@@ -10,7 +10,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all build manifest-ctl store-ctl cache-ctl deps-rocksdb test vet bench test-e2e perf-cache perf-cache-remote dedup-report release test-release clean help
+.PHONY: all build manifest-ctl store-ctl cache-ctl deps-rocksdb test test-no-rocksdb vet bench test-e2e perf-cache perf-cache-remote dedup-report release test-release clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -46,6 +46,27 @@ CGO_CFLAGS         := -I$(ROCKS_PREFIX)/include
 CGO_LDFLAGS_STATIC := -L$(ROCKS_PREFIX)/lib -Wl,-Bstatic -lrocksdb -lstdc++ -Wl,-Bdynamic -lm -lpthread -ldl
 GOLDFLAGS_STATIC   := -linkmode=external -extldflags "-static-libstdc++ -static-libgcc"
 
+# NO_ROCKSDB=1 builds cache-ctl with RocksDB support compiled out:
+# no librocksdb prerequisite, CGO_ENABLED=0, -tags no_rocksdb. The output
+# artifact is the same $(BINDIR)/cache-ctl — same program, different
+# compile-time feature set.
+NO_ROCKSDB ?= 0
+
+ifeq ($(NO_ROCKSDB),1)
+CACHE_CTL_DEPS  :=
+CACHE_CTL_CGO   := 0
+CACHE_CTL_TAGS  := no_rocksdb
+CACHE_CTL_BUILD = GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=$(CACHE_CTL_CGO) \
+    $(GO) build $(GO_BUILD_FLAGS) -tags $(CACHE_CTL_TAGS) -o $(BINDIR)/cache-ctl ./cmd/cache-ctl
+else
+CACHE_CTL_DEPS  := deps-rocksdb
+CACHE_CTL_CGO   := 1
+CACHE_CTL_TAGS  :=
+CACHE_CTL_BUILD = GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=$(CACHE_CTL_CGO) \
+    CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS_STATIC)" \
+    $(GO) build $(GO_BUILD_FLAGS) -ldflags '$(GOLDFLAGS_STATIC)' -o $(BINDIR)/cache-ctl ./cmd/cache-ctl
+endif
+
 # Native-only symlink: bin/<name> -> $(TARGET_ARCH)/<name>. $(1) = basename.
 define link_bin
 @if [ "$(HOST_ARCH)" = "$(TARGET_ARCH)" ]; then \
@@ -70,12 +91,10 @@ store-ctl:
 	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o $(BINDIR)/store-ctl ./cmd/store-ctl
 	$(call link_bin,store-ctl)
 
-# cache-ctl requires CGO for RocksDB.
-cache-ctl: deps-rocksdb
+# cache-ctl: the artifact target. NO_ROCKSDB=1 compiles RocksDB out.
+cache-ctl: $(CACHE_CTL_DEPS)
 	@mkdir -p $(BINDIR)
-	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=1 \
-	    CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS_STATIC)" \
-	    $(GO) build $(GO_BUILD_FLAGS) -ldflags '$(GOLDFLAGS_STATIC)' -o $(BINDIR)/cache-ctl ./cmd/cache-ctl
+	$(CACHE_CTL_BUILD)
 	$(call link_bin,cache-ctl)
 
 # Build librocksdb.a locally (no compression). ~minutes cold.
@@ -87,11 +106,18 @@ $(ROCKS_PREFIX)/lib/librocksdb.a:
 	TARBALL_CACHE="$(abspath build/tarball)" \
 		bash deps/build-rocksdb.sh
 
+# Compile/vet/test the no_rocksdb surface. Needs no librocksdb.
+test-no-rocksdb:
+	CGO_ENABLED=0 $(GO) build -tags no_rocksdb ./...
+	CGO_ENABLED=0 $(GO) vet -tags no_rocksdb ./...
+	CGO_ENABLED=0 $(GO) test -tags no_rocksdb ./pkg/cache/rocks
+
 # Unit tests. cache/rocks tests need librocksdb (dynamic link is fine here).
 test: deps-rocksdb
 	CGO_CFLAGS="$(CGO_CFLAGS)" \
 	CGO_LDFLAGS="-L$(ROCKS_PREFIX)/lib -lrocksdb -lstdc++ -lm -lpthread -ldl" \
 		$(GO) test ./...
+	$(MAKE) test-no-rocksdb
 	bash test/scripts/bench_cache_test.sh
 
 # vet the CGO-free client surface (no librocksdb needed).
@@ -141,7 +167,7 @@ help:
 	@echo "  build         build manifest-ctl + store-ctl + cache-ctl"
 	@echo "  manifest-ctl  pure Go"
 	@echo "  store-ctl     pure Go"
-	@echo "  cache-ctl     CGO + librocksdb (auto deps-rocksdb)"
+	@echo "  cache-ctl     CGO + librocksdb (auto deps-rocksdb); NO_ROCKSDB=1 to compile RocksDB out"
 	@echo "  deps-rocksdb  build local librocksdb.a"
 	@echo "  test          unit tests (needs librocksdb for cache/rocks)"
 	@echo "  vet           vet the CGO-free client surface"

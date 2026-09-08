@@ -44,6 +44,7 @@ RocksDB / AWS SDK / Reed-Solomon 等重依赖:
 ```bash
 make manifest-ctl store-ctl     # 两个纯 Go 二进制
 make cache-ctl                  # 自动 make deps-rocksdb 编出 librocksdb.a 再 CGO 静态链
+make cache-ctl NO_ROCKSDB=1     # 不带 RocksDB 构建 cache-ctl(-tags no_rocksdb,CGO_ENABLED=0)
 make build                      # 全部三个
 make build TARGET_ARCH=aarch64  # 交叉编译(别名 amd64 / arm64)
 make vet                        # 校验薄客户端面(无需 librocksdb)
