@@ -78,6 +78,8 @@ Reconcile Latest 工作流按 `main` 源码提交先后协调主线 Stable,同�
 ## 文档
 
 - [docs/manifest_zh.md](docs/manifest_zh.md) — 二进制清单:分块 / 收敛加密 / 密钥表 / 读写 SDK。
+- [文件工件与载体](docs/file-artifacts_zh.md) — 不可变 tarstream 加密、Bundle 布局、访问及发布。
+
 - [docs/store_zh.md](docs/store_zh.md) — 内容寻址存储:分代目录布局 / fs·S3-compatible object storage backend / GC。
 - [docs/cache_zh.md](docs/cache_zh.md) — 三层缓存 + 纠删码:local / shard / tiered 与旁路填充。
 - [docs/cache-redis.md（英文）](docs/cache-redis.md) — Redis-compatible UDS/TCP 后端、取消语义与外部 Dragonfly 部署示例。

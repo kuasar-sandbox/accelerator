@@ -88,6 +88,8 @@ See the [project release documentation](https://github.com/kuasar-sandbox/kuasar
 Manifest, Store and Cache have complete English and Chinese editions. Existing English backend guides remain available:
 
 - [Manifest — English](docs/manifest.md) / [Chinese](docs/manifest_zh.md) — sparse manifests, ingest/fetch, chunking, encryption, key tables, and public SDKs;
+- [File artifacts and carriers](docs/file-artifacts.md) — immutable tarstream encryption, Bundle layout, access and publication.
+
 - [Store — English](docs/store.md) / [Chinese](docs/store_zh.md) — filesystem and S3-compatible stores, generation layout, integrity, and garbage collection;
 - [Cache — English](docs/cache.md) / [Chinese](docs/cache_zh.md) — local, sharded, tiered, and erasure-coded caches;
 - [`docs/cache-redis.md`](docs/cache-redis.md) — Redis-compatible UDS/TCP backend and external-service deployment examples.
