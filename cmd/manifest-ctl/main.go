@@ -740,55 +740,31 @@ func cmdDiff(args []string) {
 	if err != nil {
 		fatal("unmarshal manifest-b: %v", err)
 	}
-	setA := make(map[[32]byte]struct{})
-	var bytesA uint64
-	for _, e := range mA.Entries {
-		if !e.IsZero {
-			setA[e.CiphertextHash] = struct{}{}
-			bytesA += uint64(e.Size)
-		}
-	}
-	setB := make(map[[32]byte]struct{})
-	var bytesB uint64
-	for _, e := range mB.Entries {
-		if !e.IsZero {
-			setB[e.CiphertextHash] = struct{}{}
-			bytesB += uint64(e.Size)
-		}
-	}
+	setA := uniqueChunkSizes(mA)
+	setB := uniqueChunkSizes(mB)
 	var shared, onlyA, onlyB int
 	var sharedBytes, onlyABytes, onlyBBytes uint64
-	for _, e := range mA.Entries {
-		if e.IsZero {
-			continue
-		}
-		if _, ok := setB[e.CiphertextHash]; ok {
+	for hash, size := range setA {
+		if sizeB, ok := setB[hash]; ok {
+			if size != sizeB {
+				fatal("chunk %x has conflicting sizes: %d and %d", hash, size, sizeB)
+			}
 			shared++
-			sharedBytes += uint64(e.Size)
+			sharedBytes += uint64(size)
 		} else {
 			onlyA++
-			onlyABytes += uint64(e.Size)
+			onlyABytes += uint64(size)
 		}
 	}
-	for _, e := range mB.Entries {
-		if e.IsZero {
-			continue
-		}
-		if _, ok := setA[e.CiphertextHash]; !ok {
+	for hash, size := range setB {
+		if _, ok := setA[hash]; !ok {
 			onlyB++
-			onlyBBytes += uint64(e.Size)
+			onlyBBytes += uint64(size)
 		}
 	}
 	uniqueA := len(setA)
 	uniqueB := len(setB)
-	merged := make(map[[32]byte]struct{})
-	for h := range setA {
-		merged[h] = struct{}{}
-	}
-	for h := range setB {
-		merged[h] = struct{}{}
-	}
-	uniqueMerged := len(merged)
+	uniqueMerged := shared + onlyA + onlyB
 	totalUnique := uniqueA + uniqueB
 	var dedupRatio float64
 	if totalUnique > 0 {
@@ -809,6 +785,22 @@ func cmdDiff(args []string) {
 	fmt.Printf("only in A:   %d chunks (%s)\n", onlyA, formatSize(onlyABytes))
 	fmt.Printf("only in B:   %d chunks (%s)\n", onlyB, formatSize(onlyBBytes))
 	fmt.Printf("dedup ratio: %.1f%%\n", dedupRatio*100)
+}
+
+// Diff compares content-key sets, not repeated positions in an image. Zero
+// entries have no Store object; sizes here are logical, not encoded bytes.
+func uniqueChunkSizes(m *codec.Manifest) map[[32]byte]uint32 {
+	set := make(map[[32]byte]uint32)
+	for _, entry := range m.Entries {
+		if entry.IsZero {
+			continue
+		}
+		if size, ok := set[entry.CiphertextHash]; ok && size != entry.Size {
+			fatal("chunk %x has conflicting sizes: %d and %d", entry.CiphertextHash, size, entry.Size)
+		}
+		set[entry.CiphertextHash] = entry.Size
+	}
+	return set
 }
 
 // ---------------------------------------------------------------------------
