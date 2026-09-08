@@ -422,18 +422,14 @@ cache 淘汰按频率进行,不等于 store 的 generation 生命周期。
 - `blob_file_size = 256 MiB`:blob 文件目标大小。
 - BlobDB GC 开启:后台回收无引用的 blob 文件。
 
-大 value 在 LSM 中留下 key/blob reference,payload 追加到 blob 文件,可减少普通 key
-compaction 重写的大 value 数据。旧文 ~50 bytes/key-reference、1–3× 对 10–30×
-写放大是**未核验的历史估算**,不是实测上限;实际取决于 key、RocksDB 格式、负载、
-compaction 和 blob GC。读取 blob value 可能在找到 SST reference 后还需额外 I/O。
+大 value 在 LSM 中留下 key/blob reference，payload 追加到 blob 文件，可减少普通 key compaction 重写的大 value 数据。实际写放大取决于 key、RocksDB 格式、负载、compaction 和 blob GC。读取 blob value 可能在找到 SST reference 后还需额外 I/O。
 
 #### DirectReads
 
 UseDirectReads 默认 true,对支持的数据读取绕过 OS page cache。
 
 - **L1 与 Manifest consumer 同节点**:减少 BlockCache 与 OS 对同一数据的重复缓存。
-- **L2 专用节点**:较大 BlockCache 配置下同样可减少重复。旧文“占节点 RAM 80%”
-  是部署大小选择,不是 daemon 规则。
+- **L2 专用节点**：较大 BlockCache 配置下同样可减少重复。BlockCache 大小由部署选择，不是 daemon 规则。
 
 这不表示进程 page-cache 使用为零、I/O 记账完全自管,或不存在 native/write-buffer 内存。
 
@@ -497,7 +493,7 @@ cache application 不在 Go 中维护第二套 payload SLRU/LRU:
 - 降低可能影响尾延迟的 payload allocation/GC 压力。
 - RocksDB BlockCache 管理 RAM 复用,频率 filter 管理 embedded 磁盘淘汰。
 
-旧文 “Go 内存 <200 MiB” 不是代码强制上限。CMS active/previous、重置/序列化临时
+CMS active/previous、重置/序列化临时
 buffer、wire pools、EC 工作和并发都占内存;RocksDB native allocation 又在 Go heap
 之外。Redis backend 遵守外部 server 的内存策略。
 
@@ -576,7 +572,7 @@ EC 客户端只在 tiered 的 tier chain 中使用。
 - 4 data + 1 parity 共 5 shards,除非初始配置/clamp 选择其他方案。
 - 一致 4+1 编码中任意 **4 个不同有效 idx** 可重建;其余数据完好时容忍 1 shard 不可用。
 - parity 相对逻辑数据为 25% 开销,尚未计 length prefix/padding/metadata;
-  三完整副本为 200% 额外开销。旧文约 20% 延迟改善没有可复现证据,不作为当前保证;
+  三完整副本为 200% 额外开销。
   quorum 时延取决于拓扑和负载。
 
 #### Padding
@@ -590,8 +586,7 @@ EC 客户端只在 tiered 的 tier chain 中使用。
 
 #### Maglev 一致性哈希
 
-映射使用仓内 [Maglev 实现](../pkg/maglev/maglev.go)。旧“150 virtual-node ring”
-对照混合了未经证实的复杂度、均衡和迁移数字,按源码修正为:
+映射使用仓内 [Maglev 实现](../pkg/maglev/maglev.go)。按源码比较如下：
 
 | 维度 | 经典 ring | 本实现 Maglev |
 |---|---|---|
@@ -785,6 +780,117 @@ Flags:
 ```
 
 使用独立 prefill endpoint 时，省略 mode 和显式 `--mode mixed` 都会变为 `get`，`put` 等其他 mode 才会被拒绝。解读结果前检查输出的 effective mode。`--key-salt` 参与 warm、cold 和 write key 派生；重复或并发 run 使用同一 salt 会复用 deterministic keys，可能污染原定 cold read 或覆盖旧写入。独立 run 应使用唯一 salt。`test/scripts/bench_cache.sh` 提供 run/round/mode/concurrency salt；`test/scripts/bench_cache_remote.sh` 当前未传入 `--key-salt`，其并发度扫描可能复用前轮已预热的 keys。调用时未加入不同 salt 或重置相关 cache 状态之前，不应把后续轮次当作相互隔离的冷缓存测量。刻意使用慢 origin 或较大 prefill 时可增加 client timeout；超时不把 backend error 转成 clean cache miss。
+
+### 后端 A/B 基准测试
+
+现有 cache wire benchmark 可选择物理后端,而不改变客户端 workload:
+
+```bash
+# Embedded RocksDB baseline.
+SERVER_CORES=0-7 CLIENT_CORES=8-11 \
+  PREFILL=1000 DURATION=5s \
+  ACCESS=uniform GET_CONCS='1 4 16 32' MIXED_CONCS=8 \
+  bash test/scripts/bench_cache.sh
+
+# Redis-compatible local backend. Start a disposable, empty server first.
+BENCH_BACKEND=redis REDIS_RESET=flushdb \
+  REDIS_ENDPOINT=unix:///run/kuasar-bench/redis.sock \
+  SERVER_CORES=0-3 BACKEND_CORES=4-7 CLIENT_CORES=8-11 \
+  PREFILL=1000 DURATION=5s \
+  ACCESS=uniform GET_CONCS='1 4 16 32' MIXED_CONCS=8 \
+  bash test/scripts/bench_cache.sh
+```
+
+`bench_cache.sh` 只管理 cache-ctl 进程。Redis-compatible server 是外部部署组件,
+操作者须将其进程固定到 `BACKEND_CORES`,提供隔离 namespace,并在测试后停止它。
+脚本只在报告中记录 `BACKEND_CORES`,不会实际应用该 CPU 绑定。报告必须同时记录
+cache-ctl 和后端的 CPU 分配;将无限额 Dragonfly 与有限额 embedded 进程比较不是有效 A/B。
+
+`REDIS_RESET=flushdb` 是必须显式选择的破坏性操作,每个 endpoint 都必须专供本次基准。
+脚本在首个测点前及测点之间清空后端,然后重启自己管理的 cache-ctl daemon;
+embedded 模式则重新创建 RocksDB 路径,以保持各轮容量与冷 key 状态一致。
+external cache-ctl 模式不能重置后端状态,每次调用只允许一个测点。
+该模式下 Redis endpoint、pool 和 timeout 字段只有显式提供时才记录,否则标为 unknown。
+不覆盖 phase 时,external 模式只运行 GET/concurrency 1。
+设置 `GET_CONCS`、`PUT_CONCS` 或 `MIXED_CONCS` 后,未指定的 phase 为空,
+且选定 phase 仍只能有一个测点。pool size 为零时报告实际 cache-ctl 默认值:GET 32、SET 8。
+
+external split-prefill 模式的唯一测点必须是 GET,不能是 PUT/mixed。
+两个脚本自管 tiered 场景即使被测后端为 Redis,也会启动 embedded RocksDB origin,
+因此需要默认启用 RocksDB 的二进制。`no_rocksdb` 可用于 Redis local/external 场景,
+但不能提供该内置 embedded origin。需要保留证据时设置 `KEEP_WORKDIR=1`:
+本机脚本默认在退出时删除临时配置、原始输出/TSV 与 profiles,失败时也会删除。
+
+EC 路径必须提供恰好五个独立 Redis endpoint:
+
+```bash
+BENCH_SCENARIO=tiered-shard-l2 BENCH_BACKEND=redis REDIS_RESET=flushdb \
+  REDIS_SHARD_ENDPOINTS='unix:///run/df1.sock unix:///run/df2.sock unix:///run/df3.sock unix:///run/df4.sock unix:///run/df5.sock' \
+  SERVER_CORES=0-3 BACKEND_CORES=4-7 CLIENT_CORES=8-11 \
+  ACCESS=uniform GET_CONCS='1 4 16 32' \
+  bash test/scripts/bench_cache.sh
+```
+
+每个 shard peer 拥有独立物理存储 namespace。多个 peer 指向同一 Redis namespace 无效:
+同一 content key 的不同 EC shard index 会彼此覆盖。生产通常分散到不同节点;
+单机基准须使用不同 server instance 或其他真正隔离的 namespace。
+
+热命中验收要求工作集适合所配内存。SSD tier 验收要求 uniform 工作集大于 server RAM
+预算,观察 offloaded-entry 与 pending-I/O 指标,且存储匹配生产 NVMe 等级。
+虚拟块设备结果可用于功能性 tiering 测试,不能作为生产时延证明。
+
+[Dragonfly SSD tiering](https://www.dragonflydb.io/docs/managing-dragonfly/tiering)
+当前要求 Linux 5.19 或更新版本及 `io_uring`。容量与时延验收必须覆盖活跃 offload/
+defragmentation 和磁盘接近写满的状态;systemd 示例只提供部署配置,不是性能验收结果。
+
+### 多机基准与清理安全
+
+只使用专用、可丢弃的基准主机,将下例文档地址替换为明确隔离的实际拓扑。
+生成的数据、health 与 profiling listener 在 `17070–17072`、`17080–17082`、
+`17090–17092` 绑定 `0.0.0.0`;启动前限制网络访问。
+二进制须匹配远端架构与 libc,SSH 须免交互且独立核验 host key。
+下例显式 `SSH_OPTS` 覆盖脚本默认关闭的 host-key checking。
+
+`REMOTE_DIR` 必须是远端用户主目录下新建的简单相对路径,`RESULTS_DIR` 必须专用。
+该脚本的 shell 插值不是安全的路径净化边界:不得使用空白、shell 元字符、路径穿越、
+宽泛目录或共享数据目录。
+
+```bash
+make cache-ctl
+export SHARDS='192.0.2.11 192.0.2.12 192.0.2.13 192.0.2.14 192.0.2.15'
+export ORIGIN_HOST=192.0.2.21 TIERED_HOST=192.0.2.21 BENCH_HOST=192.0.2.21
+export BINARY=bin/cache-ctl REMOTE_DIR=cache-bench-run-001
+export RESULTS_DIR=build/cache-bench-run-001
+export SSH_OPTS='-o ConnectTimeout=30 -o StrictHostKeyChecking=yes -o BatchMode=yes'
+export ACCESS=uniform CONCS='4 16 64' DURATION=30s
+bash test/scripts/bench_cache_remote.sh deploy
+bash test/scripts/bench_cache_remote.sh start all
+bash test/scripts/bench_cache_remote.sh health
+bash test/scripts/bench_cache_remote.sh bench
+bash test/scripts/bench_cache_remote.sh report
+bash test/scripts/bench_cache_remote.sh stop
+```
+
+`deploy` 会覆盖远端二进制与配置。`bench` 删除远端 `results/bench-c*.*`,随后复制结果并覆盖对应本地文件;
+其他旧并发度的本地日志仍会保留。`report` 覆盖 `RESULTS_DIR` 中生成的两个 README 报告。
+先保留旧证据,每次运行使用独立结果目录。远端 benchmark 经 `tee` 管道输出但未启用远端 `pipefail`,
+SSH 成功不代表 benchmark 成功;须检查原始日志、错误与预期的完整测量。
+
+`stop` 在选定主机上使用宽泛的 `pkill -f 'cache-ctl serve'`,不是本次 run 的 PID。
+独立目录不能隔离进程;脚本可能忽略远端停止失败,必须核验目标进程实际停止。
+不得选择仍运行其他 cache-ctl 服务的主机。
+
+`clean` 先停止服务,然后删除 `REMOTE_DIR` 下远端 `rocks-*`、整个 `results` 目录和顶层 `*.log`,
+以及 `RESULTS_DIR` 下本地 `bench-c*.log`/`bench-c*.pprof`。清理前核对具体主机与可丢弃路径。
+`all` 顺序执行 clean → deploy → start → health → bench → report,**结束时不停止服务**。
+使用上面的独立命令逐步执行;不得对共享服务或非临时数据运行 `stop`、`clean` 或 `all`。
+
+记录 workload 参数 `VALUE_SIZE`、`PREFILL`、`COLD_PREFILL`、`MISS_RATIO`、`ACCESS`、
+`ZIPF_S`、`CONCS`、`DURATION`、`TIMEOUT`,拓扑/编码参数 `EC_DATA`/`EC_PARITY`,
+后端参数 `SHARD_DISK`、`SHARD_MEM_RATIO`、`SHARD_BLOCK_SIZE`、`DIRECT_READS`、
+`BLOOM_BITS`、`ORIGIN_DISK`。生成的 shard/origin 配置默认 `freq.disable_eviction: true`,
+除非在自己管理的基准配置中明确开启并记录,否则不构成 aging 验证。
+远端扫描不传 key salt,也不在并发测点之间重置 cache,后续测点不是相互隔离的冷缓存测量。
 
 ### 基准方法学(L2 内存/磁盘路径、L3 透传、aging)
 

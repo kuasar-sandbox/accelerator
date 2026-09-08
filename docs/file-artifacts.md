@@ -66,7 +66,7 @@ Manifest and Chunk payloads are the unchanged bytes of their existing physical o
 
 Every local entry uses `zip.Store`, flags 0, no data descriptor and no local extra. Comments, timestamps, permissions and platform fields are fixed. Exactly one `bundle/index` must be the final local entry; its last 256 payload bytes immediately precede the real Central Directory.
 
-A Bundle uses no ZIP Deflate, ZIP encryption, whole-file SHA/HMAC, outer encryption, custom pack format, root entry or JSON/YAML metadata. Old `admission/*` names, old unindexed Bundles, duplicate/unknown entries, directory entries, invalid keys/admissions and truncation are rejected by the appropriate profile/verification path. Ordinary open intentionally defers some object/container checks; it is not the strict full-container verifier ([§4.10.4](#4104-explicit-strict-verification-and-exact-upload)).
+A Bundle uses no ZIP Deflate, ZIP encryption, whole-file SHA/HMAC, outer encryption, custom pack format, root entry or JSON/YAML metadata. Old `admission/*` names, old unindexed Bundles, duplicate/unknown entries, directory entries, invalid keys/admissions and truncation are rejected by the appropriate profile/verification path. Ordinary open intentionally defers some object/container checks; it is not the strict full-container verifier ([§2.4](#4104-explicit-strict-verification-and-exact-upload)).
 
 <a id="4101-bundleindex-v1"></a>
 ### 2.1 `bundle/index` v1
@@ -201,9 +201,9 @@ Strict paths then verify the full closure and object content. A missing but unac
 1. The caller selects the current/refs Bundle for each logical Manifest key at OpenManifest level. Dependencies already strictly verified in the destination Store do not enter the Bundle upload plan.
 2. Before any admission or Put, run the complete CD/LFH/index container verifier on every actual source in that plan.
 3. Before any Put, call `AdmitWriteFor(recorded.Generation)` for all actual source admissions. Returned Generation and Salt must match the recorded bytes exactly.
-4. Force verification of every selected Manifest's physical ContentKey, parse it, unseal its table with the customer key, and prove its entire chunk closure resides in that same source Bundle.
-5. For every actually used unique chunk in each source, force physical ContentKey verification, decrypt/decompress to original plaintext, and require `DeriveKey(sourceAdmission.Salt, plaintext)` to equal the table's key. Reject one ContentKey associated with inconsistent keys or plaintext sizes across Manifests.
-6. Upload all chunks concurrently first, then dependency Manifests, and publish the caller-specified current root last.
+4. Force verification of every selected Manifest's physical ContentKey, parse it, unseal its table with the customer key, and prove its entire chunk closure resides in that same source Bundle. Before any Put, reject one ContentKey associated with inconsistent keys or plaintext sizes across Manifests.
+5. Concurrent workers process every actually used unique chunk in each source: force physical ContentKey verification, decrypt/decompress to original plaintext, and require `DeriveKey(sourceAdmission.Salt, plaintext)` to equal the table's key, then Put that verified chunk. This is per-chunk verify-then-upload, not a global plaintext-verification barrier.
+6. Only after all chunk workers succeed, upload dependency Manifests and publish the caller-specified current root last. A later chunk verification or upload failure can leave earlier verified chunks in Store, but prevents publication of the root.
 
 Each object uses its source Bundle's recorded admission. Upload neither redirects objects to the newest generation nor rechunks, recompresses, re-encrypts, reseals the table or rewrites upper-level `snapshot.cfg`. Root ManifestKey and physical bytes remain unchanged. Failure in admission preflight, dependency verification or Put prevents final root publication. Refs and admission entries are container metadata, not Store objects, and are not uploaded.
 

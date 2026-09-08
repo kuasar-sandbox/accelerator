@@ -160,8 +160,8 @@ rpc Put(stream PutRequest) returns (PutResponse);
 ```
 
 `AdmitWriteRequest.generation` 为空时保持选择最新可写 generation 的原语义；非空时
-先校验名称，再要求它仍在本请求读取的当前列表中，否则返回
-`FailedPrecondition`。成功响应始终返回该 generation 的 canonical
+名称非法时返回 `InvalidArgument`;名称有效但不在本请求读取的当前列表中时返回
+`FailedPrecondition`。服务端 generation 列表为空时返回 `Unavailable`。成功响应始终返回该 generation 的 canonical
 `WriteAdmission`。官方 Go client 保留 `AdmitWrite(ctx)`，并新增
 `AdmitWriteFor(ctx, generation)`；Put wire 与 Backend 接口不变。
 

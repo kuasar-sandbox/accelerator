@@ -4,7 +4,7 @@
 
 # manifest — the interface to content-addressed storage
 
-`manifest-ctl` is the entry and exit point for content-addressed data. Image, memory-snapshot, disk and user-file bytes can be ingested through the sparse-source API; the CLI `store` command specifically accepts a **tarstream artifact**, not an arbitrary raw file. Ingest produces a **Manifest**: a compact binary object containing chunk metadata and a sealed table of chunk keys. Its content key is the handle for later `load` operations and `manifest://<key>` references. Local Manifest Bundles provide another carrier for the same objects ([§4.10](file-artifacts.md#410-multi-manifest-zip-bundles)).
+`manifest-ctl` is the entry and exit point for content-addressed data. Image, memory-snapshot, disk and user-file bytes can be ingested through the sparse-source API; the CLI `store` command specifically accepts a **tarstream artifact**, not an arbitrary raw file. Ingest produces a **Manifest**: a compact binary object containing chunk metadata and a sealed table of chunk keys. Its content key is the handle for later `load` operations and `manifest://<key>` references. Local Manifest Bundles provide another carrier for the same objects ([§2](file-artifacts.md#410-multi-manifest-zip-bundles)).
 
 <a id="1-概述"></a>
 
@@ -514,11 +514,21 @@ Snappy scratch uses explicit size-class free lists, not a `sync.Pool` with no re
 Prefetch still performs only full physical-object cache Get and immediate Release. It neither verifies/decrypts nor populates the plaintext cache. Thus prefetch and on-demand ReadAt may each issue a Get, while repeated on-demand partial reads are coalesced and reused inside the Stream.
 
 
+<a id="49-本地-immutable-tarstream-加密"></a>
+
 ### 4.9 Local immutable tarstream encryption
 
 The complete file-carrier contract is maintained in [file-artifacts.md](file-artifacts.md#1-immutable-local-tarstreams-and-encryption). Manifest logical content/key rules remain in this document.
 
 
+<a id="410-多-manifest-zip-bundle"></a>
+<a id="4101-bundleindex-v1"></a>
+<a id="4102-metadata-prefix-and-reader-io"></a>
+<a id="4102-metadata-prefix-与-reader-io"></a>
+<a id="4103-source-selection-chunk-preparation-and-ordinary-restore"></a>
+<a id="4103-source-selectionchunk-preparation-与普通-restore"></a>
+<a id="4104-explicit-strict-verification-and-exact-upload"></a>
+<a id="4104-显式严格验证与-exact-upload"></a>
 ### 4.10 Multi-Manifest ZIP Bundles
 
 The complete file-carrier contract is maintained in [file-artifacts.md](file-artifacts.md#2-multi-manifest-bundle-carrier). Manifest logical content/key rules remain in this document.

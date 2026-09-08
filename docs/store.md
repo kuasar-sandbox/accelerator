@@ -144,7 +144,7 @@ rpc Get(GetRequest) returns (stream GetResponse);
 rpc Put(stream PutRequest) returns (PutResponse);
 ```
 
-An empty `AdmitWriteRequest.generation` keeps the existing behavior of choosing the newest writable generation. A nonempty value is first name-validated and must be in the current list observed by this request; otherwise the server returns `FailedPrecondition`. A successful response always returns the canonical `WriteAdmission` for that generation. The official Go client retains `AdmitWrite(ctx)` and additionally provides `AdmitWriteFor(ctx, generation)`. Put wire format and the Backend interface are unchanged.
+An empty `AdmitWriteRequest.generation` keeps the existing behavior of choosing the newest writable generation. A nonempty invalid name returns `InvalidArgument`; a valid name absent from the current list observed by this request returns `FailedPrecondition`. An empty server generation list returns `Unavailable`. A successful response always returns the canonical `WriteAdmission` for that generation. The official Go client retains `AdmitWrite(ctx)` and additionally provides `AdmitWriteFor(ctx, generation)`. Put wire format and the Backend interface are unchanged.
 
 `PutHeader` contains the partition, 32-byte key, generation and a presence-aware `optional uint64 size`. Zero means a known empty object; only absence means unknown size. The official Go client receives a complete `[]byte`, so it always sends `uint64(len(data))`. The server checks overflow before converting to `int64`.
 

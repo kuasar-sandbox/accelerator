@@ -412,14 +412,14 @@ All three CFs enable RocksDB BlobDB with fixed options, not YAML knobs:
 - `blob_file_size = 256 MiB`: target blob-file sizing.
 - Blob garbage collection is enabled to reclaim stale/unreferenced blob data.
 
-Large values leave a key/blob reference in the LSM; payloads are appended to blob files, reducing the amount of large-value data rewritten during ordinary key compaction. The old guide quoted roughly 50 bytes per key/reference and 1–3× versus 10–30× write amplification. Those are **unverified historical estimates**, not measured bounds: key sizes, RocksDB format, workload, compaction and blob GC determine actual amplification. Fetching a blob value can require additional I/O beyond locating its SST reference.
+Large values leave a key/blob reference in the LSM; payloads are appended to blob files, reducing the amount of large-value data rewritten during ordinary key compaction. Actual amplification depends on key sizes, RocksDB format, workload, compaction and blob GC. Fetching a blob value can require additional I/O beyond locating its SST reference.
 
 #### DirectReads
 
 UseDirectReads defaults to true and bypasses the OS page cache for supported data reads.
 
 - **L1 beside Manifest consumers:** it reduces duplicated data caching between RocksDB BlockCache and the OS.
-- **Dedicated L2:** it can similarly reduce duplication when a large BlockCache is configured. The original 80%-of-node-RAM assumption is a deployment sizing choice, not a daemon rule.
+- **Dedicated L2:** it can similarly reduce duplication when a large BlockCache is configured. BlockCache sizing is a deployment choice, not a daemon rule.
 
 It does not mean the process has zero page-cache use, completely self-contained I/O accounting, or no other native/write-buffer memory.
 
@@ -484,7 +484,7 @@ The cache application does not maintain a second payload SLRU/LRU in Go:
 - Reduce payload allocation/GC pressure that can affect latency tails.
 - Let RocksDB's BlockCache manage RAM reuse and the frequency filter manage embedded disk eviction.
 
-The old “Go memory <200 MiB” figure is not an implementation-enforced limit. CMS active/previous generations, transient reset/serialization buffers, wire pools, EC work and concurrency consume memory, while RocksDB's native allocations are outside Go heap. Redis backends follow their external server's memory policy.
+CMS active/previous generations, transient reset/serialization buffers, wire pools, EC work and concurrency consume memory, while RocksDB's native allocations are outside Go heap. Redis backends follow their external server's memory policy.
 
 <a id="46-tieredcache-与读路径"></a>
 
@@ -557,7 +557,7 @@ The EC client is used as a tier in tiered mode.
 
 - Four data shards and one parity shard, five total, unless initial configuration/clamping selects another scheme.
 - Any **four distinct valid indexes** can reconstruct the object in a consistent 4+1 scheme, tolerating one unavailable shard when the remaining data is intact.
-- Parity adds 25% relative to logical data, before length-prefix, padding and metadata overhead. Three complete replicas add 200%. The old claim of about 20% latency improvement was not tied to reproducible evidence and is not a current guarantee; quorum timing depends on topology and load.
+- Parity adds 25% relative to logical data, before length-prefix, padding and metadata overhead. Three complete replicas add 200%. Quorum timing depends on topology and load.
 
 #### Padding
 
@@ -572,7 +572,7 @@ The object size need not be divisible by the data-shard count k:
 
 #### Maglev consistent hashing
 
-Shard placement uses the repository's [Maglev implementation](../pkg/maglev/maglev.go). The earlier comparison against a “150 virtual-node ring” combined unsupported complexity, balance and remapping figures. The source-backed comparison is:
+Shard placement uses the repository's [Maglev implementation](../pkg/maglev/maglev.go). The source-backed comparison is:
 
 | Dimension | Classic ring | This Maglev table |
 |---|---|---|
@@ -761,6 +761,108 @@ Flags:
 ```
 
 With a separate prefill endpoint, both an omitted mode and explicit `--mode mixed` are changed to `get`; `put` and other modes are rejected. Inspect the reported effective mode before interpreting results. `--key-salt` participates in warm, cold, and write-key derivation: repeated or concurrent runs with the same salt reuse deterministic keys and can contaminate intended cold reads or overwrite prior writes. Use a unique salt for each isolated run. `test/scripts/bench_cache.sh` supplies a run/round/mode/concurrency salt; `test/scripts/bench_cache_remote.sh` currently does not pass `--key-salt`, so its concurrency sweep can reuse keys warmed by earlier rounds. Do not treat those later rounds as isolated cold-cache measurements without adding distinct salts at invocation or resetting the relevant cache state. Increase the client timeout when an intentionally slow origin or large prefill requires it; a timeout does not convert a backend error into a clean cache miss.
+
+### Backend A/B benchmark
+
+The repository's existing cache wire benchmark can select the physical store
+without changing its client workload:
+
+```bash
+# Embedded RocksDB baseline.
+SERVER_CORES=0-7 CLIENT_CORES=8-11 \
+  PREFILL=1000 DURATION=5s \
+  ACCESS=uniform GET_CONCS='1 4 16 32' MIXED_CONCS=8 \
+  bash test/scripts/bench_cache.sh
+
+# Redis-compatible local backend. Start a disposable, empty server first.
+BENCH_BACKEND=redis REDIS_RESET=flushdb \
+  REDIS_ENDPOINT=unix:///run/kuasar-bench/redis.sock \
+  SERVER_CORES=0-3 BACKEND_CORES=4-7 CLIENT_CORES=8-11 \
+  PREFILL=1000 DURATION=5s \
+  ACCESS=uniform GET_CONCS='1 4 16 32' MIXED_CONCS=8 \
+  bash test/scripts/bench_cache.sh
+```
+
+`bench_cache.sh` manages only cache-ctl processes. The Redis-compatible server
+is an external deployment component, so the operator must pin its process to
+`BACKEND_CORES`, give the benchmark an isolated namespace, and stop it after
+the run.
+`BACKEND_CORES` is recorded in the report but is not applied by the script.
+Report both cache-ctl and backend CPU allocations; comparing an unbounded
+Dragonfly process with a bounded embedded process is not a valid A/B.
+`REDIS_RESET=flushdb` is deliberately explicit and destructive: every endpoint
+must be dedicated to the benchmark. The harness clears it before the first
+point and between points, then restarts its cache-ctl daemons. Embedded runs
+recreate their RocksDB paths instead. This keeps capacity and cold-key state
+identical across the sweep. External cache-ctl mode cannot reset backing state
+and accepts only one point per invocation. In that mode, Redis endpoint, pool
+and timeout fields are reported only when explicitly provided; otherwise the
+report marks them as unknown.
+With no phase override, external mode runs one GET point at concurrency 1.
+Setting `GET_CONCS`, `PUT_CONCS`, or `MIXED_CONCS` makes unspecified phases
+empty, and the selected phase must still contain exactly one point. A pool size
+of zero is reported as its effective cache-ctl default (32 GET, 8 SET).
+
+In external split-prefill mode, the single point must be GET, not PUT/mixed. Both harness-owned tiered scenarios start an embedded RocksDB origin even when the measured backend is Redis, so they require the normal RocksDB-enabled binary. `no_rocksdb` can serve Redis local/external scenarios but not that built-in embedded origin. Set `KEEP_WORKDIR=1` when retaining evidence: by default the local harness deletes its temporary configs, raw outputs/TSV and profiles on exit, including failure.
+
+For the EC path, provide exactly five independent Redis endpoints:
+
+```bash
+BENCH_SCENARIO=tiered-shard-l2 BENCH_BACKEND=redis REDIS_RESET=flushdb \
+  REDIS_SHARD_ENDPOINTS='unix:///run/df1.sock unix:///run/df2.sock unix:///run/df3.sock unix:///run/df4.sock unix:///run/df5.sock' \
+  SERVER_CORES=0-3 BACKEND_CORES=4-7 CLIENT_CORES=8-11 \
+  ACCESS=uniform GET_CONCS='1 4 16 32' \
+  bash test/scripts/bench_cache.sh
+```
+
+Each shard peer owns a physical storage namespace. Pointing multiple shard
+peers at the same Redis namespace is invalid because their values for one
+content key represent different EC shard indexes and would overwrite each
+other. In production those endpoints normally reside on different nodes; a
+single-host benchmark must use separate server instances or otherwise
+isolated namespaces.
+
+Hot-hit acceptance requires a working set that fits the configured memory.
+SSD-tier acceptance requires a uniform working set larger than the server's
+RAM budget, observed offloaded-entry and pending-I/O metrics, and storage that
+matches the production NVMe class. Results from a virtual block device may be
+used for functional tiering tests but not for the production latency claim.
+
+[Dragonfly SSD tiering](https://www.dragonflydb.io/docs/managing-dragonfly/tiering)
+currently requires Linux 5.19 or newer with `io_uring`. Capacity and latency
+acceptance must include active offload/defragmentation and near-full disk
+states; the systemd sample is deployment scaffolding, not a performance
+qualification result.
+
+### Multi-host benchmark and cleanup safety
+
+Use dedicated, disposable benchmark hosts and replace the documentation addresses below with the intended isolated topology. The generated data, health and profiling listeners bind `0.0.0.0` on ports `17070–17072`, `17080–17082` and `17090–17092`; restrict network access before startup. Use a binary matching the remote architecture and libc, and passwordless SSH with independently verified host keys. The explicit `SSH_OPTS` below overrides the harness's disabled host-key checking.
+
+Choose a fresh, simple relative `REMOTE_DIR` beneath the remote user's home and a dedicated `RESULTS_DIR`. Shell interpolation in this harness is not a safe path-sanitization boundary: do not use whitespace, shell metacharacters, traversal, broad directories or shared data locations.
+
+```bash
+make cache-ctl
+export SHARDS='192.0.2.11 192.0.2.12 192.0.2.13 192.0.2.14 192.0.2.15'
+export ORIGIN_HOST=192.0.2.21 TIERED_HOST=192.0.2.21 BENCH_HOST=192.0.2.21
+export BINARY=bin/cache-ctl REMOTE_DIR=cache-bench-run-001
+export RESULTS_DIR=build/cache-bench-run-001
+export SSH_OPTS='-o ConnectTimeout=30 -o StrictHostKeyChecking=yes -o BatchMode=yes'
+export ACCESS=uniform CONCS='4 16 64' DURATION=30s
+bash test/scripts/bench_cache_remote.sh deploy
+bash test/scripts/bench_cache_remote.sh start all
+bash test/scripts/bench_cache_remote.sh health
+bash test/scripts/bench_cache_remote.sh bench
+bash test/scripts/bench_cache_remote.sh report
+bash test/scripts/bench_cache_remote.sh stop
+```
+
+`deploy` overwrites remote binaries/configuration. `bench` removes remote `results/bench-c*.*`, then copies results over corresponding local files; unrelated/stale local concurrency logs remain. `report` overwrites both generated report READMEs in `RESULTS_DIR`. Preserve previous evidence first and keep each run's results separate. The remote benchmark pipes output through `tee` without enabling remote `pipefail`; SSH success alone does not prove benchmark success. Inspect raw logs, errors and the expected completed measurements.
+
+`stop` uses broad `pkill -f 'cache-ctl serve'` on the selected hosts, not run-specific PIDs. A separate directory does not isolate processes; remote stop failures can be ignored by the script, so verify that the intended processes actually stopped. Never use these hosts if they run unrelated cache-ctl services.
+
+`clean` first stops services, then removes remote `rocks-*`, the entire `results` directory and top-level `*.log` under `REMOTE_DIR`, plus local `bench-c*.log`/`bench-c*.pprof` under `RESULTS_DIR`. Inspect exact hosts and disposable paths before requesting cleanup. `all` performs clean → deploy → start → health → bench → report and **does not stop services at the end**. Use the explicit individual commands above; never run `stop`, `clean` or `all` against shared services or non-disposable data.
+
+Record workload controls `VALUE_SIZE`, `PREFILL`, `COLD_PREFILL`, `MISS_RATIO`, `ACCESS`, `ZIPF_S`, `CONCS`, `DURATION`, `TIMEOUT`; topology/coding controls `EC_DATA`/`EC_PARITY`; and backend controls `SHARD_DISK`, `SHARD_MEM_RATIO`, `SHARD_BLOCK_SIZE`, `DIRECT_READS`, `BLOOM_BITS`, `ORIGIN_DISK`. Generated shard/origin configurations default to `freq.disable_eviction: true`, so they do not validate aging unless an owned benchmark configuration deliberately enables it and the report records that choice. The remote sweep supplies no key salt and does not reset caches between concurrency points; later points are not isolated cold-cache measurements.
 
 <a id="基准方法学l2-内存磁盘路径l3-透传aging"></a>
 

@@ -6,7 +6,7 @@
 字节可经 sparse-source API 入库;CLI `store` 专门接受 **tarstream 工件**,不直接
 接受任意 raw 文件。入库产出 **Manifest**:包含 chunk 元数据与密封密钥表的小型二进制
 对象。其 content key 是后续 `load` 与 `manifest://<key>` 引用的句柄;本地 Manifest
-Bundle 是同一批对象的另一种载体([§4.10](file-artifacts_zh.md#410-多-manifest-zip-bundle))。
+Bundle 是同一批对象的另一种载体([§2](file-artifacts_zh.md#410-多-manifest-zip-bundle))。
 
 ## 1. 概述
 
@@ -619,11 +619,16 @@ retained buffer 为 2 MiB,异常大 buffer 用后丢弃。slot 和 weighted byte
 的 on-demand 部分读由 Stream 内部合并和复用。
 
 
+
 ### 4.9 本地 immutable tarstream 加密
 
 完整文件载体契约见 [file-artifacts_zh.md](file-artifacts_zh.md#1-不可变本地-tarstream-与加密)；Manifest 逻辑内容与密钥规则仍由本篇定义。
 
 
+<a id="4101-bundleindex-v1"></a>
+<a id="4102-metadata-prefix-与-reader-io"></a>
+<a id="4103-source-selectionchunk-preparation-与普通-restore"></a>
+<a id="4104-显式严格验证与-exact-upload"></a>
 ### 4.10 多 Manifest ZIP Bundle
 
 完整文件载体契约见 [file-artifacts_zh.md](file-artifacts_zh.md#2-多-manifest-bundle-载体)；Manifest 逻辑内容与密钥规则仍由本篇定义。

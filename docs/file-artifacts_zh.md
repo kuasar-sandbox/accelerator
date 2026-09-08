@@ -97,7 +97,7 @@ Local Entry；其 payload 最后 256 bytes 与真实 Central Directory 紧邻。
 ZIP Deflate、ZIP encryption、整文件 SHA/HMAC、外层加密、自定义 pack、root entry 或
 JSON/YAML metadata。旧 `admission/*`、旧的无索引 Bundle、重复或未知 entry、目录、
 非法 key/admission 与截断由对应 profile/验证路径拒绝。普通 Open 有意延迟部分对象与
-容器检查,不等于严格 full-container verifier([§4.10.4](#4104-显式严格验证与-exact-upload))。
+容器检查,不等于严格 full-container verifier([§2.4](#4104-显式严格验证与-exact-upload))。
 
 <a id="4101-bundleindex-v1"></a>
 ### 2.1 `bundle/index` v1
@@ -277,10 +277,12 @@ range，证明没有重排、gap、隐藏/重叠 entry；随后要求 index 是 
    `AdmitWriteFor(recorded.Generation)`；返回 Generation/Salt 必须逐字节相等。
 4. 强制验证每个选定 Manifest physical ContentKey、解析并用 customer key 解封 key
    table，并证明该 Manifest 的完整 Chunk 闭包位于同一 source Bundle。
-5. 每个 source 中实际使用的唯一 Chunk 强制验证 physical ContentKey，解密/解压为
-   原明文，并要求 `DeriveKey(sourceAdmission.Salt, plaintext)` 等于 key table 中的
-   key；跨 Manifest 的同一 ContentKey 对应不同 key 或 plaintext size 时拒绝。
-6. 先并发上传全部 Chunk，再上传依赖 Manifest，最后发布调用方指定的 current root。
+   在任何 Put 前拒绝跨 Manifest 的同一 ContentKey 对应不同 key 或 plaintext size。
+5. 并发 worker 逐个处理每个 source 中实际使用的唯一 Chunk:强制验证 physical ContentKey,
+   解密/解压为原明文,要求 `DeriveKey(sourceAdmission.Salt, plaintext)` 等于 key table 中的
+   key,然后 Put 该已验证 Chunk。这是逐 Chunk 验证后上传,不是全部明文验证完毕才开始写入。
+6. 只有全部 Chunk worker 成功后才上传依赖 Manifest,最后发布调用方指定的 current root。
+   后续 Chunk 验证或上传失败时,先前已验证的 Chunk 可能留在 Store,但根不会发布。
 
 每个对象使用其 source Bundle 的 recorded admission，不改投最新 generation，不
 重新 chunk、压缩、加密、seal key table 或改写上层 `snapshot.cfg`，因此 root
