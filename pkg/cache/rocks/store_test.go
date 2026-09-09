@@ -356,4 +356,15 @@ func TestBlobDBEnabled(t *testing.T) {
 		t.Fatalf("expected at least one .blob file after Flush; rocks dir contents: %v", allNames)
 	}
 	t.Logf("BlobDB produced %d .blob file(s) in %s", len(blobFiles), filepath.Base(cfg.Path))
+
+	// Blob cache + prepopulate must still serve the value after flush
+	// (memtable is gone; GetCF reads the blob file / cache).
+	got, ok, err := s.get(ctx, cfChunk, chunkKey[:])
+	if err != nil || !ok {
+		t.Fatalf("Get chunk after Flush: ok=%v err=%v", ok, err)
+	}
+	if len(got.Bytes()) != len(value) {
+		t.Fatalf("Get chunk after Flush: len=%d want %d", len(got.Bytes()), len(value))
+	}
+	got.Release()
 }
