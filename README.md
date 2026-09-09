@@ -32,6 +32,9 @@ The downstream import surface is kept small and mostly pure Go, so consumers suc
 | `pkg/flatten`, `pkg/image`, `pkg/remote`, `pkg/tar` | OCI/directory retrieval, image configuration, and EROFS flattening primitives |
 
 Heavy server backends remain behind component binaries and server packages.
+The detailed sparse Run/Stream, chunk-window and local tarstream contracts belong
+to [Manifest §4.8–§4.10](docs/manifest.md#48-read-path-in-detail) and
+[file artifacts](docs/file-artifacts.md), not a separate README protocol.
 
 ## Binaries
 
@@ -64,6 +67,19 @@ make test-e2e                   # component owner suite; requires the assembled 
 
 Go and native prerequisites vary by target. The current source tree documents and builds any native cache dependencies through repository scripts. Real object-storage tests must use explicit test credentials or a local S3-compatible service; ordinary unit and local-filesystem tests must not require production cloud credentials.
 
+`cache-ctl` normally uses CGO and a locally built static `librocksdb.a` from
+`deps/build-rocksdb.sh`; `manifest-ctl`, `store-ctl` and the downstream import
+surface do not require RocksDB. `make release VERSION=vX.Y.Z` creates and checks
+a local release bundle; the official cache payload must retain RocksDB support.
+
+### Private-network and offline builds
+
+This module has no cross-repository Go dependencies. Point `GOPROXY` at the
+deployment's mirror, with its checksum-database policy, or use a populated
+verified module cache when offline. Coordinated sibling development can use the
+[project workspace](https://github.com/kuasar-sandbox/kuasar-sandbox); it is not a
+prerequisite for this component's standalone build.
+
 ## Running independently
 
 The three services can be deployed independently of the full platform:
@@ -87,7 +103,9 @@ This repository publishes independent component versions named `vX.Y.Z`. The x86
 
 The project repository publishes aggregate versions named `release-vX.Y.Z`, selecting exact versions of `accelerator` and the other release units, validating their assets, and running cross-component tests. Aggregate and component version numbers are independent.
 
-See the [project release documentation](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release.md) and the [latest Stable aggregate release](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest).
+Release branches, Preview, Latest reconciliation and concurrency/cancellation
+handling are owned by the [project release documentation](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release.md).
+For ordinary use, start from the [latest Stable aggregate channel](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest).
 
 ## Documentation
 
@@ -96,7 +114,7 @@ Manifest, Store and Cache have complete English and Chinese editions. Existing E
 - [Manifest — English](docs/manifest.md) / [Chinese](docs/manifest_zh.md) — sparse manifests, ingest/fetch, chunking, encryption, key tables, and public SDKs;
 - [File artifacts and carriers](docs/file-artifacts.md) — immutable tarstream encryption, Bundle layout, access and publication.
 
-- [Store — English](docs/store.md) / [Chinese](docs/store_zh.md) — filesystem and S3-compatible stores, generation layout, integrity, and garbage collection;
+- [Store — English](docs/store.md) / [Chinese](docs/store_zh.md) — filesystem and S3-compatible stores, generation retention, integrity, and explicit purge (not reachability GC);
 - [Cache — English](docs/cache.md) / [Chinese](docs/cache_zh.md) — local, sharded, tiered, and erasure-coded caches;
 - [`docs/cache-redis.md`](docs/cache-redis.md) — Redis-compatible UDS/TCP backend and external-service deployment examples.
 
