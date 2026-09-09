@@ -14,6 +14,8 @@ fail() {
 # shellcheck source=scripts/release-materials.sh
 source "$ROOT/scripts/release-materials.sh"
 
+bash "$ROOT/scripts/test-release-materials.sh"
+
 init_fixture_repo() {
   local directory="$1"
   shift
@@ -217,8 +219,33 @@ for entrypoint in test/e2e/e2e_manifest.sh test/e2e/e2e_obs.sh \
 done
 
 mkdir -p "$TMP/bin" "$TMP/src" "$TMP/rocksdb"
-printf 'package main\nfunc main() {}\n' > "$TMP/src/main.go"
-GO111MODULE=off go build -o "$TMP/go-fixture" "$TMP/src/main.go"
+fixture_root="$TMP/project"
+mkdir -p "$fixture_root/scripts"
+install -m 0644 "$ROOT/LICENSE" "$fixture_root/LICENSE"
+printf '/bin/\n/build/\n' > "$fixture_root/.gitignore"
+install -m 0755 "$ROOT/scripts/release.sh" "$fixture_root/scripts/release.sh"
+install -m 0755 "$ROOT/scripts/release-materials.sh" "$fixture_root/scripts/release-materials.sh"
+printf 'module release-fixture.invalid\n\ngo 1.24\n' > "$fixture_root/go.mod"
+printf 'package main\nfunc main() {}\n' > "$fixture_root/main.go"
+mkdir -p "$fixture_root/test"
+cp -a "$ROOT/test/scripts" "$fixture_root/test/scripts"
+fixture_project_sha="$(init_fixture_repo "$fixture_root" LICENSE .gitignore scripts go.mod main.go test/scripts)"
+(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/go-fixture" .)
+release_materials_require_go_revision "$TMP/go-fixture" "$fixture_project_sha"
+printf '// dirty fixture\n' >> "$fixture_root/main.go"
+(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/dirty-go-fixture" .)
+if (release_materials_require_go_revision "$TMP/dirty-go-fixture" "$fixture_project_sha" >/dev/null 2>&1); then
+  fail "release accepted a binary built from dirty source"
+fi
+printf 'package main\nfunc main() {}\n' > "$fixture_root/main.go"
+if (release_materials_require_go_revision "$TMP/go-fixture" \
+  0000000000000000000000000000000000000000 >/dev/null 2>&1); then
+  fail "release accepted a binary built from another commit"
+fi
+GO111MODULE=off go build -o "$TMP/unstamped-go-fixture" "$fixture_root/main.go"
+if (release_materials_require_go_revision "$TMP/unstamped-go-fixture" "$fixture_project_sha" >/dev/null 2>&1); then
+  fail "release accepted a binary without source stamping"
+fi
 for binary in manifest-ctl store-ctl cache-ctl; do
   install -m 0755 "$TMP/go-fixture" "$TMP/bin/$binary"
 done
@@ -227,19 +254,19 @@ printf 'fixture RocksDB license\n' > "$TMP/rocksdb/LICENSE"
 mkdir -p "$TMP/no-rocksdb-bin"
 install -m 0755 "$TMP/bin/manifest-ctl" "$TMP/no-rocksdb-bin/manifest-ctl"
 install -m 0755 "$TMP/bin/store-ctl" "$TMP/no-rocksdb-bin/store-ctl"
-GO111MODULE=off go build -tags no_rocksdb -o "$TMP/no-rocksdb-bin/cache-ctl" \
-  "$TMP/src/main.go"
+(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -tags no_rocksdb \
+  -o "$TMP/no-rocksdb-bin/cache-ctl" .)
 if SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/no-rocksdb-bin" \
   RELEASE_ROCKSDB_SOURCE_DIR="$TMP/rocksdb" \
-  "$ROOT/scripts/release.sh" package v1.2.3 x86_64 \
+  "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 \
     "$TMP/no-rocksdb-bundle" >/dev/null 2>&1; then
   fail "packager accepted cache-ctl with RocksDB compiled out"
 fi
 
 SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   RELEASE_ROCKSDB_SOURCE_DIR="$TMP/rocksdb" \
-  "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
-"$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
+  "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
+"$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
 "$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
   "$TMP/bundle" kuasar-sandbox/accelerator v1.2.3 \
   1111111111111111111111111111111111111111 main
@@ -272,19 +299,19 @@ fi
 
 SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   RELEASE_ROCKSDB_SOURCE_DIR="$TMP/rocksdb" \
-  "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible"
+  "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible"
 cmp -s "$archive" "$TMP/reproducible/assets/accelerator-v1.2.3-linux-x86_64.tar.gz" \
   || fail "identical inputs did not produce an identical archive"
 
 cp -a "$TMP/bundle" "$TMP/tampered"
 printf 'tampered\n' >> "$TMP/tampered/assets/accelerator-v1.2.3-linux-x86_64.tar.gz"
-if "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/tampered" >/dev/null 2>&1; then
+if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/tampered" >/dev/null 2>&1; then
   fail "validator accepted a tampered archive"
 fi
 
 cp -a "$TMP/bundle" "$TMP/extra"
 touch "$TMP/extra/assets/release.json"
-if "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/extra" >/dev/null 2>&1; then
+if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/extra" >/dev/null 2>&1; then
   fail "validator accepted an extra asset"
 fi
 
@@ -298,16 +325,16 @@ tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='@1700000000' \
   -C "$TMP/material-stage" .
 (cd "$TMP/material-tampered/assets" \
   && sha256sum accelerator-v1.2.3-linux-x86_64.tar.gz > SHA256SUMS)
-if "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 \
+if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 \
   "$TMP/material-tampered" >/dev/null 2>&1; then
   fail "validator accepted license material that disagrees with its inventory"
 fi
 
-if RELEASE_BIN_DIR="$TMP/bin" "$ROOT/scripts/release.sh" package 01.2.3 x86_64 \
+if RELEASE_BIN_DIR="$TMP/bin" "$fixture_root/scripts/release.sh" package 01.2.3 x86_64 \
   "$TMP/invalid-version" >/dev/null 2>&1; then
   fail "packager accepted an invalid version"
 fi
-if RELEASE_BIN_DIR="$TMP/bin" "$ROOT/scripts/release.sh" package v1.2.3 aarch64 \
+if RELEASE_BIN_DIR="$TMP/bin" "$fixture_root/scripts/release.sh" package v1.2.3 aarch64 \
   "$TMP/invalid-arch" >/dev/null 2>&1; then
   fail "packager accepted an unvalidated release architecture"
 fi

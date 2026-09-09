@@ -170,6 +170,9 @@ package_release() {
 
   rocksdb_source="${RELEASE_ROCKSDB_SOURCE_DIR:-$ROOT/build/src/rocksdb}"
   project_sha="$(release_materials_resolve_git_source "$ROOT" "" accelerator)"
+  release_materials_require_go_revision "$STAGE/bin/manifest-ctl" "$project_sha"
+  release_materials_require_go_revision "$STAGE/bin/store-ctl" "$project_sha"
+  release_materials_require_go_revision "$STAGE/bin/cache-ctl" "$project_sha"
   release_materials_init "$STAGE" "$WORK/materials" "$NAME"
   release_materials_copy_licenses "$ROOT" project
   release_materials_copy_licenses "$rocksdb_source" rocksdb
