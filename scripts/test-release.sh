@@ -15,6 +15,7 @@ fail() {
 source "$ROOT/scripts/release-materials.sh"
 
 bash "$ROOT/scripts/test-release-materials.sh"
+bash "$ROOT/deps/test-common.sh"
 
 init_fixture_repo() {
   local directory="$1"
