@@ -104,7 +104,7 @@ The README provides the public component entry path; the complete design guides 
 - network allocation and forwarding belong to [`connector`](https://github.com/kuasar-sandbox/connector);
 - the guest kernel, runtime image, and `flatten-ctl` release artifact belong to [`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime);
 - node and cluster orchestration belong to [`orchestrator`](https://github.com/kuasar-sandbox/orchestrator);
-- system-level design, shared BMS, demos, and aggregate releases belong to [`kuasar-sandbox/kuasar-sandbox`](https://github.com/kuasar-sandbox/kuasar-sandbox).
+- system-level design, shared integration tests, demos, and aggregate releases belong to [`kuasar-sandbox/kuasar-sandbox`](https://github.com/kuasar-sandbox/kuasar-sandbox).
 
 ## Contributing and security
 

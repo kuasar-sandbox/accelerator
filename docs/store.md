@@ -254,13 +254,37 @@ store-ctl serve   --config FILE
 - `purge --generation` rejects the last entry, removes the generation from a writable source, then deletes FS/S3 data. S3 source updates use ETag `If-Match` CAS, rereading and retrying within a bound on conflicts.
 - `purge --all` is offline maintenance and still requires `--confirm`: stop every `store-ctl serve` process and quiesce all writers first. File/S3 sources are removed. For a config source, only object data is removed, not the main YAML. A running server treats a missing source as refresh failure and deliberately retains its last valid list; therefore this command is not an online write-revocation mechanism.
 
-A typical online rollout:
+A write-generation rollout does not retire existing data:
 
 ```text
-[G1] -> [G1, G2] -> [G2]
+[G1] -> [G1, G2]              new default writes use G2; G1 remains readable
+[G1, G2] -> [G2]              only after G1 is no longer needed by retained data
 ```
 
-After the first refresh, new admissions use G2, existing G1 admissions may still complete, and Get reads G2 then G1. Once old admissions have finished, remove G1 from the list and clean up its data. No `store-ctl serve` restart is needed.
+After the first refresh, new default admissions use G2, listed G1 admissions may
+still complete, and Get reads G2 then G1. An explicit admission can still select
+G1 while it is listed. Finishing old writes is therefore neither a read-retention
+policy nor evidence that G1 can be deleted. Existing images, templates, snapshots
+and their parent chains can continue to reference objects in G1 indefinitely.
+
+Before removing G1, the deployment owner must establish that no retained artifact
+or parent reference depends on objects available only through that generation.
+Where an alternative source is used, verify that the original references and
+required content remain resolvable from that durable source; a cache hit or a
+newer write generation is not such evidence. Without this proof, retain G1 in the
+read list. The server does not discover live application references or migrate
+objects when rolling out a generation.
+
+Coordinate all readers and writers and allow in-flight operations to complete
+before physical deletion. A refreshed server stops looking in a removed
+generation even if its files still exist; a stale server or in-flight request may
+still hold the previous list. Each request captures one list, and refresh is not
+a fleet-wide synchronization barrier. `purge --generation` combines list removal
+and destructive data deletion: it is not a reference-aware garbage collector.
+Backups and retirement decisions belong to the operator. `purge --all` additionally
+requires retiring or replacing every affected reference and an intentional data
+loss or recovery plan, not merely stopping the processes. Valid list changes do
+not require a `store-ctl serve` restart; this does not make unsafe deletion safe.
 
 <a id="7-s3-数据面"></a>
 ## 7. S3 data plane
