@@ -57,6 +57,10 @@ make test-e2e                  # 运行 test/e2e/run_all.sh;需要项目主仓�
 本仓文档与 `test/e2e/` 不进入组件包,由项目主仓聚合所选 tag 的源码并只放入
 `platform-release-vX.Y.Z.tar.gz`。
 本地可用 `make release VERSION=vX.Y.Z` 生成并校验相同布局的 release bundle。
+归档名称记录请求的发行版本;来源记录只有在本地 Git Tag 指向所选 commit 时才保留
+该版本,打 Tag 前使用 `git:<commit>`。验证器将所有 Go 载荷及项目来源 URL/摘要
+绑定到同一 commit。发布者传入其预期 commit,在任何 Tag/Release 写入前拒绝不同
+源码产生的包。
 当前组件 Release 构建并打包 Linux x86_64 目标;项目聚合随后针对所选真实发布资产组合
 运行集成测试。组件打包成功不等于聚合验证通过。项目主仓的
 每日协调器显式传入源码分支和精确 SHA;组件 `main` 用于主线,`release/vX.Y.x`

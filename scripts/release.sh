@@ -118,8 +118,11 @@ validate_bundle() {
   mkdir -p "$extract"
   tar -xzf "$bundle/assets/$archive" -C "$extract"
   release_materials_validate "$extract" "$NAME"
-  release_materials_require_source "$extract" "$NAME" 'bin/*,test/scripts/*' 'accelerator' "$version"
-  release_materials_require_source "$extract" "$NAME" 'bin/cache-ctl' 'rocksdb' "v9.7.4"
+  release_materials_require_project_source "$extract" "$NAME" 'bin/*,test/scripts/*' "$version" \
+    bin/manifest-ctl bin/store-ctl bin/cache-ctl
+  release_materials_require_source "$extract" "$NAME" 'bin/cache-ctl' 'rocksdb' "v9.7.4" \
+    'https://github.com/facebook/rocksdb/archive/refs/tags/v9.7.4.tar.gz' \
+    'sha256-tree:1341893a5951347a7f658151c10f0b15e0ddd67c28b3804fdfed9a4a7736f52b'
   release_materials_require_go "$extract" "$NAME" 'bin/manifest-ctl'
   release_materials_require_go "$extract" "$NAME" 'bin/store-ctl'
   release_materials_require_go "$extract" "$NAME" 'bin/cache-ctl'
@@ -178,13 +181,15 @@ package_release() {
 
   rocksdb_source="${RELEASE_ROCKSDB_SOURCE_DIR:-$ROOT/build/src/rocksdb}"
   project_sha="$(release_materials_resolve_git_source "$ROOT" "" accelerator)"
+  local project_version
+  project_version="$(release_materials_git_version "$ROOT" "$version" "$project_sha")"
   release_materials_require_go_revision "$STAGE/bin/manifest-ctl" "$project_sha"
   release_materials_require_go_revision "$STAGE/bin/store-ctl" "$project_sha"
   release_materials_require_go_revision "$STAGE/bin/cache-ctl" "$project_sha"
   release_materials_init "$STAGE" "$WORK/materials" "$NAME"
   release_materials_copy_licenses "$ROOT" project
   release_materials_copy_licenses "$rocksdb_source" rocksdb
-  release_materials_record_source 'bin/*,test/scripts/*' accelerator "$version" \
+  release_materials_record_source 'bin/*,test/scripts/*' accelerator "$project_version" \
     "https://github.com/kuasar-sandbox/accelerator/commit/$project_sha" \
     "git:$project_sha" project
   release_materials_record_source bin/cache-ctl rocksdb v9.7.4 \
