@@ -110,6 +110,11 @@ validate_bundle() {
   mkdir -p "$extract"
   tar -xzf "$bundle/assets/$archive" -C "$extract"
   release_materials_validate "$extract" "$NAME"
+  release_materials_require_source "$extract" "$NAME" 'bin/*,test/scripts/*' 'accelerator' "$version"
+  release_materials_require_source "$extract" "$NAME" 'bin/cache-ctl' 'rocksdb' "v9.7.4"
+  release_materials_require_go "$extract" "$NAME" 'bin/manifest-ctl'
+  release_materials_require_go "$extract" "$NAME" 'bin/store-ctl'
+  release_materials_require_go "$extract" "$NAME" 'bin/cache-ctl'
   local file
   for file in manifest-ctl store-ctl cache-ctl; do
     [ -x "$extract/bin/$file" ] || fail "$archive is missing executable bin/$file"
