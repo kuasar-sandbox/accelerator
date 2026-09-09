@@ -58,7 +58,7 @@ make test-e2e                  # 运行 test/e2e/run_all.sh;需要项目主仓�
 `platform-release-vX.Y.Z.tar.gz`。
 本地可用 `make release VERSION=vX.Y.Z` 生成并校验相同布局的 release bundle。
 当前组件 Release 构建并打包 Linux x86_64 目标;项目聚合随后针对所选真实发布资产组合
-运行 BMS。组件打包成功不等于聚合验证通过。项目主仓的
+运行集成测试。组件打包成功不等于聚合验证通过。项目主仓的
 每日协调器显式传入源码分支和精确 SHA;组件 `main` 用于主线,`release/vX.Y.x`
 用于对应组件维护线。Preview 和维护分支 Stable 不更新 GitHub Latest;独立的幂等
 Reconcile Latest 工作流按 `main` 源码提交先后协调主线 Stable,同一提交才比较 SemVer。
