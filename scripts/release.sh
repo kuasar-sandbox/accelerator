@@ -164,8 +164,7 @@ package_release() {
   copy_root_executable test/scripts/proc_analyze.py test/scripts/proc_analyze.py
 
   rocksdb_source="${RELEASE_ROCKSDB_SOURCE_DIR:-$ROOT/build/src/rocksdb}"
-  project_sha="$(git -C "$ROOT" rev-parse HEAD)"
-  [[ "$project_sha" =~ ^[0-9a-f]{40}$ ]] || fail "cannot resolve the accelerator source commit"
+  project_sha="$(release_materials_resolve_git_source "$ROOT" "" accelerator)"
   release_materials_init "$STAGE" "$WORK/materials" "$NAME"
   release_materials_copy_licenses "$ROOT" project
   release_materials_copy_licenses "$rocksdb_source" rocksdb
