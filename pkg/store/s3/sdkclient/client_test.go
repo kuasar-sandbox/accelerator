@@ -475,3 +475,56 @@ func TestNewRejectsInvalidConfiguration(t *testing.T) {
 		})
 	}
 }
+
+// TestInsecureConfigSkipsTLSVerification pins the TLS behaviour of the
+// Insecure config: a self-signed certificate (as TLS-intercepting proxies
+// present) fails strict verification but is accepted when the endpoint is
+// configured insecure. The two clients coexist against the same endpoint —
+// an insecure configuration never relaxes another client's verification.
+func TestInsecureConfigSkipsTLSVerification(t *testing.T) {
+	// One attempt only: the strict client's failure is a connection
+	// error, which the retryer would otherwise back off and retry.
+	t.Setenv("AWS_MAX_ATTEMPTS", "1")
+	setDefaultCredentialEnvironment(t)
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("ETag", `"tls-etag"`)
+		if r.Method == http.MethodGet {
+			_, _ = io.WriteString(w, "G1\n")
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	newClient := func(insecure bool) *Client {
+		t.Helper()
+		client, err := New(context.Background(), Config{
+			Endpoint:  server.URL,
+			Bucket:    "test-bucket",
+			PathStyle: true,
+			Insecure:  insecure,
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		return client
+	}
+
+	if _, _, err := newClient(false).Get(context.Background(), "__meta/generations"); err == nil {
+		t.Fatal("strict client accepted a certificate from an unknown authority")
+	} else if msg := err.Error(); !strings.Contains(msg, "certificate") && !strings.Contains(msg, "tls:") {
+		t.Fatalf("strict client error is not a TLS verification failure: %v", err)
+	}
+
+	insecure := newClient(true)
+	if _, err := insecure.Put(context.Background(), "objects/key", []byte("payload"), stores3.PutOptions{}); err != nil {
+		t.Fatalf("insecure client Put: %v", err)
+	}
+	body, meta, err := insecure.Get(context.Background(), "objects/key")
+	if err != nil {
+		t.Fatalf("insecure client Get: %v", err)
+	}
+	if string(body) != "G1\n" || meta.ETag != `"tls-etag"` {
+		t.Fatalf("insecure client read = %q, etag = %q", body, meta.ETag)
+	}
+}

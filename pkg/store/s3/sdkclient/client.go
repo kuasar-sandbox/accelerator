@@ -11,13 +11,16 @@ package sdkclient
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
@@ -51,6 +54,15 @@ type Config struct {
 	// AccessKey / SecretKey: static AK/SK. Empty → default chain.
 	AccessKey string
 	SecretKey string
+
+	// Insecure skips TLS certificate verification for the endpoint.
+	// Strict verification (the default) is required for any endpoint
+	// reachable through an untrusted network. Operators may opt in
+	// when a mandatory TLS-intercepting proxy presents certificates
+	// that cannot be added to the trust store — this re-exposes the
+	// connection to MITM, so it is only for controlled networks where
+	// that risk is accepted.
+	Insecure bool
 }
 
 // Client is the s3Client implementation. Held in the parent package
@@ -84,12 +96,38 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		loadOpts = append(loadOpts, awsconfig.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")))
 	}
+	if cfg.Insecure {
+		loadOpts = append(loadOpts, awsconfig.WithHTTPClient(insecureHTTPClient()))
+	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("s3 sdkclient: load aws config: %w", err)
 	}
 	api := newAPI(awsCfg, cfg.Endpoint, cfg.PathStyle)
 	return &Client{api: api, bucket: cfg.Bucket}, nil
+}
+
+// insecureHTTPClient builds the HTTP client used for Insecure endpoints.
+// It starts from the SDK's own buildable client so pooling, dialer and
+// timeout defaults are identical to the strict path; only certificate
+// verification is turned off. A fresh client per call keeps an insecure
+// configuration from ever leaking into another endpoint's connection
+// pool — strict and insecure clients share nothing.
+func insecureHTTPClient() *awshttp.BuildableClient {
+	return awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
+		// The default transport pins TLS 1.2 as its floor; keep that.
+		base := tr.TLSClientConfig
+		if base == nil {
+			base = &tls.Config{MinVersion: tls.VersionTLS12}
+		}
+		tlsCfg := base.Clone()
+		// InsecureSkipVerify is the entire point of this client: the
+		// operator has explicitly accepted the MITM risk because the
+		// endpoint's certificates cannot be verified (mandatory
+		// TLS-intercepting proxy). Strict clients never reach here.
+		tlsCfg.InsecureSkipVerify = true //nolint:gosec // opt-in via config
+		tr.TLSClientConfig = tlsCfg
+	})
 }
 
 func newAPI(awsCfg aws.Config, endpoint string, pathStyle bool) *awss3.Client {

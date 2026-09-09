@@ -78,10 +78,17 @@ s3:
   max_inflight: 64
   op_timeout: 10s
   max_object_size_bytes: 16777216
+  insecure: false
 ```
 
 静态 AK/SK 必须成对出现；两者都为空时使用 AWS SDK 默认凭据链。字符串字段支持
 `${VAR}` 展开。`region` 缺省为 `us-east-1`，`path_style` 缺省为 `true`。
+
+`insecure: true` 跳过该 endpoint 的 TLS 证书校验。**安全警告：这会关闭传输层
+对中间人（MITM）攻击的防护——任何能截获连接的一方都可以读取或替换流量，包括
+对象数据和凭据。** 只要 endpoint 可能经由不可信网络到达，就应保持缺省的严格
+校验。该选项用于强制 TLS 拦截代理后、证书无法加入信任库的 endpoint；与
+`http://` endpoint 组合使用是冗余的，但不报错。
 
 ### 2.3 Generation source
 
@@ -119,7 +126,12 @@ generations:
     path_style: true
     access_key: ${GENERATION_S3_ACCESS_KEY}
     secret_key: ${GENERATION_S3_SECRET_KEY}
+    insecure: false
 ```
+
+`generations.s3.insecure` 独立于数据后端的 `s3.insecure` 生效，安全警告相同。
+省略 `generations` 段时，后端本地的 legacy S3 位置继承数据后端的 `s3.insecure`
+设置。
 
 文件和 S3 object 都使用逐行文本格式，顺序为 oldest → newest。它们按
 `refresh_interval` 周期刷新；`SIGHUP` 也会立即刷新。config source 在
@@ -334,7 +346,9 @@ Server 不会在 rollout 时发现应用侧的有效引用或迁移对象。
 PutHandle 在内存中有界缓冲并以单次 PutObject 写入固定 key。`max_inflight` 限制
 并发 S3 调用；`op_timeout` 为空时只受调用方 context 控制；
 `max_object_size_bytes` 限制单对象大小。generation source 的 S3 endpoint、bucket、
-key 和凭据可与数据 backend 完全不同。
+key 和凭据可与数据 backend 完全不同。配置为 `insecure` 的 endpoint，对其的所有
+请求都跳过 TLS 证书校验——数据面与 generation 读取各自遵循自己的设置，严格与
+insecure 的 endpoint 不会共享 HTTP client。
 
 ## 8. `cache_listen` 与运维
 

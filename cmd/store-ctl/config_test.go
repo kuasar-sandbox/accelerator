@@ -294,6 +294,74 @@ func TestLoadConfigRejectsIncompleteStaticCredentials(t *testing.T) {
 	}
 }
 
+func TestLoadConfigS3Insecure(t *testing.T) {
+	t.Run("absent defaults to strict", func(t *testing.T) {
+		path := writeYAML(t, "backend: s3\ns3:\n  endpoint: https://objects.example.com\n  bucket: b\n")
+		cfg, err := LoadConfig(path, false)
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if cfg.S3.Insecure {
+			t.Error("s3.insecure should default to false")
+		}
+	})
+
+	t.Run("explicit true preserved", func(t *testing.T) {
+		path := writeYAML(t, "backend: s3\ns3:\n  endpoint: https://objects.example.com\n  bucket: b\n  insecure: true\n")
+		cfg, err := LoadConfig(path, false)
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if !cfg.S3.Insecure {
+			t.Error("s3.insecure=true was not preserved")
+		}
+	})
+
+	t.Run("true with plain http endpoint is redundant not an error", func(t *testing.T) {
+		path := writeYAML(t, "backend: s3\ns3:\n  endpoint: http://objects.example.com\n  bucket: b\n  insecure: true\n")
+		cfg, err := LoadConfig(path, false)
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if !cfg.S3.Insecure {
+			t.Error("s3.insecure=true was not preserved")
+		}
+	})
+
+	t.Run("legacy obs section keeps insecure through normalisation", func(t *testing.T) {
+		path := writeYAML(t, "backend: obs\nobs:\n  endpoint: https://legacy-objects.example.com\n  bucket: legacy-bucket\n  insecure: true\n")
+		cfg, err := LoadConfig(path, false)
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if cfg.Backend != "s3" || cfg.S3 == nil || !cfg.S3.Insecure {
+			t.Fatalf("legacy obs insecure flag was lost: backend=%q s3=%+v", cfg.Backend, cfg.S3)
+		}
+	})
+
+	t.Run("generations.s3.insecure honored independently", func(t *testing.T) {
+		path := writeYAML(t, `
+backend: fs
+fs:
+  root: /objects
+generations:
+  refresh_interval: 5s
+  s3:
+    endpoint: https://meta.example
+    bucket: metadata
+    key: prod/generations
+    insecure: true
+`)
+		cfg, err := LoadConfig(path, false)
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if cfg.Generations == nil || cfg.Generations.S3 == nil || !cfg.Generations.S3.Insecure {
+			t.Fatalf("generations.s3.insecure=true was not honored: %+v", cfg.Generations)
+		}
+	})
+}
+
 func TestLoadConfigRejectsMismatchedSections(t *testing.T) {
 	cases := []struct {
 		name string
@@ -393,6 +461,10 @@ func TestStoreConfigTemplateUsesS3(t *testing.T) {
 		!strings.Contains(storeConfigTemplate, "# s3:") ||
 		!strings.Contains(storeConfigTemplate, "#   path_style: true") {
 		t.Fatalf("generated template does not describe s3 backend:\n%s", storeConfigTemplate)
+	}
+	if !strings.Contains(storeConfigTemplate, "#   insecure: false") ||
+		!strings.Contains(storeConfigTemplate, "Skip TLS certificate verification") {
+		t.Fatalf("generated template does not document the insecure option:\n%s", storeConfigTemplate)
 	}
 	if strings.Contains(storeConfigTemplate, "backend: obs") || strings.Contains(storeConfigTemplate, "# obs:") {
 		t.Fatalf("generated template exposes legacy configuration:\n%s", storeConfigTemplate)

@@ -171,6 +171,11 @@ type GenerationS3Config struct {
 	PathStyle *bool  `yaml:"path_style"`
 	AccessKey string `yaml:"access_key"`
 	SecretKey string `yaml:"secret_key"`
+
+	// Insecure skips TLS certificate verification for the generation
+	// endpoint. It is honored independently of the data backend's
+	// s3.insecure. Strict verification is the default.
+	Insecure bool `yaml:"insecure"`
 }
 
 func (c *GenerationS3Config) expandEnv() {
@@ -227,6 +232,16 @@ type S3Config struct {
 
 	// MaxObjectSize bounds Get response bytes. Default 16 MiB.
 	MaxObjectSize int64 `yaml:"max_object_size_bytes"`
+
+	// Insecure skips TLS certificate verification for the endpoint.
+	// Strict verification is the default and must stay so on any
+	// untrusted network; enabling this accepts the risk of a MITM
+	// being able to read or replace traffic (including object data
+	// and credentials). It exists for endpoints reached through a
+	// mandatory TLS-intercepting proxy whose certificates cannot be
+	// added to the trust store. Setting it alongside an http://
+	// endpoint is redundant, not an error.
+	Insecure bool `yaml:"insecure"`
 }
 
 // envVarPattern matches `${VAR_NAME}` with alphanumeric / underscore
@@ -369,6 +384,7 @@ func (c *Config) normaliseGenerations() error {
 					PathStyle: c.S3.PathStyle,
 					AccessKey: c.S3.AccessKey,
 					SecretKey: c.S3.SecretKey,
+					Insecure:  c.S3.Insecure,
 				},
 				s3Set: true,
 			}

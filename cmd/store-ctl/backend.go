@@ -50,6 +50,7 @@ func newS3Client(ctx context.Context, cfg *Config) (*sdkclient.Client, error) {
 		PathStyle: cfg.S3PathStyle(),
 		AccessKey: cfg.S3.AccessKey,
 		SecretKey: cfg.S3.SecretKey,
+		Insecure:  cfg.S3.Insecure,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("s3 client: %w", err)
