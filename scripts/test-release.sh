@@ -62,14 +62,28 @@ for entrypoint in test/e2e/e2e_manifest.sh test/e2e/e2e_obs.sh \
     || fail "$entrypoint is not executable in the Git index"
 done
 
-mkdir -p "$TMP/bin" "$TMP/src"
+mkdir -p "$TMP/bin" "$TMP/src" "$TMP/rocksdb"
 printf 'package main\nfunc main() {}\n' > "$TMP/src/main.go"
 GO111MODULE=off go build -o "$TMP/go-fixture" "$TMP/src/main.go"
 for binary in manifest-ctl store-ctl cache-ctl; do
   install -m 0755 "$TMP/go-fixture" "$TMP/bin/$binary"
 done
+printf 'fixture RocksDB license\n' > "$TMP/rocksdb/LICENSE"
+
+mkdir -p "$TMP/no-rocksdb-bin"
+install -m 0755 "$TMP/bin/manifest-ctl" "$TMP/no-rocksdb-bin/manifest-ctl"
+install -m 0755 "$TMP/bin/store-ctl" "$TMP/no-rocksdb-bin/store-ctl"
+GO111MODULE=off go build -tags no_rocksdb -o "$TMP/no-rocksdb-bin/cache-ctl" \
+  "$TMP/src/main.go"
+if SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/no-rocksdb-bin" \
+  RELEASE_ROCKSDB_SOURCE_DIR="$TMP/rocksdb" \
+  "$ROOT/scripts/release.sh" package v1.2.3 x86_64 \
+    "$TMP/no-rocksdb-bundle" >/dev/null 2>&1; then
+  fail "packager accepted cache-ctl with RocksDB compiled out"
+fi
 
 SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
+  RELEASE_ROCKSDB_SOURCE_DIR="$TMP/rocksdb" \
   "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
 "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
 "$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
@@ -81,7 +95,13 @@ SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
 
 archive="$TMP/bundle/assets/accelerator-v1.2.3-linux-x86_64.tar.gz"
 for path in ./bin/manifest-ctl ./bin/store-ctl ./bin/cache-ctl \
-  ./test/scripts/bench_cache.sh; do
+  ./test/scripts/bench_cache.sh \
+  ./share/licenses/accelerator/project/LICENSE \
+  ./share/licenses/accelerator/rocksdb/LICENSE \
+  ./share/sources/accelerator/SOURCES.tsv \
+  ./share/sources/accelerator/GO-BUILD-INFO.tsv \
+  ./share/sources/accelerator/GO-MODULES.tsv \
+  ./share/sources/accelerator/MATERIALS.sha256; do
   tar -tzf "$archive" | grep -Fx "$path" >/dev/null || fail "archive is missing $path"
 done
 if tar -tzf "$archive" | grep -E '^\./(docs|test/e2e)(/|$)' >/dev/null; then
@@ -92,6 +112,7 @@ if tar -tzf "$archive" | grep -E '(^|/)release\.json$|(^|/)release/[^/]+\.json$'
 fi
 
 SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
+  RELEASE_ROCKSDB_SOURCE_DIR="$TMP/rocksdb" \
   "$ROOT/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible"
 cmp -s "$archive" "$TMP/reproducible/assets/accelerator-v1.2.3-linux-x86_64.tar.gz" \
   || fail "identical inputs did not produce an identical archive"
@@ -106,6 +127,21 @@ cp -a "$TMP/bundle" "$TMP/extra"
 touch "$TMP/extra/assets/release.json"
 if "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/extra" >/dev/null 2>&1; then
   fail "validator accepted an extra asset"
+fi
+
+mkdir -p "$TMP/material-stage"
+tar -xzf "$archive" -C "$TMP/material-stage"
+printf 'not the packaged license\n' > "$TMP/material-stage/share/licenses/accelerator/rocksdb/LICENSE"
+cp -a "$TMP/bundle" "$TMP/material-tampered"
+tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='@1700000000' \
+  --pax-option=delete=atime,delete=ctime -czf \
+  "$TMP/material-tampered/assets/accelerator-v1.2.3-linux-x86_64.tar.gz" \
+  -C "$TMP/material-stage" .
+(cd "$TMP/material-tampered/assets" \
+  && sha256sum accelerator-v1.2.3-linux-x86_64.tar.gz > SHA256SUMS)
+if "$ROOT/scripts/release.sh" validate v1.2.3 x86_64 \
+  "$TMP/material-tampered" >/dev/null 2>&1; then
+  fail "validator accepted license material that disagrees with its inventory"
 fi
 
 if RELEASE_BIN_DIR="$TMP/bin" "$ROOT/scripts/release.sh" package 01.2.3 x86_64 \

@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+umask 022
 
 NAME=accelerator
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+# shellcheck source=scripts/release-materials.sh
+source "$ROOT/scripts/release-materials.sh"
 
 fail() {
   echo "release: $*" >&2
@@ -70,8 +73,10 @@ validate_archive_paths() {
   fi
   awk '
     { path=$0; sub(/^\.\//, "", path) }
-    path != "" && path !~ /\/$/ && path !~ /^bin\// && path !~ /^test\/scripts\// { exit 1 }
-  ' "$listing" || fail "$archive contains a file outside bin/ or test/scripts/"
+    path != "" && path !~ /\/$/ && path !~ /^bin\// && path !~ /^test\/scripts\// && path !~ /^share\/(licenses|sources)\/accelerator\// { exit 1 }
+  ' "$listing" || fail "$archive contains a file outside the accelerator release layout"
+  tar -tvzf "$archive" | awk '$1 !~ /^[-d]/ { exit 1 }' \
+    || fail "$archive contains a non-regular, non-directory entry"
 }
 
 validate_bundle() {
@@ -104,6 +109,7 @@ validate_bundle() {
   rm -rf "$extract"
   mkdir -p "$extract"
   tar -xzf "$bundle/assets/$archive" -C "$extract"
+  release_materials_validate "$extract" "$NAME"
   local file
   for file in manifest-ctl store-ctl cache-ctl; do
     [ -x "$extract/bin/$file" ] || fail "$archive is missing executable bin/$file"
@@ -118,7 +124,7 @@ validate_bundle() {
 
 package_release() {
   [ "$#" -eq 3 ] || fail "usage: release.sh package <version> <arch> <output-dir>"
-  local version="$1" arch output="$3" archive epoch bin_dir
+  local version="$1" arch output="$3" archive epoch bin_dir rocksdb_source project_sha
   arch="$(normalize_arch "$2")"
   archive="$(archive_name "$version" "$arch")"
   if [ -z "$output" ] || [ "$output" = / ] || [ "$output" = . ]; then
@@ -138,11 +144,41 @@ package_release() {
   check_go_binary "$STAGE/bin/manifest-ctl"
   check_go_binary "$STAGE/bin/store-ctl"
   check_go_binary "$STAGE/bin/cache-ctl"
+  if go version -m "$STAGE/bin/cache-ctl" | awk -F '\t' '
+    $2 == "build" && $3 ~ /^-tags=/ {
+      value=substr($3, 7)
+      gsub(/"/, "", value)
+      count=split(value, tags, /[, ]+/)
+      for (i=1; i <= count; i++) {
+        if (tags[i] == "no_rocksdb") found=1
+      }
+    }
+    END { exit !found }
+  '; then
+    fail "official accelerator release must include RocksDB support"
+  fi
   copy_root_executable test/scripts/bench_cache.sh test/scripts/bench_cache.sh
   copy_root_executable test/scripts/bench_cache_remote.sh test/scripts/bench_cache_remote.sh
   copy_root_executable test/scripts/dedup_report.sh test/scripts/dedup_report.sh
   copy_root_executable test/scripts/procmon.sh test/scripts/procmon.sh
   copy_root_executable test/scripts/proc_analyze.py test/scripts/proc_analyze.py
+
+  rocksdb_source="${RELEASE_ROCKSDB_SOURCE_DIR:-$ROOT/build/src/rocksdb}"
+  project_sha="$(git -C "$ROOT" rev-parse HEAD)"
+  [[ "$project_sha" =~ ^[0-9a-f]{40}$ ]] || fail "cannot resolve the accelerator source commit"
+  release_materials_init "$STAGE" "$WORK/materials" "$NAME"
+  release_materials_copy_licenses "$ROOT" project
+  release_materials_copy_licenses "$rocksdb_source" rocksdb
+  release_materials_record_source 'bin/*,test/scripts/*' accelerator "$version" \
+    "https://github.com/kuasar-sandbox/accelerator/commit/$project_sha" \
+    "git:$project_sha" project
+  release_materials_record_source bin/cache-ctl rocksdb v9.7.4 \
+    'https://github.com/facebook/rocksdb/archive/refs/tags/v9.7.4.tar.gz' \
+    'sha256-tree:1341893a5951347a7f658151c10f0b15e0ddd67c28b3804fdfed9a4a7736f52b' rocksdb
+  release_materials_add_go_binary "$STAGE/bin/manifest-ctl" bin/manifest-ctl
+  release_materials_add_go_binary "$STAGE/bin/store-ctl" bin/store-ctl
+  release_materials_add_go_binary "$STAGE/bin/cache-ctl" bin/cache-ctl
+  release_materials_finish
 
   mkdir -p "$output/assets"
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \
