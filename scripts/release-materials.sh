@@ -116,6 +116,71 @@ release_materials_copy_licenses() {
   [ "$count" -gt 0 ] || fail "no license or notice material found in $source"
 }
 
+release_materials_require_git_licenses() {
+  local root="$1" unit="$2" source="$3" sha="$4" label="$5"
+  local verification entry relative mode type blob count=0
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || fail "license source must identify an exact Git commit"
+  release_materials_safe_relative "$label" || fail "unsafe Git license material label"
+  git -C "$source" cat-file -e "$sha^{commit}" 2>/dev/null \
+    || fail "selected license source commit is unavailable; fetch that exact commit before validation"
+  verification="$(mktemp -d "$WORK/verify-git-license.XXXXXX")"
+  mkdir -p "$verification/source"
+  git -C "$source" ls-tree -r -z "$sha" > "$verification/tree" \
+    || fail "cannot enumerate selected license source tree"
+  while IFS= read -r -d '' entry; do
+    relative="${entry#*$'\t'}"
+    case "$relative" in
+      LICENSES/*) ;;
+      */*) continue ;;
+      *)
+        case "${relative,,}" in license*|copying*|notice*|patents*|authors*|credits*|copyright*) ;; *) continue ;; esac
+        ;;
+    esac
+    release_materials_safe_relative "$relative" || fail "unsafe selected license source path"
+    read -r mode type blob <<< "${entry%%$'\t'*}"
+    [[ "$type" = blob && "$mode" =~ ^100(644|755)$ && "$blob" =~ ^[0-9a-f]{40}$ ]] \
+      || fail "selected Git license material must be a regular file"
+    mkdir -p "$verification/source/$(dirname "$relative")"
+    git -C "$source" cat-file blob "$blob" > "$verification/source/$relative" \
+      || fail "cannot read selected license source blob"
+    count=$((count + 1))
+  done < "$verification/tree"
+  [ "$count" -gt 0 ] || fail "selected Git commit has no license material"
+  (
+    release_materials_init "$verification/stage" "$verification/materials" "$unit"
+    release_materials_copy_licenses "$verification/source" "$label"
+    diff -r "$verification/stage/share/licenses/$unit/$label" "$root/share/licenses/$unit/$label" >/dev/null \
+      || fail "license bytes differ from selected Git source: $label"
+  )
+}
+
+release_materials_rocksdb_notice_hashes() {
+  # Complete notice set from the verified v9.7.4 normalized source tree
+  # 1341893a5951347a7f658151c10f0b15e0ddd67c28b3804fdfed9a4a7736f52b.
+  # Keep this binding in sync with the native source pin, not release assets.
+  cat <<'EOF'
+8915c3700b0d6397bdb462cbba30915383be7b1ca0475f83441ecc5994651b55  AUTHORS
+8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643  COPYING
+cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30  LICENSE.Apache
+b568f1f37a5a1d37a3e981e7c8b7fc4856ca33b2ca0a45bc8e847aaaf7afe485  LICENSE.leveldb
+EOF
+}
+
+release_materials_require_rocksdb_notices() {
+  local root="$1" expected="$WORK/rocksdb-expected-notices" actual="$WORK/rocksdb-actual-notices"
+  release_materials_rocksdb_notice_hashes > "$expected"
+  awk '{print $2}' "$expected" > "$WORK/rocksdb-expected-paths"
+  (
+    cd "$root/share/licenses/accelerator/rocksdb" || fail "RocksDB license directory is missing"
+    find . -mindepth 1 -printf '%P\n' | LC_ALL=C sort > "$WORK/rocksdb-actual-paths" \
+      || fail "cannot enumerate RocksDB notices"
+    cmp -s "$WORK/rocksdb-expected-paths" "$WORK/rocksdb-actual-paths" \
+      || fail "RocksDB notice paths differ from the pinned source"
+    sha256sum AUTHORS COPYING LICENSE.Apache LICENSE.leveldb > "$actual"
+  )
+  cmp -s "$expected" "$actual" || fail "RocksDB notice bytes differ from the pinned source"
+}
+
 release_materials_record_source() {
   [ "$#" -eq 6 ] || fail "release_materials_record_source requires payload, name, version, source, integrity and license directory"
   local value

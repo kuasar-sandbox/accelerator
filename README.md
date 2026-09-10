@@ -161,7 +161,12 @@ its output umask explicitly; a caller's restrictive umask does not change the
 published directory contract. Build and publish retain the same Go routing policy.
 
 The pinned RocksDB source supplies `AUTHORS`, `COPYING`, `LICENSE.Apache` and
-`LICENSE.leveldb`; all four are mandatory archive materials. License collection
+`LICENSE.leveldb`; standalone validation compares this complete file set and its
+bytes with the verified native-source digest binding, not the bundle's own
+checksums. Project notices, including nested `LICENSES`, are reconstructed from
+the selected commit's Git blobs and compared in full. Changed, missing and extra
+material is rejected without executing candidate source files.
+All four RocksDB notices are mandatory archive materials. License collection
 refuses unreadable subtrees and incomplete traversals. Distinct native link
 inputs cannot overwrite notices under a shared material name. Packaging cleans
 its own read-only Go module cache on success and failure without touching other

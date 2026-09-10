@@ -205,6 +205,8 @@ validate_bundle() {
     awk -F '\t' '$2 == "build" && $3 ~ /^vcs.revision=/ {print substr($3, 14)}')"
   validate_copied_source_files "$extract" "$project_sha"
   require_rocksdb_payload "$extract/bin/cache-ctl"
+  release_materials_require_git_licenses "$extract" "$NAME" "$ROOT" "$project_sha" project
+  release_materials_require_rocksdb_notices "$extract"
   release_materials_validate "$extract" "$NAME"
   release_materials_require_project_source "$extract" "$NAME" 'bin/*,test/scripts/*' "$version" \
     bin/manifest-ctl bin/store-ctl bin/cache-ctl
