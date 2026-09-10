@@ -17,6 +17,8 @@ source "$ROOT/scripts/release-materials.sh"
 export FIXTURE_GO_DISTRIBUTION_CACHE
 FIXTURE_GO_DISTRIBUTION_CACHE="$(go env GOMODCACHE)"
 bash "$ROOT/scripts/test-release-materials.sh"
+bash "$ROOT/scripts/test-release-license-traversal.sh"
+bash "$ROOT/scripts/test-release-cleanup.sh"
 GOWORK=off go test -race "$ROOT/scripts/release-go-toolchain.go" "$ROOT/scripts/release-go-toolchain_test.go"
 GOWORK=off go test -race "$ROOT/scripts/release-archive-validator.go" "$ROOT/scripts/release-archive-validator_test.go"
 bash "$ROOT/deps/test-common.sh"
@@ -291,7 +293,7 @@ build:
 	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/manifest-ctl ./cmd/manifest-ctl
 	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/store-ctl ./cmd/store-ctl
 	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/cache-ctl ./cmd/cache-ctl
-	printf 'fixture RocksDB license\n' > build/src/rocksdb/LICENSE
+	for notice in AUTHORS COPYING LICENSE.Apache LICENSE.leveldb; do printf 'fixture RocksDB %s\n' "$$notice" > "build/src/rocksdb/$$notice"; done
 	printf 'fresh synthetic RocksDB archive\n' > build/x86_64/rocksdb/lib/librocksdb.a
 	printf 'synthetic stdc++ archive\n' > build/test-system/libstdc++.a
 	printf 'synthetic gcc archive\n' > build/test-system/libgcc.a
@@ -366,7 +368,10 @@ go_toolchain="$(go version | awk '{print $3}')"
 for path in ./bin/manifest-ctl ./bin/store-ctl ./bin/cache-ctl \
   ./test/scripts/bench_cache.sh \
   ./share/licenses/accelerator/project/LICENSE \
-  ./share/licenses/accelerator/rocksdb/LICENSE \
+  ./share/licenses/accelerator/rocksdb/AUTHORS \
+  ./share/licenses/accelerator/rocksdb/COPYING \
+  ./share/licenses/accelerator/rocksdb/LICENSE.Apache \
+  ./share/licenses/accelerator/rocksdb/LICENSE.leveldb \
   ./share/licenses/accelerator/go-toolchain/"$go_toolchain"/LICENSE \
   ./share/sources/accelerator/SOURCES.tsv \
   ./share/sources/accelerator/GO-BUILD-INFO.tsv \
@@ -496,6 +501,24 @@ for native in rocksdb-static-library system:libstdc++.a system:libgcc.a; do
     || fail "$native failed for an unrelated reason"
 done
 
+for notice in AUTHORS COPYING LICENSE.Apache LICENSE.leveldb; do
+  candidate="$TMP/missing-rocks-notice-$notice"
+  cp -a "$TMP/bundle" "$candidate"
+  mkdir "$candidate/root"
+  tar -xzf "$archive" -C "$candidate/root"
+  rm "$candidate/root/share/licenses/accelerator/rocksdb/$notice"
+  release_materials_hash_tree "$candidate/root" accelerator \
+    "$candidate/root/share/sources/accelerator/MATERIALS.sha256"
+  tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
+    -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
+  (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+    fail "validator accepted missing RocksDB $notice with regenerated checksums"
+  fi
+  grep -Fq "missing member \"./share/licenses/accelerator/rocksdb/$notice\"" "$candidate/result.log" \
+    || fail "missing RocksDB notice failed for an unrelated reason"
+done
+
 # The archive name is the requested release target; an untagged source record
 # identifies the actual commit and does not pretend that target tag exists.
 tar -xOf "$archive" ./share/sources/accelerator/SOURCES.tsv | \
@@ -536,7 +559,7 @@ fi
 
 mkdir -p "$TMP/material-stage"
 tar -xzf "$archive" -C "$TMP/material-stage"
-printf 'not the packaged license\n' > "$TMP/material-stage/share/licenses/accelerator/rocksdb/LICENSE"
+printf 'not the packaged license\n' > "$TMP/material-stage/share/licenses/accelerator/rocksdb/COPYING"
 cp -a "$TMP/bundle" "$TMP/material-tampered"
 tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='@1700000000' \
   --pax-option=delete=atime,delete=ctime -czf \

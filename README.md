@@ -160,6 +160,16 @@ padding) to 1 GiB and the entry count to 20,000 before extraction. Packaging set
 its output umask explicitly; a caller's restrictive umask does not change the
 published directory contract. Build and publish retain the same Go routing policy.
 
+The pinned RocksDB source supplies `AUTHORS`, `COPYING`, `LICENSE.Apache` and
+`LICENSE.leveldb`; all four are mandatory archive materials. License collection
+refuses unreadable subtrees and incomplete traversals. Distinct native link
+inputs cannot overwrite notices under a shared material name. Packaging cleans
+its own read-only Go module cache on success and failure without touching other
+workspaces. Third-party local Go replacements without authenticated module
+checksums are not supported in official packages; use versioned module
+replacements. Existing Kuasar sibling replacements and ordinary development
+builds are unchanged.
+
 This repository publishes independent component versions named `vX.Y.Z`. The x86_64 component archive contains the three service binaries and the documented operational/performance helper scripts selected by the release contract. Component design documents and E2E sources are collected from the selected tag into the project platform archive.
 
 The project repository publishes aggregate versions named `release-vX.Y.Z`, selecting exact versions of `accelerator` and the other release units, validating their assets, and running cross-component tests. Aggregate and component version numbers are independent.

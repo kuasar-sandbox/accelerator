@@ -31,12 +31,15 @@ var archiveContract = map[string]entryContract{
 	"./test/scripts/dedup_report.sh":       {typeflag: tar.TypeReg, mode: 0o755},
 	"./test/scripts/procmon.sh":            {typeflag: tar.TypeReg, mode: 0o755},
 	"./test/scripts/proc_analyze.py":       {typeflag: tar.TypeReg, mode: 0o755},
-	"./share/licenses/accelerator/project/LICENSE":  {typeflag: tar.TypeReg, mode: 0o644},
-	"./share/licenses/accelerator/rocksdb/LICENSE":  {typeflag: tar.TypeReg, mode: 0o644},
-	"./share/sources/accelerator/GO-BUILD-INFO.tsv": {typeflag: tar.TypeReg, mode: 0o644},
-	"./share/sources/accelerator/GO-MODULES.tsv":    {typeflag: tar.TypeReg, mode: 0o644},
-	"./share/sources/accelerator/MATERIALS.sha256":  {typeflag: tar.TypeReg, mode: 0o644},
-	"./share/sources/accelerator/SOURCES.tsv":       {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/licenses/accelerator/project/LICENSE":         {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/licenses/accelerator/rocksdb/AUTHORS":         {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/licenses/accelerator/rocksdb/COPYING":         {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/licenses/accelerator/rocksdb/LICENSE.Apache":  {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/licenses/accelerator/rocksdb/LICENSE.leveldb": {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/sources/accelerator/GO-BUILD-INFO.tsv":        {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/sources/accelerator/GO-MODULES.tsv":           {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/sources/accelerator/MATERIALS.sha256":         {typeflag: tar.TypeReg, mode: 0o644},
+	"./share/sources/accelerator/SOURCES.tsv":              {typeflag: tar.TypeReg, mode: 0o644},
 }
 
 func materialContract(name string) (entryContract, bool) {

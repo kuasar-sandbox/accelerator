@@ -204,3 +204,19 @@ for mutation in valid missing-map empty-map missing-rocks missing-stdlib missing
   fi
 done
 printf 'test-native-materials: exact cache link-input selection PASS\n'
+
+mkdir -p "$test_root/link/other"
+printf 'distinct same-name archive\n' > "$test_root/link/other/libstdc++.a"
+release_materials_init "$test_root/collision-stage" "$test_root/collision-work" fixture
+printf 'LOAD %s\n' "$test_root/link/system/librocksdb.a" \
+  "$test_root/link/system/libstdc++.a" "$test_root/link/other/libstdc++.a" \
+  > "$test_root/link/collision.map"
+if (release_native_cache_inputs "$test_root/link/collision.map" "$test_root/link/system/librocksdb.a" \
+    "$test_root/link/go-temp" > "$test_root/collision.log" 2>&1); then
+  fail "accepted colliding native input material names"
+fi
+grep -Fq 'distinct native link inputs share a material name' "$test_root/collision.log" \
+  || fail "native collision failed for an unrelated reason"
+[ "$(wc -l < "$RELEASE_MATERIALS_WORK/sources")" -eq 1 ] \
+  || fail "second colliding native input reached the material collector"
+printf 'test-native-materials: colliding input rejected before overwriting materials PASS\n'

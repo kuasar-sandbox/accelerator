@@ -153,7 +153,8 @@ release_native_system_input() {
 }
 
 release_native_cache_inputs() {
-  local map="$1" rocks_library="$2" generated_root="$3" input canonical count=0 rocks_seen=0
+  local map="$1" rocks_library="$2" generated_root="$3" input canonical name count=0 rocks_seen=0
+  local -A selected_inputs=()
   [ -s "$map" ] || fail "fresh cache-ctl linker map is missing"
   rocks_library="$(realpath -e "$rocks_library")" || fail "fresh RocksDB archive is missing"
   generated_root="$(realpath -e "$generated_root")" || fail "owned Go build directory is missing"
@@ -168,6 +169,11 @@ release_native_cache_inputs() {
       rocks_seen=$((rocks_seen + 1))
       continue
     fi
+    name="$(basename "$canonical")"
+    if [ -n "${selected_inputs[$name]:-}" ] && [ "${selected_inputs[$name]}" != "$canonical" ]; then
+      fail "distinct native link inputs share a material name: $name"
+    fi
+    selected_inputs[$name]="$canonical"
     release_native_system_input "$canonical" bin/cache-ctl
     count=$((count + 1))
   done < <(awk '$1 == "LOAD" && $2 ~ /\.(a|o)$/ {print $2}' "$map" | LC_ALL=C sort -u)
