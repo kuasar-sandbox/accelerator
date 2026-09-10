@@ -24,6 +24,7 @@ GOWORK=off go test -race "$ROOT/scripts/release-go-toolchain.go" "$ROOT/scripts/
 GOWORK=off go test -race "$ROOT/scripts/release-archive-validator.go" "$ROOT/scripts/release-archive-validator_test.go"
 bash "$ROOT/deps/test-common.sh"
 bash "$ROOT/scripts/test-release-native-materials.sh"
+bash "$ROOT/scripts/test-release-rpm-enumeration.sh"
 
 init_fixture_repo() {
   local directory="$1"
@@ -267,6 +268,11 @@ release_materials_download_go_toolchain() {
   for suffix in zip ziphash info mod; do
     [ ! -f "$cached/$identity.$suffix" ] || cp --reflink=auto "$cached/$identity.$suffix" "$destination/"
   done
+  # Public signed lookup/tile responses still undergo Go's normal signature
+  # verification. Do not reuse caller HOME, authentication or VCS state.
+  if [ -d "$FIXTURE_GO_DISTRIBUTION_CACHE/cache/download/sumdb" ]; then
+    cp -a "$FIXTURE_GO_DISTRIBUTION_CACHE/cache/download/sumdb" "${destination%/golang.org/toolchain/@v}/"
+  fi
   _release_materials_download_go_toolchain "$@"
 }
 # Synthetic native payloads have explicit fixture notice inputs. The production
@@ -452,7 +458,7 @@ for target in darwin/amd64 linux/arm64; do
   (cd "$fixture_root" && GOWORK=off CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" \
     go build -buildvcs=true -o "$TMP/target-${target//\//-}" "./cmd/$target_command")
 done
-for mutation in extra-binary extra-script extra-directory duplicate no-rocksdb wrong-os wrong-arch; do
+for mutation in extra-binary extra-script extra-directory extra-source extra-source-directory duplicate no-rocksdb wrong-os wrong-arch; do
   candidate="$TMP/exact-contract-$mutation"
   cp -a "$TMP/bundle" "$candidate"
   mkdir "$candidate/root"
@@ -461,6 +467,8 @@ for mutation in extra-binary extra-script extra-directory duplicate no-rocksdb w
     extra-binary) install -m 0755 "$TMP/go-fixture" "$candidate/root/bin/unexpected-tool" ;;
     extra-script) install -m 0755 "$TMP/go-fixture" "$candidate/root/test/scripts/unexpected-helper" ;;
     extra-directory) mkdir "$candidate/root/unexpected-directory" ;;
+    extra-source) printf 'uncontracted metadata\n' > "$candidate/root/share/sources/accelerator/unexpected" ;;
+    extra-source-directory) mkdir "$candidate/root/share/sources/accelerator/nested" ;;
     no-rocksdb) install -m 0755 "$TMP/no-rocksdb-bin/cache-ctl" "$candidate/root/bin/cache-ctl" ;;
     wrong-os) install -m 0755 "$TMP/target-darwin-amd64" "$candidate/root/bin/store-ctl" ;;
     wrong-arch) install -m 0755 "$TMP/target-linux-arm64" "$candidate/root/bin/manifest-ctl" ;;
@@ -550,7 +558,7 @@ for native in rocksdb-static-library system:libstdc++.a system:libgcc.a; do
     fail "validator accepted missing $native with regenerated checksums"
   fi
   grep -Eq 'RocksDB static-library digest|inconsistent source record for system:' "$candidate/result.log" \
-    || fail "$native failed for an unrelated reason"
+    || { cat "$candidate/result.log" >&2; fail "$native failed for an unrelated reason"; }
 done
 
 for notice in AUTHORS COPYING LICENSE.Apache LICENSE.leveldb; do

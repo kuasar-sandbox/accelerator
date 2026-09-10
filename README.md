@@ -110,6 +110,12 @@ payload names before any source or toolchain download; path aliases are rejected
 These release checks do not change ordinary development module authentication.
 Source inventories reject duplicate or excessive records before per-row work;
 each metadata table is capped at 16 MiB and the source inventory at 16,384 rows.
+RPM notice collection checks both the installed-package listing and every
+same-source sibling file listing. A partial failure aborts collection even when
+another sibling supplied valid notices; partial output is not complete coverage.
+Source metadata is limited to `SOURCES.tsv`, `GO-BUILD-INFO.tsv`,
+`GO-MODULES.tsv` and `MATERIALS.sha256`; only license material has dynamic
+nested paths. Extra source files/directories are rejected before extraction.
 
 The trusted publisher generates the standard release text and source/Preview
 markers from its validated request. Downloaded `release-notes.md` is a local

@@ -54,8 +54,7 @@ func materialContract(name string) (entryContract, bool) {
 			return entryContract{typeflag: tar.TypeDir, mode: 0o755}, true
 		}
 	}
-	if !strings.HasPrefix(name, "./share/licenses/accelerator/") &&
-		!strings.HasPrefix(name, "./share/sources/accelerator/") {
+	if !strings.HasPrefix(name, "./share/licenses/accelerator/") {
 		return entryContract{}, false
 	}
 	clean := path.Clean(strings.TrimPrefix(name, "./"))

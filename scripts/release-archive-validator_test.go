@@ -70,6 +70,26 @@ func archiveFixture(t *testing.T, oversizedHeader bool, memberSize int, trailing
 	return name
 }
 
+func TestSourceMetadataHasNoDynamicFallback(t *testing.T) {
+	for _, name := range []string{
+		"./share/sources/accelerator/unexpected",
+		"./share/sources/accelerator/nested/",
+		"./share/sources/accelerator/nested/NOTICE",
+	} {
+		if _, ok := materialContract(name); ok {
+			t.Fatalf("undeclared source metadata accepted: %s", name)
+		}
+	}
+	if _, ok := materialContract("./share/licenses/accelerator/dependency/LICENSE"); !ok {
+		t.Fatal("ordinary nested license material was rejected")
+	}
+	for _, name := range []string{"SOURCES.tsv", "GO-BUILD-INFO.tsv", "GO-MODULES.tsv", "MATERIALS.sha256"} {
+		if _, ok := archiveContract["./share/sources/accelerator/"+name]; !ok {
+			t.Fatalf("declared source metadata missing: %s", name)
+		}
+	}
+}
+
 func TestArchiveResourceLimits(t *testing.T) {
 	valid := archiveFixture(t, false, 16, nil)
 	if err := validateArchive(valid); err != nil {
