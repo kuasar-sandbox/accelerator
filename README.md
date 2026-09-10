@@ -93,6 +93,15 @@ Configuration examples must use local paths, documentation-reserved endpoints, a
 
 ## Release model
 
+The release workflow records the completed archive's SHA-256 as a build-job
+output before uploading it. The publisher receives that independent value as
+`RELEASE_ARCHIVE_SHA256` and checks it before any Tag or Release write; a value
+recalculated from the downloaded bundle is not a substitute. This binds every
+payload and material file to that completed build, even if the bundle's own
+checksums are regenerated. Local packaging and standalone validation do not
+require this publication input. The receipt does not attest compiler provenance
+or isolate untrusted candidate code.
+
 The archive name records the requested release version. Source records retain
 that version only when its local Git tag points to the selected commit; before
 tagging they use `git:<commit>`. Validation binds every Go payload and the project
