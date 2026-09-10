@@ -148,8 +148,41 @@ validate_copied_source_files() {
 
 validate_archive_paths() {
   local archive="$1"
-  go run "$ROOT/scripts/release-archive-validator.go" "$archive" \
+  GOENV=off GOFLAGS='' GOWORK=off GOTOOLCHAIN=local GOOS='' GOARCH='' \
+    GOAMD64=v1 CGO_ENABLED=0 GOEXPERIMENT='' go run "$ROOT/scripts/release-archive-validator.go" "$archive" \
     || fail "$archive contains an unsafe type, mode or ownership, or violates the exact entry contract"
+}
+
+validate_source_inventory() {
+  local table="$1/share/sources/$NAME/SOURCES.tsv"
+  [ "$(stat -c '%s' "$table")" -le 16777216 ] || fail "source inventory exceeds its size bound"
+  awk -F '\t' '
+    NR == 1 { if ($0 != "payload\tname\tversion\tsource\tintegrity\tlicense_directory") exit 1; next }
+    NF != 6 || NR > 16385 || seen[$1 FS $2]++ { exit 1 }
+    $2 == "accelerator" { if ($1 != "bin/*,test/scripts/*") exit 1; next }
+    $2 == "rocksdb" || $2 == "rocksdb-static-library" { if ($1 != "bin/cache-ctl") exit 1; next }
+    $2 == "Go toolchain" {
+      if ($1 !~ /^bin\/(manifest-ctl|store-ctl|cache-ctl)$/) exit 1
+      next
+    }
+    $2 ~ /^system:/ {
+      name=substr($2, 8)
+      if ($1 != "bin/cache-ctl" || name !~ /^[A-Za-z0-9._+-]+[.](a|o)$/ ||
+          $6 != "share/licenses/accelerator/system/" name || $3 !~ /^[A-Za-z0-9.+:~_-]+$/) exit 1
+      if (split($5, fields, ";") != 2 || fields[1] !~ /^sha256:/ || fields[2] !~ /^package:/) exit 1
+      digest=substr(fields[1], 8); package=substr(fields[2], 9)
+      if (length(digest) != 64 || digest ~ /[^0-9a-f]/ || package !~ /^[A-Za-z0-9][A-Za-z0-9.+_-]*$/) exit 1
+      if ($4 ~ /^deb-source:/) {
+        if (package !~ /^[a-z0-9][a-z0-9+.-]*$/ || $4 != "deb-source:" package "@" $3) exit 1
+      } else if ($4 ~ /^rpm-source:[A-Za-z0-9][A-Za-z0-9.+:~_-]*[.](no)?src[.]rpm$/) {
+        suffix="-" $3 ".src.rpm"; alternate="-" $3 ".nosrc.rpm"
+        if (substr($4, length($4)-length(suffix)+1) != suffix &&
+            substr($4, length($4)-length(alternate)+1) != alternate) exit 1
+      } else exit 1
+      next
+    }
+    { exit 1 }
+  ' "$table" || fail "unrecognized or inconsistent source inventory record"
 }
 
 require_rocksdb_payload() {
@@ -207,6 +240,7 @@ validate_bundle() {
   require_rocksdb_payload "$extract/bin/cache-ctl"
   release_materials_require_git_licenses "$extract" "$NAME" "$ROOT" "$project_sha" project
   release_materials_require_rocksdb_notices "$extract"
+  validate_source_inventory "$extract"
   release_materials_validate "$extract" "$NAME"
   release_materials_require_project_source "$extract" "$NAME" 'bin/*,test/scripts/*' "$version" \
     bin/manifest-ctl bin/store-ctl bin/cache-ctl

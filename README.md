@@ -108,8 +108,17 @@ bypasses, Git configuration and caller credentials while retaining validated,
 credential-free routing. Uploaded Go record keys must match the exact official
 payload names before any source or toolchain download; path aliases are rejected.
 These release checks do not change ordinary development module authentication.
+No organization-owned Go module is exempt from module checksum and notice
+validation in this component; it has no separately collected internal Go dependency.
 Source inventories reject duplicate or excessive records before per-row work;
 each metadata table is capped at 16 MiB and the source inventory at 16,384 rows.
+Only project, RocksDB, official per-payload Go toolchain and system-link input
+source kinds are accepted. System rows require their own material directory,
+a SHA-256 input digest and consistent Debian/RPM source-package/version fields.
+These are record-consistency checks; the trusted build verifies actual installed
+input/notice bytes, and its independent archive digest binds them for publication.
+The host archive parser ignores persisted Go settings and ambient build flags,
+uses the local compiler and targets the host instead of an inherited cross target.
 RPM notice collection checks both the installed-package listing and every
 same-source sibling file listing. A partial failure aborts collection even when
 another sibling supplied valid notices; partial output is not complete coverage.

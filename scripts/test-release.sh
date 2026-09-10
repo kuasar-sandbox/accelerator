@@ -25,6 +25,7 @@ GOWORK=off go test -race "$ROOT/scripts/release-archive-validator.go" "$ROOT/scr
 bash "$ROOT/deps/test-common.sh"
 bash "$ROOT/scripts/test-release-native-materials.sh"
 bash "$ROOT/scripts/test-release-rpm-enumeration.sh"
+PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-validator-environment.py"
 
 init_fixture_repo() {
   local directory="$1"
@@ -295,7 +296,7 @@ release_native_system_input() {
   mkdir -p "$RELEASE_MATERIALS_STAGE/share/licenses/$RELEASE_MATERIALS_UNIT/$label"
   printf 'synthetic fixture compiler-runtime notice\n' \
     > "$RELEASE_MATERIALS_STAGE/share/licenses/$RELEASE_MATERIALS_UNIT/$label/LICENSE"
-  release_materials_record_source "$2" "system:$(basename "$input")" fixture \
+  release_materials_record_source "$2" "system:$(basename "$input")" 1.0 \
     deb-source:fixture@1.0 "sha256:$(sha256sum "$input" | awk '{print $1}');package:fixture" "$label"
 }
 EOF
@@ -559,6 +560,46 @@ for native in rocksdb-static-library system:libstdc++.a system:libgcc.a; do
   fi
   grep -Eq 'RocksDB static-library digest|inconsistent source record for system:' "$candidate/result.log" \
     || { cat "$candidate/result.log" >&2; fail "$native failed for an unrelated reason"; }
+done
+
+for mutation in unknown-kind unknown-payload unknown-toolchain \
+  native-version native-source native-integrity native-package native-license; do
+  candidate="$TMP/source-contract-$mutation"
+  cp -a "$TMP/bundle" "$candidate"
+  mkdir "$candidate/root"
+  tar -xzf "$archive" -C "$candidate/root"
+  table="$candidate/root/share/sources/accelerator/SOURCES.tsv"
+  awk -F '\t' -v OFS='\t' -v mutation="$mutation" '
+    { print }
+    NR == 2 && mutation ~ /^unknown-/ {
+      $1="bin/cache-ctl"; $2="unrecognized"; $6="share/licenses/accelerator/project"
+      if (mutation == "unknown-payload") { $1="bin/manifest-ctl"; $2="rocksdb" }
+      if (mutation == "unknown-toolchain") { $1="test/scripts/proc_analyze.py"; $2="Go toolchain" }
+      print
+    }
+  ' "$table" > "$candidate/changed-sources"
+  if [[ "$mutation" == native-* ]]; then
+    awk -F '\t' -v OFS='\t' -v mutation="$mutation" '
+      $2 == "system:libgcc.a" {
+        if (mutation == "native-version") $3="different-version"
+        if (mutation == "native-source") $4="https://example.invalid/unverified-native"
+        if (mutation == "native-integrity") $5="not-an-input-digest"
+        if (mutation == "native-package") sub(/;package:.*/, ";package:another-package", $5)
+        if (mutation == "native-license") $6="share/licenses/accelerator/system/libstdc++.a"
+      }
+      { print }
+    ' "$table" > "$candidate/changed-sources"
+  fi
+  install -m 0644 "$candidate/changed-sources" "$table"
+  release_materials_hash_tree "$candidate/root" accelerator "$candidate/root/share/sources/accelerator/MATERIALS.sha256"
+  tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
+    -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
+  (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+    fail "validator accepted $mutation with regenerated material/archive checksums"
+  fi
+  grep -Fq 'unrecognized or inconsistent source inventory record' "$candidate/result.log" \
+    || fail "$mutation failed for an unrelated reason"
 done
 
 for notice in AUTHORS COPYING LICENSE.Apache LICENSE.leveldb; do
