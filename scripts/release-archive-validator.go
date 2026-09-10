@@ -83,11 +83,22 @@ func main() {
 }
 
 func validateArchive(path string) error {
+	return validateArchiveWithLimits(path, 512<<20, 1<<30, 20000)
+}
+
+func validateArchiveWithLimits(path string, maxMember, maxExpanded int64, maxMembers int) error {
 	file, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
+	stat, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if stat.Size() > maxExpanded {
+		return errors.New("compressed archive exceeds size limit")
+	}
 
 	gzipReader, err := gzip.NewReader(file)
 	if err != nil {
@@ -96,14 +107,29 @@ func validateArchive(path string) error {
 	defer gzipReader.Close()
 
 	seen := make(map[string]struct{}, len(archiveContract))
-	tarReader := tar.NewReader(gzipReader)
+	limited := &io.LimitedReader{R: gzipReader, N: maxExpanded + 1}
+	tarReader := tar.NewReader(limited)
 	for {
 		header, err := tarReader.Next()
+		if limited.N <= 0 {
+			return errors.New("expanded archive exceeds size limit")
+		}
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
 			return err
+		}
+		// Check before Next consumes any declared member body. The reader limit
+		// also bounds padding, extension headers and concatenated gzip streams.
+		if header.Size > maxMember {
+			return fmt.Errorf("member %q exceeds size limit", header.Name)
+		}
+		if header.Size >= limited.N {
+			return errors.New("expanded archive exceeds size limit")
+		}
+		if len(seen) >= maxMembers {
+			return errors.New("archive exceeds member count limit")
 		}
 
 		contract, ok := archiveContract[header.Name]
@@ -132,6 +158,25 @@ func validateArchive(path string) error {
 		}
 		if header.Linkname != "" {
 			return fmt.Errorf("member %q stores link target %q", header.Name, header.Linkname)
+		}
+	}
+	// Consume only bounded zero tar padding; authenticate the gzip trailer too.
+	var buffer [32 << 10]byte
+	for {
+		n, err := limited.Read(buffer[:])
+		if limited.N <= 0 {
+			return errors.New("expanded archive exceeds size limit")
+		}
+		for _, value := range buffer[:n] {
+			if value != 0 {
+				return errors.New("unexpected data after tar end marker")
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return err
 		}
 	}
 

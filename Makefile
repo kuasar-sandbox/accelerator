@@ -154,7 +154,7 @@ dedup-report:
 
 VERSION ?= v0.1.0
 
-release: build
+release:
 	rm -rf build/release-bundle
 	SOURCE_DATE_EPOCH="$$(git show -s --format=%ct HEAD)" \
 		bash scripts/release.sh package "$(VERSION)" "$(TARGET_ARCH)" build/release-bundle

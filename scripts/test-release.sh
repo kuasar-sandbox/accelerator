@@ -14,8 +14,13 @@ fail() {
 # shellcheck source=scripts/release-materials.sh
 source "$ROOT/scripts/release-materials.sh"
 
+export FIXTURE_GO_DISTRIBUTION_CACHE
+FIXTURE_GO_DISTRIBUTION_CACHE="$(go env GOMODCACHE)"
 bash "$ROOT/scripts/test-release-materials.sh"
+GOWORK=off go test -race "$ROOT/scripts/release-go-toolchain.go" "$ROOT/scripts/release-go-toolchain_test.go"
+GOWORK=off go test -race "$ROOT/scripts/release-archive-validator.go" "$ROOT/scripts/release-archive-validator_test.go"
 bash "$ROOT/deps/test-common.sh"
+bash "$ROOT/scripts/test-release-native-materials.sh"
 
 init_fixture_repo() {
   local directory="$1"
@@ -189,6 +194,17 @@ grep -Fqx 'run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }}' \
   "$ROOT/.github/workflows/release.yml" \
   || fail "release run identity does not pin source_sha"
 workflow="$ROOT/.github/workflows/release.yml"
+for job in build publish; do
+  for routing in 'GOPROXY: https://goproxy.cn,direct' 'GOSUMDB: sum.golang.google.cn' 'GOTOOLCHAIN: local'; do
+    awk -v job="$job" '
+      $0 == "  " job ":" { inside=1; next }
+      inside && /^  [A-Za-z0-9_-]+:/ { exit }
+      inside && /^    steps:/ { exit }
+      inside { print }
+    ' "$workflow" | grep -Fx "      $routing" >/dev/null \
+      || fail "$workflow $job is missing the verified Go routing policy: $routing"
+  done
+done
 [ "$(grep -Fc 'archive_sha256: ${{ steps.release-archive-digest.outputs.archive_sha256 }}' \
   "$workflow")" -eq 1 ] \
   || fail "$workflow does not expose exactly one independent build archive digest"
@@ -233,25 +249,71 @@ install -m 0644 "$ROOT/LICENSE" "$fixture_root/LICENSE"
 printf '/bin/\n/build/\n' > "$fixture_root/.gitignore"
 install -m 0755 "$ROOT/scripts/release.sh" "$fixture_root/scripts/release.sh"
 install -m 0755 "$ROOT/scripts/release-materials.sh" "$fixture_root/scripts/release-materials.sh"
+install -m 0644 "$ROOT/scripts/release-go-toolchain.go" "$fixture_root/scripts/release-go-toolchain.go"
+install -m 0644 "$ROOT/scripts/release-native-materials.sh" "$fixture_root/scripts/release-native-materials.sh"
+cat >> "$fixture_root/scripts/release-materials.sh" <<'EOF'
+release_materials_download_go_toolchain() {
+  GOMODCACHE="${FIXTURE_GO_DISTRIBUTION_CACHE:?}" _release_materials_download_go_toolchain "$@"
+}
+EOF
+# Real package ownership/byte verification is covered by the isolated native
+# suite above. These synthetic archives test the actual linker-map selection
+# and packaging flow without claiming a real RocksDB/native build.
+cat >> "$fixture_root/scripts/release-native-materials.sh" <<'EOF'
+release_native_system_input() {
+  local input="$1" label="system/$(basename "$1")"
+  case "$(basename "$input")" in libstdc++.a|libgcc.a) ;; *) fail "unexpected fixture system input" ;; esac
+  mkdir -p "$RELEASE_MATERIALS_STAGE/share/licenses/$RELEASE_MATERIALS_UNIT/$label"
+  printf 'synthetic fixture compiler-runtime notice\n' \
+    > "$RELEASE_MATERIALS_STAGE/share/licenses/$RELEASE_MATERIALS_UNIT/$label/LICENSE"
+  release_materials_record_source "$2" "system:$(basename "$input")" fixture \
+    deb-source:fixture@1.0 "sha256:$(sha256sum "$input" | awk '{print $1}');package:fixture" "$label"
+}
+EOF
 install -m 0644 "$ROOT/scripts/release-archive-validator.go" "$fixture_root/scripts/release-archive-validator.go"
-printf 'module release-fixture.invalid\n\ngo 1.24\n' > "$fixture_root/go.mod"
-printf 'package main\nfunc main() {}\n' > "$fixture_root/main.go"
+install -m 0755 "$ROOT/scripts/publish-release.sh" "$fixture_root/scripts/publish-release.sh"
+printf 'module github.com/kuasar-sandbox/accelerator\n\ngo 1.24\n' > "$fixture_root/go.mod"
+for binary in manifest-ctl store-ctl cache-ctl; do
+  mkdir -p "$fixture_root/cmd/$binary"
+  printf 'package main\nfunc main() {}\n' > "$fixture_root/cmd/$binary/main.go"
+done
 mkdir -p "$fixture_root/test"
 cp -a "$ROOT/test/scripts" "$fixture_root/test/scripts"
-fixture_project_sha="$(init_fixture_repo "$fixture_root" LICENSE .gitignore scripts go.mod main.go test/scripts)"
-(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/go-fixture" .)
+cat > "$fixture_root/Makefile" <<'EOF'
+.PHONY: build
+build:
+	test "$$GOWORK" = off && test "$$GOFLAGS" = -mod=readonly
+	test "$$GOENV" = off && test "$$GOTOOLCHAIN" = local
+	test -z "$${GH_TOKEN:-}" && test -z "$${AWS_SECRET_ACCESS_KEY:-}"
+	test ! -e ignored-release-input.txt
+	test ! -e build/x86_64/rocksdb/lib/librocksdb.a
+	mkdir -p bin/x86_64 build/src/rocksdb build/x86_64/rocksdb/lib build/test-system
+	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/manifest-ctl ./cmd/manifest-ctl
+	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/store-ctl ./cmd/store-ctl
+	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/cache-ctl ./cmd/cache-ctl
+	printf 'fixture RocksDB license\n' > build/src/rocksdb/LICENSE
+	printf 'fresh synthetic RocksDB archive\n' > build/x86_64/rocksdb/lib/librocksdb.a
+	printf 'synthetic stdc++ archive\n' > build/test-system/libstdc++.a
+	printf 'synthetic gcc archive\n' > build/test-system/libgcc.a
+	@map="$$(printf '%s\n' '$(GOLDFLAGS_STATIC)' | sed 's/.*-Wl,-Map,//; s/"$$//')"; \
+	  test -n "$$map" && test "$$map" != '$(GOLDFLAGS_STATIC)'; \
+	  printf 'LOAD %s\n' "$(CURDIR)/build/x86_64/rocksdb/lib/librocksdb.a" \
+	    "$(CURDIR)/build/test-system/libstdc++.a" "$(CURDIR)/build/test-system/libgcc.a" > "$$map"
+EOF
+fixture_project_sha="$(init_fixture_repo "$fixture_root" LICENSE .gitignore scripts go.mod cmd test/scripts Makefile)"
+(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/go-fixture" ./cmd/manifest-ctl)
 release_materials_require_go_revision "$TMP/go-fixture" "$fixture_project_sha"
-printf '// dirty fixture\n' >> "$fixture_root/main.go"
-(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/dirty-go-fixture" .)
+printf '// dirty fixture\n' >> "$fixture_root/cmd/manifest-ctl/main.go"
+(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/dirty-go-fixture" ./cmd/manifest-ctl)
 if (release_materials_require_go_revision "$TMP/dirty-go-fixture" "$fixture_project_sha" >/dev/null 2>&1); then
   fail "release accepted a binary built from dirty source"
 fi
-printf 'package main\nfunc main() {}\n' > "$fixture_root/main.go"
+printf 'package main\nfunc main() {}\n' > "$fixture_root/cmd/manifest-ctl/main.go"
 if (release_materials_require_go_revision "$TMP/go-fixture" \
   0000000000000000000000000000000000000000 >/dev/null 2>&1); then
   fail "release accepted a binary built from another commit"
 fi
-GO111MODULE=off go build -o "$TMP/unstamped-go-fixture" "$fixture_root/main.go"
+GO111MODULE=off go build -o "$TMP/unstamped-go-fixture" "$fixture_root/cmd/manifest-ctl/main.go"
 if (release_materials_require_go_revision "$TMP/unstamped-go-fixture" "$fixture_project_sha" >/dev/null 2>&1); then
   fail "release accepted a binary without source stamping"
 fi
@@ -264,22 +326,38 @@ mkdir -p "$TMP/no-rocksdb-bin"
 install -m 0755 "$TMP/bin/manifest-ctl" "$TMP/no-rocksdb-bin/manifest-ctl"
 install -m 0755 "$TMP/bin/store-ctl" "$TMP/no-rocksdb-bin/store-ctl"
 (cd "$fixture_root" && GOWORK=off go build -buildvcs=true -tags no_rocksdb \
-  -o "$TMP/no-rocksdb-bin/cache-ctl" .)
+  -o "$TMP/no-rocksdb-bin/cache-ctl" ./cmd/cache-ctl)
 if SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/no-rocksdb-bin" \
-  RELEASE_ROCKSDB_SOURCE_DIR="$TMP/rocksdb" \
   "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 \
-    "$TMP/no-rocksdb-bundle" >/dev/null 2>&1; then
-  fail "packager accepted cache-ctl with RocksDB compiled out"
+    "$TMP/no-rocksdb-bundle" > "$TMP/prebuilt-rejection.log" 2>&1; then
+  fail "packager accepted a prebuilt binary override"
 fi
+grep -Fq 'RELEASE_BIN_DIR is not supported' "$TMP/prebuilt-rejection.log" \
+  || fail "prebuilt rejection failed for an unrelated reason"
+if RELEASE_ROCKSDB_SOURCE_DIR="$TMP/rocksdb" \
+  "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 \
+    "$TMP/foreign-rocksdb-bundle" > "$TMP/source-rejection.log" 2>&1; then
+  fail "packager accepted a foreign RocksDB source override"
+fi
+grep -Fq 'RELEASE_ROCKSDB_SOURCE_DIR is not supported' "$TMP/source-rejection.log" \
+  || fail "RocksDB source rejection failed for an unrelated reason"
+printf 'ignored-release-input.txt\n' > "$fixture_root/.git/info/exclude"
+printf 'ignored development input\n' > "$fixture_root/ignored-release-input.txt"
+mkdir -p "$fixture_root/build/x86_64/rocksdb/lib"
+printf 'pre-existing development library\n' > "$fixture_root/build/x86_64/rocksdb/lib/librocksdb.a"
 
-SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
-  RELEASE_ROCKSDB_SOURCE_DIR="$TMP/rocksdb" \
+SOURCE_DATE_EPOCH=1700000000 GH_TOKEN=fixture-must-not-reach-build \
+  AWS_SECRET_ACCESS_KEY=fixture-must-not-reach-build \
   "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
+grep -Fqx 'pre-existing development library' "$fixture_root/build/x86_64/rocksdb/lib/librocksdb.a" \
+  || fail "release packaging changed the development RocksDB archive"
+grep -Fqx 'fixture RocksDB license' "$TMP/rocksdb/LICENSE" \
+  || fail "release packaging changed foreign source material"
 "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
-"$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
+"$ROOT/scripts/test-publisher.sh" "$fixture_root/scripts/publish-release.sh" \
   "$TMP/bundle" kuasar-sandbox/accelerator v1.2.3 \
   "$fixture_project_sha" main
-"$ROOT/scripts/test-publisher.sh" "$ROOT/scripts/publish-release.sh" \
+"$ROOT/scripts/test-publisher.sh" "$fixture_root/scripts/publish-release.sh" \
   "$TMP/bundle" kuasar-sandbox/accelerator v1.2.3 \
   "$fixture_project_sha" release/v1.2.x
 
@@ -306,15 +384,16 @@ if tar -tzf "$archive" | grep -E '(^|/)release\.json$|(^|/)release/[^/]+\.json$'
   fail "archive contains release metadata JSON"
 fi
 
-SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
-  RELEASE_ROCKSDB_SOURCE_DIR="$TMP/rocksdb" \
-  "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible"
+(umask 077; SOURCE_DATE_EPOCH=1700000000 \
+  "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible")
 cmp -s "$archive" "$TMP/reproducible/assets/accelerator-v1.2.3-linux-x86_64.tar.gz" \
   || fail "identical inputs did not produce an identical archive"
 
 for target in darwin/amd64 linux/arm64; do
+  target_command=manifest-ctl
+  [ "$target" != darwin/amd64 ] || target_command=store-ctl
   (cd "$fixture_root" && GOWORK=off CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" \
-    go build -buildvcs=true -o "$TMP/target-${target//\//-}" .)
+    go build -buildvcs=true -o "$TMP/target-${target//\//-}" "./cmd/$target_command")
 done
 for mutation in extra-binary extra-script extra-directory duplicate no-rocksdb wrong-os wrong-arch; do
   candidate="$TMP/exact-contract-$mutation"
@@ -350,6 +429,71 @@ for mutation in extra-binary extra-script extra-directory duplicate no-rocksdb w
     wrong-*) expected='must target linux/amd64' ;;
   esac
   grep -Fq "$expected" "$candidate/result.log" || fail "$mutation failed for an unrelated reason"
+done
+
+for payload in manifest-ctl store-ctl cache-ctl; do
+  candidate="$TMP/wrong-main-$payload"
+  cp -a "$TMP/bundle" "$candidate"
+  mkdir "$candidate/root"
+  tar -xzf "$archive" -C "$candidate/root"
+  other=manifest-ctl
+  [ "$payload" != manifest-ctl ] || other=store-ctl
+  install -m 0755 "$candidate/root/bin/$other" "$candidate/root/bin/$payload"
+  release_materials_require_go_revision "$candidate/root/bin/$payload" "$fixture_project_sha"
+  release_materials_init "$candidate/metadata-stage" "$candidate/materials" accelerator
+  for binary in manifest-ctl store-ctl cache-ctl; do
+    release_materials_add_go_binary "$candidate/root/bin/$binary" "bin/$binary"
+  done
+  {
+    printf 'payload\trecord\tname\tversion_or_value\tchecksum\n'
+    LC_ALL=C sort -u "$candidate/materials/go-build-info"
+  } > "$candidate/root/share/sources/accelerator/GO-BUILD-INFO.tsv"
+  release_materials_hash_tree "$candidate/root" accelerator \
+    "$candidate/root/share/sources/accelerator/MATERIALS.sha256"
+  tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
+    -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
+  (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+    fail "validator accepted another same-commit main package as $payload"
+  fi
+  grep -Fq 'must have its expected main package' "$candidate/result.log" \
+    || fail "$payload identity failed for an unrelated reason"
+done
+
+for helper in bench_cache.sh bench_cache_remote.sh dedup_report.sh procmon.sh proc_analyze.py; do
+  candidate="$TMP/changed-helper-$helper"
+  cp -a "$TMP/bundle" "$candidate"
+  mkdir "$candidate/root"
+  tar -xzf "$archive" -C "$candidate/root"
+  printf '\n# changed fixture helper\n' >> "$candidate/root/test/scripts/$helper"
+  tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
+    -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
+  (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+    fail "validator accepted changed helper $helper"
+  fi
+  grep -Fq 'helper bytes differ from selected source' "$candidate/result.log" \
+    || fail "$helper failed for an unrelated reason"
+done
+
+for native in rocksdb-static-library system:libstdc++.a system:libgcc.a; do
+  candidate="$TMP/missing-native-${native//:/-}"
+  cp -a "$TMP/bundle" "$candidate"
+  mkdir "$candidate/root"
+  tar -xzf "$archive" -C "$candidate/root"
+  inventory="$candidate/root/share/sources/accelerator/SOURCES.tsv"
+  awk -F '\t' -v name="$native" '$2 != name' "$inventory" > "$candidate/changed.tsv"
+  mv "$candidate/changed.tsv" "$inventory"
+  release_materials_hash_tree "$candidate/root" accelerator \
+    "$candidate/root/share/sources/accelerator/MATERIALS.sha256"
+  tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
+    -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
+  (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+    fail "validator accepted missing $native with regenerated checksums"
+  fi
+  grep -Eq 'RocksDB static-library digest|inconsistent source record for system:' "$candidate/result.log" \
+    || fail "$native failed for an unrelated reason"
 done
 
 # The archive name is the requested release target; an untagged source record

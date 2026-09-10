@@ -101,6 +101,46 @@ payload and material file to that completed build, even if the bundle's own
 checksums are regenerated. Local packaging and standalone validation do not
 require this publication input. The receipt does not attest compiler provenance
 or isolate untrusted candidate code.
+The trusted publisher generates the standard release text and source/Preview
+markers from its validated request. Downloaded `release-notes.md` is a local
+bundle aid, not an authority for the public release body or reconciliation.
+
+Packaging creates a fresh checkout of the selected Accelerator commit and rebuilds
+all three Go payloads and the recipe-pinned RocksDB static library. It rejects
+`RELEASE_BIN_DIR` and `RELEASE_ROCKSDB_SOURCE_DIR`; prebuilt binaries, ignored
+development files and extracted/native build caches are not reused. Cached
+download bytes may be copied into the owned workspace, but the RocksDB recipe
+checks the normalized source-tree digest before compiling them. The five shipped
+helpers and RocksDB license texts are copied from those fresh selected trees.
+Build commands use a private home, temporary directory and Go caches without
+cloud/release credentials or inherited build-flag overrides. Credential-free
+HTTPS routing, `GOSUMDB` (including a checksum mirror) and `GOTOOLCHAIN` are
+preserved; the latter two default to `sum.golang.org` and `local`.
+
+The cache payload's actual linker map must select the newly built
+`librocksdb.a`, `libstdc++.a` and `libgcc.a`. Packaging records the RocksDB
+library digest and collects each linked system archive/startup object's digest,
+Debian/RPM source-package identity and corresponding copyright/license/NOTICE
+bytes. Installed inputs and notices must match package-file metadata; ownership
+alone is insufficient. These checks do not attest a compromised host or package
+database, and do not change RocksDB's backend or durability policy.
+
+Release packaging records the Go compiler selected in the fresh build context,
+then compares its distribution inputs before and after building with the matching
+`golang.org/toolchain` archive authenticated by the configured checksum database.
+This covers the compiler, standard-library sources and other files in that
+distribution; extra non-build `api`, `doc`, `misc` and `test` files in a full Go
+installation are not authenticated or used as release license sources. The
+standard `go.mod`/`_go.mod` installation transformation is accounted for.
+Go license/notice bytes, including nested compiler and standard-library dependency
+materials, come from the verified archive with their relative paths retained.
+Standalone validation
+rechecks their bytes, source URL and module h1. A version string or recomputed
+bundle checksum cannot substitute for that source check. Verification requires
+an enabled checksum database and its matching archive/cache; it may fetch
+verification material with `GOTOOLCHAIN=local` but does not switch the build
+compiler or silently enable automatic toolchain selection. These checks assume
+the trusted build host and do not attest a compromised host.
 
 The archive name records the requested release version. Source records retain
 that version only when its local Git tag points to the selected commit; before
@@ -111,6 +151,14 @@ Archive validation enumerates the three Go binaries and five shipped helper
 scripts, rejects extra or duplicate payload entries, requires Linux/amd64 Go
 build targets, and rejects `no_rocksdb` in the official cache payload. Component
 license/source material directories remain independently namespaced.
+Each CLI must also identify its own `cmd/<name>` main package in the Accelerator
+module. Every shipped helper is compared with the selected Git blob, so validation
+requires that exact commit in the local object database. The trusted publisher
+reads source history without executing candidate helpers. The archive parser
+limits regular members to 512 MiB, the entire expanded gzip stream (including
+padding) to 1 GiB and the entry count to 20,000 before extraction. Packaging sets
+its output umask explicitly; a caller's restrictive umask does not change the
+published directory contract. Build and publish retain the same Go routing policy.
 
 This repository publishes independent component versions named `vX.Y.Z`. The x86_64 component archive contains the three service binaries and the documented operational/performance helper scripts selected by the release contract. Component design documents and E2E sources are collected from the selected tag into the project platform archive.
 

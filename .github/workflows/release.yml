@@ -148,6 +148,10 @@ jobs:
   publish:
     needs: [preflight, build]
     runs-on: [self-hosted, Linux, X64, kuasar-control]
+    env:
+      GOPROXY: https://goproxy.cn,direct
+      GOSUMDB: sum.golang.google.cn
+      GOTOOLCHAIN: local
     permissions:
       actions: read
       contents: write
@@ -156,6 +160,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # Read selected main/maintenance blobs without executing their helpers.
+          fetch-depth: 0
 
       - name: Install pinned GitHub CLI
         run: bash scripts/install-gh-cli.sh
