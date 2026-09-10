@@ -221,9 +221,9 @@ validate_bundle() {
   for file in libstdc++.a libgcc.a; do
     release_materials_require_source "$extract" "$NAME" bin/cache-ctl "system:$file" ""
   done
-  release_materials_require_go "$extract" "$NAME" 'bin/manifest-ctl'
-  release_materials_require_go "$extract" "$NAME" 'bin/store-ctl'
-  release_materials_require_go "$extract" "$NAME" 'bin/cache-ctl'
+  release_materials_require_go_key "$extract" "$NAME" 'bin/manifest-ctl'
+  release_materials_require_go_key "$extract" "$NAME" 'bin/store-ctl'
+  release_materials_require_go_key "$extract" "$NAME" 'bin/cache-ctl'
   for file in manifest-ctl store-ctl cache-ctl; do
     [ -x "$extract/bin/$file" ] || fail "$archive is missing executable bin/$file"
     check_go_binary "$extract/bin/$file"
