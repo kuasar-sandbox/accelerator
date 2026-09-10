@@ -98,6 +98,10 @@ that version only when its local Git tag points to the selected commit; before
 tagging they use `git:<commit>`. Validation binds every Go payload and the project
 source URL/digest to the same commit. The publisher supplies its expected commit
 and rejects a different-source bundle before any Tag or Release write.
+Archive validation enumerates the three Go binaries and five shipped helper
+scripts, rejects extra or duplicate payload entries, requires Linux/amd64 Go
+build targets, and rejects `no_rocksdb` in the official cache payload. Component
+license/source material directories remain independently namespaced.
 
 This repository publishes independent component versions named `vX.Y.Z`. The x86_64 component archive contains the three service binaries and the documented operational/performance helper scripts selected by the release contract. Component design documents and E2E sources are collected from the selected tag into the project platform archive.
 

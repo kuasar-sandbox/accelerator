@@ -226,6 +226,7 @@ install -m 0644 "$ROOT/LICENSE" "$fixture_root/LICENSE"
 printf '/bin/\n/build/\n' > "$fixture_root/.gitignore"
 install -m 0755 "$ROOT/scripts/release.sh" "$fixture_root/scripts/release.sh"
 install -m 0755 "$ROOT/scripts/release-materials.sh" "$fixture_root/scripts/release-materials.sh"
+install -m 0644 "$ROOT/scripts/release-archive-validator.go" "$fixture_root/scripts/release-archive-validator.go"
 printf 'module release-fixture.invalid\n\ngo 1.24\n' > "$fixture_root/go.mod"
 printf 'package main\nfunc main() {}\n' > "$fixture_root/main.go"
 mkdir -p "$fixture_root/test"
@@ -303,6 +304,46 @@ SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible"
 cmp -s "$archive" "$TMP/reproducible/assets/accelerator-v1.2.3-linux-x86_64.tar.gz" \
   || fail "identical inputs did not produce an identical archive"
+
+for target in darwin/amd64 linux/arm64; do
+  (cd "$fixture_root" && GOWORK=off CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" \
+    go build -buildvcs=true -o "$TMP/target-${target//\//-}" .)
+done
+for mutation in extra-binary extra-script extra-directory duplicate no-rocksdb wrong-os wrong-arch; do
+  candidate="$TMP/exact-contract-$mutation"
+  cp -a "$TMP/bundle" "$candidate"
+  mkdir "$candidate/root"
+  tar -xzf "$archive" -C "$candidate/root"
+  case "$mutation" in
+    extra-binary) install -m 0755 "$TMP/go-fixture" "$candidate/root/bin/unexpected-tool" ;;
+    extra-script) install -m 0755 "$TMP/go-fixture" "$candidate/root/test/scripts/unexpected-helper" ;;
+    extra-directory) mkdir "$candidate/root/unexpected-directory" ;;
+    no-rocksdb) install -m 0755 "$TMP/no-rocksdb-bin/cache-ctl" "$candidate/root/bin/cache-ctl" ;;
+    wrong-os) install -m 0755 "$TMP/target-darwin-amd64" "$candidate/root/bin/store-ctl" ;;
+    wrong-arch) install -m 0755 "$TMP/target-linux-arm64" "$candidate/root/bin/manifest-ctl" ;;
+  esac
+  if [ "$mutation" = duplicate ]; then
+    tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
+      -cf "$candidate/duplicate.tar" -C "$candidate/root" .
+    tar --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
+      -rf "$candidate/duplicate.tar" -C "$candidate/root" ./bin/manifest-ctl
+    gzip -c "$candidate/duplicate.tar" > "$candidate/assets/$(basename "$archive")"
+  else
+    tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
+      -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
+  fi
+  (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
+  if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
+    fail "validator accepted $mutation with regenerated checksums"
+  fi
+  case "$mutation" in
+    extra-*) expected='unexpected member' ;;
+    duplicate) expected='duplicate member' ;;
+    no-rocksdb) expected='must include RocksDB support' ;;
+    wrong-*) expected='must target linux/amd64' ;;
+  esac
+  grep -Fq "$expected" "$candidate/result.log" || fail "$mutation failed for an unrelated reason"
+done
 
 # The archive name is the requested release target; an untagged source record
 # identifies the actual commit and does not pretend that target tag exists.

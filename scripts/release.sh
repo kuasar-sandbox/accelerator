@@ -56,35 +56,34 @@ copy_root_executable() {
 }
 
 check_go_binary() {
-  local file="$1"
-  go version -m "$file" >/dev/null 2>&1 \
+  local file="$1" info
+  info="$(go version -m "$file" 2>/dev/null)" \
     || fail "Go build info is missing from $file"
+  awk -F '\t' '
+    $2 == "build" && $3 ~ /^GOOS=/ { os++; if ($3 != "GOOS=linux") bad=1 }
+    $2 == "build" && $3 ~ /^GOARCH=/ { arch++; if ($3 != "GOARCH=amd64") bad=1 }
+    END { exit bad || os != 1 || arch != 1 }
+  ' <<< "$info" || fail "Go release payload must target linux/amd64: $file"
 }
 
 validate_archive_paths() {
-  local archive="$1" listing="$WORK/listing"
-  tar -tzf "$archive" > "$listing"
-  awk '
-    /^\// { exit 1 }
-    { path=$0; sub(/^\.\//, "", path); if (path ~ /(^|\/)\.\.($|\/)/) exit 1 }
-  ' "$listing" || fail "$archive contains an unsafe path"
-  if grep -E '(^|/)release\.json$|(^|/)release/[^/]+\.json$' "$listing" >/dev/null; then
-    fail "$archive contains release metadata JSON"
-  fi
-  awk '
-    { path=$0; sub(/^\.\//, "", path) }
-    path != "" && path !~ /\/$/ && path !~ /^bin\// && path !~ /^test\/scripts\// && path !~ /^share\/(licenses|sources)\/accelerator\// { exit 1 }
-  ' "$listing" || fail "$archive contains a file outside the accelerator release layout"
-  tar --numeric-owner -tvzf "$archive" | awk '
-    $2 != "0/0" { exit 1 }
-    $1 ~ /^d/ { if ($1 != "drwxr-xr-x") exit 1; next }
-    $1 !~ /^-/ { exit 1 }
-    {
-      path=$6; sub(/^\.\//, "", path)
-      expected=(path ~ /^(bin\/|test\/scripts\/)/ ? "-rwxr-xr-x" : "-rw-r--r--")
-      if ($1 != expected) exit 1
+  local archive="$1"
+  go run "$ROOT/scripts/release-archive-validator.go" "$archive" \
+    || fail "$archive contains an unsafe type, mode or ownership, or violates the exact entry contract"
+}
+
+require_rocksdb_payload() {
+  if go version -m "$1" | awk -F '\t' '
+    $2 == "build" && $3 ~ /^-tags=/ {
+      value=substr($3, 7)
+      gsub(/"/, "", value)
+      count=split(value, tags, /[, ]+/)
+      for (i=1; i <= count; i++) if (tags[i] == "no_rocksdb") found=1
     }
-  ' || fail "$archive contains an unsafe type, mode or ownership"
+    END { exit !found }
+  '; then
+    fail "official accelerator release must include RocksDB support"
+  fi
 }
 
 validate_bundle() {
@@ -117,6 +116,11 @@ validate_bundle() {
   rm -rf "$extract"
   mkdir -p "$extract"
   tar -xzf "$bundle/assets/$archive" -C "$extract"
+  local file
+  for file in manifest-ctl store-ctl cache-ctl; do
+    check_go_binary "$extract/bin/$file"
+  done
+  require_rocksdb_payload "$extract/bin/cache-ctl"
   release_materials_validate "$extract" "$NAME"
   release_materials_require_project_source "$extract" "$NAME" 'bin/*,test/scripts/*' "$version" \
     bin/manifest-ctl bin/store-ctl bin/cache-ctl
@@ -126,7 +130,6 @@ validate_bundle() {
   release_materials_require_go "$extract" "$NAME" 'bin/manifest-ctl'
   release_materials_require_go "$extract" "$NAME" 'bin/store-ctl'
   release_materials_require_go "$extract" "$NAME" 'bin/cache-ctl'
-  local file
   for file in manifest-ctl store-ctl cache-ctl; do
     [ -x "$extract/bin/$file" ] || fail "$archive is missing executable bin/$file"
     check_go_binary "$extract/bin/$file"
@@ -160,19 +163,7 @@ package_release() {
   check_go_binary "$STAGE/bin/manifest-ctl"
   check_go_binary "$STAGE/bin/store-ctl"
   check_go_binary "$STAGE/bin/cache-ctl"
-  if go version -m "$STAGE/bin/cache-ctl" | awk -F '\t' '
-    $2 == "build" && $3 ~ /^-tags=/ {
-      value=substr($3, 7)
-      gsub(/"/, "", value)
-      count=split(value, tags, /[, ]+/)
-      for (i=1; i <= count; i++) {
-        if (tags[i] == "no_rocksdb") found=1
-      }
-    }
-    END { exit !found }
-  '; then
-    fail "official accelerator release must include RocksDB support"
-  fi
+  require_rocksdb_payload "$STAGE/bin/cache-ctl"
   copy_root_executable test/scripts/bench_cache.sh test/scripts/bench_cache.sh
   copy_root_executable test/scripts/bench_cache_remote.sh test/scripts/bench_cache_remote.sh
   copy_root_executable test/scripts/dedup_report.sh test/scripts/dedup_report.sh
