@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -526,5 +528,83 @@ func TestInsecureConfigSkipsTLSVerification(t *testing.T) {
 	}
 	if string(body) != "G1\n" || meta.ETag != `"tls-etag"` {
 		t.Fatalf("insecure client read = %q, etag = %q", body, meta.ETag)
+	}
+}
+
+// TestInsecureTransportDoesNotReachCredentialProviders pins the isolation
+// the Insecure config promises: only object traffic to the configured S3
+// endpoint skips certificate verification. The default credential chain's
+// identity fetches must keep the strict transport they captured during
+// LoadDefaultConfig. The web-identity chain is pointed at a self-signed
+// TLS "STS" via AWS_ENDPOINT_URL_STS: with the isolation in place the
+// token exchange fails certificate verification and the object Get fails
+// with it; if the insecure transport leaked into the chain, the exchange
+// would succeed against the mock and the Get would complete.
+func TestInsecureTransportDoesNotReachCredentialProviders(t *testing.T) {
+	t.Setenv("AWS_MAX_ATTEMPTS", "1")
+	// Default chain with every earlier-winning provider neutralised so
+	// the web-identity provider is the one that runs.
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "")
+	t.Setenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", "")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "no-config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "no-credentials"))
+
+	tokenFile := filepath.Join(t.TempDir(), "identity-token")
+	if err := os.WriteFile(tokenFile, []byte("mock-identity-token"), 0o600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+	t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", tokenFile)
+	t.Setenv("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/mock-role")
+
+	// The STS mock presents a certificate no strict client trusts. If
+	// the insecure transport reaches it, it hands out valid temporary
+	// credentials and the object Get succeeds — the leak this test
+	// guards against.
+	stsMock := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/xml")
+		_, _ = io.WriteString(w, `<AssumeRoleWithWebIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+  <AssumeRoleWithWebIdentityResult>
+    <Credentials>
+      <AccessKeyId>ASIAMOCKCREDENTIALS</AccessKeyId>
+      <SecretAccessKey>mock-secret</SecretAccessKey>
+      <SessionToken>mock-session-token</SessionToken>
+      <Expiration>2099-01-01T00:00:00Z</Expiration>
+    </Credentials>
+  </AssumeRoleWithWebIdentityResult>
+  <ResponseMetadata><RequestId>mock-request</RequestId></ResponseMetadata>
+</AssumeRoleWithWebIdentityResponse>`)
+	}))
+	t.Cleanup(stsMock.Close)
+	t.Setenv("AWS_ENDPOINT_URL_STS", stsMock.URL)
+
+	// Plain-HTTP S3 endpoint: a completed request means credentials were
+	// obtained from the mock.
+	s3Endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("ETag", `"leak-etag"`)
+		_, _ = io.WriteString(w, "G1\n")
+	}))
+	t.Cleanup(s3Endpoint.Close)
+
+	client, err := New(context.Background(), Config{
+		Endpoint:  s3Endpoint.URL,
+		Bucket:    "test-bucket",
+		PathStyle: true,
+		Insecure:  true, // S3 traffic skips verification; the chain must not.
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, _, err = client.Get(context.Background(), "__meta/generations")
+	if err == nil {
+		t.Fatal("object Get succeeded: the insecure transport reached the credential provider's STS fetch")
+	}
+	if msg := err.Error(); !strings.Contains(msg, "certificate") && !strings.Contains(msg, "tls:") {
+		t.Fatalf("error is not a TLS verification failure from the identity fetch: %v", err)
 	}
 }

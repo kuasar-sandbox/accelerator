@@ -88,7 +88,9 @@ s3:
 对中间人（MITM）攻击的防护——任何能截获连接的一方都可以读取或替换流量，包括
 对象数据和凭据。** 只要 endpoint 可能经由不可信网络到达，就应保持缺省的严格
 校验。该选项用于强制 TLS 拦截代理后、证书无法加入信任库的 endpoint；与
-`http://` endpoint 组合使用是冗余的，但不报错。
+`http://` endpoint 组合使用是冗余的，但不报错。该开关只放宽对所配置 endpoint
+的对象流量——SDK 默认凭据链（instance role、web identity、SSO）自身的身份请求
+仍保持严格校验。
 
 ### 2.3 Generation source
 

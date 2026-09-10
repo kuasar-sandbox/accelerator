@@ -96,12 +96,21 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		loadOpts = append(loadOpts, awsconfig.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")))
 	}
-	if cfg.Insecure {
-		loadOpts = append(loadOpts, awsconfig.WithHTTPClient(insecureHTTPClient()))
-	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("s3 sdkclient: load aws config: %w", err)
+	}
+	if cfg.Insecure {
+		// Attached only after LoadDefaultConfig has resolved the
+		// credential chain. Passing this client as a load option would
+		// install it on the shared aws.Config before that resolution,
+		// and the default chain's identity clients (STS assume-role /
+		// web identity, SSO OIDC) capture cfg.HTTPClient at
+		// construction — their token and temporary-credential fetches
+		// would then also run with verification disabled. The providers
+		// keep the strict default transport; only this S3 client's
+		// config copy carries the insecure one.
+		awsCfg.HTTPClient = insecureHTTPClient()
 	}
 	api := newAPI(awsCfg, cfg.Endpoint, cfg.PathStyle)
 	return &Client{api: api, bucket: cfg.Bucket}, nil

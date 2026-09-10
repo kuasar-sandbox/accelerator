@@ -76,7 +76,7 @@ s3:
 
 Static AK/SK values must be supplied together. When both are empty, the AWS SDK default credential chain is used. String fields support `${VAR}` expansion. `region` defaults to `us-east-1`; `path_style` defaults to `true`.
 
-`insecure: true` skips TLS certificate verification for the endpoint. **Security warning: this disables the transport's protection against man-in-the-middle attacks — anyone able to intercept the connection can read or replace traffic, including object data and credentials.** Leave it unset (the default, strict verification) whenever the endpoint is reachable through an untrusted network. It exists for endpoints behind a mandatory TLS-intercepting proxy whose certificates cannot be added to the trust store; combining it with an `http://` endpoint is redundant but not an error.
+`insecure: true` skips TLS certificate verification for the endpoint. **Security warning: this disables the transport's protection against man-in-the-middle attacks — anyone able to intercept the connection can read or replace traffic, including object data and credentials.** Leave it unset (the default, strict verification) whenever the endpoint is reachable through an untrusted network. It exists for endpoints behind a mandatory TLS-intercepting proxy whose certificates cannot be added to the trust store; combining it with an `http://` endpoint is redundant but not an error. The flag relaxes verification only for object traffic to the configured endpoint — the SDK's default credential chain (instance role, web identity, SSO) keeps strict verification for its own identity requests.
 
 ### 2.3 Generation source
 
