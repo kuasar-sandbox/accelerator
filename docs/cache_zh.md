@@ -387,17 +387,17 @@ Wire 帧头只携带 32 字节 `Hash`——Object 与 Shard 都不需要告诉�
 | 参数/选项 | 默认 | 含义 |
 |---|---|---|
 | `disk_bytes` | 1 TiB | 大小计算输入,**不是强制磁盘配额** |
-| `mem_ratio` | 0.01 | 共享 BlockCache=disk_bytes×mem_ratio,最小 64 MiB |
+| `mem_ratio` | 0.01 | 共享 **block+blob** LRU=`disk_bytes × mem_ratio`,最小 64 MiB(SST index/filter/data **以及** BlobDB payload) |
 | `block_size` | 64 KiB | SST data block 大小 |
 | `bloom_bits` | 15 | 每 key Bloom 位数,实际假阳性率不是固定文档百分比 |
 | compression | none | 固定 RocksDB 选项;加密 chunk 已是高熵 |
-| `direct_reads` | true | 对支持的读取启用 UseDirectReads |
-| `write_buffer_bytes` | 256 MiB | write-buffer 大小配置输入 |
+| `direct_reads` | true | 启用 UseDirectReads,同时设置 UseDirectIOForFlushAndCompaction(读与 flush/compaction 必须一致) |
+| `write_buffer_bytes` | 256 MiB | **按 CF**(chunk、manifest、blob)。`NewDefaultOptions()` 构造的 CF 不继承 DB 级设置。默认 256 MiB,`max_write_buffer_number=4` |
 | `max_background_jobs` | 8 | 用于最大 background compactions;实现另设 2 个 background flush |
 | compaction | leveled/default | 实际组织遵守底层配置 |
 | pin L0 filter/index | true | 同时设置 CacheIndexAndFilterBlocks 与 PinL0FilterAndIndexBlocksInCache,不表示所有 level metadata 永久 pin |
 
-index/filter 与 data block 共用 BlockCache。不能把它们当成独立保证常驻的预算,
+index/filter、SST data block 与 BlobDB payload 共用该 **block+blob** LRU。不能把它们当成独立保证常驻的预算,
 也不能由此推出所有 key 单次 I/O。
 
 #### Column Family 隔离
@@ -421,12 +421,14 @@ cache 淘汰按频率进行,不等于 store 的 generation 生命周期。
   `.blob` 文件(达到阈值也可进入 blob 路径)。
 - `blob_file_size = 256 MiB`:blob 文件目标大小。
 - BlobDB GC 开启:后台回收无引用的 blob 文件。
+- `SetBlockCache` 用的同一 LRU 也作为 `SetBlobCache`。
+- `PrepopulateBlobCache = FlushOnly`,使刚 flush 的 blob 在 Direct I/O 下不会立刻被再读一遍。
 
-大 value 在 LSM 中留下 key/blob reference，payload 追加到 blob 文件，可减少普通 key compaction 重写的大 value 数据。实际写放大取决于 key、RocksDB 格式、负载、compaction 和 blob GC。读取 blob value 可能在找到 SST reference 后还需额外 I/O。
+大 value 在 LSM 中留下 key/blob reference，payload 追加到 blob 文件，可减少普通 key compaction 重写的大 value 数据。实际写放大取决于 key、RocksDB 格式、负载、compaction 和 blob GC。读取 blob value 可能在找到 SST reference 后还需额外 I/O：那是 blob-cache miss（冷或已被淘汰），不是刚 flush 的 restore 路径。
 
 #### DirectReads
 
-UseDirectReads 默认 true,对支持的数据读取绕过 OS page cache。
+UseDirectReads 默认 true,对支持的数据读取绕过 OS page cache。同一 `.blob` 文件上缓冲 flush 与 O_DIRECT GetCF 混用会产生 ≥8ms 尾延迟;因此 flush/compaction 的 Direct I/O 跟随 `direct_reads`。
 
 - **L1 与 Manifest consumer 同节点**:减少 BlockCache 与 OS 对同一数据的重复缓存。
 - **L2 专用节点**：较大 BlockCache 配置下同样可减少重复。BlockCache 大小由部署选择，不是 daemon 规则。
@@ -633,7 +635,7 @@ tiered 仅提供 object read chain,拒绝 writes 和 shard operations。协议�
 
 ### 5.1 L1(tiered 进程内嵌 embedded tier)
 
-配置的 BlockCache 是一项主要 native-memory 额度，不是完整进程上限。memtable/write buffer、native metadata、BlobDB/compaction、wire payload pool、active/previous CMS generation 与临时 buffer 需分别计入。缓存中的 index/filter block 共享 BlockCache，不能再次视为独立 pinned 区域重复计数。
+配置的 **block+blob** LRU(`disk_bytes × mem_ratio`,§4.4)是一项主要 native-memory 额度，不是完整进程上限。BlobDB payload 在该 LRU **内部**与 SST index/filter/data block 竞争,不是第二套 cache。memtable/write buffer(256 MiB × CF × buffer)、native metadata、BlobDB/compaction、wire payload pool、active/previous CMS generation 与临时 buffer 需分别计入。缓存中的 index/filter block 共享同一 LRU,不能再次视为独立 pinned 区域重复计数。
 
 按 embedded 后端契约（§4.4）的实际配置和最小值推导 cache 额度。Go heap、在飞 request/fill 并发、native 与 OS 内存都取决于负载。DirectReads 可减少受支持数据读取的 page cache，但不表示全进程 page-cache 用量为零。应测量整个进程/cgroup，而非把单项额度当作总量限制。
 
