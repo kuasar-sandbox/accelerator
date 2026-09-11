@@ -205,6 +205,7 @@ func TestLoadConfigS3EnvExpansion(t *testing.T) {
 	t.Setenv("TEST_S3_BUCKET", "env-bucket")
 	t.Setenv("TEST_S3_AK", "from-env-AK")
 	t.Setenv("TEST_S3_SK", "from-env-SK")
+	t.Setenv("TEST_S3_CA", "/etc/ssl/env-ca.pem")
 	path := writeYAML(t, `
 backend: s3
 s3:
@@ -213,6 +214,8 @@ s3:
   bucket: ${TEST_S3_BUCKET}
   access_key: ${TEST_S3_AK}
   secret_key: ${TEST_S3_SK}
+  tls:
+    ca_cert: ${TEST_S3_CA}
 `)
 	cfg, err := LoadConfig(path, false)
 	if err != nil {
@@ -222,6 +225,12 @@ s3:
 		cfg.S3.Region != "env-region-1" || cfg.S3.Bucket != "env-bucket" ||
 		cfg.S3.AccessKey != "from-env-AK" || cfg.S3.SecretKey != "from-env-SK" {
 		t.Fatalf("environment expansion failed: %+v", cfg.S3)
+	}
+	if cfg.S3.TLS == nil || cfg.S3.TLS.CACert != "/etc/ssl/env-ca.pem" {
+		t.Fatalf("tls.ca_cert expansion failed: %+v", cfg.S3.TLS)
+	}
+	if cfg.Generations.S3.TLS == nil || cfg.Generations.S3.TLS.CACert != "/etc/ssl/env-ca.pem" {
+		t.Fatalf("default generation source did not inherit the expanded tls block: %+v", cfg.Generations.S3.TLS)
 	}
 }
 

@@ -103,6 +103,10 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.TLS.CACert != "" && cfg.TLS.InsecureSkipVerify {
 		return nil, errors.New("s3 sdkclient: tls ca_cert and insecure_skip_verify are mutually exclusive")
 	}
+	tlsClient, err := tlsHTTPClient(cfg.TLS)
+	if err != nil {
+		return nil, err
+	}
 
 	region := cfg.Region
 	if region == "" {
@@ -116,10 +120,6 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("s3 sdkclient: load aws config: %w", err)
-	}
-	tlsClient, err := tlsHTTPClient(cfg.TLS)
-	if err != nil {
-		return nil, err
 	}
 	if tlsClient != nil {
 		// Attached only after LoadDefaultConfig resolves the credential
