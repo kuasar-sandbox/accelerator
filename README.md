@@ -93,112 +93,56 @@ Configuration examples must use local paths, documentation-reserved endpoints, a
 
 ## Release model
 
-The release workflow records the completed archive's SHA-256 as a build-job
-output before uploading it. The publisher receives that independent value as
-`RELEASE_ARCHIVE_SHA256` and checks it before any Tag or Release write; a value
-recalculated from the downloaded bundle is not a substitute. This binds every
-payload and material file to that completed build, even if the bundle's own
-checksums are regenerated. Local packaging and standalone validation do not
-require this publication input. The receipt does not attest compiler provenance
-or isolate untrusted candidate code.
+Build from the selected source with the component Makefile. `release.sh package`
+uses the matching binaries in `bin/<arch>`, or an explicit `RELEASE_BIN_DIR`;
+it collects materials and creates the bundle without rebuilding those binaries
+or resetting source/build caches. Keep the selected source checkouts, dependency
+versions and native build records together with the outputs.
 
-Go dependency and toolchain downloads use fresh private module/VCS state, an
-enabled checksum database and `GOAUTH=off`. They clear persisted Go settings, private-module
-bypasses, Git configuration and caller credentials while retaining validated,
-credential-free routing. Uploaded Go record keys must match the exact official
-payload names before any source or toolchain download; path aliases are rejected.
-These release checks do not change ordinary development module authentication.
-No organization-owned Go module is exempt from module checksum and notice
-validation in this component; it has no separately collected internal Go dependency.
-Source inventories reject duplicate or excessive records before per-row work;
-each metadata table is capped at 16 MiB and the source inventory at 16,384 rows.
-Only project, RocksDB, official per-payload Go toolchain and system-link input
-source kinds are accepted. System rows require their own material directory,
-a SHA-256 input digest and consistent Debian/RPM source-package/version fields.
-These are record-consistency checks; the trusted build verifies actual installed
-input/notice bytes, and its independent archive digest binds them for publication.
-The host archive parser ignores persisted Go settings and ambient build flags,
-uses the local compiler and targets the host instead of an inherited cross target.
-RPM notice collection checks both the installed-package listing and every
-same-source sibling file listing. A partial failure aborts collection even when
-another sibling supplied valid notices; partial output is not complete coverage.
-Source metadata is limited to `SOURCES.tsv`, `GO-BUILD-INFO.tsv`,
-`GO-MODULES.tsv` and `MATERIALS.sha256`; only license material has dynamic
-nested paths. Extra source files/directories are rejected before extraction.
+Packaging records the actual Go versions and effective module replacements.
+Go/module LICENSE and NOTICE files come from the selected compiler installation
+and matching module sources, preserving nested paths. Module resolution uses the
+normal Go cache and routing; downloaded module checksums must match the binaries.
+Only explicitly collected internal sibling dependencies use their own source
+materials; an organization namespace alone does not exempt other modules.
+Unsupported third-party local replacements need versioned module inputs for
+the official package. Existing Kuasar local `replace` directives remain in use.
 
-The trusted publisher generates the standard release text and source/Preview
-markers from its validated request. Downloaded `release-notes.md` is a local
-bundle aid, not an authority for the public release body or reconciliation.
+Materials live under `share/licenses/<component>` and
+`share/sources/<component>`. The latter contains `SOURCES.tsv`,
+`GO-BUILD-INFO.tsv`, `GO-MODULES.tsv` and `MATERIALS.sha256`.
+Collection fails on missing notices, unreadable subtrees or partial traversals.
+Independent validation checks the shipped inventory, checksums, required files,
+source-record consistency, payload identities and archive paths/types/modes.
+It does not fetch source checkouts or Go modules, compare notices with remote
+source trees, or download/authenticate compiler distributions. Checksums and
+VCS records are consistency checks, not proof of an arbitrary producer's identity.
 
-Packaging creates a fresh checkout of the selected Accelerator commit and rebuilds
-all three Go payloads and the recipe-pinned RocksDB static library. It rejects
-`RELEASE_BIN_DIR` and `RELEASE_ROCKSDB_SOURCE_DIR`; prebuilt binaries, ignored
-development files and extracted/native build caches are not reused. Cached
-download bytes may be copied into the owned workspace, but the RocksDB recipe
-checks the normalized source-tree digest before compiling them. The five shipped
-helpers and RocksDB license texts are copied from those fresh selected trees.
-Build commands use a private home, temporary directory and Go caches without
-cloud/release credentials or inherited build-flag overrides. Credential-free
-HTTPS routing, `GOSUMDB` (including a checksum mirror) and `GOTOOLCHAIN` are
-preserved; the latter two default to `sum.golang.org` and `local`.
+The archive name identifies the requested release target. Project and internal
+dependency records use a release version when its local tag matches the selected
+commit, otherwise `git:<commit>`; packaging does not require creating future
+target tags. The publisher passes the selected project SHA to validation before
+Tag/Release writes, uses the bundle's `release-notes.md` body, and appends the
+existing source/Preview markers. Trusted source selection, build/publish permission
+separation and the refusal to replace published assets remain required.
 
-The cache payload's actual linker map must select the newly built
-`librocksdb.a`, `libstdc++.a` and `libgcc.a`. Packaging records the RocksDB
-library digest and collects each linked system archive/startup object's digest,
-Debian/RPM source-package identity and corresponding copyright/license/NOTICE
-bytes. Installed inputs and notices must match package-file metadata; ownership
-alone is insufficient. These checks do not attest a compromised host or package
-database, and do not change RocksDB's backend or durability policy.
+The official package requires the three Linux/amd64 command binaries with
+their own Accelerator main-package identities; `cache-ctl` must include RocksDB.
+The five shipped operational helpers are copied from the selected source tree.
+Before extraction the validator rejects extra/duplicate payloads, links,
+incorrect ownership or modes, and foreign material namespaces.
 
-Release packaging records the Go compiler selected in the fresh build context,
-then compares its distribution inputs before and after building with the matching
-`golang.org/toolchain` archive authenticated by the configured checksum database.
-This covers the compiler, standard-library sources and other files in that
-distribution; extra non-build `api`, `doc`, `misc` and `test` files in a full Go
-installation are not authenticated or used as release license sources. The
-standard `go.mod`/`_go.mod` installation transformation is accounted for.
-Go license/notice bytes, including nested compiler and standard-library dependency
-materials, come from the verified archive with their relative paths retained.
-Standalone validation
-rechecks their bytes, source URL and module h1. A version string or recomputed
-bundle checksum cannot substitute for that source check. Verification requires
-an enabled checksum database and its matching archive/cache; it may fetch
-verification material with `GOTOOLCHAIN=local` but does not switch the build
-compiler or silently enable automatic toolchain selection. These checks assume
-the trusted build host and do not attest a compromised host.
-
-The archive name records the requested release version. Source records retain
-that version only when its local Git tag points to the selected commit; before
-tagging they use `git:<commit>`. Validation binds every Go payload and the project
-source URL/digest to the same commit. The publisher supplies its expected commit
-and rejects a different-source bundle before any Tag or Release write.
-Archive validation enumerates the three Go binaries and five shipped helper
-scripts, rejects extra or duplicate payload entries, requires Linux/amd64 Go
-build targets, and rejects `no_rocksdb` in the official cache payload. Component
-license/source material directories remain independently namespaced.
-Each CLI must also identify its own `cmd/<name>` main package in the Accelerator
-module. Every shipped helper is compared with the selected Git blob, so validation
-requires that exact commit in the local object database. The trusted publisher
-reads source history without executing candidate helpers. The archive parser
-limits regular members to 512 MiB, the entire expanded gzip stream (including
-padding) to 1 GiB and the entry count to 20,000 before extraction. Packaging sets
-its output umask explicitly; a caller's restrictive umask does not change the
-published directory contract. Build and publish retain the same Go routing policy.
-
-The pinned RocksDB source supplies `AUTHORS`, `COPYING`, `LICENSE.Apache` and
-`LICENSE.leveldb`; standalone validation compares this complete file set and its
-bytes with the verified native-source digest binding, not the bundle's own
-checksums. Project notices, including nested `LICENSES`, are reconstructed from
-the selected commit's Git blobs and compared in full. Changed, missing and extra
-material is rejected without executing candidate source files.
-All four RocksDB notices are mandatory archive materials. License collection
-refuses unreadable subtrees and incomplete traversals. Distinct native link
-inputs cannot overwrite notices under a shared material name. Packaging cleans
-its own read-only Go module cache on success and failure without touching other
-workspaces. Third-party local Go replacements without authenticated module
-checksums are not supported in official packages; use versioned module
-replacements. Existing Kuasar sibling replacements and ordinary development
-builds are unchanged.
+The normal cache build retains `build/<arch>/cache-ctl.map`. Packaging reads
+that link map and the matching RocksDB library/source tree, including
+`RELEASE_ROCKSDB_SOURCE_DIR` when supplied. It records the actual RocksDB,
+libstdc++, libgcc and other linked system inputs with their digests and Debian/RPM
+source-package versions. Copyright, license, NOTICE and referenced common-license
+texts are copied from those packages; installed file bytes are not authenticated
+against package-database digests. The RocksDB material set must include
+`AUTHORS`, `COPYING`, `LICENSE.Apache` and `LICENSE.leveldb`.
+Distinct native inputs cannot overwrite a shared material name. RPM collection
+requires complete same-source sibling listings. These materials support release
+review, not legal certification, and do not change the RocksDB backend or durability.
 
 This repository publishes independent component versions named `vX.Y.Z`. The x86_64 component archive contains the three service binaries and the documented operational/performance helper scripts selected by the release contract. Component design documents and E2E sources are collected from the selected tag into the project platform archive.
 

@@ -89,80 +89,42 @@ Go 与原生前置依赖随构建目标而异。当前源码通过仓库脚本�
 
 ## 发行模型
 
-发行工作流在上传前把已完成归档的 SHA-256 记录为 build job output。发布者通过
-`RELEASE_ARCHIVE_SHA256` 接收这一独立值,在任何 Tag/Release 写入前核对;不能用
-下载后从 bundle 重新计算的值代替。即使重算 bundle 自身的校验和,全部载荷与材料
-仍须匹配该次已完成构建。本地打包和独立验证不要求这个发布输入。该记录不证明
-编译器来源,也不构成对不可信候选代码的隔离。
+使用组件 Makefile 从选定源码构建。`release.sh package` 使用匹配的
+`bin/<arch>` 二进制,或显式指定的 `RELEASE_BIN_DIR`;只收集材料并生成 bundle,
+不重新构建二进制,不重置源码或构建缓存。所选源码 checkout、依赖版本、原生
+构建记录与产物应一并保留。
 
-Go 依赖及工具链下载使用全新的私有 module/VCS 状态、已启用的 checksum database
-和 `GOAUTH=off`。它们清除持久化 Go 设置、私有 module 绕过规则、Git 配置与调用者凭据,仅保留已验证的
-无凭据路由。下载来源或工具链之前,上传的 Go 记录键必须匹配官方载荷的精确名称;
-路径别名会被拒绝。这些发行检查不改变普通开发中的 module 认证方式。
-本组件没有单独采集材料的内部 Go 依赖;组织内的其他 Go 模块也必须通过
-module 校验和与许可材料验证。
-来源清单在逐行处理前拒绝重复或过量记录;每份元数据表上限为 16 MiB,
-来源清单上限为 16,384 行。
-只接受项目、RocksDB、各官方载荷的 Go 工具链及系统链接输入来源类别。
-系统行必须指向自身材料目录,包含输入 SHA-256,且 Debian/RPM 源包与版本字段
-相互一致。这是记录相符性检查;可信构建核对实际已安装输入与声明字节,独立归档
-摘要在发布时绑定这些内容。主机归档解析器忽略持久化 Go 设置及外部构建 flag,
-使用本地编译器和主机目标,不继承交叉目标。
-RPM 声明收集核对已安装包列表及每个同源兄弟包文件列表的真实退出状态。
-即使另一个包已提供有效声明,部分枚举失败仍会终止收集,不把部分输出当作完整覆盖。
-来源元数据仅允许 `SOURCES.tsv`、`GO-BUILD-INFO.tsv`、`GO-MODULES.tsv`
-和 `MATERIALS.sha256`;只有许可材料使用动态嵌套路径。额外来源文件/目录
-在解包前被拒绝。
+打包记录实际 Go 版本和生效的 module 替换。Go/module LICENSE、NOTICE 取自所选
+编译器安装和匹配的 module 源码,保留嵌套路径。模块解析沿用正常 Go 缓存与路由,
+下载模块的校验和须匹配二进制记录。只有明确单独采集的内部兄弟组件使用其自身
+源码材料;组织命名空间本身不豁免其他模块。官方包中不受支持的第三方本地替换
+需要改用带版本的 module 输入。现有 Kuasar 本地 `replace` 继续使用。
 
-可信发布端根据已验证请求生成标准发行正文及来源/Preview 标记。下载的
-`release-notes.md` 只是本地 bundle 辅助说明,不能决定公开发行正文或对账来源。
+材料放在 `share/licenses/<component>` 和 `share/sources/<component>`。
+后者包含 `SOURCES.tsv`、`GO-BUILD-INFO.tsv`、`GO-MODULES.tsv` 与
+`MATERIALS.sha256`。声明缺失、子目录不可读或遍历不完整时收集失败。
+独立验证检查交付清单、校验和、必需文件、来源记录相符性、载荷身份及归档路径/
+类型/权限。它不获取源码 checkout 或 Go 模块,不与远端源码树比较许可正文,
+也不下载或认证编译器分发。校验和及 VCS 记录是相符性检查,不能证明任意生产者的身份。
 
-打包从选定的 Accelerator commit 建立全新 checkout,重新构建三个 Go 载荷和
-recipe pin 的 RocksDB 静态库。拒绝 `RELEASE_BIN_DIR`、`RELEASE_ROCKSDB_SOURCE_DIR`,
-不复用预制二进制、被忽略的开发文件或已解压/原生构建缓存。可以把下载缓存字节
-复制到本次所属工作区,但 RocksDB recipe 在编译前仍核对归一化源码树摘要。五个
-交付辅助脚本和 RocksDB 许可正文取自这些全新选定源码树。构建命令使用私有
-home、临时目录及 Go 缓存,不继承云/发布凭据或构建 flag 覆盖。保留无凭据的
-HTTPS 路由、`GOSUMDB`(包括 checksum mirror)和 `GOTOOLCHAIN`;后两者默认
-分别为 `sum.golang.org` 和 `local`。
+归档名称标识请求的发行目标。项目及内部依赖记录在本地 Tag 匹配所选 commit 时
+使用发行版本,否则记录 `git:<commit>`;打包不要求创建未来目标 Tag。
+发布者在 Tag/Release 写入前把选定项目 SHA 传入验证器,采用 bundle 中
+`release-notes.md` 正文,追加既有来源/Preview 标记。可信源码选择、构建/发布
+权限分离及拒绝替换已发布资产的要求保持不变。
 
-cache 载荷的实际链接映射必须选中本次新构建的 `librocksdb.a`、`libstdc++.a`
-和 `libgcc.a`。打包记录 RocksDB 静态库摘要,并收集每个实际链入的系统静态库/
-启动对象的摘要、Debian/RPM 源包身份及对应版权、许可和 NOTICE 正文。已安装输入
-及许可必须匹配包文件元数据,仅有包归属不足以证明字节完整。这些检查不证明已
-失陷主机或包数据库可信,也不改变 RocksDB 后端或持久化策略。
+官方包要求三个 Linux/amd64 命令二进制分别具有自身的 Accelerator main-package
+身份;`cache-ctl` 必须包含 RocksDB。五个交付运维脚本取自所选源码树。
+解包前拒绝额外/重复载荷、链接、错误属主或权限,以及其他组件的材料命名空间。
 
-发行打包记录全新构建上下文实际选定的 Go 编译器,在构建前后将其分发输入与匹配的
-`golang.org/toolchain` 归档逐项比较;归档由配置的 checksum database 认证。这覆盖
-编译器、标准库源码及该分发中的其他文件。完整 Go 安装中额外的非构建 `api`、
-`doc`、`misc`、`test` 文件不在认证范围,也不作为发行许可来源;核对时处理标准的
-`go.mod`/`_go.mod` 安装转换。Go 许可/NOTICE 正文来自已验证归档,包括编译器和
-标准库内嵌依赖的材料,保留各自相对路径。独立验证还会
-重新核对其字节、来源 URL 和 module h1。版本字符串或重算 bundle 校验和不能替代
-来源核对。验证要求启用 checksum database 并取得匹配的归档/缓存;即使采用
-`GOTOOLCHAIN=local`,也可能获取核验材料,但不切换构建编译器或静默启用工具链
-自动选择。这些检查以可信构建主机为前提,不证明已失陷主机可信。
-
-归档名称记录请求的发行版本。来源记录仅在本地 Git Tag 指向所选 commit 时保留该版本;打 Tag 前使用 `git:<commit>`。验证器把全部 Go 载荷和项目来源 URL/摘要绑定到同一 commit。发布者传入预期 commit,在任何 Tag 或 Release 写入前拒绝不同来源的 bundle。
-归档验证逐项列举三个 Go 二进制和五个交付辅助脚本,拒绝额外或重复的载荷条目,
-要求 Go 构建目标为 Linux/amd64,并拒绝官方 cache 载荷使用 `no_rocksdb`。
-组件的许可/来源材料目录继续按组件隔离。
-每个 CLI 还必须是 Accelerator module 中对应的 `cmd/<name>` 主入口。每个交付
-辅助脚本都与所选 Git blob 比较,因此验证端的本地对象数据库须包含该精确 commit。
-可信发布端读取源码历史,不执行候选辅助脚本。解包前,归档解析器限制单个普通文件
-不超过 512 MiB,完整 gzip 展开流(含 padding)不超过 1 GiB,条目不超过 20,000。
-打包器显式设置输出 umask,调用者的严格 umask 不会改变发行目录权限合同。
-构建和发布保留相同的 Go 路由策略。
-
-pin 的 RocksDB 源码提供 `AUTHORS`、`COPYING`、`LICENSE.Apache` 与
-`LICENSE.leveldb`。独立验证把完整文件集合及其字节与已验证原生源码的摘要绑定
-比较,不依赖 bundle 自身的校验和。项目声明(包括嵌套 `LICENSES`)从选定 commit
-的 Git blob 重建并完整比较。不执行候选源码文件,即可拒绝内容变化、缺失和额外
-材料。归档必须包含全部四份 RocksDB 声明。许可证收集拒绝不可读子目录和
-不完整遍历。不同原生链接输入不能以相同材料名称相互覆盖声明。打包成功或失败
-退出时均清理本次所属的只读 Go module 缓存,不操作其他工作区。官方包不支持
-没有已认证 module 校验和的第三方本地 Go 替换,应选择带版本的 module 替换。
-现有 Kuasar 兄弟仓本地替换和普通开发构建不变。
+正常 cache 构建保留 `build/<arch>/cache-ctl.map`。打包读取该链接映射及匹配的
+RocksDB 静态库/源码树;显式提供时使用 `RELEASE_ROCKSDB_SOURCE_DIR`。
+记录实际 RocksDB、libstdc++、libgcc 等链接输入的摘要及 Debian/RPM 源包版本,
+从对应包复制版权、许可、NOTICE 和引用的公共许可正文,不按包数据库摘要认证
+已安装文件字节。RocksDB 材料必须包含 `AUTHORS`、`COPYING`、
+`LICENSE.Apache`、`LICENSE.leveldb`。不同原生输入不能以相同材料名称相互覆盖;
+RPM 收集要求完整枚举同源兄弟包。这些材料支持发行检视,不构成法律认证,
+也不改变 RocksDB 后端或持久化策略。
 
 本仓独立发布 `vX.Y.Z` 组件版本。x86_64 组件归档包含三个服务二进制及发行合同选定的运维/性能辅助脚本。组件设计文档和 E2E 源码从选定 Tag 收集到项目平台归档。
 
