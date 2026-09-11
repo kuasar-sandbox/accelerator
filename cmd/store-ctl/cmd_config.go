@@ -96,8 +96,13 @@ fs:
 #   max_inflight: 64
 #   op_timeout: 10s
 #   max_object_size_bytes: 16777216
-#   # Skip TLS certificate verification (insecure; testing only).
-#   insecure_skip_verify: false
+#   tls:
+#     # Extra PEM CA bundle appended to the system trust store — the way
+#     # to trust an endpoint (or intercepting proxy) whose CA is private.
+#     ca_cert: ""
+#     # Skip TLS certificate verification entirely (insecure; testing
+#     # only). Mutually exclusive with ca_cert.
+#     insecure_skip_verify: false
 
 # Generation source: configure exactly one of config, file, or s3. Entries
 # are oldest -> newest; the last entry admits new writes. When this entire
@@ -123,6 +128,8 @@ fs:
 #     path_style: true
 #     access_key: ${GENERATION_S3_ACCESS_KEY}
 #     secret_key: ${GENERATION_S3_SECRET_KEY}
-#     # Independent of the data backend's; insecure, testing only.
-#     insecure_skip_verify: false
+#     # Independent of the data backend's tls block; same semantics.
+#     tls:
+#       ca_cert: ""
+#       insecure_skip_verify: false
 `

@@ -3,8 +3,17 @@ package sdkclient
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"io"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -468,6 +477,8 @@ func TestNewRejectsInvalidConfiguration(t *testing.T) {
 		{name: "missing bucket", cfg: Config{Endpoint: "https://objects.example.com"}, want: "bucket is required"},
 		{name: "access key only", cfg: Config{Endpoint: "https://objects.example.com", Bucket: "b", AccessKey: "ak"}, want: "must be set together"},
 		{name: "secret key only", cfg: Config{Endpoint: "https://objects.example.com", Bucket: "b", SecretKey: "sk"}, want: "must be set together"},
+		{name: "ca cert with skip verify", cfg: Config{Endpoint: "https://objects.example.com", Bucket: "b", TLS: TLSConfig{CACert: "/tmp/ca.pem", InsecureSkipVerify: true}}, want: "mutually exclusive"},
+		{name: "ca cert unreadable", cfg: Config{Endpoint: "https://objects.example.com", Bucket: "b", TLS: TLSConfig{CACert: "/nonexistent/ca.pem"}}, want: "read tls ca_cert"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := New(context.Background(), tc.cfg)
@@ -475,6 +486,100 @@ func TestNewRejectsInvalidConfiguration(t *testing.T) {
 				t.Fatalf("error=%v want substring %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// TestCACertTrustsPrivateCA pins the ca_cert behaviour: an HTTPS server
+// whose certificate is signed by a private CA fails strict verification
+// but is trusted once the CA bundle is configured. The CA also composes
+// with the system store — no certificate is removed, only added.
+func TestCACertTrustsPrivateCA(t *testing.T) {
+	// One attempt only: the default client's failure is a connection
+	// error, which the retryer would otherwise back off and retry.
+	t.Setenv("AWS_MAX_ATTEMPTS", "1")
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate CA key: %v", err)
+	}
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test-private-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create CA certificate: %v", err)
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatalf("parse CA certificate: %v", err)
+	}
+
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate leaf key: %v", err)
+	}
+	leafTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, caCert, &leafKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create leaf certificate: %v", err)
+	}
+
+	setDefaultCredentialEnvironment(t)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("ETag", `"ca-etag"`)
+		_, _ = io.WriteString(w, "G1\n")
+	}))
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{{
+		Certificate: [][]byte{leafDER},
+		PrivateKey:  leafKey,
+	}}}
+	server.StartTLS()
+	t.Cleanup(server.Close)
+
+	caPath := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}), 0o600); err != nil {
+		t.Fatalf("write CA bundle: %v", err)
+	}
+
+	newClient := func(tlsCfg TLSConfig) *Client {
+		t.Helper()
+		client, err := New(context.Background(), Config{
+			Endpoint:  server.URL,
+			Bucket:    "test-bucket",
+			PathStyle: true,
+			TLS:       tlsCfg,
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		return client
+	}
+
+	if _, _, err := newClient(TLSConfig{}).Get(context.Background(), "__meta/generations"); err == nil {
+		t.Fatal("default client accepted a private-CA certificate")
+	} else if msg := err.Error(); !strings.Contains(msg, "certificate") && !strings.Contains(msg, "tls:") {
+		t.Fatalf("default client error is not a TLS verification failure: %v", err)
+	}
+
+	body, meta, err := newClient(TLSConfig{CACert: caPath}).Get(context.Background(), "__meta/generations")
+	if err != nil {
+		t.Fatalf("CA-configured client Get: %v", err)
+	}
+	if string(body) != "G1\n" || meta.ETag != `"ca-etag"` {
+		t.Fatalf("CA-configured client read = %q, etag = %q", body, meta.ETag)
 	}
 }
 
@@ -500,10 +605,10 @@ func TestInsecureSkipVerifyClientAcceptsUntrustedCertificate(t *testing.T) {
 	newClient := func(skipVerify bool) *Client {
 		t.Helper()
 		client, err := New(context.Background(), Config{
-			Endpoint:           server.URL,
-			Bucket:             "test-bucket",
-			PathStyle:          true,
-			InsecureSkipVerify: skipVerify,
+			Endpoint:  server.URL,
+			Bucket:    "test-bucket",
+			PathStyle: true,
+			TLS:       TLSConfig{InsecureSkipVerify: skipVerify},
 		})
 		if err != nil {
 			t.Fatalf("New: %v", err)
@@ -587,10 +692,10 @@ func TestInsecureSkipVerifyTransportDoesNotReachCredentialProviders(t *testing.T
 	t.Cleanup(s3Endpoint.Close)
 
 	client, err := New(context.Background(), Config{
-		Endpoint:           s3Endpoint.URL,
-		Bucket:             "test-bucket",
-		PathStyle:          true,
-		InsecureSkipVerify: true, // S3 traffic skips verification; the chain must not.
+		Endpoint:  s3Endpoint.URL,
+		Bucket:    "test-bucket",
+		PathStyle: true,
+		TLS:       TLSConfig{InsecureSkipVerify: true}, // S3 traffic skips verification; the chain must not.
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

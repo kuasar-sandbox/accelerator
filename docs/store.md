@@ -71,12 +71,14 @@ s3:
   max_inflight: 64
   op_timeout: 10s
   max_object_size_bytes: 16777216
-  insecure_skip_verify: false
+  tls:
+    ca_cert: ""
+    insecure_skip_verify: false
 ```
 
 Static AK/SK values must be supplied together. When both are empty, the AWS SDK default credential chain is used. String fields support `${VAR}` expansion. `region` defaults to `us-east-1`; `path_style` defaults to `true`.
 
-`insecure_skip_verify: true` skips TLS certificate verification for the endpoint. It is insecure — traffic, including credentials, can be intercepted — and is meant for testing only, not production. Combining it with an `http://` endpoint is redundant but not an error.
+`tls.ca_cert` is a path to a PEM CA bundle (may hold several certificates) appended to the system trust store — the way to trust an endpoint (or intercepting proxy) whose CA is not in the system store. `tls.insecure_skip_verify: true` skips TLS certificate verification entirely; it is insecure — traffic, including credentials, can be intercepted — and is meant for testing only, not production. The two are mutually exclusive.
 
 ### 2.3 Generation source
 
@@ -114,10 +116,12 @@ generations:
     path_style: true
     access_key: ${GENERATION_S3_ACCESS_KEY}
     secret_key: ${GENERATION_S3_SECRET_KEY}
-    insecure_skip_verify: false
+    tls:
+      ca_cert: ""
+      insecure_skip_verify: false
 ```
 
-`generations.s3.insecure_skip_verify` is honored independently of the data backend's; when the `generations` section is omitted, the legacy backend-local S3 location inherits the data backend's setting.
+`generations.s3.tls` is honored independently of the data backend's; when the `generations` section is omitted, the legacy backend-local S3 location inherits the data backend's setting.
 
 File and S3 sources use line-oriented text in oldest-to-newest order. They refresh periodically according to `refresh_interval`; `SIGHUP` also triggers an immediate refresh. For a config source, `SIGHUP` rereads the main YAML but does not dynamically change the backend, listener, credentials or other configuration. A new list replaces the current immutable slice only after complete loading, parsing and validation. A failed refresh is logged and retains the last valid list. Startup is rejected when no valid list is available.
 

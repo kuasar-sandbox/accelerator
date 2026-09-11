@@ -12,11 +12,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -55,9 +57,25 @@ type Config struct {
 	AccessKey string
 	SecretKey string
 
-	// InsecureSkipVerify skips TLS certificate verification for the
-	// endpoint. Insecure — traffic can be intercepted; testing only.
-	// Strict verification is the default.
+	// TLS tunes certificate verification for the endpoint: an extra
+	// CA bundle to trust, or opting out of verification (testing
+	// only). Zero value → SDK defaults (system trust store, strict).
+	TLS TLSConfig
+}
+
+// TLSConfig mirrors the tls: config block used by pkg/remote and the
+// orchestrator build registry: an extra CA bundle appended to the
+// system trust store, or a full opt-out of verification.
+type TLSConfig struct {
+	// CACert is a path to a PEM CA bundle (may hold several
+	// certificates) appended to the system trust store — the way to
+	// trust an endpoint (or intercepting proxy) whose CA is not in
+	// the system store.
+	CACert string
+
+	// InsecureSkipVerify disables certificate verification entirely.
+	// Insecure — traffic including credentials can be intercepted;
+	// testing only. Mutually exclusive with CACert.
 	InsecureSkipVerify bool
 }
 
@@ -82,6 +100,9 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	if (cfg.AccessKey == "") != (cfg.SecretKey == "") {
 		return nil, errors.New("s3 sdkclient: access key and secret key must be set together")
 	}
+	if cfg.TLS.CACert != "" && cfg.TLS.InsecureSkipVerify {
+		return nil, errors.New("s3 sdkclient: tls ca_cert and insecure_skip_verify are mutually exclusive")
+	}
 
 	region := cfg.Region
 	if region == "" {
@@ -96,35 +117,53 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("s3 sdkclient: load aws config: %w", err)
 	}
-	if cfg.InsecureSkipVerify {
+	tlsClient, err := tlsHTTPClient(cfg.TLS)
+	if err != nil {
+		return nil, err
+	}
+	if tlsClient != nil {
 		// Attached only after LoadDefaultConfig resolves the credential
 		// chain: the default chain's identity clients (STS assume-role /
 		// web identity, SSO OIDC) capture cfg.HTTPClient at construction,
-		// so passing this client as a load option would disable
-		// verification for their token fetches too. Only this S3
-		// client's config copy carries it.
-		awsCfg.HTTPClient = insecureSkipVerifyHTTPClient()
+		// so passing a tuned client as a load option would apply the
+		// tuning to their token fetches too. The tuning is scoped to
+		// this S3 client's object traffic only.
+		awsCfg.HTTPClient = tlsClient
 	}
 	api := newAPI(awsCfg, cfg.Endpoint, cfg.PathStyle)
 	return &Client{api: api, bucket: cfg.Bucket}, nil
 }
 
-// insecureSkipVerifyHTTPClient builds the HTTP client for endpoints
-// configured with InsecureSkipVerify: the SDK's own buildable client
-// (pooling, dialer and timeout defaults preserved) with certificate
-// verification turned off. A fresh client per call — strict and
-// verification-skipping endpoints never share a connection pool.
-func insecureSkipVerifyHTTPClient() *awshttp.BuildableClient {
-	return awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
-		// The default transport pins TLS 1.2 as its floor; keep that.
-		base := tr.TLSClientConfig
-		if base == nil {
-			base = &tls.Config{MinVersion: tls.VersionTLS12}
+// tlsHTTPClient builds the HTTP client for an endpoint whose TLS
+// verification is tuned. It starts from the SDK's own buildable client
+// so pooling, dialer and timeout defaults are preserved, and keeps the
+// SDK transport's TLS 1.2 floor. A fresh client per call — tuned and
+// default endpoints never share a connection pool. Returns nil when no
+// tuning is configured (the SDK default, strict, applies).
+func tlsHTTPClient(cfg TLSConfig) (*awshttp.BuildableClient, error) {
+	if cfg.CACert == "" && !cfg.InsecureSkipVerify {
+		return nil, nil
+	}
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	if cfg.CACert != "" {
+		pem, err := os.ReadFile(cfg.CACert)
+		if err != nil {
+			return nil, fmt.Errorf("s3 sdkclient: read tls ca_cert %q: %w", cfg.CACert, err)
 		}
-		tlsCfg := base.Clone()
+		pool, err := x509.SystemCertPool()
+		if err != nil || pool == nil {
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("s3 sdkclient: tls ca_cert %q: no PEM certificates found", cfg.CACert)
+		}
+		tlsCfg.RootCAs = pool
+	} else {
 		tlsCfg.InsecureSkipVerify = true //nolint:gosec // opt-in via config
+	}
+	return awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
 		tr.TLSClientConfig = tlsCfg
-	})
+	}), nil
 }
 
 func newAPI(awsCfg aws.Config, endpoint string, pathStyle bool) *awss3.Client {
