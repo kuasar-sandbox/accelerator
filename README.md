@@ -32,6 +32,9 @@ The downstream import surface is kept small and mostly pure Go, so consumers suc
 | `pkg/flatten`, `pkg/image`, `pkg/remote`, `pkg/tar` | OCI/directory retrieval, image configuration, and EROFS flattening primitives |
 
 Heavy server backends remain behind component binaries and server packages.
+The detailed sparse Run/Stream, chunk-window and local tarstream contracts belong
+to [Manifest §4.8–§4.10](docs/manifest.md#48-read-path-in-detail) and
+[file artifacts](docs/file-artifacts.md), not a separate README protocol.
 
 ## Binaries
 
@@ -64,6 +67,19 @@ make test-e2e                   # component owner suite; requires the assembled 
 
 Go and native prerequisites vary by target. The current source tree documents and builds any native cache dependencies through repository scripts. Real object-storage tests must use explicit test credentials or a local S3-compatible service; ordinary unit and local-filesystem tests must not require production cloud credentials.
 
+`cache-ctl` normally uses CGO and a locally built static `librocksdb.a` from
+`deps/build-rocksdb.sh`; `manifest-ctl`, `store-ctl` and the downstream import
+surface do not require RocksDB. `make release VERSION=vX.Y.Z` creates and checks
+a local release bundle; the official cache payload must retain RocksDB support.
+
+### Private-network and offline builds
+
+This module has no cross-repository Go dependencies. Point `GOPROXY` at the
+deployment's mirror, with its checksum-database policy, or use a populated
+verified module cache when offline. Coordinated sibling development can use the
+[project workspace](https://github.com/kuasar-sandbox/kuasar-sandbox); it is not a
+prerequisite for this component's standalone build.
+
 ## Running independently
 
 The three services can be deployed independently of the full platform:
@@ -77,11 +93,64 @@ Configuration examples must use local paths, documentation-reserved endpoints, a
 
 ## Release model
 
+Build from the selected source with the component Makefile. `release.sh package`
+uses the matching binaries in `bin/<arch>`, or an explicit `RELEASE_BIN_DIR`;
+it collects materials and creates the bundle without rebuilding those binaries
+or resetting source/build caches. Keep the selected source checkouts, dependency
+versions and native build records together with the outputs.
+
+Packaging records the actual Go versions and effective module replacements.
+Go/module LICENSE and NOTICE files come from the selected compiler installation
+and matching module sources, preserving nested paths. Module resolution uses the
+normal Go cache and routing; downloaded module checksums must match the binaries.
+An organization namespace alone does not exempt modules from notice collection.
+This component has no internal sibling dependencies. Unsupported local replacements
+need versioned module inputs for the official package.
+
+Materials live under `share/licenses/<component>` and
+`share/sources/<component>`. The latter contains `SOURCES.tsv`,
+`GO-BUILD-INFO.tsv`, `GO-MODULES.tsv` and `MATERIALS.sha256`.
+Collection fails on missing notices, unreadable subtrees or partial traversals.
+Independent validation checks the shipped inventory, checksums, required files,
+source-record consistency, payload identities and archive paths/types/modes.
+It does not fetch source checkouts or Go modules, compare notices with remote
+source trees, or download/authenticate compiler distributions. Checksums and
+VCS records are consistency checks, not proof of an arbitrary producer's identity.
+
+The archive name identifies the requested release target. Project and internal
+dependency records use a release version when its local tag matches the selected
+commit, otherwise `git:<commit>`; packaging does not require creating future
+target tags. The publisher passes the selected project SHA to validation before
+Tag/Release writes, uses the bundle's `release-notes.md` body, and appends the
+existing source/Preview markers. Trusted source selection, build/publish permission
+separation and the refusal to replace published assets remain required.
+Producer-supplied notes may not contain the publisher's reserved source/Preview markers.
+
+The official package requires the three Linux/amd64 command binaries with
+their own Accelerator main-package identities; `cache-ctl` must include RocksDB.
+The five shipped operational helpers are copied from the selected source tree.
+Before extraction the validator rejects extra/duplicate payloads, links,
+incorrect ownership or modes, and foreign material namespaces.
+
+The normal cache build retains `build/<arch>/cache-ctl.map`. Packaging reads
+that link map and the matching RocksDB library/source tree, including
+`RELEASE_ROCKSDB_SOURCE_DIR` when supplied. It records the actual RocksDB,
+libstdc++, libgcc and other linked system inputs with their digests and Debian/RPM
+source-package versions. Copyright, license, NOTICE and referenced common-license
+texts are copied from those packages; installed file bytes are not authenticated
+against package-database digests. The RocksDB material set must include
+`AUTHORS`, `COPYING`, `LICENSE.Apache` and `LICENSE.leveldb`.
+Distinct native inputs cannot overwrite a shared material name. RPM collection
+requires complete same-source sibling listings. These materials support release
+review, not legal certification, and do not change the RocksDB backend or durability.
+
 This repository publishes independent component versions named `vX.Y.Z`. The x86_64 component archive contains the three service binaries and the documented operational/performance helper scripts selected by the release contract. Component design documents and E2E sources are collected from the selected tag into the project platform archive.
 
 The project repository publishes aggregate versions named `release-vX.Y.Z`, selecting exact versions of `accelerator` and the other release units, validating their assets, and running cross-component tests. Aggregate and component version numbers are independent.
 
-See the [project release documentation](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release.md) and the [latest Stable aggregate release](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest).
+Release branches, Preview, Latest reconciliation and concurrency/cancellation
+handling are owned by the [project release documentation](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release.md).
+For ordinary use, start from the [latest Stable aggregate channel](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest).
 
 ## Documentation
 
@@ -90,7 +159,7 @@ Manifest, Store and Cache have complete English and Chinese editions. Existing E
 - [Manifest — English](docs/manifest.md) / [Chinese](docs/manifest_zh.md) — sparse manifests, ingest/fetch, chunking, encryption, key tables, and public SDKs;
 - [File artifacts and carriers](docs/file-artifacts.md) — immutable tarstream encryption, Bundle layout, access and publication.
 
-- [Store — English](docs/store.md) / [Chinese](docs/store_zh.md) — filesystem and S3-compatible stores, generation layout, integrity, and garbage collection;
+- [Store — English](docs/store.md) / [Chinese](docs/store_zh.md) — filesystem and S3-compatible stores, generation retention, integrity, and explicit purge (not reachability GC);
 - [Cache — English](docs/cache.md) / [Chinese](docs/cache_zh.md) — local, sharded, tiered, and erasure-coded caches;
 - [`docs/cache-redis.md`](docs/cache-redis.md) — Redis-compatible UDS/TCP backend and external-service deployment examples.
 

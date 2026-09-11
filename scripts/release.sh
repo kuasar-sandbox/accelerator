@@ -6,9 +6,11 @@ umask 022
 NAME=accelerator
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'chmod -R u+w "$WORK"; rm -rf "$WORK"' EXIT
 # shellcheck source=scripts/release-materials.sh
 source "$ROOT/scripts/release-materials.sh"
+# shellcheck source=scripts/release-native-materials.sh
+source "$ROOT/scripts/release-native-materials.sh"
 
 fail() {
   echo "release: $*" >&2
@@ -50,33 +52,79 @@ copy_executable() {
 
 copy_root_executable() {
   local source="$1" destination="$2"
-  [ -x "$ROOT/$source" ] || fail "missing executable release input: $ROOT/$source"
+  local selected="$ROOT/$source"
+  [ -x "$selected" ] || fail "missing executable release input: $source"
   mkdir -p "$(dirname "$STAGE/$destination")"
-  install -m 0755 "$ROOT/$source" "$STAGE/$destination"
+  install -m 0755 "$selected" "$STAGE/$destination"
 }
 
 check_go_binary() {
-  local file="$1"
-  go version -m "$file" >/dev/null 2>&1 \
+  local file="$1" info expected
+  expected="github.com/kuasar-sandbox/accelerator/cmd/$(basename "$1")"
+  info="$(go version -m "$file" 2>/dev/null)" \
     || fail "Go build info is missing from $file"
+  awk -F '\t' -v expected="$expected" '
+    $2 == "path" { paths++; if ($3 != expected) bad=1 }
+    $2 == "mod" { modules++; if ($3 != "github.com/kuasar-sandbox/accelerator") bad=1 }
+    END { exit bad || paths != 1 || modules != 1 }
+  ' <<< "$info" || fail "Go release payload must have its expected main package: $file"
+  awk -F '\t' '
+    $2 == "build" && $3 ~ /^GOOS=/ { os++; if ($3 != "GOOS=linux") bad=1 }
+    $2 == "build" && $3 ~ /^GOARCH=/ { arch++; if ($3 != "GOARCH=amd64") bad=1 }
+    END { exit bad || os != 1 || arch != 1 }
+  ' <<< "$info" || fail "Go release payload must target linux/amd64: $file"
 }
 
 validate_archive_paths() {
-  local archive="$1" listing="$WORK/listing"
-  tar -tzf "$archive" > "$listing"
-  awk '
-    /^\// { exit 1 }
-    { path=$0; sub(/^\.\//, "", path); if (path ~ /(^|\/)\.\.($|\/)/) exit 1 }
-  ' "$listing" || fail "$archive contains an unsafe path"
-  if grep -E '(^|/)release\.json$|(^|/)release/[^/]+\.json$' "$listing" >/dev/null; then
-    fail "$archive contains release metadata JSON"
+  local archive="$1"
+  GOENV=off GOFLAGS='' GOWORK=off GOTOOLCHAIN=local GOOS='' GOARCH='' \
+    GOAMD64=v1 CGO_ENABLED=0 GOEXPERIMENT='' go run "$ROOT/scripts/release-archive-validator.go" "$archive" \
+    || fail "$archive contains an unsafe type, mode or ownership, or violates the exact entry contract"
+}
+
+validate_source_inventory() {
+  local table="$1/share/sources/$NAME/SOURCES.tsv"
+  awk -F '\t' '
+    NR == 1 { if ($0 != "payload\tname\tversion\tsource\tintegrity\tlicense_directory") exit 1; next }
+    NF != 6 || seen[$1 FS $2]++ { exit 1 }
+    $2 == "accelerator" { if ($1 != "bin/*,test/scripts/*") exit 1; next }
+    $2 == "rocksdb" || $2 == "rocksdb-static-library" { if ($1 != "bin/cache-ctl") exit 1; next }
+    $2 == "Go toolchain" {
+      if ($1 !~ /^bin\/(manifest-ctl|store-ctl|cache-ctl)$/) exit 1
+      next
+    }
+    $2 ~ /^system:/ {
+      name=substr($2, 8)
+      if ($1 != "bin/cache-ctl" || name !~ /^[A-Za-z0-9._+-]+[.](a|o)$/ ||
+          $6 != "share/licenses/accelerator/system/" name || $3 !~ /^[A-Za-z0-9.+:~_-]+$/) exit 1
+      if (split($5, fields, ";") != 2 || fields[1] !~ /^sha256:/ || fields[2] !~ /^package:/) exit 1
+      digest=substr(fields[1], 8); package=substr(fields[2], 9)
+      if (length(digest) != 64 || digest ~ /[^0-9a-f]/ || package !~ /^[A-Za-z0-9][A-Za-z0-9.+_-]*$/) exit 1
+      if ($4 ~ /^deb-source:/) {
+        if (package !~ /^[a-z0-9][a-z0-9+.-]*$/ || $4 != "deb-source:" package "@" $3) exit 1
+      } else if ($4 ~ /^rpm-source:[A-Za-z0-9][A-Za-z0-9.+:~_-]*[.](no)?src[.]rpm$/) {
+        suffix="-" $3 ".src.rpm"; alternate="-" $3 ".nosrc.rpm"
+        if (substr($4, length($4)-length(suffix)+1) != suffix &&
+            substr($4, length($4)-length(alternate)+1) != alternate) exit 1
+      } else exit 1
+      next
+    }
+    { exit 1 }
+  ' "$table" || fail "unrecognized or inconsistent source inventory record"
+}
+
+require_rocksdb_payload() {
+  if go version -m "$1" | awk -F '\t' '
+    $2 == "build" && $3 ~ /^-tags=/ {
+      value=substr($3, 7)
+      gsub(/"/, "", value)
+      count=split(value, tags, /[, ]+/)
+      for (i=1; i <= count; i++) if (tags[i] == "no_rocksdb") found=1
+    }
+    END { exit !found }
+  '; then
+    fail "official accelerator release must include RocksDB support"
   fi
-  awk '
-    { path=$0; sub(/^\.\//, "", path) }
-    path != "" && path !~ /\/$/ && path !~ /^bin\// && path !~ /^test\/scripts\// && path !~ /^share\/(licenses|sources)\/accelerator\// { exit 1 }
-  ' "$listing" || fail "$archive contains a file outside the accelerator release layout"
-  tar -tvzf "$archive" | awk '$1 !~ /^[-d]/ { exit 1 }' \
-    || fail "$archive contains a non-regular, non-directory entry"
 }
 
 validate_bundle() {
@@ -109,8 +157,33 @@ validate_bundle() {
   rm -rf "$extract"
   mkdir -p "$extract"
   tar -xzf "$bundle/assets/$archive" -C "$extract"
-  release_materials_validate "$extract" "$NAME"
   local file
+  for file in manifest-ctl store-ctl cache-ctl; do
+    check_go_binary "$extract/bin/$file"
+  done
+  local project_sha rocks_digest
+  project_sha="$(go version -m "$extract/bin/manifest-ctl" | \
+    awk -F '\t' '$2 == "build" && $3 ~ /^vcs.revision=/ {print substr($3, 14)}')"
+  require_rocksdb_payload "$extract/bin/cache-ctl"
+  release_materials_require_rocksdb_notices "$extract"
+  validate_source_inventory "$extract"
+  release_materials_validate "$extract" "$NAME"
+  release_materials_require_project_source "$extract" "$NAME" 'bin/*,test/scripts/*' "$version" \
+    bin/manifest-ctl bin/store-ctl bin/cache-ctl
+  release_materials_require_source "$extract" "$NAME" 'bin/cache-ctl' 'rocksdb' "v9.7.4" \
+    'https://github.com/facebook/rocksdb/archive/refs/tags/v9.7.4.tar.gz' \
+    'sha256-tree:1341893a5951347a7f658151c10f0b15e0ddd67c28b3804fdfed9a4a7736f52b'
+  rocks_digest="$(awk -F '\t' '$1 == "bin/cache-ctl" && $2 == "rocksdb-static-library" {print $5}' \
+    "$extract/share/sources/$NAME/SOURCES.tsv")"
+  [[ "$rocks_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "missing or invalid RocksDB static-library digest"
+  release_materials_require_source "$extract" "$NAME" bin/cache-ctl rocksdb-static-library v9.7.4 \
+    'https://github.com/facebook/rocksdb/archive/refs/tags/v9.7.4.tar.gz' "$rocks_digest"
+  for file in libstdc++.a libgcc.a; do
+    release_materials_require_source "$extract" "$NAME" bin/cache-ctl "system:$file" ""
+  done
+  release_materials_require_go_key "$extract" "$NAME" 'bin/manifest-ctl'
+  release_materials_require_go_key "$extract" "$NAME" 'bin/store-ctl'
+  release_materials_require_go_key "$extract" "$NAME" 'bin/cache-ctl'
   for file in manifest-ctl store-ctl cache-ctl; do
     [ -x "$extract/bin/$file" ] || fail "$archive is missing executable bin/$file"
     check_go_binary "$extract/bin/$file"
@@ -137,6 +210,7 @@ package_release() {
   STAGE="$WORK/stage"
   rm -rf "$STAGE"
   mkdir -p "$STAGE"
+  project_sha="$(release_materials_resolve_git_source "$ROOT" "" accelerator)"
   bin_dir="${RELEASE_BIN_DIR:-$ROOT/bin/$arch}"
   copy_executable "$bin_dir/manifest-ctl" bin/manifest-ctl
   copy_executable "$bin_dir/store-ctl" bin/store-ctl
@@ -144,19 +218,7 @@ package_release() {
   check_go_binary "$STAGE/bin/manifest-ctl"
   check_go_binary "$STAGE/bin/store-ctl"
   check_go_binary "$STAGE/bin/cache-ctl"
-  if go version -m "$STAGE/bin/cache-ctl" | awk -F '\t' '
-    $2 == "build" && $3 ~ /^-tags=/ {
-      value=substr($3, 7)
-      gsub(/"/, "", value)
-      count=split(value, tags, /[, ]+/)
-      for (i=1; i <= count; i++) {
-        if (tags[i] == "no_rocksdb") found=1
-      }
-    }
-    END { exit !found }
-  '; then
-    fail "official accelerator release must include RocksDB support"
-  fi
+  require_rocksdb_payload "$STAGE/bin/cache-ctl"
   copy_root_executable test/scripts/bench_cache.sh test/scripts/bench_cache.sh
   copy_root_executable test/scripts/bench_cache_remote.sh test/scripts/bench_cache_remote.sh
   copy_root_executable test/scripts/dedup_report.sh test/scripts/dedup_report.sh
@@ -164,16 +226,25 @@ package_release() {
   copy_root_executable test/scripts/proc_analyze.py test/scripts/proc_analyze.py
 
   rocksdb_source="${RELEASE_ROCKSDB_SOURCE_DIR:-$ROOT/build/src/rocksdb}"
-  project_sha="$(release_materials_resolve_git_source "$ROOT" "" accelerator)"
+  local project_version
+  project_version="$(release_materials_git_version "$ROOT" "$version" "$project_sha")"
+  release_materials_require_go_revision "$STAGE/bin/manifest-ctl" "$project_sha"
+  release_materials_require_go_revision "$STAGE/bin/store-ctl" "$project_sha"
+  release_materials_require_go_revision "$STAGE/bin/cache-ctl" "$project_sha"
   release_materials_init "$STAGE" "$WORK/materials" "$NAME"
   release_materials_copy_licenses "$ROOT" project
   release_materials_copy_licenses "$rocksdb_source" rocksdb
-  release_materials_record_source 'bin/*,test/scripts/*' accelerator "$version" \
+  release_materials_record_source 'bin/*,test/scripts/*' accelerator "$project_version" \
     "https://github.com/kuasar-sandbox/accelerator/commit/$project_sha" \
     "git:$project_sha" project
   release_materials_record_source bin/cache-ctl rocksdb v9.7.4 \
     'https://github.com/facebook/rocksdb/archive/refs/tags/v9.7.4.tar.gz' \
     'sha256-tree:1341893a5951347a7f658151c10f0b15e0ddd67c28b3804fdfed9a4a7736f52b' rocksdb
+  local rocks_library="$ROOT/build/$arch/rocksdb/lib/librocksdb.a"
+  release_native_cache_inputs "$ROOT/build/$arch/cache-ctl.map" "$rocks_library" "$ROOT/build/$arch"
+  release_materials_record_source bin/cache-ctl rocksdb-static-library v9.7.4 \
+    'https://github.com/facebook/rocksdb/archive/refs/tags/v9.7.4.tar.gz' \
+    "sha256:$(sha256sum "$rocks_library" | awk '{print $1}')" rocksdb
   release_materials_add_go_binary "$STAGE/bin/manifest-ctl" bin/manifest-ctl
   release_materials_add_go_binary "$STAGE/bin/store-ctl" bin/store-ctl
   release_materials_add_go_binary "$STAGE/bin/cache-ctl" bin/cache-ctl

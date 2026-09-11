@@ -44,7 +44,7 @@ ROCKS_PREFIX   := $(abspath $(BUILD_DIR)/rocksdb)
 # dynamic. RocksDB is built without compression so the link line stays minimal.
 CGO_CFLAGS         := -I$(ROCKS_PREFIX)/include
 CGO_LDFLAGS_STATIC := -L$(ROCKS_PREFIX)/lib -Wl,-Bstatic -lrocksdb -lstdc++ -Wl,-Bdynamic -lm -lpthread -ldl
-GOLDFLAGS_STATIC   := -linkmode=external -extldflags "-static-libstdc++ -static-libgcc"
+GOLDFLAGS_STATIC   := -linkmode=external -extldflags "-static-libstdc++ -static-libgcc -Wl,-Map,$(abspath $(BUILD_DIR)/cache-ctl.map)"
 
 # NO_ROCKSDB=1 builds cache-ctl with RocksDB support compiled out:
 # no librocksdb prerequisite, CGO_ENABLED=0, -tags no_rocksdb. The output
@@ -62,7 +62,7 @@ else
 CACHE_CTL_DEPS  := deps-rocksdb
 CACHE_CTL_CGO   := 1
 CACHE_CTL_TAGS  :=
-CACHE_CTL_BUILD = GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=$(CACHE_CTL_CGO) \
+CACHE_CTL_BUILD = TMPDIR="$(abspath $(BUILD_DIR))" GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=$(CACHE_CTL_CGO) \
     CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS_STATIC)" \
     $(GO) build $(GO_BUILD_FLAGS) -ldflags '$(GOLDFLAGS_STATIC)' -o $(BINDIR)/cache-ctl ./cmd/cache-ctl
 endif
