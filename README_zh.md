@@ -96,9 +96,9 @@ Go 与原生前置依赖随构建目标而异。当前源码通过仓库脚本�
 
 打包记录实际 Go 版本和生效的 module 替换。Go/module LICENSE、NOTICE 取自所选
 编译器安装和匹配的 module 源码,保留嵌套路径。模块解析沿用正常 Go 缓存与路由,
-下载模块的校验和须匹配二进制记录。只有明确单独采集的内部兄弟组件使用其自身
-源码材料;组织命名空间本身不豁免其他模块。官方包中不受支持的第三方本地替换
-需要改用带版本的 module 输入。现有 Kuasar 本地 `replace` 继续使用。
+下载模块的校验和须匹配二进制记录。组织命名空间本身不豁免模块的声明收集。
+本组件没有内部兄弟组件依赖。官方包中不受支持的本地替换需要改用带版本的
+module 输入。
 
 材料放在 `share/licenses/<component>` 和 `share/sources/<component>`。
 后者包含 `SOURCES.tsv`、`GO-BUILD-INFO.tsv`、`GO-MODULES.tsv` 与
@@ -112,6 +112,7 @@ Go 与原生前置依赖随构建目标而异。当前源码通过仓库脚本�
 发布者在 Tag/Release 写入前把选定项目 SHA 传入验证器,采用 bundle 中
 `release-notes.md` 正文,追加既有来源/Preview 标记。可信源码选择、构建/发布
 权限分离及拒绝替换已发布资产的要求保持不变。
+生产者提供的说明不得夹带发布者专属的来源/Preview 标记。
 
 官方包要求三个 Linux/amd64 命令二进制分别具有自身的 Accelerator main-package
 身份;`cache-ctl` 必须包含 RocksDB。五个交付运维脚本取自所选源码树。

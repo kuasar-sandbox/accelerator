@@ -103,10 +103,9 @@ Packaging records the actual Go versions and effective module replacements.
 Go/module LICENSE and NOTICE files come from the selected compiler installation
 and matching module sources, preserving nested paths. Module resolution uses the
 normal Go cache and routing; downloaded module checksums must match the binaries.
-Only explicitly collected internal sibling dependencies use their own source
-materials; an organization namespace alone does not exempt other modules.
-Unsupported third-party local replacements need versioned module inputs for
-the official package. Existing Kuasar local `replace` directives remain in use.
+An organization namespace alone does not exempt modules from notice collection.
+This component has no internal sibling dependencies. Unsupported local replacements
+need versioned module inputs for the official package.
 
 Materials live under `share/licenses/<component>` and
 `share/sources/<component>`. The latter contains `SOURCES.tsv`,
@@ -125,6 +124,7 @@ target tags. The publisher passes the selected project SHA to validation before
 Tag/Release writes, uses the bundle's `release-notes.md` body, and appends the
 existing source/Preview markers. Trusted source selection, build/publish permission
 separation and the refusal to replace published assets remain required.
+Producer-supplied notes may not contain the publisher's reserved source/Preview markers.
 
 The official package requires the three Linux/amd64 command binaries with
 their own Accelerator main-package identities; `cache-ctl` must include RocksDB.
