@@ -54,13 +54,13 @@ func openGenerationSource(ctx context.Context, cfg *Config, configPath string) (
 		return &generationSourceHandle{source: source, kind: generationSourceFile, interval: cfg.GenerationRefreshInterval(), file: source}, nil
 	case g.S3 != nil:
 		client, err := sdkclient.New(ctx, sdkclient.Config{
-			Endpoint:  g.S3.Endpoint,
-			Region:    g.S3.Region,
-			Bucket:    g.S3.Bucket,
-			PathStyle: g.S3.pathStyle(),
-			AccessKey: g.S3.AccessKey,
-			SecretKey: g.S3.SecretKey,
-			Insecure:  g.S3.Insecure,
+			Endpoint:           g.S3.Endpoint,
+			Region:             g.S3.Region,
+			Bucket:             g.S3.Bucket,
+			PathStyle:          g.S3.pathStyle(),
+			AccessKey:          g.S3.AccessKey,
+			SecretKey:          g.S3.SecretKey,
+			InsecureSkipVerify: g.S3.InsecureSkipVerify,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("generation s3 client: %w", err)

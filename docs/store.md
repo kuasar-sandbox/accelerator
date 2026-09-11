@@ -71,12 +71,12 @@ s3:
   max_inflight: 64
   op_timeout: 10s
   max_object_size_bytes: 16777216
-  insecure: false
+  insecure_skip_verify: false
 ```
 
 Static AK/SK values must be supplied together. When both are empty, the AWS SDK default credential chain is used. String fields support `${VAR}` expansion. `region` defaults to `us-east-1`; `path_style` defaults to `true`.
 
-`insecure: true` skips TLS certificate verification for the endpoint. **Security warning: this disables the transport's protection against man-in-the-middle attacks — anyone able to intercept the connection can read or replace traffic, including object data and credentials.** Leave it unset (the default, strict verification) whenever the endpoint is reachable through an untrusted network. It exists for endpoints behind a mandatory TLS-intercepting proxy whose certificates cannot be added to the trust store; combining it with an `http://` endpoint is redundant but not an error. The flag relaxes verification only for object traffic to the configured endpoint — the SDK's default credential chain (instance role, web identity, SSO) keeps strict verification for its own identity requests.
+`insecure_skip_verify: true` skips TLS certificate verification for the endpoint. It is insecure — traffic, including credentials, can be intercepted — and is meant for testing only, not production. Combining it with an `http://` endpoint is redundant but not an error.
 
 ### 2.3 Generation source
 
@@ -114,10 +114,10 @@ generations:
     path_style: true
     access_key: ${GENERATION_S3_ACCESS_KEY}
     secret_key: ${GENERATION_S3_SECRET_KEY}
-    insecure: false
+    insecure_skip_verify: false
 ```
 
-`generations.s3.insecure` is honored independently of the data backend's `s3.insecure` and carries the same security warning. When the `generations` section is omitted, the legacy backend-local S3 location inherits the data backend's `s3.insecure` setting.
+`generations.s3.insecure_skip_verify` is honored independently of the data backend's; when the `generations` section is omitted, the legacy backend-local S3 location inherits the data backend's setting.
 
 File and S3 sources use line-oriented text in oldest-to-newest order. They refresh periodically according to `refresh_interval`; `SIGHUP` also triggers an immediate refresh. For a config source, `SIGHUP` rereads the main YAML but does not dynamically change the backend, listener, credentials or other configuration. A new list replaces the current immutable slice only after complete loading, parsing and validation. A failed refresh is logged and retains the last valid list. Startup is rejected when no valid list is available.
 
@@ -301,7 +301,7 @@ The object layout matches FS:
 <prefix>/<partition>/<generation>/<aa>/<bb>/<content-key>
 ```
 
-PutHandle buffers within a memory bound and writes the fixed key with one PutObject. `max_inflight` limits concurrent S3 calls; an empty `op_timeout` leaves timeout control solely to the caller's context; `max_object_size_bytes` limits object size. The generation source may use an entirely different S3 endpoint, bucket, key and credentials from the data backend. An endpoint configured `insecure` skips TLS certificate verification on every request to it — data plane and generation reads each follow their own setting, and a strict and an insecure endpoint never share an HTTP client.
+PutHandle buffers within a memory bound and writes the fixed key with one PutObject. `max_inflight` limits concurrent S3 calls; an empty `op_timeout` leaves timeout control solely to the caller's context; `max_object_size_bytes` limits object size. The generation source may use an entirely different S3 endpoint, bucket, key and credentials from the data backend.
 
 <a id="8-cache_listen-与运维"></a>
 ## 8. `cache_listen` and operations

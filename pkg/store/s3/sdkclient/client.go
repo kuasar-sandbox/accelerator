@@ -55,14 +55,10 @@ type Config struct {
 	AccessKey string
 	SecretKey string
 
-	// Insecure skips TLS certificate verification for the endpoint.
-	// Strict verification (the default) is required for any endpoint
-	// reachable through an untrusted network. Operators may opt in
-	// when a mandatory TLS-intercepting proxy presents certificates
-	// that cannot be added to the trust store — this re-exposes the
-	// connection to MITM, so it is only for controlled networks where
-	// that risk is accepted.
-	Insecure bool
+	// InsecureSkipVerify skips TLS certificate verification for the
+	// endpoint. Insecure — traffic can be intercepted; testing only.
+	// Strict verification is the default.
+	InsecureSkipVerify bool
 }
 
 // Client is the s3Client implementation. Held in the parent package
@@ -100,29 +96,25 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("s3 sdkclient: load aws config: %w", err)
 	}
-	if cfg.Insecure {
-		// Attached only after LoadDefaultConfig has resolved the
-		// credential chain. Passing this client as a load option would
-		// install it on the shared aws.Config before that resolution,
-		// and the default chain's identity clients (STS assume-role /
-		// web identity, SSO OIDC) capture cfg.HTTPClient at
-		// construction — their token and temporary-credential fetches
-		// would then also run with verification disabled. The providers
-		// keep the strict default transport; only this S3 client's
-		// config copy carries the insecure one.
-		awsCfg.HTTPClient = insecureHTTPClient()
+	if cfg.InsecureSkipVerify {
+		// Attached only after LoadDefaultConfig resolves the credential
+		// chain: the default chain's identity clients (STS assume-role /
+		// web identity, SSO OIDC) capture cfg.HTTPClient at construction,
+		// so passing this client as a load option would disable
+		// verification for their token fetches too. Only this S3
+		// client's config copy carries it.
+		awsCfg.HTTPClient = insecureSkipVerifyHTTPClient()
 	}
 	api := newAPI(awsCfg, cfg.Endpoint, cfg.PathStyle)
 	return &Client{api: api, bucket: cfg.Bucket}, nil
 }
 
-// insecureHTTPClient builds the HTTP client used for Insecure endpoints.
-// It starts from the SDK's own buildable client so pooling, dialer and
-// timeout defaults are identical to the strict path; only certificate
-// verification is turned off. A fresh client per call keeps an insecure
-// configuration from ever leaking into another endpoint's connection
-// pool — strict and insecure clients share nothing.
-func insecureHTTPClient() *awshttp.BuildableClient {
+// insecureSkipVerifyHTTPClient builds the HTTP client for endpoints
+// configured with InsecureSkipVerify: the SDK's own buildable client
+// (pooling, dialer and timeout defaults preserved) with certificate
+// verification turned off. A fresh client per call — strict and
+// verification-skipping endpoints never share a connection pool.
+func insecureSkipVerifyHTTPClient() *awshttp.BuildableClient {
 	return awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
 		// The default transport pins TLS 1.2 as its floor; keep that.
 		base := tr.TLSClientConfig
@@ -130,10 +122,6 @@ func insecureHTTPClient() *awshttp.BuildableClient {
 			base = &tls.Config{MinVersion: tls.VersionTLS12}
 		}
 		tlsCfg := base.Clone()
-		// InsecureSkipVerify is the entire point of this client: the
-		// operator has explicitly accepted the MITM risk because the
-		// endpoint's certificates cannot be verified (mandatory
-		// TLS-intercepting proxy). Strict clients never reach here.
 		tlsCfg.InsecureSkipVerify = true //nolint:gosec // opt-in via config
 		tr.TLSClientConfig = tlsCfg
 	})

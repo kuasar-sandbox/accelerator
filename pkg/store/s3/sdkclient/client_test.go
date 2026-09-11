@@ -478,12 +478,11 @@ func TestNewRejectsInvalidConfiguration(t *testing.T) {
 	}
 }
 
-// TestInsecureConfigSkipsTLSVerification pins the TLS behaviour of the
-// Insecure config: a self-signed certificate (as TLS-intercepting proxies
-// present) fails strict verification but is accepted when the endpoint is
-// configured insecure. The two clients coexist against the same endpoint —
-// an insecure configuration never relaxes another client's verification.
-func TestInsecureConfigSkipsTLSVerification(t *testing.T) {
+// TestInsecureSkipVerifyClientAcceptsUntrustedCertificate pins the
+// InsecureSkipVerify behaviour: a self-signed certificate fails strict
+// verification but is accepted when the endpoint opts out, and the opt-out
+// never relaxes another client.
+func TestInsecureSkipVerifyClientAcceptsUntrustedCertificate(t *testing.T) {
 	// One attempt only: the strict client's failure is a connection
 	// error, which the retryer would otherwise back off and retry.
 	t.Setenv("AWS_MAX_ATTEMPTS", "1")
@@ -498,13 +497,13 @@ func TestInsecureConfigSkipsTLSVerification(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	newClient := func(insecure bool) *Client {
+	newClient := func(skipVerify bool) *Client {
 		t.Helper()
 		client, err := New(context.Background(), Config{
-			Endpoint:  server.URL,
-			Bucket:    "test-bucket",
-			PathStyle: true,
-			Insecure:  insecure,
+			Endpoint:           server.URL,
+			Bucket:             "test-bucket",
+			PathStyle:          true,
+			InsecureSkipVerify: skipVerify,
 		})
 		if err != nil {
 			t.Fatalf("New: %v", err)
@@ -518,29 +517,26 @@ func TestInsecureConfigSkipsTLSVerification(t *testing.T) {
 		t.Fatalf("strict client error is not a TLS verification failure: %v", err)
 	}
 
-	insecure := newClient(true)
-	if _, err := insecure.Put(context.Background(), "objects/key", []byte("payload"), stores3.PutOptions{}); err != nil {
-		t.Fatalf("insecure client Put: %v", err)
+	skipVerify := newClient(true)
+	if _, err := skipVerify.Put(context.Background(), "objects/key", []byte("payload"), stores3.PutOptions{}); err != nil {
+		t.Fatalf("verification-skipping client Put: %v", err)
 	}
-	body, meta, err := insecure.Get(context.Background(), "objects/key")
+	body, meta, err := skipVerify.Get(context.Background(), "objects/key")
 	if err != nil {
-		t.Fatalf("insecure client Get: %v", err)
+		t.Fatalf("verification-skipping client Get: %v", err)
 	}
 	if string(body) != "G1\n" || meta.ETag != `"tls-etag"` {
-		t.Fatalf("insecure client read = %q, etag = %q", body, meta.ETag)
+		t.Fatalf("verification-skipping client read = %q, etag = %q", body, meta.ETag)
 	}
 }
 
-// TestInsecureTransportDoesNotReachCredentialProviders pins the isolation
-// the Insecure config promises: only object traffic to the configured S3
-// endpoint skips certificate verification. The default credential chain's
-// identity fetches must keep the strict transport they captured during
-// LoadDefaultConfig. The web-identity chain is pointed at a self-signed
-// TLS "STS" via AWS_ENDPOINT_URL_STS: with the isolation in place the
-// token exchange fails certificate verification and the object Get fails
-// with it; if the insecure transport leaked into the chain, the exchange
-// would succeed against the mock and the Get would complete.
-func TestInsecureTransportDoesNotReachCredentialProviders(t *testing.T) {
+// TestInsecureSkipVerifyTransportDoesNotReachCredentialProviders pins the
+// isolation the config promises: only object traffic to the configured S3
+// endpoint skips verification. The default credential chain's identity fetches
+// must keep the strict transport they captured during LoadDefaultConfig —
+// the web-identity chain is pointed at a self-signed TLS "STS" mock, so a
+// leaked transport would obtain credentials and complete the object Get.
+func TestInsecureSkipVerifyTransportDoesNotReachCredentialProviders(t *testing.T) {
 	t.Setenv("AWS_MAX_ATTEMPTS", "1")
 	// Default chain with every earlier-winning provider neutralised so
 	// the web-identity provider is the one that runs.
@@ -562,9 +558,9 @@ func TestInsecureTransportDoesNotReachCredentialProviders(t *testing.T) {
 	t.Setenv("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/mock-role")
 
 	// The STS mock presents a certificate no strict client trusts. If
-	// the insecure transport reaches it, it hands out valid temporary
-	// credentials and the object Get succeeds — the leak this test
-	// guards against.
+	// the verification-skipping transport reaches it, it hands out valid
+	// temporary credentials and the object Get succeeds — the leak this
+	// test guards against.
 	stsMock := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/xml")
 		_, _ = io.WriteString(w, `<AssumeRoleWithWebIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
@@ -591,10 +587,10 @@ func TestInsecureTransportDoesNotReachCredentialProviders(t *testing.T) {
 	t.Cleanup(s3Endpoint.Close)
 
 	client, err := New(context.Background(), Config{
-		Endpoint:  s3Endpoint.URL,
-		Bucket:    "test-bucket",
-		PathStyle: true,
-		Insecure:  true, // S3 traffic skips verification; the chain must not.
+		Endpoint:           s3Endpoint.URL,
+		Bucket:             "test-bucket",
+		PathStyle:          true,
+		InsecureSkipVerify: true, // S3 traffic skips verification; the chain must not.
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -602,7 +598,7 @@ func TestInsecureTransportDoesNotReachCredentialProviders(t *testing.T) {
 
 	_, _, err = client.Get(context.Background(), "__meta/generations")
 	if err == nil {
-		t.Fatal("object Get succeeded: the insecure transport reached the credential provider's STS fetch")
+		t.Fatal("object Get succeeded: the verification-skipping transport reached the credential provider's STS fetch")
 	}
 	if msg := err.Error(); !strings.Contains(msg, "certificate") && !strings.Contains(msg, "tls:") {
 		t.Fatalf("error is not a TLS verification failure from the identity fetch: %v", err)

@@ -55,36 +55,27 @@ func TestDefaultGenerationSourcesRemainCompatible(t *testing.T) {
 	}
 }
 
-func TestDefaultGenerationS3SourceInheritsInsecure(t *testing.T) {
-	s3Path := filepath.Join(t.TempDir(), "s3.yaml")
-	writeText(t, s3Path, "backend: s3\ns3:\n  endpoint: https://s3.example\n  bucket: data\n  insecure: true\n")
-	cfg, err := LoadConfig(s3Path, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !cfg.Generations.S3.Insecure {
-		t.Fatalf("default generation source did not inherit s3.insecure: %+v", cfg.Generations.S3)
-	}
+func TestGenerationS3InsecureSkipVerifyScoping(t *testing.T) {
+	t.Run("omitted generations inherits the data backend", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "s3.yaml")
+		writeText(t, path, "backend: s3\ns3:\n  endpoint: https://s3.example\n  bucket: data\n  insecure_skip_verify: true\n")
+		cfg, err := LoadConfig(path, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.Generations.S3.InsecureSkipVerify {
+			t.Fatalf("default generation source did not inherit s3.insecure_skip_verify: %+v", cfg.Generations.S3)
+		}
+	})
 
-	strictPath := filepath.Join(t.TempDir(), "strict.yaml")
-	writeText(t, strictPath, "backend: s3\ns3:\n  endpoint: https://s3.example\n  bucket: data\n")
-	strict, err := LoadConfig(strictPath, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strict.Generations.S3.Insecure {
-		t.Fatal("default generation source must stay strict when s3.insecure is unset")
-	}
-}
-
-func TestGenerationS3InsecureIsIndependentOfDataBackend(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "store.yaml")
-	writeText(t, path, `
+	t.Run("explicit generations.s3 is independent of the data backend", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "store.yaml")
+		writeText(t, path, `
 backend: s3
 s3:
   endpoint: https://objects.example.com
   bucket: data
-  insecure: true
+  insecure_skip_verify: true
 generations:
   refresh_interval: 5s
   s3:
@@ -92,16 +83,14 @@ generations:
     bucket: metadata
     key: prod/generations
 `)
-	cfg, err := LoadConfig(path, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !cfg.S3.Insecure {
-		t.Fatal("data backend s3.insecure=true was not preserved")
-	}
-	if cfg.Generations.S3.Insecure {
-		t.Fatal("explicit generations.s3 must not inherit the data backend's insecure setting")
-	}
+		cfg, err := LoadConfig(path, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.S3.InsecureSkipVerify || cfg.Generations.S3.InsecureSkipVerify {
+			t.Fatalf("unexpected scoping: data=%v generations=%v", cfg.S3.InsecureSkipVerify, cfg.Generations.S3.InsecureSkipVerify)
+		}
+	})
 }
 
 func TestGenerationSourceSelectionIsExclusive(t *testing.T) {

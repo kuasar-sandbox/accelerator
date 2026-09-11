@@ -44,13 +44,13 @@ func openS3Store(ctx context.Context, cfg *Config) (*s3.Store, error) {
 // credential-provider and signing behavior consistent across subcommands.
 func newS3Client(ctx context.Context, cfg *Config) (*sdkclient.Client, error) {
 	client, err := sdkclient.New(ctx, sdkclient.Config{
-		Endpoint:  cfg.S3.Endpoint,
-		Region:    cfg.S3.Region,
-		Bucket:    cfg.S3.Bucket,
-		PathStyle: cfg.S3PathStyle(),
-		AccessKey: cfg.S3.AccessKey,
-		SecretKey: cfg.S3.SecretKey,
-		Insecure:  cfg.S3.Insecure,
+		Endpoint:           cfg.S3.Endpoint,
+		Region:             cfg.S3.Region,
+		Bucket:             cfg.S3.Bucket,
+		PathStyle:          cfg.S3PathStyle(),
+		AccessKey:          cfg.S3.AccessKey,
+		SecretKey:          cfg.S3.SecretKey,
+		InsecureSkipVerify: cfg.S3.InsecureSkipVerify,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("s3 client: %w", err)
