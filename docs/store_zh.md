@@ -78,10 +78,20 @@ s3:
   max_inflight: 64
   op_timeout: 10s
   max_object_size_bytes: 16777216
+  tls:
+    ca_cert: ""
+    insecure_skip_verify: false
 ```
 
 静态 AK/SK 必须成对出现；两者都为空时使用 AWS SDK 默认凭据链。字符串字段支持
 `${VAR}` 展开。`region` 缺省为 `us-east-1`，`path_style` 缺省为 `true`。
+
+`tls.ca_cert` 指向 PEM CA bundle 路径（可含多张证书），追加进系统信任库——用于
+信任 CA 不在系统库中的 endpoint（或拦截代理）。`tls.insecure_skip_verify: true`
+完全跳过 TLS 证书校验；不安全——流量（含凭据）可能被截获——仅供测试，勿用于
+生产。两者互斥。二者都只作用于所配置 endpoint 的对象流量；SDK 凭据链的身份请求
+（instance role、web identity、SSO）始终使用系统信任库，全拦截网络下需要把 CA
+装入系统库或改用静态 AK/SK。
 
 ### 2.3 Generation source
 
@@ -119,7 +129,13 @@ generations:
     path_style: true
     access_key: ${GENERATION_S3_ACCESS_KEY}
     secret_key: ${GENERATION_S3_SECRET_KEY}
+    tls:
+      ca_cert: ""
+      insecure_skip_verify: false
 ```
+
+`generations.s3.tls` 独立于数据后端的同名设置生效；省略 `generations` 段时，
+后端本地的 legacy S3 位置继承数据后端的设置。
 
 文件和 S3 object 都使用逐行文本格式，顺序为 oldest → newest。它们按
 `refresh_interval` 周期刷新；`SIGHUP` 也会立即刷新。config source 在

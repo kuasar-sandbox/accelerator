@@ -50,11 +50,24 @@ func newS3Client(ctx context.Context, cfg *Config) (*sdkclient.Client, error) {
 		PathStyle: cfg.S3PathStyle(),
 		AccessKey: cfg.S3.AccessKey,
 		SecretKey: cfg.S3.SecretKey,
+		TLS:       tlsDialConfig(cfg.S3.TLS),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("s3 client: %w", err)
 	}
 	return client, nil
+}
+
+// tlsDialConfig converts the YAML-facing tls block into the sdkclient's
+// dialing-side TLSConfig. A nil block means strict defaults.
+func tlsDialConfig(t *S3TLSConfig) sdkclient.TLSConfig {
+	if t == nil {
+		return sdkclient.TLSConfig{}
+	}
+	return sdkclient.TLSConfig{
+		CACert:             t.CACert,
+		InsecureSkipVerify: t.InsecureSkipVerify,
+	}
 }
 
 // s3StoreConfig builds the data-plane config used by serve and admin helpers.

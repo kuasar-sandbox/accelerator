@@ -55,6 +55,45 @@ func TestDefaultGenerationSourcesRemainCompatible(t *testing.T) {
 	}
 }
 
+func TestGenerationS3TLSScoping(t *testing.T) {
+	t.Run("omitted generations inherits the data backend", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "s3.yaml")
+		writeText(t, path, "backend: s3\ns3:\n  endpoint: https://s3.example\n  bucket: data\n  tls:\n    insecure_skip_verify: true\n")
+		cfg, err := LoadConfig(path, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Generations.S3.TLS == nil || !cfg.Generations.S3.TLS.InsecureSkipVerify {
+			t.Fatalf("default generation source did not inherit s3.tls: %+v", cfg.Generations.S3.TLS)
+		}
+	})
+
+	t.Run("explicit generations.s3 is independent of the data backend", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "store.yaml")
+		writeText(t, path, `
+backend: s3
+s3:
+  endpoint: https://objects.example.com
+  bucket: data
+  tls:
+    ca_cert: /tmp/data-ca.pem
+generations:
+  refresh_interval: 5s
+  s3:
+    endpoint: https://meta.example
+    bucket: metadata
+    key: prod/generations
+`)
+		cfg, err := LoadConfig(path, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.S3.TLS == nil || cfg.S3.TLS.CACert != "/tmp/data-ca.pem" || cfg.Generations.S3.TLS != nil {
+			t.Fatalf("unexpected scoping: data=%+v generations=%+v", cfg.S3.TLS, cfg.Generations.S3.TLS)
+		}
+	})
+}
+
 func TestGenerationSourceSelectionIsExclusive(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "store.yaml")
 	writeText(t, configPath, "backend: fs\nfs:\n  root: /tmp/store\ngenerations:\n  config: [G1]\n  file:\n    path: /tmp/generations\n")

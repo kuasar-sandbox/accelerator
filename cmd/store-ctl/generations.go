@@ -60,6 +60,7 @@ func openGenerationSource(ctx context.Context, cfg *Config, configPath string) (
 			PathStyle: g.S3.pathStyle(),
 			AccessKey: g.S3.AccessKey,
 			SecretKey: g.S3.SecretKey,
+			TLS:       tlsDialConfig(g.S3.TLS),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("generation s3 client: %w", err)

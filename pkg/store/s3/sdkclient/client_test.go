@@ -3,10 +3,21 @@ package sdkclient
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"io"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -466,6 +477,8 @@ func TestNewRejectsInvalidConfiguration(t *testing.T) {
 		{name: "missing bucket", cfg: Config{Endpoint: "https://objects.example.com"}, want: "bucket is required"},
 		{name: "access key only", cfg: Config{Endpoint: "https://objects.example.com", Bucket: "b", AccessKey: "ak"}, want: "must be set together"},
 		{name: "secret key only", cfg: Config{Endpoint: "https://objects.example.com", Bucket: "b", SecretKey: "sk"}, want: "must be set together"},
+		{name: "ca cert with skip verify", cfg: Config{Endpoint: "https://objects.example.com", Bucket: "b", TLS: TLSConfig{CACert: "/tmp/ca.pem", InsecureSkipVerify: true}}, want: "mutually exclusive"},
+		{name: "ca cert unreadable", cfg: Config{Endpoint: "https://objects.example.com", Bucket: "b", TLS: TLSConfig{CACert: "/nonexistent/ca.pem"}}, want: "read tls ca_cert"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := New(context.Background(), tc.cfg)
@@ -473,5 +486,226 @@ func TestNewRejectsInvalidConfiguration(t *testing.T) {
 				t.Fatalf("error=%v want substring %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// TestCACertTrustsPrivateCA pins the ca_cert behaviour: an HTTPS server
+// whose certificate is signed by a private CA fails strict verification
+// but is trusted once the CA bundle is configured. The CA also composes
+// with the system store — no certificate is removed, only added.
+func TestCACertTrustsPrivateCA(t *testing.T) {
+	// One attempt only: the default client's failure is a connection
+	// error, which the retryer would otherwise back off and retry.
+	t.Setenv("AWS_MAX_ATTEMPTS", "1")
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate CA key: %v", err)
+	}
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test-private-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create CA certificate: %v", err)
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatalf("parse CA certificate: %v", err)
+	}
+
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate leaf key: %v", err)
+	}
+	leafTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, caCert, &leafKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create leaf certificate: %v", err)
+	}
+
+	setDefaultCredentialEnvironment(t)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("ETag", `"ca-etag"`)
+		_, _ = io.WriteString(w, "G1\n")
+	}))
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{{
+		Certificate: [][]byte{leafDER},
+		PrivateKey:  leafKey,
+	}}}
+	server.StartTLS()
+	t.Cleanup(server.Close)
+
+	caPath := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}), 0o600); err != nil {
+		t.Fatalf("write CA bundle: %v", err)
+	}
+
+	newClient := func(tlsCfg TLSConfig) *Client {
+		t.Helper()
+		client, err := New(context.Background(), Config{
+			Endpoint:  server.URL,
+			Bucket:    "test-bucket",
+			PathStyle: true,
+			TLS:       tlsCfg,
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		return client
+	}
+
+	if _, _, err := newClient(TLSConfig{}).Get(context.Background(), "__meta/generations"); err == nil {
+		t.Fatal("default client accepted a private-CA certificate")
+	} else if msg := err.Error(); !strings.Contains(msg, "certificate") && !strings.Contains(msg, "tls:") {
+		t.Fatalf("default client error is not a TLS verification failure: %v", err)
+	}
+
+	body, meta, err := newClient(TLSConfig{CACert: caPath}).Get(context.Background(), "__meta/generations")
+	if err != nil {
+		t.Fatalf("CA-configured client Get: %v", err)
+	}
+	if string(body) != "G1\n" || meta.ETag != `"ca-etag"` {
+		t.Fatalf("CA-configured client read = %q, etag = %q", body, meta.ETag)
+	}
+}
+
+// TestInsecureSkipVerifyClientAcceptsUntrustedCertificate pins the
+// InsecureSkipVerify behaviour: a self-signed certificate fails strict
+// verification but is accepted when the endpoint opts out, and the opt-out
+// never relaxes another client.
+func TestInsecureSkipVerifyClientAcceptsUntrustedCertificate(t *testing.T) {
+	// One attempt only: the strict client's failure is a connection
+	// error, which the retryer would otherwise back off and retry.
+	t.Setenv("AWS_MAX_ATTEMPTS", "1")
+	setDefaultCredentialEnvironment(t)
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("ETag", `"tls-etag"`)
+		if r.Method == http.MethodGet {
+			_, _ = io.WriteString(w, "G1\n")
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	newClient := func(skipVerify bool) *Client {
+		t.Helper()
+		client, err := New(context.Background(), Config{
+			Endpoint:  server.URL,
+			Bucket:    "test-bucket",
+			PathStyle: true,
+			TLS:       TLSConfig{InsecureSkipVerify: skipVerify},
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		return client
+	}
+
+	if _, _, err := newClient(false).Get(context.Background(), "__meta/generations"); err == nil {
+		t.Fatal("strict client accepted a certificate from an unknown authority")
+	} else if msg := err.Error(); !strings.Contains(msg, "certificate") && !strings.Contains(msg, "tls:") {
+		t.Fatalf("strict client error is not a TLS verification failure: %v", err)
+	}
+
+	skipVerify := newClient(true)
+	if _, err := skipVerify.Put(context.Background(), "objects/key", []byte("payload"), stores3.PutOptions{}); err != nil {
+		t.Fatalf("verification-skipping client Put: %v", err)
+	}
+	body, meta, err := skipVerify.Get(context.Background(), "objects/key")
+	if err != nil {
+		t.Fatalf("verification-skipping client Get: %v", err)
+	}
+	if string(body) != "G1\n" || meta.ETag != `"tls-etag"` {
+		t.Fatalf("verification-skipping client read = %q, etag = %q", body, meta.ETag)
+	}
+}
+
+// TestInsecureSkipVerifyTransportDoesNotReachCredentialProviders pins the
+// isolation the config promises: only object traffic to the configured S3
+// endpoint skips verification. The default credential chain's identity fetches
+// must keep the strict transport they captured during LoadDefaultConfig —
+// the web-identity chain is pointed at a self-signed TLS "STS" mock, so a
+// leaked transport would obtain credentials and complete the object Get.
+func TestInsecureSkipVerifyTransportDoesNotReachCredentialProviders(t *testing.T) {
+	t.Setenv("AWS_MAX_ATTEMPTS", "1")
+	// Default chain with every earlier-winning provider neutralised so
+	// the web-identity provider is the one that runs.
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "")
+	t.Setenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", "")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "no-config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "no-credentials"))
+
+	tokenFile := filepath.Join(t.TempDir(), "identity-token")
+	if err := os.WriteFile(tokenFile, []byte("mock-identity-token"), 0o600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+	t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", tokenFile)
+	t.Setenv("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/mock-role")
+
+	// The STS mock presents a certificate no strict client trusts. If
+	// the verification-skipping transport reaches it, it hands out valid
+	// temporary credentials and the object Get succeeds — the leak this
+	// test guards against.
+	stsMock := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/xml")
+		_, _ = io.WriteString(w, `<AssumeRoleWithWebIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+  <AssumeRoleWithWebIdentityResult>
+    <Credentials>
+      <AccessKeyId>ASIAMOCKCREDENTIALS</AccessKeyId>
+      <SecretAccessKey>mock-secret</SecretAccessKey>
+      <SessionToken>mock-session-token</SessionToken>
+      <Expiration>2099-01-01T00:00:00Z</Expiration>
+    </Credentials>
+  </AssumeRoleWithWebIdentityResult>
+  <ResponseMetadata><RequestId>mock-request</RequestId></ResponseMetadata>
+</AssumeRoleWithWebIdentityResponse>`)
+	}))
+	t.Cleanup(stsMock.Close)
+	t.Setenv("AWS_ENDPOINT_URL_STS", stsMock.URL)
+
+	// Plain-HTTP S3 endpoint: a completed request means credentials were
+	// obtained from the mock.
+	s3Endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("ETag", `"leak-etag"`)
+		_, _ = io.WriteString(w, "G1\n")
+	}))
+	t.Cleanup(s3Endpoint.Close)
+
+	client, err := New(context.Background(), Config{
+		Endpoint:  s3Endpoint.URL,
+		Bucket:    "test-bucket",
+		PathStyle: true,
+		TLS:       TLSConfig{InsecureSkipVerify: true}, // S3 traffic skips verification; the chain must not.
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, _, err = client.Get(context.Background(), "__meta/generations")
+	if err == nil {
+		t.Fatal("object Get succeeded: the verification-skipping transport reached the credential provider's STS fetch")
+	}
+	if msg := err.Error(); !strings.Contains(msg, "certificate") && !strings.Contains(msg, "tls:") {
+		t.Fatalf("error is not a TLS verification failure from the identity fetch: %v", err)
 	}
 }

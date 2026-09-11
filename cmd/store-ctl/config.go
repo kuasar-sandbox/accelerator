@@ -171,6 +171,39 @@ type GenerationS3Config struct {
 	PathStyle *bool  `yaml:"path_style"`
 	AccessKey string `yaml:"access_key"`
 	SecretKey string `yaml:"secret_key"`
+
+	// TLS tunes certificate verification for the generation endpoint,
+	// independently of the data backend's s3.tls.
+	TLS *S3TLSConfig `yaml:"tls,omitempty"`
+}
+
+// S3TLSConfig tunes how the endpoint's HTTPS certificates are verified,
+// mirroring pkg/remote's and the orchestrator build registry's tls
+// block. The zero value is strict verification against the system
+// trust store.
+type S3TLSConfig struct {
+	// CACert is a path to a PEM CA bundle (may hold several
+	// certificates) appended to the system trust store — the way to
+	// trust an endpoint (or intercepting proxy) whose CA is not in
+	// the system store. Supports ${VAR} expansion.
+	CACert string `yaml:"ca_cert"`
+
+	// InsecureSkipVerify disables certificate verification entirely.
+	// Insecure — traffic including credentials can be intercepted;
+	// testing only. Mutually exclusive with ca_cert.
+	InsecureSkipVerify bool `yaml:"insecure_skip_verify"`
+}
+
+// validate rejects the one nonsensical combination. prefix locates the
+// block in error messages (e.g. "s3.tls", "generations.s3.tls").
+func (c *S3TLSConfig) validate(prefix string) error {
+	if c == nil {
+		return nil
+	}
+	if c.CACert != "" && c.InsecureSkipVerify {
+		return fmt.Errorf("store-ctl: %s.ca_cert and %s.insecure_skip_verify are mutually exclusive", prefix, prefix)
+	}
+	return nil
 }
 
 func (c *GenerationS3Config) expandEnv() {
@@ -180,6 +213,9 @@ func (c *GenerationS3Config) expandEnv() {
 	c.Key = expandEnv(c.Key)
 	c.AccessKey = expandEnv(c.AccessKey)
 	c.SecretKey = expandEnv(c.SecretKey)
+	if c.TLS != nil {
+		c.TLS.CACert = expandEnv(c.TLS.CACert)
+	}
 }
 
 func (c *GenerationS3Config) pathStyle() bool {
@@ -227,6 +263,9 @@ type S3Config struct {
 
 	// MaxObjectSize bounds Get response bytes. Default 16 MiB.
 	MaxObjectSize int64 `yaml:"max_object_size_bytes"`
+
+	// TLS tunes certificate verification for the endpoint.
+	TLS *S3TLSConfig `yaml:"tls,omitempty"`
 }
 
 // envVarPattern matches `${VAR_NAME}` with alphanumeric / underscore
@@ -251,6 +290,9 @@ func (c *S3Config) expandEnv() {
 	c.AccessKey = expandEnv(c.AccessKey)
 	c.SecretKey = expandEnv(c.SecretKey)
 	c.OpTimeout = expandEnv(c.OpTimeout)
+	if c.TLS != nil {
+		c.TLS.CACert = expandEnv(c.TLS.CACert)
+	}
 }
 
 // normalizeBackend validates that the selected backend and config section
@@ -344,6 +386,9 @@ func LoadConfig(path string, requireListen bool) (*Config, error) {
 		if (cfg.S3.AccessKey == "") != (cfg.S3.SecretKey == "") {
 			return nil, fmt.Errorf("store-ctl: s3.access_key and s3.secret_key must be set together")
 		}
+		if err := cfg.S3.TLS.validate("s3.tls"); err != nil {
+			return nil, err
+		}
 	}
 	if err := cfg.normaliseGenerations(); err != nil {
 		return nil, err
@@ -369,6 +414,7 @@ func (c *Config) normaliseGenerations() error {
 					PathStyle: c.S3.PathStyle,
 					AccessKey: c.S3.AccessKey,
 					SecretKey: c.S3.SecretKey,
+					TLS:       c.S3.TLS,
 				},
 				s3Set: true,
 			}
@@ -419,6 +465,9 @@ func (c *Config) normaliseGenerations() error {
 		}
 		if (g.S3.AccessKey == "") != (g.S3.SecretKey == "") {
 			return fmt.Errorf("store-ctl: generations.s3 access_key and secret_key must be set together")
+		}
+		if err := g.S3.TLS.validate("generations.s3.tls"); err != nil {
+			return err
 		}
 	}
 	if g.RefreshInterval == "" {
