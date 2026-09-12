@@ -131,7 +131,7 @@ clean:
 # Tests + benchmarks + perf
 # ---------------------------------------------------------------------------
 # E2E needs the assembled platform binary set because accelerator-owned cases
-# also exercise flatten-ctl. The platform BMS sets BIN explicitly; this default
+# also exercise flatten-ctl. Integration E2E sets BIN explicitly; this default
 # is convenient for the normal sibling-repository checkout.
 E2E_BIN ?= $(abspath ../kuasar-sandbox/bin/$(TARGET_ARCH))
 
