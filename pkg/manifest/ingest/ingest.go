@@ -258,7 +258,7 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 					fail(fmt.Errorf("ingest: encrypt chunk: %w", err))
 					continue
 				}
-				if err := validateEncryptedChunkObject(ciphertext, j.oc.size); err != nil {
+				if err := validateEncryptedChunkObject(ciphertext, j.oc.size, i.enc.Mode()); err != nil {
 					fail(fmt.Errorf("ingest: encrypt chunk: %w", err))
 					continue
 				}
@@ -439,15 +439,22 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 	return &res, nil
 }
 
-func validateEncryptedChunkObject(object []byte, plaintextSize uint32) error {
+func validateEncryptedChunkObject(object []byte, plaintextSize uint32, mode string) error {
 	if len(object) == 0 {
 		return fmt.Errorf("empty physical object")
 	}
 	encodedSize := uint64(len(object) - 1)
 	switch object[0] {
 	case crypto.ChunkFormatAESRaw:
-		if encodedSize != uint64(plaintextSize) {
-			return fmt.Errorf("RAW payload size %d, want %d", encodedSize, plaintextSize)
+		if mode == "aes" {
+			if encodedSize != uint64(plaintextSize) {
+				return fmt.Errorf("AES: RAW payload size %d, want %d", encodedSize, plaintextSize)
+			}
+		} else if mode == "aes-gcm" {
+			expectedEncodedSize := uint64(plaintextSize) + uint64(crypto.GetGCMAuthTagSize()) + uint64(crypto.GetGCMNonceSize())
+			if encodedSize != expectedEncodedSize {
+				return fmt.Errorf("AES-GCM: RAW payload size %d, want %d", encodedSize, expectedEncodedSize)
+			}
 		}
 	case crypto.ChunkFormatAESSnappy:
 		if !objectformat.CompressionBeneficial(uint64(plaintextSize), encodedSize) {

@@ -372,32 +372,53 @@ func (s *manifestStream) readChunkDirect(
 	}
 	defer blob.Release()
 	ciphertext := blob.Bytes()
-	// The content key is SHA256(ciphertext) and is authenticated by the key
-	// table's AAD, so verifying the returned bytes against it rejects a corrupt
-	// or tampered chunk before the unauthenticated AES-CTR decrypt would turn
-	// attacker-chosen ciphertext into attacker-chosen plaintext. Hash the bytes
-	// as received and keep the borrowed Blob bytes immutable throughout decode.
-	if s.verifyContent && sha256.Sum256(ciphertext) != e.CiphertextHash {
-		return 0, fmt.Errorf("chunk %d: ciphertext hash mismatch (corrupt or tampered store/cache)", chunkIdx)
+
+	if s.decryptor.Mode() == "aes" {
+		// The content key is SHA256(ciphertext) and is authenticated by the key
+		// table's AAD, so verifying the returned bytes against it rejects a corrupt
+		// or tampered chunk before the unauthenticated AES-CTR decrypt would turn
+		// attacker-chosen ciphertext into attacker-chosen plaintext. Hash the bytes
+		// as received and keep the borrowed Blob bytes immutable throughout decode.
+		if s.verifyContent && sha256.Sum256(ciphertext) != e.CiphertextHash {
+			return 0, fmt.Errorf("chunk %d: ciphertext hash mismatch (corrupt or tampered store/cache)", chunkIdx)
+		}
 	}
+
 	if offset == e.Offset && uint64(len(buf)) == uint64(e.Size) {
 		if err := s.decryptor.DecryptChunkTo(ctx, s.keys[chunkIdx], ciphertext, buf); err != nil {
 			return 0, fmt.Errorf("chunk %d: decrypt: %w", chunkIdx, err)
 		}
 		return len(buf), nil
 	}
-	rangeDecryptor, ok := s.decryptor.(chunkRangeDecryptor)
-	if !ok {
-		return 0, fmt.Errorf("chunk %d: decryptor cannot serve an oversized partial range", chunkIdx)
-	}
+
 	innerOffset := offset - e.Offset
-	if innerOffset > uint64(^uint(0)>>1) || uint64(e.Size) > uint64(^uint(0)>>1) {
-		return 0, fmt.Errorf("chunk %d: plaintext offset %d overflows int", chunkIdx, innerOffset)
+	if s.decryptor.Mode() == "aes" {
+		rangeDecryptor, ok := s.decryptor.(chunkRangeDecryptor)
+		if !ok {
+			return 0, fmt.Errorf("chunk %d: decryptor cannot serve an oversized partial range", chunkIdx)
+		}
+		if innerOffset > uint64(^uint(0)>>1) || uint64(e.Size) > uint64(^uint(0)>>1) {
+			return 0, fmt.Errorf("chunk %d: plaintext offset %d overflows int", chunkIdx, innerOffset)
+		}
+		if err := rangeDecryptor.DecryptChunkRangeTo(ctx, s.keys[chunkIdx], ciphertext, int(e.Size), int(innerOffset), buf); err != nil {
+			return 0, fmt.Errorf("chunk %d: range decrypt: %w", chunkIdx, err)
+		}
+		return len(buf), nil
 	}
-	if err := rangeDecryptor.DecryptChunkRangeTo(ctx, s.keys[chunkIdx], ciphertext, int(e.Size), int(innerOffset), buf); err != nil {
-		return 0, fmt.Errorf("chunk %d: range decrypt: %w", chunkIdx, err)
+
+	// AES-GCM cannot independently authenticate an arbitrary ciphertext range.
+	// Authenticate and decrypt the complete chunk first, then copy the requested
+	// plaintext range into the caller's buffer.
+	if s.decryptor.Mode() == "aes-gcm" {
+		plain := make([]byte, e.Size)
+		if err := s.decryptor.DecryptChunkTo(ctx, s.keys[chunkIdx], ciphertext, plain); err != nil {
+			return 0, fmt.Errorf("chunk %d: decrypt: %w", chunkIdx, err)
+		}
+		copy(buf, plain[int(innerOffset):int(innerOffset)+len(buf)])
+		return len(buf), nil
 	}
-	return len(buf), nil
+
+	return 0, fmt.Errorf("chunk %d: unknown decryptor mode %s", chunkIdx, s.decryptor.Mode())
 }
 
 // loadOwnedPlainChunk allocates exactly one plaintext-sized cache buffer and

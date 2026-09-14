@@ -10,6 +10,8 @@ import (
 // two views over the same underlying codec keep ingest and fetch paths
 // from accidentally touching each other's primitives.
 type Encryptor interface {
+	// Mode returns the mode of the decryptor.
+	Mode() string
 	// EncryptChunk derives the convergent key from (salt, original plaintext),
 	// chooses the fixed canonical RAW/Snappy payload, encrypts it, and returns the
 	// complete physical object, its hash, and the key recorded in the key table.
@@ -20,6 +22,8 @@ type Encryptor interface {
 // Decryptor is the read-side narrow interface. Symmetric counterpart
 // to Encryptor — same algorithms, opposite direction.
 type Decryptor interface {
+	// Mode returns the mode of the decryptor.
+	Mode() string
 	// DecryptChunkTo treats ciphertext as immutable and fills the exact-size
 	// destination. The slices must not overlap. ctx controls bounded Snappy scratch
 	// admission; on an error dst is unspecified.
@@ -52,8 +56,12 @@ func New(cfg Config) (Encryptor, Decryptor, error) {
 // codec combines the chunk and key-table implementations behind the narrow
 // read/write interfaces. Both views share the same bounded codec state.
 type codec struct {
-	chunk *AESChunkEncryptor
+	chunk ChunkEncryptor
 	kt    KeyTableEncryptor
+}
+
+func (c *codec) Mode() string {
+	return c.chunk.Mode()
 }
 
 func (c *codec) EncryptChunk(ctx context.Context, salt [32]byte, plaintext []byte) ([]byte, [32]byte, [32]byte, error) {
