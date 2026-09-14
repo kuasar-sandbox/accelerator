@@ -332,14 +332,13 @@ func TestConcurrentPrefetchCallsAreIndependent(t *testing.T) {
 	secondStarted := make(chan struct{})
 	secondDone := asyncPrefetch(prefetcher, secondStarted)
 	<-secondStarted
-	close(firstCall.release)
-	if err := receivePrefetchError(t, firstDone); err != nil {
-		t.Fatalf("first Prefetch: %v", err)
-	}
-
 	secondCall := receivePrefetchGateCall(t, getter.entered)
 	if firstCall.blob == secondCall.blob {
 		t.Fatal("concurrent Prefetch calls shared one Blob handle")
+	}
+	close(firstCall.release)
+	if err := receivePrefetchError(t, firstDone); err != nil {
+		t.Fatalf("first Prefetch: %v", err)
 	}
 	close(secondCall.release)
 	if err := receivePrefetchError(t, secondDone); err != nil {

@@ -8,9 +8,15 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
+// maxPrefetchGets is the number of cache Gets one Fetcher may run for
+// prefetch at once. It is kept below a typical sandboxer cache.pool (16)
+// so an on-demand UFFD fault can still Acquire a connection immediately.
+const maxPrefetchGets = 8
+
 // requestScheduler coordinates on-demand and prefetch cache requests made by
 // one Fetcher. On-demand requests never wait for prefetch; prefetch requests
-// are admitted one at a time and only while no on-demand request is active.
+// are admitted up to maxPrefetchGets at a time and only while no on-demand
+// request is active.
 //
 // changed is allocated only when a prefetch request has to wait. It is closed
 // only when the admission predicate may have become true, then reset to nil so
@@ -18,7 +24,7 @@ import (
 type requestScheduler struct {
 	mu       sync.Mutex
 	onDemand int
-	prefetch bool
+	prefetch int
 	changed  chan struct{}
 }
 
@@ -35,21 +41,21 @@ func (s *requestScheduler) endOnDemand() {
 		panic("fetch: request scheduler on-demand underflow")
 	}
 	s.onDemand--
-	if s.onDemand == 0 && !s.prefetch {
+	if s.onDemand == 0 && s.prefetch < maxPrefetchGets {
 		s.signalLocked()
 	}
 	s.mu.Unlock()
 }
 
-// tryBeginPrefetch either acquires the sole prefetch token or returns the
-// current change notification channel. The predicate check, token transition,
-// and channel snapshot are all serialized by mu, preventing lost wakeups.
+// tryBeginPrefetch either acquires one prefetch slot or returns the current
+// change notification channel. The predicate check, token transition, and
+// channel snapshot are all serialized by mu, preventing lost wakeups.
 func (s *requestScheduler) tryBeginPrefetch() (bool, <-chan struct{}) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.onDemand == 0 && !s.prefetch {
-		s.prefetch = true
+	if s.onDemand == 0 && s.prefetch < maxPrefetchGets {
+		s.prefetch++
 		return true, nil
 	}
 	return false, s.waitLocked()
@@ -74,11 +80,11 @@ func (s *requestScheduler) beginPrefetch(ctx context.Context) error {
 
 func (s *requestScheduler) endPrefetch() {
 	s.mu.Lock()
-	if !s.prefetch {
+	if s.prefetch <= 0 {
 		s.mu.Unlock()
 		panic("fetch: request scheduler prefetch token underflow")
 	}
-	s.prefetch = false
+	s.prefetch--
 	if s.onDemand == 0 {
 		s.signalLocked()
 	}
