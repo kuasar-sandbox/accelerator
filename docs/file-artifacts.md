@@ -4,9 +4,6 @@
 
 This specification owns the generic immutable-file encryption, tarstream and multi-Manifest Bundle contracts. Logical Manifest/Chunk objects and keys remain in [manifest.md](manifest.md); persistence/admission belongs to [store.md](store.md). It does not define Sandbox E/S contents or OCI/EROFS image semantics. Those consumers apply these carriers according to their own [sandbox artifact](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox-artifacts.md) and [image](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten.md) contracts.
 
-<a id="49-本地-immutable-tarstream-加密"></a>
-
-<a id="49-local-immutable-tarstream-encryption"></a>
 ## 1. Immutable local tarstreams and encryption
 
 A canonical plaintext tarstream contains the payload, a `.kuasar.digest.<plainDigest>` marker body and exactly two trailer blocks. Payload PAX records define its boundary; the marker body records that boundary and the payload commitment. Full reads recompute the commitment from payload bytes.
@@ -43,9 +40,6 @@ Random artifact salt makes two writes of the same plaintext/customer key produce
 If a caller stops early, no full-validation conclusion applies to unread data. Publishing, uploading and converting paths must consume all Data extents and propagate terminal validation errors.
 
 
-<a id="410-多-manifest-zip-bundle"></a>
-
-<a id="410-multi-manifest-zip-bundles"></a>
 ## 2. Multi-Manifest Bundle carrier
 
 Local Manifest snapshots use a standard ZIP container with ZIP64 support and a **mandatory tail index**. The current profile requires `bundle/index` directly: no legacy-format probing, unindexed compatibility or Central Directory fallback.
@@ -66,9 +60,8 @@ Manifest and Chunk payloads are the unchanged bytes of their existing physical o
 
 Every local entry uses `zip.Store`, flags 0, no data descriptor and no local extra. Comments, timestamps, permissions and platform fields are fixed. Exactly one `bundle/index` must be the final local entry; its last 256 payload bytes immediately precede the real Central Directory.
 
-A Bundle uses no ZIP Deflate, ZIP encryption, whole-file SHA/HMAC, outer encryption, custom pack format, root entry or JSON/YAML metadata. Old `admission/*` names, old unindexed Bundles, duplicate/unknown entries, directory entries, invalid keys/admissions and truncation are rejected by the appropriate profile/verification path. Ordinary open intentionally defers some object/container checks; it is not the strict full-container verifier ([§2.4](#4104-explicit-strict-verification-and-exact-upload)).
+A Bundle uses no ZIP Deflate, ZIP encryption, whole-file SHA/HMAC, outer encryption, custom pack format, root entry or JSON/YAML metadata. Old `admission/*` names, old unindexed Bundles, duplicate/unknown entries, directory entries, invalid keys/admissions and truncation are rejected by the appropriate profile/verification path. Ordinary open intentionally defers some object/container checks; it is not the strict full-container verifier ([§2.4](#24-explicit-strict-verification-and-exact-upload)).
 
-<a id="4101-bundleindex-v1"></a>
 ### 2.1 `bundle/index` v1
 
 The index payload is **Chunk section, Manifest section, fixed footer**, in that order. Each section is strictly increasing by ContentKey; its partition is implicit in its section. Duplicate or unsorted keys are invalid. Every record is exactly 48 bytes, explicitly little-endian:
@@ -121,9 +114,6 @@ Section SHA-256 and footer CRC32C detect index corruption; they are not signatur
 
 The writer does not depend on `archive/zip.Writer`'s internal flush position. It maintains a logical `nextOffset` from canonical Local Header layout: `dataOffset = nextOffset + 30 + len(name)`. Finalize first checks the root Manifest, then sorts/encodes Chunk and Manifest records, writes the final `bundle/index`, and lets the standard ZIP writer emit Central Directory/ZIP64/EOCD. Strict verification and tests cross-check each record's offset, size and CRC against actual CD/LFH/data ranges.
 
-<a id="4102-metadata-prefix-与-reader-io"></a>
-
-<a id="4102-metadata-prefix-and-reader-io"></a>
 ### 2.2 Metadata prefix and Reader I/O
 
 If present, `bundle/refs` must be nonempty and the first physical Local File Header. Admission follows immediately. Without refs, admission is first. The admission payload is empty.
@@ -151,9 +141,6 @@ Ordinary `Open`/`NewReader` neither invokes `archive/zip.NewReader` nor reads Ce
 
 Thus the specified ZIP32 ReaderAt open uses **five fixed range reads**; ZIP64 uses **seven**. The count does not grow with Chunk count. Local file opening prefers read-only mmap. The ReaderAt object-payload fallback uses a bounded per-Reader buffer pool with 4 KiB–2 MiB size classes and at most **32 MiB retained**.
 
-<a id="4103-source-selectionchunk-preparation-与普通-restore"></a>
-
-<a id="4103-source-selection-chunk-preparation-and-ordinary-restore"></a>
 ### 2.3 Source selection, Chunk preparation and ordinary restore
 
 A Bundle can hold the root memory Manifest, current root/data-disk layer Manifests and, when needed, incorporated parent-layer Manifests. All objects share the complete `store.WriteAdmission` recorded in the admission entry. The caller obtains one admission before constructing `bundle.Writer`; subsequent Ingest calls read that fixed value. Shared chunks are written once per ContentKey.
@@ -187,9 +174,6 @@ Ordinary restore does **not** pre-scan the Manifest's complete chunk closure. A 
 
 `manifest.verify_content=false` does not implicitly trigger physical SHA scans. When enabled, the Manifest and Chunk physical hashes and key-table authentication are checked according to the normal read contract. Neither case makes ordinary lazy restore equivalent to a complete availability verification.
 
-<a id="4104-显式严格验证与-exact-upload"></a>
-
-<a id="4104-explicit-strict-verification-and-exact-upload"></a>
 ### 2.4 Explicit strict verification and exact upload
 
 Single-Bundle full verify/upload and multi-source `VerifyExactManifests`/`UploadExactManifests` first run an explicit container verifier, regardless of `manifest.verify_content`.

@@ -1,16 +1,10 @@
 [English](manifest.md) | [简体中文](manifest_zh.md)
 
-<a id="manifest--内容寻址存储的统一出入口"></a>
-
 # manifest — the interface to content-addressed storage
 
-`manifest-ctl` is the entry and exit point for content-addressed data. Image, memory-snapshot, disk and user-file bytes can be ingested through the sparse-source API; the CLI `store` command specifically accepts a **tarstream artifact**, not an arbitrary raw file. Ingest produces a **Manifest**: a compact binary object containing chunk metadata and a sealed table of chunk keys. Its content key is the handle for later `load` operations and `manifest://<key>` references. Local Manifest Bundles provide another carrier for the same objects ([§2](file-artifacts.md#410-multi-manifest-zip-bundles)).
-
-<a id="1-概述"></a>
+`manifest-ctl` is the entry and exit point for content-addressed data. Image, memory-snapshot, disk and user-file bytes can be ingested through the sparse-source API; the CLI `store` command specifically accepts a **tarstream artifact**, not an arbitrary raw file. Ingest produces a **Manifest**: a compact binary object containing chunk metadata and a sealed table of chunk keys. Its content key is the handle for later `load` operations and `manifest://<key>` references. Local Manifest Bundles provide another carrier for the same objects ([§2](file-artifacts.md#2-multi-manifest-bundle-carrier)).
 
 ## 1. Overview
-
-<a id="11-模块定位"></a>
 
 ### 1.1 Role
 
@@ -26,16 +20,12 @@ flowchart TD
 
 The read direction reverses this flow: `load` gets the Manifest, resolves its chunk list, fetches through the configured cache or directly from store, decrypts and emits a tarstream artifact encoded according to `crypto.local`. A configured cache is the selected remote read path; this does not imply automatic direct-store retry on cache errors.
 
-<a id="12-设计原则"></a>
-
 ### 1.2 Principles
 
 - **Write path:** `sparse.Source → chunker → Snappy/RAW selection → encrypt → store.Put → Manifest`. Hole runs are recorded without reading them. Zero runs synthesize zero bytes for chunking without fetching a payload.
 - **Read path:** `Manifest → fetch → decrypt → io.Writer`.
 - **Deduplication unit:** a variable-length FastCDC chunk or a fixed-size chunk.
 - **Deduplication domains:** salt separates convergent-key domains. Chunk payloads are stored as ciphertext; the Manifest's index/geometry and sealed key-table container are not wholly encrypted. Salt separation and encryption do not implement tenant authorization (§4.4–4.5).
-
-<a id="13-不做什么"></a>
 
 ### 1.3 Non-goals
 
@@ -44,11 +34,7 @@ The read direction reverses this flow: `load` gets the Manifest, resolves its ch
 - Understanding Docker, OCI, EROFS or other high-level payload formats: the data layer handles bytes and sparse geometry.
 - Implementing ACLs: the caller/deployment protects customer keys, endpoints and references.
 
-<a id="2-命令行接口"></a>
-
 ## 2. Command-line interface
-
-<a id="21-公共-flag"></a>
 
 ### 2.1 Shared flag
 
@@ -58,8 +44,6 @@ Shared flag on subcommands that accept configuration:
 ```
 
 Commands that use configuration require either `--manifest-config` or `MANIFEST_CONFIG` to name a valid YAML file. **Exceptions:** `config generate`, local-file/stdin `info`, and local-file `diff` do not need a configuration file. See §3.1 for the schema. The flag belongs after the subcommand, not before it.
-
-<a id="22-子命令一览"></a>
 
 ### 2.2 Subcommands
 
@@ -85,8 +69,6 @@ file://<path>[@digest:<digest>|@hmac:<digest>|@manifest:<key>][@location:<name>]
 ```
 
 The three identity qualifiers are mutually exclusive. `@manifest` selects a root Manifest in a Manifest Bundle and must be rejected by a tarstream opener; a Bundle opener must reject `@digest` and `@hmac`. With a location, the path must be a basename. The location must match `[A-Za-z0-9][A-Za-z0-9._-]*` and carries a logical name, not a host directory. A leading digit is allowed so UUIDv7 sandbox/build IDs can be used directly.
-
-<a id="23-manifest-ctl-store--数据写入"></a>
 
 ### 2.3 `manifest-ctl store` — ingest
 
@@ -129,8 +111,6 @@ manifest-ctl store --extra-salt "tenant-xyz" snap.bin
 # Change chunking or crypto policy through YAML
 ```
 
-<a id="24-manifest-ctl-load--数据读取"></a>
-
 ### 2.4 `manifest-ctl load` — read data
 
 ```text
@@ -158,8 +138,6 @@ manifest-ctl load --offset 4096 --length 65536 --output slice.img a1b2c3d4...
 # The manifest:// prefix is also accepted
 manifest-ctl load --output disk.img manifest://a1b2c3d4...
 ```
-
-<a id="25-manifest-ctl-get-manifest--取回-manifest-字节"></a>
 
 ### 2.5 `manifest-ctl get-manifest` — retrieve Manifest bytes
 
@@ -222,8 +200,6 @@ manifest-ctl verify [--no-progress] a1b2c3d4...        # or manifest://a1b2c3d4.
 verified: 20480  skipped(zero): 0  holes: 0  failed: 0  total chunks: 20480
 ```
 
-<a id="28-manifest-ctl-diff--去重率分析"></a>
-
 ### 2.8 `manifest-ctl diff` — deduplication analysis
 
 ```text
@@ -253,8 +229,6 @@ manifest-ctl config generate
 ```
 
 `generate` prints a commented template. `show` prints the loaded configuration as YAML; it does not prove that all backend connections and deferred constructors will succeed.
-
-<a id="3-配置"></a>
 
 ## 3. Configuration
 
@@ -299,8 +273,6 @@ Fields:
 - `crypto.chunk` and `crypto.manifest` each accept only `aes`; other values fail when the crypto objects are constructed (§4.3–4.4).
 - `crypto.local` is a local-format compatibility/enforcement policy, not an algorithm selector. `off` does not enable the local codec; `auto` reads legacy plaintext or encrypted carriers; `required` accepts only encrypted carriers. The default is `off`.
 
-<a id="32-加载顺序"></a>
-
 ### 3.2 Loading order
 
 The **configuration filename** comes only from the CLI flag or its environment variable; there is **no automatic discovery**:
@@ -316,8 +288,6 @@ The **customer key** has a separate precedence rule: nonempty `MANIFEST_KEY` ove
 `pkg/manifest.ParseConfig` also accepts **in-memory YAML bytes**, for example configuration delivered to sandbox-ctl over a config socket. Endpoint and crypto settings need not be written to disk. A caller may set the key separately in `Config.Manifest.Key`; the environment override still applies when `CustomerKey()` is used.
 
 There are no per-field command-line overrides for chunker or crypto settings. Change the YAML to change those settings.
-
-<a id="4-设计"></a>
 
 ## 4. Design
 
@@ -345,13 +315,9 @@ Fixed-size chunks default to 512 KiB. The layout is simple and predictable, but 
 
 Change YAML `chunker.mode` to select the mode; the command-line interface is unchanged.
 
-<a id="42-收敛加密convergent-encryption"></a>
-
 ### 4.2 Convergent encryption
 
 The invariant is **same plaintext + same salt → same ciphertext**, allowing objects within a shared deduplication domain to reuse stored chunk bytes. Chunk payloads are encrypted; this is not a claim that every Manifest field is secret or that a store cannot infer repeated content.
-
-<a id="key-派生"></a>
 
 #### Key derivation
 
@@ -369,8 +335,6 @@ The canonical encoder is the block API in **`github.com/golang/snappy` v1.0.0**.
 #### Content key
 
 Chunks use `SHA256(physical_object)` as the store key; Manifests use `SHA256(physical_envelope)`. Salt is not separately concatenated into the address calculation. It changes encrypted object bytes, which changes their physical hash. Store can therefore expose one content-key KV view while preserving distinct encrypted objects for different salt domains. See [store](store.md).
-
-<a id="43-加密模式--chunk"></a>
 
 ### 4.3 Chunk encryption format
 
@@ -394,8 +358,6 @@ The encryption layer derives `SHA256(salt || plaintext)` internally; its caller 
 
 The Manifest entry records the original plaintext size and the complete physical hash; it does not add a codec field. Unknown formats, inconsistent lengths, truncation, invalid Snappy blocks and Snappy objects that violate the fixed benefit threshold fail. There is no format guessing or fallback. With physical SHA verification enabled, changed object bytes fail hash validation; AES-CTR and structural checks alone do not authenticate all possible plaintext corruption when that verification is disabled.
 
-<a id="44-加密模式--manifest"></a>
-
 ### 4.4 Manifest encryption format
 
 The Manifest's **key table** encodes all nonzero chunks' encryption keys.
@@ -405,8 +367,6 @@ The Manifest's **key table** encodes all nonzero chunks' encryption keys.
 | `aes` | AES-GCM seals the key table with `manifest.key` and Manifest AAD; the customer key is required to unseal it. |
 
 This protects the key table, not the entire Manifest index. A store holding only the objects does not obtain the customer key from them. However, the chunk key is derived from salt and plaintext independently of that customer key. An actor with the relevant salt and a plausible plaintext guess can derive a candidate chunk key and test the corresponding object. Same-domain deduplication also reveals equality. Therefore “the customer key never leaks” alone is not a universal guarantee that stored chunk contents cannot be inferred. Protect key/salt access, references and service authorization according to the deployment's trust boundary.
-
-<a id="45-salt-与-dedup-域"></a>
 
 ### 4.5 Salt and deduplication domains
 
@@ -423,8 +383,6 @@ final_salt = SHA256("accelerator-extra-salt-v1" || server_salt || extra_salt) # 
 ```
 
 `extra_salt` creates a narrower deduplication domain within one store generation, for example per tenant. This is domain separation, not an ACL.
-
-<a id="46-manifest-二进制格式"></a>
 
 ### 4.6 Manifest binary format
 
@@ -454,8 +412,6 @@ All-zero chunks (flag bit 0) are neither encrypted nor stored and have no key-ta
 
 For ordinary reads with `manifest.verify_content=true`, the physical envelope hash is checked against the requested Manifest key before parsing. The reader parses the header/index, finds the requested chunk by binary search, unseals the key table, fetches the chunk by `cipher_hash` through cache/store, decrypts and writes the logical bytes. Disabling ordinary verification changes the hash-check step as described in §3.1; explicit verify paths always force it.
 
-<a id="47-写路径细节"></a>
-
 ### 4.7 Write path in detail
 
 The stages below describe one logical chunk; encryption and upload run concurrently across chunks as explained afterward.
@@ -477,8 +433,6 @@ The stages below describe one logical chunk; encryption and upload run concurren
 The derive/encode/encrypt/Put work uses a **bounded worker pool**, with worker count obtained from the store writer's `PoolSize()` capability. The standard store client's pool is configured by `store.pool`; a writer that does not expose this capability uses one worker. This is an ingest implementation limit, not a claim that one gRPC connection can have only one RPC in flight.
 
 Chunking remains sequential, the index is assembled in source order and progress callbacks are serialized. Out-of-order upload completion does not reorder the Manifest. Reproducible Manifest bytes additionally require the same sparse input, chunker/codec settings, salt/admission and customer-key/AAD inputs; concurrency alone does not establish cross-configuration determinism. Bounded parallel upload can overlap backend round trips for multi-GiB snapshots. The [project performance guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf.md) describes measurement; no throughput improvement is guaranteed without a recorded workload and run.
-
-<a id="48-读路径细节"></a>
 
 ### 4.8 Read path in detail
 
@@ -517,27 +471,6 @@ Snappy scratch uses explicit size-class free lists, not a `sync.Pool` with no re
 
 Prefetch still performs only full physical-object cache Get and immediate Release. It neither verifies/decrypts nor populates the plaintext cache. Thus prefetch and on-demand ReadAt may each issue a Get, while repeated on-demand partial reads are coalesced and reused inside the Stream.
 
-
-<a id="49-本地-immutable-tarstream-加密"></a>
-
-### 4.9 Local immutable tarstream encryption
-
-The complete file-carrier contract is maintained in [file-artifacts.md](file-artifacts.md#1-immutable-local-tarstreams-and-encryption). Manifest logical content/key rules remain in this document.
-
-
-<a id="410-多-manifest-zip-bundle"></a>
-<a id="4101-bundleindex-v1"></a>
-<a id="4102-metadata-prefix-and-reader-io"></a>
-<a id="4102-metadata-prefix-与-reader-io"></a>
-<a id="4103-source-selection-chunk-preparation-and-ordinary-restore"></a>
-<a id="4103-source-selectionchunk-preparation-与普通-restore"></a>
-<a id="4104-explicit-strict-verification-and-exact-upload"></a>
-<a id="4104-显式严格验证与-exact-upload"></a>
-### 4.10 Multi-Manifest ZIP Bundles
-
-The complete file-carrier contract is maintained in [file-artifacts.md](file-artifacts.md#2-multi-manifest-bundle-carrier). Manifest logical content/key rules remain in this document.
-
-<a id="5-性能特征"></a>
 
 ## 5. Performance characteristics
 

@@ -4,7 +4,6 @@
 
 本篇定义通用不可变文件加密、tarstream 与多 Manifest Bundle 契约。[manifest_zh.md](manifest_zh.md) 定义逻辑 Manifest/Chunk 对象与密钥，[store_zh.md](store_zh.md) 定义持久化和准入。本篇不定义 Sandbox E/S 内容或 OCI/EROFS 镜像语义；对应消费者按自身 [Sandbox 工件](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox-artifacts_zh.md) 和 [镜像](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten_zh.md) 契约使用这些载体。
 
-<a id="49-本地-immutable-tarstream-加密"></a>
 ## 1. 不可变本地 tarstream 与加密
 
 canonical tarstream 的plaintext结构为payload、
@@ -67,7 +66,6 @@ expected `digest|hmac` 和outer EOF。跨artifact record splice会在顺序读�
 路径必须消费全部 Data extents并传播终点错误。
 
 
-<a id="410-多-manifest-zip-bundle"></a>
 ## 2. 多 Manifest Bundle 载体
 
 本地 Manifest 快照使用支持 ZIP64 的标准 ZIP 容器,带强制尾部索引。当前 profile 直接要求
@@ -97,9 +95,8 @@ Local Entry；其 payload 最后 256 bytes 与真实 Central Directory 紧邻。
 ZIP Deflate、ZIP encryption、整文件 SHA/HMAC、外层加密、自定义 pack、root entry 或
 JSON/YAML metadata。旧 `admission/*`、旧的无索引 Bundle、重复或未知 entry、目录、
 非法 key/admission 与截断由对应 profile/验证路径拒绝。普通 Open 有意延迟部分对象与
-容器检查,不等于严格 full-container verifier([§2.4](#4104-显式严格验证与-exact-upload))。
+容器检查,不等于严格 full-container verifier([§2.4](#24-显式严格验证与-exact-upload))。
 
-<a id="4101-bundleindex-v1"></a>
 ### 2.1 `bundle/index` v1
 
 索引 payload 依次是 Chunk section、Manifest section 和固定 footer。两个 section 各自
@@ -163,7 +160,6 @@ root Manifest，再分别排序并编码 Chunk/Manifest records，写出最后�
 最后才由标准 ZIP writer 写 Central Directory/ZIP64/EOCD。严格 verifier 和测试会把
 每个 record 的 offset、size、CRC 与实际 CD/LFH/data range 交叉核对。
 
-<a id="4102-metadata-prefix-与-reader-io"></a>
 ### 2.2 metadata prefix 与 Reader I/O
 
 `bundle/refs` 存在时必须非空并作为第一个物理 Local File Header；admission 必须紧随
@@ -204,7 +200,6 @@ preflight 只需发现 location/admission 时可使用 `OpenMetadata`/`ReadMetad
 文件打开仍优先使用 read-only mmap；ReaderAt 对象 payload 回退路径使用按
 4 KiB～2 MiB 分级、每个 Reader 最多保留 32 MiB 的有界 buffer pool。
 
-<a id="4103-source-selectionchunk-preparation-与普通-restore"></a>
 ### 2.3 source selection、Chunk preparation 与普通 restore
 
 一个 Bundle 从首版容纳根内存 Manifest、根/数据盘当前层 Manifest，以及必要时
@@ -255,7 +250,6 @@ Store。`manifest.verify_content=false` 仍不会隐式执行 physical SHA 扫�
 Manifest/Chunk physical hash 与 key table authentication 遵守普通读合同。无论开关取值,
 普通 lazy restore 都不等于完整可用性验证。
 
-<a id="4104-显式严格验证与-exact-upload"></a>
 ### 2.4 显式严格验证与 exact upload
 
 单 Bundle full verify/upload 与多 source `VerifyExactManifests` /

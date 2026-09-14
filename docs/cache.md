@@ -1,23 +1,16 @@
 [English](cache.md) | [简体中文](cache_zh.md)
 
-<a id="cache--分层内容缓存"></a>
-
 # cache — tiered content caching
 
 `cache-ctl` is the platform's content cache **shared across sandboxes**. It reuses frequently read chunks on one node and across a shard cluster, reducing reads from remote S3-compatible object storage. Embedded deployments can serve hot content from RocksDB BlockCache; a Redis-compatible external backend is also available. One binary supports three YAML-selected modes: `local`, `shard` and `tiered`.
 
-<a id="1-概述"></a>
-
 ## 1. Overview
 
-<a id="11-解决的问题"></a>
 ### 1.1 Problem
 
 Concurrent consumers often read common immutable chunks. Local and distributed cache tiers reduce repeated origin reads while preserving the Manifest/Store identity and integrity contracts. Reuse depends on the working set, configured security domain, cache capacity and request timing: concurrent misses, eviction and failed fills can cause repeated origin access.
 
 On-demand loading reads the ranges a consumer needs; it does not require every artifact to use a cache or object store. End-to-end startup/restore also includes VMM/guest execution and data-access latency. Cache hit ratios are observed averages with explicit denominators, not per-request bounds. Index/filter residency, false positives, SST/blob reads and compaction affect disk I/O even for a cache deployment.
-
-<a id="12-设计原则"></a>
 
 ### 1.2 Principles
 
@@ -28,9 +21,9 @@ On-demand loading reads the ranges a consumer needs; it does not require every a
 - **Writes:** no application-level frequency admission filter. Embedded disk eviction uses a CMS-driven RocksDB CompactionFilter; a Redis-compatible server owns its own eviction/capacity policy. Neither policy guarantees a write succeeds through storage/resource failures.
 - **Filling:** successful lower-tier reads asynchronously fill upper tiers.
 
-<a id="2-命令行接口"></a>
-
 ## 2. Command-line interface
+
+For `cache-ctl bench` commands, workload controls and safeguards, see [§7.1](#71-backend-and-wire-benchmarks).
 
 ### 2.1 `cache-ctl serve`
 
@@ -49,8 +42,6 @@ cache-ctl config generate
 
 `generate` prints a commented template, defaulting to a tiered configuration with embedded RocksDB L1 and a store origin.
 
-<a id="23-cache-ctl-object--完整对象操作"></a>
-
 ### 2.3 `cache-ctl object` — complete objects
 
 Use a data endpoint, conventionally port 7070. The normal intended roles are local for writes and local/tiered for reads; local and shard currently both expose complete-object operations (§4.10).
@@ -61,8 +52,6 @@ cache-ctl object put --endpoint host:port --namespace chunk --hash HEX --value F
 ```
 
 Supply `--endpoint` or `CACHE_ENDPOINT`. Get writes the value to stdout; `--value -` reads stdin. Tiered rejects Put (§3.1).
-
-<a id="24-cache-ctl-shard--ec-分片操作"></a>
 
 ### 2.4 `cache-ctl shard` — EC shards
 
@@ -88,15 +77,7 @@ Ping and remote Info target the **control-plane `health_listen`**, conventionall
 `info --rocks-path` opens RocksDB through **OpenDbForReadOnlyColumnFamilies**, not a secondary-instance API. Use remote Info to inspect a running daemon; offline read-only opening is intended for postmortem inspection and does not promise a coherent live view while another process modifies the files.
 
 
-### 2.6 `cache-ctl bench`
-
-Benchmark commands, workload controls, isolation/destructive-test safeguards and interpretation are maintained together in [performance validation](#71-backend-and-wire-benchmarks).
-
-<a id="3-配置"></a>
-
 ## 3. Configuration
-
-<a id="31-三形态对比"></a>
 
 ### 3.1 Mode comparison
 
@@ -109,8 +90,6 @@ Benchmark commands, workload controls, isolation/destructive-test safeguards and
 | Reads | Selected backend. | Selected backend. | Traverse the chain on clean misses; asynchronously fill upper tiers on a hit. |
 | Origin dependency | None. | None. | Configured Store/upstream RPC access; remote object-store credentials stay with the service owning that backend. |
 | Typical deployment | Tests, debugging or one-node cache. | Five peers for unchanged RS(4+1). | Beside Manifest consumers as a node-local cache proxy. |
-
-<a id="32-local-模式"></a>
 
 ### 3.2 Local mode
 
@@ -138,8 +117,6 @@ rocks:
   bloom_bits: 15
 ```
 
-<a id="33-shard-模式"></a>
-
 ### 3.3 Shard mode
 
 ```yaml
@@ -165,8 +142,6 @@ rocks:
   write_buffer_bytes: 512MiB
   max_background_jobs: 16
 ```
-
-<a id="34-tiered-模式"></a>
 
 ### 3.4 Tiered mode
 
@@ -216,8 +191,6 @@ origin:
 
 `origin.type: store` routes final origin reads through store-ctl gRPC Get. **This does not remove cache-ctl's filesystem access:** embedded RocksDB still reads/writes its cache directory. Only authoritative origin persistence belongs to store-ctl. The other origin type is `upstream`, pointing at another cache wire endpoint.
 
-<a id="分片数自动收敛clamp"></a>
-
 #### Initial shard-count clamp
 
 Each object places `data + parity` shards on distinct peers selected by Maglev. That total must fit the peer count. Otherwise routing cannot return enough distinct nodes.
@@ -229,8 +202,6 @@ At EC construction, defaults are first applied (`data≤0 → 4`, `parity≤0 �
 - If `data + parity ≤ n`, keep the scheme. Selecting only a subset of a larger peer set is valid, distributes objects and can reduce each object's fanout.
 
 A zero-peer configuration is invalid. To retain **4+1**, supply at least five peers initially. The clamp is a **construction-time** operation. SIGHUP updates membership, not the codec's data/parity scheme; reducing live membership below the existing total can produce routing errors (§4.9).
-
-<a id="upstream-层可选"></a>
 
 #### Optional upstream tier
 
@@ -249,8 +220,6 @@ tiers:
     timeout: 2s
 ```
 
-<a id="35-关键参数"></a>
-
 ### 3.5 Important parameters
 
 | Parameter | Meaning |
@@ -265,11 +234,7 @@ tiers:
 | `timeout` | Client per-operation timeout. **An intermediate upstream tier (`tiers[].timeout`) and an EC cluster (`tiers[].cluster.timeout`) default to 2s** when empty/invalid/nonpositive. **Origin clients (`origin.store.timeout` and `origin.upstream.timeout`) default to 0**, bounded by caller/connection lifetime. Redis has its own validation/defaults and requires an explicitly supplied timeout to be positive and valid. |
 | `pprof_listen` | Optional HTTP `/debug/pprof/*` listener, for example 127.0.0.1:6060. Leave empty normally; enable temporarily for diagnostics (§6.4). |
 
-<a id="4-设计"></a>
-
 ## 4. Design
-
-<a id="41-总体架构"></a>
 
 ### 4.1 Architecture
 
@@ -285,13 +250,9 @@ flowchart TD
 
 Manifest ingest writes directly to store-ctl, bypassing cache-ctl. Cache filling is a separate write path: successful reads trigger TieredCache's internal fill-aside calls, which do not loop through that same daemon's wire listener. Cache Put/ShardPut operations still exist for backend filling and explicit tooling.
 
-<a id="42-wire-协议"></a>
-
 ### 4.2 Wire protocol
 
 The data plane uses a compact binary protocol instead of gRPC/protobuf. It reduces framing/serialization work and supports Blob ownership across backend/response paths; this alone does not prove a universal throughput gain or eliminate every copy.
-
-<a id="帧布局"></a>
 
 #### Frame layout
 
@@ -325,8 +286,6 @@ Response (fixed 8-byte header + optional ErrMsg + optional Value):
 
 MaxFrameSize covers the **whole frame**, including header and payload. Client/server validate TotalLen before accepting the rest of the frame; oversized frames are protocol errors and the connection is closed.
 
-<a id="错误模型"></a>
-
 #### Error model
 
 There is no gRPC-style catalog of application error codes. Backend failures and rejected operations use StatusError with text. A **clean final miss uses StatusMiss**, not StatusError.
@@ -342,23 +301,17 @@ Internally, `CacheHitMiss` is a negative-cache hit that ends lookup with a miss,
 
 Individual backends can have their own quorum semantics. For example, insufficient usable EC shards may produce a clean miss, allowing origin lookup; routing, reconstruction and invalid-length errors can remain errors. This does **not** mean every transport error or malformed backend response is interchangeable with a miss. Redis timeout, EOF, protocol and server errors likewise are not ordinary tier fallthrough.
 
-<a id="请求取消cancelrequest--statuscancelled"></a>
-
 #### Cancellation: CancelRequest / StatusCancelled
 
 A client can send CancelRequest (0x06) while an operation is in flight. The server cancels the handler context and responds with StatusCancelled (0x03), also cancelling pending queued requests on that connection. Context-aware remote hops and origin I/O can stop; synchronous RocksDB CGO cannot be interrupted in the middle of its call, so cancellation is not a universal instantaneous backend-stop guarantee.
 
 EC uses this mechanism to cancel remaining foreground ShardGets once **data distinct valid shard indexes** have arrived. It need not wait for every peer to serve the read. A cancelled slow peer is unknown, not a confirmed miss; repair handles that distinction (§4.7).
 
-<a id="不提供的操作"></a>
-
 #### Operations not provided
 
 - **Delete:** no wire deletion operation. Embedded cache eviction is asynchronous CMS/CompactionFilter work (§4.5); external Redis eviction belongs to that server. This says nothing about the separate store generation/GC API.
 - **AdminService:** no standalone admin RPC. Info/Get pulls counters (§1.2, §6.3); adaptive stderr statistics are normally enabled (§6.6). Offline diagnostics use read-only `info --rocks-path`, not a secondary-instance API.
 - **Streaming:** values are one-shot request/response payloads bounded by MaxFrameSize. EC subdivides storage among peers, but the complete-object response from tiered still must fit a wire frame. It does not make arbitrary-size objects transportable; choose upper-layer object/chunk sizes that fit or use an appropriate non-wire path.
-
-<a id="43-key-编码与-opcode-分派"></a>
 
 ### 4.3 Key encoding and opcode dispatch
 
@@ -370,8 +323,6 @@ EC uses this mechanism to cancel remaining foreground ShardGets once **data dist
 The wire header always carries 32 hash bytes. A shard request does not assert which idx the peer should hold: idx/total travels in the value prefix. The 32-byte object and 33-byte shard keys cannot collide even within one RocksDB CF.
 
 Placing shard identity in the value makes a surviving peer's existing shard discoverable after membership changes. A client uses the reported index rather than assuming a fixed peer-position-to-shard-index mapping. It still needs enough **distinct** valid indexes for the active coding scheme.
-
-<a id="44-rocksdb-调优"></a>
 
 ### 4.4 RocksDB tuning
 
@@ -390,8 +341,6 @@ Placing shard identity in the value makes a surviving peer's existing shard disc
 
 Index/filter blocks and data blocks share the configured BlockCache. Do not count them as independent guaranteed resident budgets or infer one-I/O reads for every key.
 
-<a id="column-family-隔离"></a>
-
 #### Column-family isolation
 
 Chunk, Manifest and blob each have a separate CF:
@@ -401,8 +350,6 @@ Chunk, Manifest and blob each have a separate CF:
 - **Blob:** arbitrary content-addressed data, store's third partition; see [store](store.md). It uses the same BlobDB/Bloom/compaction-filter mechanism as the other cache CFs.
 
 Separate CFs isolate write-buffer, filter and compaction state, though they share process resources and BlockCache. Cache eviction is frequency based; cached blob values do not automatically follow store generation deletion because cache keys do not encode generation.
-
-<a id="blobdb-与写放大"></a>
 
 #### BlobDB and write amplification
 
@@ -422,8 +369,6 @@ UseDirectReads defaults to true and bypasses the OS page cache for supported dat
 - **Dedicated L2:** it can similarly reduce duplication when a large BlockCache is configured. BlockCache sizing is a deployment choice, not a daemon rule.
 
 It does not mean the process has zero page-cache use, completely self-contained I/O accounting, or no other native/write-buffer memory.
-
-<a id="45-频率统计与磁盘淘汰"></a>
 
 ### 4.5 Frequency tracking and disk eviction
 
@@ -446,21 +391,15 @@ During background compaction on chunk, manifest and blob CFs:
 
 Touch hashes the key (O(key length), effectively fixed-size for cache keys). Reset rolls generations; it does not repeatedly halve one array in place. The older generation is discarded at the next rollover.
 
-<a id="恢复期保护"></a>
-
 #### Recovery-time protection
 
 The filter is attached before DB Open, while its sketch is absent and armed=false. Startup/recovery compaction therefore preserves keys. After constructing the sketch and **attempting** to restore the reserved `__freq_sketch__` record, the store installs/arms the filter, unless eviction is disabled.
-
-<a id="冷启动保护"></a>
 
 #### Cold-start protection
 
 Without restored frequency history, old keys have zero estimates and may be removed by compaction. To reduce that problem, the active CMS generation is serialized to the reserved RocksDB key, normally every five minutes and on orderly close. Restart restores the active generation; the previous rolling generation is deliberately not persisted.
 
 This is not an unconditional grace period or durable history guarantee. A missing, corrupt or unreadable checkpoint can leave a fresh sketch, after which the filter is still armed. Persist failures are logged. `freq.disable_eviction` keeps the filter unarmed when the deployment intentionally requires no frequency-based eviction.
-
-<a id="cms-默认参数"></a>
 
 #### CMS parameter profiles
 
@@ -474,8 +413,6 @@ The following are the documented L1/L2 configuration profiles. L2 values must be
 | `evict_threshold` | 1. | 1. |
 | `persist_interval` | 5m. | 5m. |
 
-<a id="不做应用层-slrulru"></a>
-
 #### No application-level SLRU/LRU
 
 The cache application does not maintain a second payload SLRU/LRU in Go:
@@ -485,8 +422,6 @@ The cache application does not maintain a second payload SLRU/LRU in Go:
 - Let RocksDB's BlockCache manage RAM reuse and the frequency filter manage embedded disk eviction.
 
 CMS active/previous generations, transient reset/serialization buffers, wire pools, EC work and concurrency consume memory, while RocksDB's native allocations are outside Go heap. Redis backends follow their external server's memory policy.
-
-<a id="46-tieredcache-与读路径"></a>
 
 ### 4.6 TieredCache and the read path
 
@@ -523,8 +458,6 @@ On a hit at layer i (tiers 0..N-1; origin N):
 
 Tests and warmup must confirm availability with actual Get/ShardGet calls, not merely observe that fill goroutines briefly drained. Repeated fills of the same key/bytes are idempotent in the intended content-addressed usage: RocksDB or wire writes overwrite the same value. Fill errors are discarded by startFill and do not retroactively fail the successful read.
 
-<a id="ec-分片缺失修复"></a>
-
 #### Missing EC shard repair
 
 For a healthy fixed 4+1 scheme:
@@ -537,21 +470,15 @@ For a healthy fixed 4+1 scheme:
 
 Foreground quorum cancellation leaves a peer **unknown**, not missing. A bounded follow-up probe can resolve unknown peers; repair writes only confirmed misses whose missing indexes map exactly to destinations. Transport errors, invalid prefixes, stale coding schemes and ambiguous mappings do not justify overwriting a peer's existing shard. Enough responses is insufficient if indexes are duplicated.
 
-<a id="48-强制准入语义"></a>
-
 ### 4.8 Unconditional admission policy
 
 Put/PutShard has no application-level frequency admission filter. **This does not mean every write succeeds:** read-only mode, disk/resource failure, invalid input or backend errors can reject it.
 
 A normal fill represents a chunk that was just read. An additional W-TinyLFU-style admission rejection could cause the next access to go to origin again, conflicting with progressive warming. Embedded space reclamation instead uses the frequency/compaction policy (§4.5), not admission. Redis-compatible backends own their own eviction decisions.
 
-<a id="49-ec-客户端"></a>
-
 ### 4.9 EC client
 
 The EC client is used as a tier in tiered mode.
-
-<a id="reed-solomon-45"></a>
 
 #### Reed–Solomon 4/5
 
@@ -567,8 +494,6 @@ The object size need not be divisible by the data-shard count k:
 2. Pad the combined bytes to a multiple of k.
 3. RS Split into k data shards and produce parity.
 4. Reconstruct and truncate to the recorded length.
-
-<a id="maglev-一致性哈希"></a>
 
 #### Maglev consistent hashing
 
@@ -588,8 +513,6 @@ Shard placement uses the repository's [Maglev implementation](../pkg/maglev/magl
 
 Member IDs are sorted before constructing the table, so reordering an otherwise identical valid configuration does not remap it. Configure unique, stable peer identities; shard index is not part of the routing key.
 
-<a id="集群成员变更"></a>
-
 #### Membership changes
 
 The EC router publishes immutable `(epoch, peers, maglev_table)` snapshots through `atomic.Pointer`. New epochs must be strictly increasing. In the daemon, explicit YAML + SIGHUP reload drives changes; a short connection outage does not automatically increment the epoch or recompute placement.
@@ -600,37 +523,27 @@ To add/remove a peer, update YAML and send HUP, then inspect the logged membersh
 
 Change **one peer at a time** for a 4+1 rollout, verify readiness and let repair/warming complete. Replacing two or more simultaneously can exhaust parity and cause misses/origin reads. Even a one-peer change is not a guarantee of zero impact; preexisting loss, membership filtering and origin failures matter.
 
-<a id="410-跨形态混发的行为"></a>
-
 ### 4.10 Mixing operations across modes
 
 Current local and shard modes connect the same selected backend to both object and shard interfaces. Therefore ObjectPut to a shard daemon is accepted by the handler and can really write a complete object. This reflects a primary deployment role, not exclusive protocol permission.
 
 Tiered exposes only the object read chain. It rejects writes and shard operations. The protocol should not be mistaken for an authorization boundary; endpoint access belongs to the deployment.
 
-<a id="5-内存预算"></a>
-
 ## 5. Memory budgeting
 
-<a id="51-l1tiered-进程内嵌-embedded-tier"></a>
 ### 5.1 L1: an embedded tier inside a tiered process
 
 The configured BlockCache is one major native-memory allowance, not a complete process limit. Account separately for memtables/write buffers, native metadata, BlobDB/compaction activity, wire payload pools, active/previous CMS generations and transient buffers. Cached index/filter blocks share the configured BlockCache; do not count them again as independently pinned memory.
 
 Derive the cache allowance from the actual sizing configuration and minimum size in the embedded-backend contract (§4.4). Go heap, in-flight request/fill concurrency and native/OS memory are workload-dependent. DirectReads can reduce supported data-read page caching but does not imply zero process-wide page-cache use. Measure the whole process/cgroup rather than treating one allowance as an enforced total.
 
-<a id="52-l2shard-专用节点"></a>
 ### 5.2 L2: dedicated shard nodes
 
 Size shard nodes from their actual physical keys, shard coding, CF distribution and object-size distribution. An idealized Bloom bit budget is `actual keys × bits per key / 8`; index and per-entry/native overhead are separate and should be measured. Do not multiply the entire logical dataset by every CF or equate complete-object count with encoded shard-key count.
 
 L0 pinning and cached indexes/filters can reduce I/O but do not prove all metadata stays resident, zero-I/O misses or single-I/O hits. Bloom false positives, SST traversal and BlobDB payload reads remain possible. Validate memory and disk behavior under actual cold reads, fills, repair and compaction, leaving operating margin rather than copying a historical host allocation.
 
-<a id="6-运维"></a>
-
 ## 6. Operations
-
-<a id="61-启动"></a>
 
 ### 6.1 Startup
 
@@ -641,8 +554,6 @@ cache-ctl serve --config /etc/cache/shard.yaml
 # Tiered proxy beside Manifest consumers
 cache-ctl serve --config /etc/cache/tiered.yaml
 ```
-
-<a id="62-信号处理"></a>
 
 ### 6.2 Signals and shutdown
 
@@ -655,15 +566,11 @@ SIGINT/SIGTERM trigger:
 
 Clients can observe cancellation, EOF, or another connection error during shutdown. Retry eligible operations against a healthy endpoint according to caller policy; loss of a response does not prove that a write was never applied. The five-second wire wait is not a five-second bound on the entire process shutdown: other cleanup and backend calls can take longer. SIGHUP reloads EC membership as described in §4.9.
 
-<a id="63-运行时计数pull-only"></a>
-
 ### 6.3 Runtime counters: pull-only
 
 Pull cumulative counters through `cac.cache.v1.Info/Get` on health_listen. `cache-ctl info --endpoint host:port` returns one snapshot, as a table or raw JSON. It includes server hits/misses/fills, tier/origin counters, EC peer counters and backend information, including embedded/local/shard RocksDB CF properties and Redis-specific gauges.
 
 Benchmark scripts compare snapshots before/after the window. Individual atomic counters are useful cumulative evidence; the entire multi-counter response is not a transactional point-in-time snapshot. For routine observation, use the adaptive statistics line (§6.6) without repeatedly pulling Info.
-
-<a id="64-离线诊断"></a>
 
 ### 6.4 Offline inspection
 
@@ -674,8 +581,6 @@ cache-ctl info --rocks-path /var/cache/accel-l1
 The tool opens DB files through OpenDbForReadOnlyColumnFamilies and prints properties such as estimated keys, disk usage and compaction statistics. It is intended for offline/postmortem inspection; it is **not** a RocksDB secondary instance and does not promise a coherent concurrent view of a live writer. For a running service, use Info over gRPC.
 
 A nonempty pprof_listen starts an HTTP `/debug/pprof/*` listener. Use `go tool pprof` for CPU, heap or goroutine investigation. Leave it empty during normal operation and enable only for the diagnostic need.
-
-<a id="65-慢卡请求追踪cache_ctl_debug"></a>
 
 ### 6.5 Slow/stalled request tracing: `CACHE_CTL_DEBUG`
 
@@ -694,8 +599,6 @@ CACHE_CTL_SLOW=2s CACHE_CTL_DEBUG=1 cache-ctl serve ...
 Separately, **CACHE_CTL_TIMING=1**, read at process startup, enables sampled EC Get timing: LocateN, fanout, decode and shard arrival offsets. Sampling is 1%; it is disabled by default. This targets EC quorum/hedging tails and is independent of CACHE_CTL_DEBUG.
 
 Both normally stay disabled. They complement pprof: operation traces identify slow/stalled requests; profiles identify where time/resources are spent.
-
-<a id="66-周期自适应统计行stats_interval"></a>
 
 ### 6.6 Adaptive statistics: `stats_interval`
 
@@ -721,15 +624,13 @@ This is a format example, not a fresh benchmark. In tiered mode, internal fill w
 
 Adaptive statistics give ongoing window-level visibility; Info provides cumulative values for scripts and benchmark deltas. CACHE_CTL_DEBUG instead focuses on abnormal long tails.
 
-<a id="7-性能特征"></a>
 ## 7. Performance characteristics
 
 Measure local, shard and tiered paths separately, recording source/binary revisions, hardware, backend configuration, object sizes, concurrency, cache state and failures. Define timing boundaries and hit/miss denominators before comparing measurements. Conditional per-tier hit rates cannot simply be added. No universal latency, hit-rate or capacity guarantee follows from a cache topology.
 
 Use the [project performance methodology](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf.md) and [Redis-compatible backend guide](cache-redis.md) for evidence and external-service deployment validation. Existing commands and safeguards follow below.
 
-<a id="26-cache-ctl-bench"></a>
-## 7.1 Backend and wire benchmarks
+### 7.1 Backend and wire benchmarks
 
 The built-in benchmark sends wire-protocol traffic to a running daemon for quick throughput/latency smoke checks. It does not replace [bench_cache.sh](../test/scripts/bench_cache.sh), which adds CPU affinity and parameter sweeps.
 
@@ -762,7 +663,7 @@ Flags:
 
 With a separate prefill endpoint, both an omitted mode and explicit `--mode mixed` are changed to `get`; `put` and other modes are rejected. Inspect the reported effective mode before interpreting results. `--key-salt` participates in warm, cold, and write-key derivation: repeated or concurrent runs with the same salt reuse deterministic keys and can contaminate intended cold reads or overwrite prior writes. Use a unique salt for each isolated run. `test/scripts/bench_cache.sh` supplies a run/round/mode/concurrency salt; `test/scripts/bench_cache_remote.sh` currently does not pass `--key-salt`, so its concurrency sweep can reuse keys warmed by earlier rounds. Do not treat those later rounds as isolated cold-cache measurements without adding distinct salts at invocation or resetting the relevant cache state. Increase the client timeout when an intentionally slow origin or large prefill requires it; a timeout does not convert a backend error into a clean cache miss.
 
-### Backend A/B benchmark
+#### Backend A/B benchmark
 
 The repository's existing cache wire benchmark can select the physical store
 without changing its client workload:
@@ -834,7 +735,7 @@ acceptance must include active offload/defragmentation and near-full disk
 states; the systemd sample is deployment scaffolding, not a performance
 qualification result.
 
-### Multi-host benchmark and cleanup safety
+#### Multi-host benchmark and cleanup safety
 
 Use dedicated, disposable benchmark hosts and replace the documentation addresses below with the intended isolated topology. The generated data, health and profiling listeners bind `0.0.0.0` on ports `17070–17072`, `17080–17082` and `17090–17092`; restrict network access before startup. Use a binary matching the remote architecture and libc, and passwordless SSH with independently verified host keys. The explicit `SSH_OPTS` below overrides the harness's disabled host-key checking.
 
@@ -864,9 +765,7 @@ bash test/scripts/bench_cache_remote.sh stop
 
 Record workload controls `VALUE_SIZE`, `PREFILL`, `COLD_PREFILL`, `MISS_RATIO`, `ACCESS`, `ZIPF_S`, `CONCS`, `DURATION`, `TIMEOUT`; topology/coding controls `EC_DATA`/`EC_PARITY`; and backend controls `SHARD_DISK`, `SHARD_MEM_RATIO`, `SHARD_BLOCK_SIZE`, `DIRECT_READS`, `BLOOM_BITS`, `ORIGIN_DISK`. Generated shard/origin configurations default to `freq.disable_eviction: true`, so they do not validate aging unless an owned benchmark configuration deliberately enables it and the report records that choice. The remote sweep supplies no key salt and does not reset caches between concurrency points; later points are not isolated cold-cache measurements.
 
-<a id="基准方法学l2-内存磁盘路径l3-透传aging"></a>
-
-### Benchmark methodology: L2 memory/disk, L3 and aging
+#### Benchmark methodology: L2 memory/disk, L3 and aging
 
 [bench_cache_remote.sh](../test/scripts/bench_cache_remote.sh) deploys N shards, origin and tiered daemons for a multi-host concurrency sweep. Its `report` subcommand emits complete `README.md` / `README_zh.md` reports with reciprocal selectors from the same parsed rows. It reads the current `hit%` column after `end-flight` and `errors`; origin-hit share counts successful origin reads divided by benchmark ops, excluding origin misses/errors. Missing cache counters remain unknown. Read-through and reused unsalted keys mean these observations need not equal `--miss-ratio`. Pair it with [procmon.sh](../test/scripts/procmon.sh), a dependency-free /proc CPU/diskstats/network sampler, and [proc_analyze.py](../test/scripts/proc_analyze.py) to attribute resource use.
 

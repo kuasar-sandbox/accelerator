@@ -33,7 +33,7 @@ The downstream import surface is kept small and mostly pure Go, so consumers suc
 
 Heavy server backends remain behind component binaries and server packages.
 The detailed sparse Run/Stream, chunk-window and local tarstream contracts belong
-to [Manifest §4.8–§4.10](docs/manifest.md#48-read-path-in-detail) and
+to [Manifest §4.8](docs/manifest.md#48-read-path-in-detail) and
 [file artifacts](docs/file-artifacts.md), not a separate README protocol.
 
 ## Binaries

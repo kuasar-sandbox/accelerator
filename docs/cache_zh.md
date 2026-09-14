@@ -34,6 +34,8 @@ object storage 的读取。embedded 部署可从本地 RocksDB BlockCache 服务
 
 ## 2. 命令行接口
 
+`cache-ctl bench` 命令、工作负载控制和保护措施见 [§7.1](#71-后端与-wire-基准测试)。
+
 ### 2.1 `cache-ctl serve`
 
 ```
@@ -95,10 +97,6 @@ cache-ctl info --rocks-path PATH               # 离线只读打开 RocksDB,查�
 检查运行中 daemon 应用远端 Info;本地只读打开用于离线/故障后检查,不承诺其他进程修改
 DB 文件时得到一致 live view。
 
-
-### 2.6 `cache-ctl bench`
-
-基准命令、工作负载控制、隔离与破坏性测试保护、结果解释统一见 [性能验证](#71-后端与-wire-基准测试)。
 
 ## 3. 配置
 
@@ -748,8 +746,7 @@ cache stat tiered | get 5.1k/s 620MiB/s p50 40µs/p99 700µs/max 9ms · hit 94% 
 
 证据要求和外部服务部署验证见 [项目性能方法](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf_zh.md) 与 [Redis-compatible 后端指南（英文）](cache-redis.md)，现有命令和保护措施完整保留在下方。
 
-<a id="26-cache-ctl-bench"></a>
-## 7.1 后端与 wire 基准测试
+### 7.1 后端与 wire 基准测试
 
 内置吞吐/延迟基准,通过 wire 协议向运行中的 cache-ctl 发压。用于快速
 smoke 验证;不替代 `test/scripts/bench_cache.sh`(后者加 taskset CPU 固
@@ -781,7 +778,7 @@ Flags:
 
 使用独立 prefill endpoint 时，省略 mode 和显式 `--mode mixed` 都会变为 `get`，`put` 等其他 mode 才会被拒绝。解读结果前检查输出的 effective mode。`--key-salt` 参与 warm、cold 和 write key 派生；重复或并发 run 使用同一 salt 会复用 deterministic keys，可能污染原定 cold read 或覆盖旧写入。独立 run 应使用唯一 salt。`test/scripts/bench_cache.sh` 提供 run/round/mode/concurrency salt；`test/scripts/bench_cache_remote.sh` 当前未传入 `--key-salt`，其并发度扫描可能复用前轮已预热的 keys。调用时未加入不同 salt 或重置相关 cache 状态之前，不应把后续轮次当作相互隔离的冷缓存测量。刻意使用慢 origin 或较大 prefill 时可增加 client timeout；超时不把 backend error 转成 clean cache miss。
 
-### 后端 A/B 基准测试
+#### 后端 A/B 基准测试
 
 现有 cache wire benchmark 可选择物理后端,而不改变客户端 workload:
 
@@ -843,7 +840,7 @@ BENCH_SCENARIO=tiered-shard-l2 BENCH_BACKEND=redis REDIS_RESET=flushdb \
 当前要求 Linux 5.19 或更新版本及 `io_uring`。容量与时延验收必须覆盖活跃 offload/
 defragmentation 和磁盘接近写满的状态;systemd 示例只提供部署配置,不是性能验收结果。
 
-### 多机基准与清理安全
+#### 多机基准与清理安全
 
 只使用专用、可丢弃的基准主机,将下例文档地址替换为明确隔离的实际拓扑。
 生成的数据、health 与 profiling listener 在 `17070–17072`、`17080–17082`、
@@ -892,7 +889,7 @@ SSH 成功不代表 benchmark 成功;须检查原始日志、错误与预期的�
 除非在自己管理的基准配置中明确开启并记录,否则不构成 aging 验证。
 远端扫描不传 key salt,也不在并发测点之间重置 cache,后续测点不是相互隔离的冷缓存测量。
 
-### 基准方法学(L2 内存/磁盘路径、L3 透传、aging)
+#### 基准方法学(L2 内存/磁盘路径、L3 透传、aging)
 
 `test/scripts/bench_cache_remote.sh report` 从同一份解析行生成完整 `README.md` / `README_zh.md` 报告并带双向选择器。按当前输出读取 `end-flight`、`errors` 之后的 `hit%`；origin-hit 占比为 origin 成功读取数 / benchmark ops，不包括 origin misses/errors。缺失 cache counter 保持 unknown。Read-through 与不带 salt 的重复 key 会改变观测，不能假定等于 `--miss-ratio`。
 

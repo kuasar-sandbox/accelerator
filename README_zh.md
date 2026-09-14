@@ -18,8 +18,6 @@
 
 这些路径向下游暴露共同的逻辑数据与引用语义。因此 `sandboxer` 可以消费镜像或快照,不必让生命周期 API 绑定某种物理后端。
 
-<a id="导出面下游-import-的薄客户端"></a>
-
 ## 公共 Go 导出面
 
 下游 import 面保持精简,主要使用纯 Go,使 `sandboxer` 等消费者不必把存储服务端、对象存储 SDK、纠删码或数据库实现链接到自己的二进制中。
@@ -33,7 +31,7 @@
 | `pkg/tarstream` | 携带身份及完整性元数据的本地稀疏传输工件 |
 | `pkg/flatten`、`pkg/image`、`pkg/remote`、`pkg/tar` | OCI/目录拉取、镜像配置与 EROFS 展平基础能力 |
 
-重服务端后端保留在组件二进制和 server package 后面。稀疏 Run/Stream、chunk-window 与本地 tarstream 的详细契约归属于 [Manifest §4.8–§4.10](docs/manifest_zh.md#48-读路径细节)及[文件工件](docs/file-artifacts_zh.md),README 不另建一套协议。
+重服务端后端保留在组件二进制和 server package 后面。稀疏 Run/Stream、chunk-window 与本地 tarstream 的详细契约归属于 [Manifest §4.8](docs/manifest_zh.md#48-读路径细节)及[文件工件](docs/file-artifacts_zh.md),README 不另建一套协议。
 
 ## 二进制
 
@@ -51,8 +49,6 @@
 
 内容加密不意味着任何威胁模型下都不泄露元数据,也不意味着所有租户私有数据都应全局去重。部署应根据数据分类与信任边界选择共享域。直接本地或共享文件路径也可应用项目定义的本地工件保护策略。
 
-<a id="构建"></a>
-
 ## 构建与测试
 
 ```bash
@@ -69,8 +65,6 @@ make test-e2e                   # 组件 owner suite;需要项目组装的 BIN
 Go 与原生前置依赖随构建目标而异。当前源码通过仓库脚本说明并构建所需原生缓存依赖。真实对象存储测试必须使用显式测试凭据或本地 S3-compatible 服务;普通单元测试与本地文件系统测试不应要求生产云凭据。
 
 `cache-ctl` 通常使用 CGO 以及 `deps/build-rocksdb.sh` 在本地构建的静态 `librocksdb.a`;`manifest-ctl`、`store-ctl` 与下游 import 面不需要 RocksDB。`make release VERSION=vX.Y.Z` 生成并检查本地发行 bundle;官方缓存载荷必须保留 RocksDB 支持。
-
-<a id="私网--离线构建"></a>
 
 ### 私网与离线构建
 
