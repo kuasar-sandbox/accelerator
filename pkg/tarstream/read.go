@@ -1261,6 +1261,9 @@ func readFixed(r io.Reader, p []byte) (n int, err error) {
 					e = io.ErrUnexpectedEOF
 				}
 			}
+			if n == len(p) && e == io.ErrUnexpectedEOF {
+				e = readerr.Mark(e, false)
+			}
 			return n, e
 		}
 	}

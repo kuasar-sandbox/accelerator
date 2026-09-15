@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"syscall"
 	"testing"
@@ -11,6 +12,27 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
+
+func TestSequentialProbePreservesCompleteUnexpectedEOF(t *testing.T) {
+	var artifact bytes.Buffer
+	if _, _, err := WriteTo(context.Background(), &artifact, "image", sparse.Dense(bytes.NewReader([]byte("data")), 4)); err != nil {
+		t.Fatal(err)
+	}
+	for _, cause := range []error{io.ErrUnexpectedEOF, readerr.Mark(io.ErrUnexpectedEOF, true), fmt.Errorf("source: %w", io.ErrUnexpectedEOF), io.EOF} {
+		source, _, err := SourceFrom(&failedFieldReader{Reader: bytes.NewReader(artifact.Bytes()), at: 0, cause: cause}, "")
+		var got [4]byte
+		if err == nil {
+			_, err = source.ReadAt(context.Background(), got[:], 0)
+		}
+		if cause == io.EOF {
+			if err != nil || string(got[:]) != "data" {
+				t.Fatalf("full bare EOF changed: %v %q", err, got)
+			}
+		} else if !errors.Is(err, cause) || readerr.IsPermanent(err) != (cause == io.ErrUnexpectedEOF) {
+			t.Fatalf("full first probe cause lost: %v %q", err, got)
+		}
+	}
+}
 
 type failedFieldReader struct {
 	*bytes.Reader

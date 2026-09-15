@@ -4,12 +4,41 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"syscall"
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 )
+
+type fullErrorReaderAt struct{ err error }
+
+func (r fullErrorReaderAt) ReadAt(p []byte, _ int64) (int, error) {
+	return copy(p, "data"), r.err
+}
+
+func TestStaticRangeUnexpectedEOFClassification(t *testing.T) {
+	for _, cause := range []error{io.ErrUnexpectedEOF, readerr.Mark(io.ErrUnexpectedEOF, true), fmt.Errorf("source: %w", io.ErrUnexpectedEOF), io.EOF} {
+		s, err := NewSource(fullErrorReaderAt{cause}, 4, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		run, err := s.RunAt(0, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := make([]byte, 4)
+		n, err := run.ReadAt(context.Background(), p, 0)
+		if cause == io.EOF {
+			if n != 4 || err != nil || string(p) != "data" {
+				t.Fatalf("legal full EOF changed: %d %v %q", n, err, p)
+			}
+		} else if !errors.Is(err, cause) || readerr.IsPermanent(err) != (cause == io.ErrUnexpectedEOF) {
+			t.Fatalf("static declared range cause changed: n=%d err=%v", n, err)
+		}
+	}
+}
 
 type consumedErrorReader struct {
 	*bytes.Reader

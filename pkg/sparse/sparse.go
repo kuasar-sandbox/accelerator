@@ -158,6 +158,9 @@ func (s *staticSource) ReadAt(_ context.Context, buf []byte, offset uint64) (int
 		eof = io.EOF
 	}
 	m, err := s.ra.ReadAt(buf[:n], int64(offset))
+	if err == io.ErrUnexpectedEOF {
+		err = readerr.Mark(err, false)
+	}
 	if err != nil && err != io.EOF {
 		return m, fmt.Errorf("sparse: read @ %d: %w", offset, err)
 	}
