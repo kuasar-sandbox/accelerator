@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"io"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
 
@@ -157,29 +157,37 @@ func TestReadAtPlansAllRunsBeforeStartingIO(t *testing.T) {
 	}
 }
 
-func TestReadAtRejectsRunShortReadAndFullEOF(t *testing.T) {
+func TestReadAtRangeContract(t *testing.T) {
 	tests := []struct {
-		name string
-		read func(context.Context, []byte, uint64) (int, error)
-		want error
+		name               string
+		n                  int
+		cause              error
+		permanent, success bool
 	}{
-		{name: "short read", read: func(_ context.Context, buf []byte, _ uint64) (int, error) { return len(buf) - 1, nil }},
-		{name: "full read with EOF", read: func(_ context.Context, buf []byte, _ uint64) (int, error) { return len(buf), io.EOF }, want: io.EOF},
+		{"short nil", 7, nil, true, false},
+		{"short EOF", 7, io.EOF, true, false},
+		{"short unexpected EOF", 7, io.ErrUnexpectedEOF, true, false},
+		{"full EOF", 8, io.EOF, false, true},
+		{"full unexpected EOF", 8, io.ErrUnexpectedEOF, true, false},
+		{"full retryable EOF", 8, readerr.Mark(io.EOF, true), false, false},
+		{"full permanent EOF", 8, readerr.Mark(io.EOF, false), true, false},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			leaf := &resolverTestStream{size: 8, read: tt.read}
+			leaf := &resolverTestStream{size: 8, read: func(context.Context, []byte, uint64) (int, error) { return tt.n, tt.cause }}
 			stream := NewLayered(leaf, resolverHoleStream(8))
 			n, err := stream.ReadAt(context.Background(), make([]byte, 8), 0)
-			if n != 0 || err == nil {
-				t.Fatalf("ReadAt = (%d, %v), want (0, error)", n, err)
+			if tt.success {
+				if n != 8 || err != nil {
+					t.Fatalf("success = %d, %v", n, err)
+				}
+				return
 			}
-			if tt.want != nil && !errors.Is(err, tt.want) {
-				t.Fatalf("ReadAt error = %v, want %v", err, tt.want)
+			if n != 0 || err == nil || readerr.IsPermanent(err) != tt.permanent {
+				t.Fatalf("ReadAt = %d, %v, permanent=%t", n, err, readerr.IsPermanent(err))
 			}
-			if tt.want == nil && !strings.Contains(err.Error(), "short read") {
-				t.Fatalf("ReadAt error = %v, want short-read diagnostic", err)
+			if tt.cause != nil && !errors.Is(err, tt.cause) {
+				t.Fatalf("lost cause %v: %v", tt.cause, err)
 			}
 		})
 	}

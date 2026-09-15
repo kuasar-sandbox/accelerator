@@ -516,22 +516,15 @@ func TestEncryptedTarStreamShortIO(t *testing.T) {
 		t.Fatal("short-I/O round trip mismatch")
 	}
 
-	random, _, err := tarstream.SourceAt(
+	_, _, err = tarstream.SourceAt(
 		shortReaderAt{r: bytes.NewReader(output.Bytes()), max: 3},
 		int64(output.Len()),
 		"",
 		tarstream.WithCodec(codec, true),
 		tarstream.WithExpectedDigest(scheme, digest),
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err = readSparseSource(context.Background(), random)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, body) {
-		t.Fatal("short ReaderAt round trip mismatch")
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("short nil ReaderAt must not splice attempts: %v", err)
 	}
 }
 

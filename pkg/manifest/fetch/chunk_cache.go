@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"context"
 	"errors"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"sync"
 	"time"
 )
@@ -14,7 +15,7 @@ const (
 	manifestChunkCacheIdleTTL    = 5 * time.Second
 )
 
-var errManifestChunkCacheClosed = errors.New("fetch: manifest chunk cache is closed")
+var errManifestChunkCacheClosed = readerr.Mark(errors.New("fetch: manifest chunk cache is closed"), false)
 
 // decryptedChunkKey includes every input that determines plaintext. A single
 // manifest stream can therefore reuse duplicate physical chunks without

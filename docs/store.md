@@ -332,3 +332,5 @@ The race-detector command requires CGO and a working C toolchain. Disabling CGO 
 - [manifest.md](manifest.md): manifest ingest/fetch and encryption.
 - [cache.md](cache.md): tiered cache, origins and wire protocol.
 - Repository-root `README.md` / `Makefile`: build and full-test entry points.
+
+Immutable read errors and client recovery are specified in [Read errors and recovery](accelerator-read-recovery.md).

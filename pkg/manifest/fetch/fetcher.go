@@ -9,6 +9,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
@@ -78,20 +79,20 @@ func (f *fetcher) OpenManifest(ctx context.Context, manifestKey store.ContentKey
 		if blob != nil {
 			blob.Release()
 		}
-		return nil, fmt.Errorf("fetch: manifest not found: %s", hex.EncodeToString(manifestKey[:]))
+		return nil, readerr.Mark(fmt.Errorf("fetch: manifest %s: %w", hex.EncodeToString(manifestKey[:]), store.ErrNotFound), false)
 	}
 	if blob == nil {
-		return nil, fmt.Errorf("fetch: manifest cache hit returned nil blob")
+		return nil, readerr.Mark(fmt.Errorf("fetch: manifest cache hit returned nil blob"), false)
 	}
 	mData := blob.Bytes()
 	if f.verifyContent && sha256.Sum256(mData) != manifestKey {
 		blob.Release()
-		return nil, fmt.Errorf("fetch: manifest content key mismatch (corrupt or tampered store/cache)")
+		return nil, readerr.Mark(fmt.Errorf("fetch: manifest content key mismatch (corrupt or tampered store/cache)"), false)
 	}
 	m, sealedKT, err := codec.Unmarshal(mData)
 	blob.Release()
 	if err != nil {
-		return nil, fmt.Errorf("fetch: unmarshal manifest: %w", err)
+		return nil, readerr.Mark(fmt.Errorf("fetch: unmarshal manifest: %w", err), false)
 	}
 	if f.validator != nil {
 		if err := f.validator.ValidateManifest(manifestKey, m); err != nil {

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/subtle"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 
@@ -46,12 +45,8 @@ func (v *sequentialVerifier) finish() error {
 	pad := int((512 - v.meta.stored%512) % 512)
 	if pad > 0 {
 		padding := make([]byte, pad)
-		if _, err := io.ReadFull(v.reader, padding); err != nil {
-			if errors.Is(err, ErrAuthentication) || errors.Is(err, ErrMalformedEnvelope) {
-				v.err = err
-				return v.err
-			}
-			v.err = fmt.Errorf("%w: invalid payload padding", ErrInvalidCanonicalTarstream)
+		if _, err := readFixed(v.reader, padding); err != nil {
+			v.err = &canonicalReadError{category: fmt.Errorf("%w: invalid payload padding", ErrInvalidCanonicalTarstream), cause: fixedReadError(err)}
 			return v.err
 		}
 		if !isZeroBlock(padding) {
@@ -60,21 +55,13 @@ func (v *sequentialVerifier) finish() error {
 		}
 	}
 	var marker [512]byte
-	if _, err := io.ReadFull(v.reader, marker[:]); err != nil {
-		if errors.Is(err, ErrAuthentication) || errors.Is(err, ErrMalformedEnvelope) {
-			v.err = err
-			return v.err
-		}
-		v.err = fmt.Errorf("%w: missing digest marker", ErrInvalidCanonicalTarstream)
+	if _, err := readFixed(v.reader, marker[:]); err != nil {
+		v.err = &canonicalReadError{category: fmt.Errorf("%w: missing digest marker", ErrInvalidCanonicalTarstream), cause: fixedReadError(err)}
 		return v.err
 	}
 	var markerBody [512]byte
-	if _, err := io.ReadFull(v.reader, markerBody[:]); err != nil {
-		if errors.Is(err, ErrAuthentication) || errors.Is(err, ErrMalformedEnvelope) {
-			v.err = err
-			return v.err
-		}
-		v.err = fmt.Errorf("%w: invalid digest marker body", ErrInvalidCanonicalTarstream)
+	if _, err := readFixed(v.reader, markerBody[:]); err != nil {
+		v.err = &canonicalReadError{category: fmt.Errorf("%w: invalid digest marker body", ErrInvalidCanonicalTarstream), cause: fixedReadError(err)}
 		return v.err
 	}
 	declared, err := parseCanonicalMarker(marker[:], markerBody[:])
@@ -83,12 +70,8 @@ func (v *sequentialVerifier) finish() error {
 		return v.err
 	}
 	var trailer [1024]byte
-	if _, err := io.ReadFull(v.reader, trailer[:]); err != nil {
-		if errors.Is(err, ErrAuthentication) || errors.Is(err, ErrMalformedEnvelope) {
-			v.err = err
-			return v.err
-		}
-		v.err = fmt.Errorf("%w: invalid end-of-archive", ErrInvalidCanonicalTarstream)
+	if _, err := readFixed(v.reader, trailer[:]); err != nil {
+		v.err = &canonicalReadError{category: fmt.Errorf("%w: invalid end-of-archive", ErrInvalidCanonicalTarstream), cause: fixedReadError(err)}
 		return v.err
 	}
 	if !isZeroBlock(trailer[:512]) || !isZeroBlock(trailer[512:]) {
@@ -189,7 +172,7 @@ func readOneByte(reader io.Reader, buffer []byte) (int, error) {
 
 func openSequentialPlaintext(r io.Reader, options readOptions) (io.Reader, *envelopeHeader, error) {
 	first := make([]byte, len(envelopeMagic))
-	n, err := io.ReadFull(r, first)
+	n, err := readFixed(r, first)
 	if err != nil {
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			if options.required {
@@ -210,8 +193,8 @@ func openSequentialPlaintext(r io.Reader, options readOptions) (io.Reader, *enve
 	}
 	var prefix [envelopePrefixSize]byte
 	copy(prefix[:8], first)
-	if _, err := io.ReadFull(r, prefix[8:]); err != nil {
-		return nil, nil, fmt.Errorf("%w: truncated clear prefix", ErrMalformedEnvelope)
+	if _, err := readFixed(r, prefix[8:]); err != nil {
+		return nil, nil, &canonicalReadError{category: fmt.Errorf("%w: truncated clear prefix", ErrMalformedEnvelope), cause: fixedReadError(err)}
 	}
 	if err := validatePrefix(prefix); err != nil {
 		return nil, nil, err
@@ -224,12 +207,12 @@ func openSequentialPlaintext(r io.Reader, options readOptions) (io.Reader, *enve
 		return nil, nil, fmt.Errorf("%w: codec header size", ErrMalformedEnvelope)
 	}
 	sealed := make([]byte, envelopeHeaderSealed)
-	if _, err := io.ReadFull(r, sealed); err != nil {
-		return nil, nil, fmt.Errorf("%w: truncated encrypted header", ErrMalformedEnvelope)
+	if _, err := readFixed(r, sealed); err != nil {
+		return nil, nil, &canonicalReadError{category: fmt.Errorf("%w: truncated encrypted header", ErrMalformedEnvelope), cause: fixedReadError(err)}
 	}
 	plaintext, err := recordCodec.DecryptInPlace(sealed, headerAAD(prefix), 0)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w: encrypted header", ErrAuthentication)
+		return nil, nil, &canonicalReadError{category: fmt.Errorf("%w: encrypted header", ErrAuthentication), cause: err}
 	}
 	if len(plaintext) != envelopeHeaderSize || &plaintext[0] != &sealed[1] {
 		return nil, nil, fmt.Errorf("%w: codec violated in-place header contract", ErrMalformedEnvelope)

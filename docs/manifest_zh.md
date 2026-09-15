@@ -662,3 +662,5 @@ metadata 读取及其与 chunk 数的关系。benchmark fixture 名称不覆盖�
 - [guest-runtime flatten](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten_zh.md):镜像展平后经 `flatten-ctl export --upload` 入库。
 - [sandboxer](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox_zh.md):磁盘 base 与快照的 Manifest key 引用。
 - [系统架构](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox_zh.md):Manifest 抽象在平台中的位置。
+
+不可变读取错误及 client 恢复见[读取错误与恢复](accelerator-read-recovery_zh.md).

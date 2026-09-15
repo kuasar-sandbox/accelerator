@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -15,11 +14,11 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -121,8 +120,7 @@ type Reader struct {
 	indexCRC32      uint32
 	manifests       map[store.ContentKey]archiveEntry
 	chunks          map[store.ContentKey]archiveEntry
-	chunkOnce       sync.Once
-	chunkErr        error
+	chunkMu         sync.Mutex
 	buffers         readBufferPool
 
 	lifeMu         sync.Mutex
@@ -146,7 +144,7 @@ func Open(path string) (*Reader, error) {
 	}
 	if info.Size() <= 0 || info.Size() > int64(maxInt()) {
 		_ = file.Close()
-		return nil, fmt.Errorf("manifest bundle: invalid file size %d", info.Size())
+		return nil, readerr.Mark(fmt.Errorf("manifest bundle: invalid file size %d", info.Size()), false)
 	}
 	if mapped, mapErr := unix.Mmap(int(file.Fd()), 0, int(info.Size()), unix.PROT_READ, unix.MAP_SHARED); mapErr == nil {
 		_ = file.Close()
@@ -175,48 +173,54 @@ func NewReader(source io.ReaderAt, size int64) (*Reader, error) {
 
 func readFullAt(source io.ReaderAt, dst []byte, offset int64) error {
 	n, err := source.ReadAt(dst, offset)
+	if readerr.IsPermanent(err) {
+		return err
+	}
 	if n < 0 || n > len(dst) {
 		if err != nil {
-			return fmt.Errorf("invalid ReaderAt byte count %d for %d-byte buffer: %w", n, len(dst), err)
+			return readerr.Mark(fmt.Errorf("invalid ReaderAt byte count %d for %d-byte buffer: %w", n, len(dst), err), false)
 		}
-		return fmt.Errorf("invalid ReaderAt byte count %d for %d-byte buffer", n, len(dst))
+		return readerr.Mark(fmt.Errorf("invalid ReaderAt byte count %d for %d-byte buffer", n, len(dst)), false)
 	}
 	if n == len(dst) {
-		if err == nil || errors.Is(err, io.EOF) {
+		if err == nil || err == io.EOF {
 			return nil
+		}
+		if err == io.ErrUnexpectedEOF {
+			return readerr.Mark(err, false)
 		}
 		return err
 	}
-	if err == nil || errors.Is(err, io.EOF) {
-		return fmt.Errorf("%w: ReaderAt read %d of %d bytes", io.ErrUnexpectedEOF, n, len(dst))
+	if err == nil || err == io.EOF || err == io.ErrUnexpectedEOF {
+		return readerr.Mark(fmt.Errorf("%w: ReaderAt read %d of %d bytes", io.ErrUnexpectedEOF, n, len(dst)), false)
 	}
 	return fmt.Errorf("ReaderAt read %d of %d bytes: %w", n, len(dst), err)
 }
 
 func newReader(source io.ReaderAt, size int64, slicer entrySlicer, cleanup func() error) (*Reader, error) {
 	if source == nil {
-		return nil, fmt.Errorf("manifest bundle: source is required")
+		return nil, readerr.Mark(fmt.Errorf("manifest bundle: source is required"), false)
 	}
 	const directoryEndSize = 22
 	if size < directoryEndSize {
-		return nil, fmt.Errorf("manifest bundle: truncated ZIP")
+		return nil, readerr.Mark(fmt.Errorf("manifest bundle: truncated ZIP"), false)
 	}
 	var directoryEnd [directoryEndSize]byte
 	if err := readFullAt(source, directoryEnd[:], size-directoryEndSize); err != nil {
 		return nil, fmt.Errorf("manifest bundle: read ZIP directory end: %w", err)
 	}
 	if !bytesEqual4(directoryEnd[:4], zipDirectoryEndMagic) || binary.LittleEndian.Uint16(directoryEnd[20:22]) != 0 {
-		return nil, fmt.Errorf("manifest bundle: Central Directory does not end at archive EOF with an empty comment")
+		return nil, readerr.Mark(fmt.Errorf("manifest bundle: Central Directory does not end at archive EOF with an empty comment"), false)
 	}
 	directoryOffset, directoryRecords, err := readCentralDirectoryLocation(source, size, directoryEnd)
 	if err != nil {
 		return nil, err
 	}
 	if directoryRecords > maxBundleEntries {
-		return nil, fmt.Errorf("manifest bundle: Central Directory record count %d exceeds limit %d", directoryRecords, maxBundleEntries)
+		return nil, readerr.Mark(fmt.Errorf("manifest bundle: Central Directory record count %d exceeds limit %d", directoryRecords, maxBundleEntries), false)
 	}
 	if directoryOffset < indexFooterSize {
-		return nil, fmt.Errorf("manifest bundle: mandatory index footer is missing")
+		return nil, readerr.Mark(fmt.Errorf("manifest bundle: mandatory index footer is missing"), false)
 	}
 	var encodedFooter [indexFooterSize]byte
 	if err := readFullAt(source, encodedFooter[:], directoryOffset-indexFooterSize); err != nil {
@@ -243,14 +247,14 @@ func newReader(source io.ReaderAt, size int64, slicer entrySlicer, cleanup func(
 		return nil, err
 	}
 	if uint64(metadataEnd) != footer.MetadataPrefixEnd {
-		return nil, fmt.Errorf("manifest bundle: metadata prefix end %d differs from index footer %d", metadataEnd, footer.MetadataPrefixEnd)
+		return nil, readerr.Mark(fmt.Errorf("manifest bundle: metadata prefix end %d differs from index footer %d", metadataEnd, footer.MetadataPrefixEnd), false)
 	}
 	expectedRecords, err := checkedAdd64(footer.Manifest.Count, footer.Chunk.Count)
 	if err == nil {
 		expectedRecords, err = checkedAdd64(expectedRecords, uint64(metadataEntries+1)) // mandatory index entry
 	}
 	if err != nil || expectedRecords != directoryRecords || expectedRecords > maxBundleEntries {
-		return nil, fmt.Errorf("manifest bundle: index and metadata describe %d ZIP entries, Central Directory reports %d", expectedRecords, directoryRecords)
+		return nil, readerr.Mark(fmt.Errorf("manifest bundle: index and metadata describe %d ZIP entries, Central Directory reports %d", expectedRecords, directoryRecords), false)
 	}
 	manifestBytes, err := readIndexSectionAt(source, footer.Manifest, store.PartitionManifest)
 	if err != nil {
@@ -284,32 +288,32 @@ func readAndValidateIndexLocalHeader(source io.ReaderAt, archiveSize int64, foot
 		return 0, err
 	}
 	if headerOffset < 0 || int64(indexLocalHeaderSize) > archiveSize-headerOffset {
-		return 0, fmt.Errorf("manifest bundle: index Local Header is outside archive")
+		return 0, readerr.Mark(fmt.Errorf("manifest bundle: index Local Header is outside archive"), false)
 	}
 	var header [indexLocalHeaderSize]byte
 	if err := readFullAt(source, header[:], headerOffset); err != nil {
 		return 0, fmt.Errorf("manifest bundle: read index Local Header: %w", err)
 	}
 	if !bytesEqual4(header[:4], zipLocalHeaderMagic) {
-		return 0, fmt.Errorf("manifest bundle: index Local Header magic is invalid")
+		return 0, readerr.Mark(fmt.Errorf("manifest bundle: index Local Header magic is invalid"), false)
 	}
 	if binary.LittleEndian.Uint16(header[4:6]) != 45 || binary.LittleEndian.Uint16(header[6:8]) != 0 ||
 		binary.LittleEndian.Uint16(header[8:10]) != zip.Store || binary.LittleEndian.Uint16(header[10:12]) != 0 ||
 		binary.LittleEndian.Uint16(header[12:14]) != 0 {
-		return 0, fmt.Errorf("manifest bundle: index Local Header is not canonical Store metadata")
+		return 0, readerr.Mark(fmt.Errorf("manifest bundle: index Local Header is not canonical Store metadata"), false)
 	}
 	if footer.IndexPayloadSize > math.MaxUint32 || uint64(binary.LittleEndian.Uint32(header[18:22])) != footer.IndexPayloadSize ||
 		uint64(binary.LittleEndian.Uint32(header[22:26])) != footer.IndexPayloadSize {
-		return 0, fmt.Errorf("manifest bundle: index Local Header size differs from footer")
+		return 0, readerr.Mark(fmt.Errorf("manifest bundle: index Local Header size differs from footer"), false)
 	}
 	if int(binary.LittleEndian.Uint16(header[26:28])) != len(indexName) || binary.LittleEndian.Uint16(header[28:30]) != 0 {
-		return 0, fmt.Errorf("manifest bundle: index Local Header name or extra field is not canonical")
+		return 0, readerr.Mark(fmt.Errorf("manifest bundle: index Local Header name or extra field is not canonical"), false)
 	}
 	if string(header[zipLocalHeaderFixedSize:]) != indexName {
-		return 0, fmt.Errorf("manifest bundle: index Local Header name is invalid")
+		return 0, readerr.Mark(fmt.Errorf("manifest bundle: index Local Header name is invalid"), false)
 	}
 	if footer.IndexHeaderOffset+uint64(indexLocalHeaderSize) != footer.IndexPayloadOffset {
-		return 0, fmt.Errorf("manifest bundle: index Local Header does not precede its payload")
+		return 0, readerr.Mark(fmt.Errorf("manifest bundle: index Local Header does not precede its payload"), false)
 	}
 	return binary.LittleEndian.Uint32(header[14:18]), nil
 }
@@ -334,7 +338,7 @@ func readIndexSectionAt(source io.ReaderAt, section indexSection, partition stor
 
 func readCentralDirectoryLocation(source io.ReaderAt, archiveSize int64, end [22]byte) (int64, uint64, error) {
 	if binary.LittleEndian.Uint16(end[4:6]) != 0 || binary.LittleEndian.Uint16(end[6:8]) != 0 {
-		return 0, 0, fmt.Errorf("manifest bundle: multi-disk ZIP is not allowed")
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: multi-disk ZIP is not allowed"), false)
 	}
 	recordsDisk := binary.LittleEndian.Uint16(end[8:10])
 	recordsTotal := binary.LittleEndian.Uint16(end[10:12])
@@ -344,25 +348,25 @@ func readCentralDirectoryLocation(source io.ReaderAt, archiveSize int64, end [22
 		directorySize32 == math.MaxUint32 || directoryOffset32 == math.MaxUint32
 	if !zip64 {
 		if recordsDisk != recordsTotal {
-			return 0, 0, fmt.Errorf("manifest bundle: Central Directory record counts differ")
+			return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: Central Directory record counts differ"), false)
 		}
 		offset := uint64(directoryOffset32)
 		directorySize := uint64(directorySize32)
 		endOffset := uint64(archiveSize - int64(len(end)))
 		if offset > endOffset || directorySize != endOffset-offset {
-			return 0, 0, fmt.Errorf("manifest bundle: Central Directory range is not contiguous with EOCD")
+			return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: Central Directory range is not contiguous with EOCD"), false)
 		}
 		return int64(offset), uint64(recordsTotal), nil
 	}
 	if recordsDisk != math.MaxUint16 || recordsTotal != math.MaxUint16 ||
 		directorySize32 != math.MaxUint32 || directoryOffset32 != math.MaxUint32 {
-		return 0, 0, fmt.Errorf("manifest bundle: non-canonical partial ZIP64 EOCD sentinels")
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: non-canonical partial ZIP64 EOCD sentinels"), false)
 	}
 
 	const locatorSize = 20
 	locatorOffset := archiveSize - int64(len(end)) - locatorSize
 	if locatorOffset < 0 {
-		return 0, 0, fmt.Errorf("manifest bundle: ZIP64 locator is missing")
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: ZIP64 locator is missing"), false)
 	}
 	var locator [locatorSize]byte
 	if err := readFullAt(source, locator[:], locatorOffset); err != nil {
@@ -370,12 +374,12 @@ func readCentralDirectoryLocation(source io.ReaderAt, archiveSize int64, end [22
 	}
 	if !bytesEqual4(locator[:4], zipDirectory64LocatorMagic) ||
 		binary.LittleEndian.Uint32(locator[4:8]) != 0 || binary.LittleEndian.Uint32(locator[16:20]) != 1 {
-		return 0, 0, fmt.Errorf("manifest bundle: ZIP64 locator is not canonical")
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: ZIP64 locator is not canonical"), false)
 	}
 	zip64Offset := binary.LittleEndian.Uint64(locator[8:16])
 	const zip64EndSize = 56
 	if zip64Offset > uint64(locatorOffset) || zip64EndSize > uint64(locatorOffset)-zip64Offset {
-		return 0, 0, fmt.Errorf("manifest bundle: ZIP64 EOCD is outside archive")
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: ZIP64 EOCD is outside archive"), false)
 	}
 	var zip64End [zip64EndSize]byte
 	if err := readFullAt(source, zip64End[:], int64(zip64Offset)); err != nil {
@@ -384,20 +388,20 @@ func readCentralDirectoryLocation(source io.ReaderAt, archiveSize int64, end [22
 	if !bytesEqual4(zip64End[:4], zipDirectory64Magic) || binary.LittleEndian.Uint64(zip64End[4:12]) != 44 ||
 		binary.LittleEndian.Uint16(zip64End[12:14]) != 45 || binary.LittleEndian.Uint16(zip64End[14:16]) != 45 ||
 		binary.LittleEndian.Uint32(zip64End[16:20]) != 0 || binary.LittleEndian.Uint32(zip64End[20:24]) != 0 {
-		return 0, 0, fmt.Errorf("manifest bundle: ZIP64 EOCD is not canonical")
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: ZIP64 EOCD is not canonical"), false)
 	}
 	if zip64Offset+zip64EndSize != uint64(locatorOffset) {
-		return 0, 0, fmt.Errorf("manifest bundle: ZIP64 EOCD and locator are not contiguous")
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: ZIP64 EOCD and locator are not contiguous"), false)
 	}
 	recordsDisk64 := binary.LittleEndian.Uint64(zip64End[24:32])
 	recordsTotal64 := binary.LittleEndian.Uint64(zip64End[32:40])
 	if recordsDisk64 != recordsTotal64 {
-		return 0, 0, fmt.Errorf("manifest bundle: ZIP64 Central Directory record counts differ")
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: ZIP64 Central Directory record counts differ"), false)
 	}
 	directorySize := binary.LittleEndian.Uint64(zip64End[40:48])
 	directoryOffset := binary.LittleEndian.Uint64(zip64End[48:56])
 	if directoryOffset > zip64Offset || directorySize != zip64Offset-directoryOffset || directoryOffset > math.MaxInt64 {
-		return 0, 0, fmt.Errorf("manifest bundle: ZIP64 Central Directory range is not contiguous with EOCD")
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: ZIP64 Central Directory range is not contiguous with EOCD"), false)
 	}
 	return int64(directoryOffset), recordsTotal64, nil
 }
@@ -405,7 +409,7 @@ func readCentralDirectoryLocation(source io.ReaderAt, archiveSize int64, end [22
 func parseObjectEntry(name, prefix string) (store.ContentKey, error) {
 	raw := strings.TrimPrefix(name, prefix)
 	if strings.Contains(raw, "/") {
-		return store.ContentKey{}, fmt.Errorf("manifest bundle: malformed ZIP entry %q", name)
+		return store.ContentKey{}, readerr.Mark(fmt.Errorf("manifest bundle: malformed ZIP entry %q", name), false)
 	}
 	key, err := parseLowerHexKey(raw)
 	if err != nil {
@@ -416,25 +420,25 @@ func parseObjectEntry(name, prefix string) (store.ContentKey, error) {
 
 func validateEntryHeader(file *zip.File) error {
 	if file.Name == "" || strings.HasSuffix(file.Name, "/") {
-		return fmt.Errorf("manifest bundle: directory or empty ZIP entry %q is not allowed", file.Name)
+		return readerr.Mark(fmt.Errorf("manifest bundle: directory or empty ZIP entry %q is not allowed", file.Name), false)
 	}
 	if file.Method != zip.Store {
-		return fmt.Errorf("manifest bundle: ZIP entry %q method %d, want Store", file.Name, file.Method)
+		return readerr.Mark(fmt.Errorf("manifest bundle: ZIP entry %q method %d, want Store", file.Name, file.Method), false)
 	}
 	if file.Flags != 0 {
-		return fmt.Errorf("manifest bundle: ZIP entry %q flags 0x%x are not allowed", file.Name, file.Flags)
+		return readerr.Mark(fmt.Errorf("manifest bundle: ZIP entry %q flags 0x%x are not allowed", file.Name, file.Flags), false)
 	}
 	if file.CompressedSize64 != file.UncompressedSize64 {
-		return fmt.Errorf("manifest bundle: ZIP entry %q compressed size differs under Store", file.Name)
+		return readerr.Mark(fmt.Errorf("manifest bundle: ZIP entry %q compressed size differs under Store", file.Name), false)
 	}
 	if file.Comment != "" || file.ModifiedTime != 0 || file.ModifiedDate != 0 || file.ExternalAttrs != 0 || file.NonUTF8 {
-		return fmt.Errorf("manifest bundle: ZIP entry %q has non-canonical metadata", file.Name)
+		return readerr.Mark(fmt.Errorf("manifest bundle: ZIP entry %q has non-canonical metadata", file.Name), false)
 	}
 	if file.CreatorVersion != 45 {
-		return fmt.Errorf("manifest bundle: ZIP entry %q creator version %d is not canonical", file.Name, file.CreatorVersion)
+		return readerr.Mark(fmt.Errorf("manifest bundle: ZIP entry %q creator version %d is not canonical", file.Name, file.CreatorVersion), false)
 	}
 	if file.ReaderVersion != 45 {
-		return fmt.Errorf("manifest bundle: ZIP entry %q reader version %d is not canonical", file.Name, file.ReaderVersion)
+		return readerr.Mark(fmt.Errorf("manifest bundle: ZIP entry %q reader version %d is not canonical", file.Name, file.ReaderVersion), false)
 	}
 	if err := validateExtra(file.Extra); err != nil {
 		return fmt.Errorf("manifest bundle: ZIP entry %q: %w", file.Name, err)
@@ -446,19 +450,19 @@ func validateExtra(extra []byte) error {
 	seenZIP64 := false
 	for len(extra) != 0 {
 		if len(extra) < 4 {
-			return fmt.Errorf("truncated ZIP extra field")
+			return readerr.Mark(fmt.Errorf("truncated ZIP extra field"), false)
 		}
 		id := binary.LittleEndian.Uint16(extra[:2])
 		size := int(binary.LittleEndian.Uint16(extra[2:4]))
 		extra = extra[4:]
 		if size > len(extra) {
-			return fmt.Errorf("truncated ZIP extra payload")
+			return readerr.Mark(fmt.Errorf("truncated ZIP extra payload"), false)
 		}
 		if id != 0x0001 || seenZIP64 {
-			return fmt.Errorf("non-ZIP64 extra field 0x%04x is not allowed", id)
+			return readerr.Mark(fmt.Errorf("non-ZIP64 extra field 0x%04x is not allowed", id), false)
 		}
 		if size != 8 && size != 16 && size != 24 && size != 28 {
-			return fmt.Errorf("invalid ZIP64 extra size %d", size)
+			return readerr.Mark(fmt.Errorf("invalid ZIP64 extra size %d", size), false)
 		}
 		seenZIP64 = true
 		extra = extra[size:]
@@ -499,16 +503,27 @@ func (r *Reader) ChunkKeys() []store.ContentKey {
 }
 
 // prepareChunks loads and validates the complete Chunk section in one
-// contiguous ReaderAt call. The first caller's result, including cancellation
-// or Close, is retained for every concurrent and subsequent caller.
+// contiguous ReaderAt call. Only a fully validated successful index is
+// retained. Failure leaves the next caller free to make another attempt.
 func (r *Reader) prepareChunks(ctx context.Context) error {
 	if ctx == nil {
-		return fmt.Errorf("manifest bundle: Chunk index preparation context is required")
+		return readerr.Mark(fmt.Errorf("manifest bundle: Chunk index preparation context is required"), false)
 	}
-	r.chunkOnce.Do(func() {
-		r.chunkErr = r.loadChunkIndex(ctx)
-	})
-	return r.chunkErr
+	r.chunkMu.Lock()
+	defer r.chunkMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.lifeMu.Lock()
+	closed := r.closeRequested || r.closed
+	r.lifeMu.Unlock()
+	if closed {
+		return ErrClosed
+	}
+	if r.chunks != nil {
+		return nil
+	}
+	return r.loadChunkIndex(ctx)
 }
 
 func (r *Reader) loadChunkIndex(ctx context.Context) error {
@@ -583,7 +598,7 @@ func (g *getter) Get(ctx context.Context, partition store.Partition, key store.C
 // fetch.ManifestValidator and therefore does not scan an unvisited closure.
 func (r *Reader) validateManifestClosure(key store.ContentKey, manifest *codec.Manifest) error {
 	if !r.HasManifest(key) {
-		return fmt.Errorf("manifest bundle: Manifest %s is not local", hex.EncodeToString(key[:]))
+		return readerr.Mark(fmt.Errorf("manifest bundle: Manifest %s is not local", hex.EncodeToString(key[:])), false)
 	}
 	for index, entry := range manifest.Entries {
 		if entry.IsZero {
@@ -613,7 +628,7 @@ func (r *Reader) entryBlob(partition store.Partition, key store.ContentKey, entr
 		return nil, err
 	}
 	if offset < 0 || offset > r.size || int64(size) > r.size-offset {
-		return nil, fmt.Errorf("manifest bundle: %s %s data range is outside archive", partition, hex.EncodeToString(key[:]))
+		return nil, readerr.Mark(fmt.Errorf("manifest bundle: %s %s data range is outside archive", partition, hex.EncodeToString(key[:])), false)
 	}
 	var data []byte
 	var pooled []byte
@@ -647,7 +662,7 @@ func (r *Reader) validateLocalHeaderAt(file *zip.File, headerOffset int64, scrat
 	const fixedSize = 30
 	headerSize := fixedSize + len(file.Name)
 	if headerOffset < 0 || int64(headerSize) > r.size-headerOffset {
-		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q local header is outside archive", file.Name)
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: ZIP entry %q local header is outside archive", file.Name), false)
 	}
 	if headerSize > len(scratch) {
 		scratch = make([]byte, headerSize)
@@ -657,44 +672,44 @@ func (r *Reader) validateLocalHeaderAt(file *zip.File, headerOffset int64, scrat
 		return 0, 0, fmt.Errorf("manifest bundle: read ZIP entry %q local header: %w", file.Name, err)
 	}
 	if !bytesEqual4(header[:4], zipLocalHeaderMagic) {
-		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q does not match physical local-header order", file.Name)
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: ZIP entry %q does not match physical local-header order", file.Name), false)
 	}
 	if version := binary.LittleEndian.Uint16(header[4:6]); version != 45 {
-		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q local reader version %d is not canonical", file.Name, version)
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: ZIP entry %q local reader version %d is not canonical", file.Name, version), false)
 	}
 	if flags := binary.LittleEndian.Uint16(header[6:8]); flags != 0 {
-		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q local flags 0x%x are not allowed", file.Name, flags)
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: ZIP entry %q local flags 0x%x are not allowed", file.Name, flags), false)
 	}
 	if method := binary.LittleEndian.Uint16(header[8:10]); method != zip.Store {
-		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q local method %d, want Store", file.Name, method)
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: ZIP entry %q local method %d, want Store", file.Name, method), false)
 	}
 	if binary.LittleEndian.Uint16(header[10:12]) != 0 || binary.LittleEndian.Uint16(header[12:14]) != 0 {
-		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q has non-canonical local timestamp", file.Name)
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: ZIP entry %q has non-canonical local timestamp", file.Name), false)
 	}
 	if crc := binary.LittleEndian.Uint32(header[14:18]); crc != file.CRC32 {
-		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q local CRC differs from Central Directory", file.Name)
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: ZIP entry %q local CRC differs from Central Directory", file.Name), false)
 	}
 	if file.CompressedSize64 > math.MaxUint32 || file.UncompressedSize64 > math.MaxUint32 {
-		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q requires a non-canonical local ZIP64 size", file.Name)
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: ZIP entry %q requires a non-canonical local ZIP64 size", file.Name), false)
 	}
 	if size := binary.LittleEndian.Uint32(header[18:22]); uint64(size) != file.CompressedSize64 {
-		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q local compressed size differs from Central Directory", file.Name)
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: ZIP entry %q local compressed size differs from Central Directory", file.Name), false)
 	}
 	if size := binary.LittleEndian.Uint32(header[22:26]); uint64(size) != file.UncompressedSize64 {
-		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q local uncompressed size differs from Central Directory", file.Name)
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: ZIP entry %q local uncompressed size differs from Central Directory", file.Name), false)
 	}
 	if nameSize := int(binary.LittleEndian.Uint16(header[26:28])); nameSize != len(file.Name) {
-		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q local name length differs from Central Directory", file.Name)
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: ZIP entry %q local name length differs from Central Directory", file.Name), false)
 	}
 	if extraSize := binary.LittleEndian.Uint16(header[28:30]); extraSize != 0 {
-		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q local extra field is not allowed", file.Name)
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: ZIP entry %q local extra field is not allowed", file.Name), false)
 	}
 	if string(header[fixedSize:]) != file.Name {
-		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q local name differs from Central Directory", file.Name)
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: ZIP entry %q local name differs from Central Directory", file.Name), false)
 	}
 	dataOffset := headerOffset + int64(headerSize)
 	if dataOffset < 0 || uint64(dataOffset) > uint64(r.size) || file.CompressedSize64 > uint64(r.size-dataOffset) {
-		return 0, 0, fmt.Errorf("manifest bundle: ZIP entry %q data range is outside archive", file.Name)
+		return 0, 0, readerr.Mark(fmt.Errorf("manifest bundle: ZIP entry %q data range is outside archive", file.Name), false)
 	}
 	return dataOffset, dataOffset + int64(file.CompressedSize64), nil
 }

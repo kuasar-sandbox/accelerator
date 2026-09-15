@@ -351,8 +351,10 @@ tier fallthrough。
 StatusCancelled(0x03),也取消该连接中已排队请求。响应 context 的远端跳转和 origin
 I/O 可停止;同步 RocksDB CGO 不能在调用中途打断,因此不是任意 backend 立即停止的保证。
 
-EC 在收到 **data 个不同且有效 shard idx** 后可取消余下前台 ShardGet,无需等待每个
-peer 完成。被取消的慢 peer 是 unknown,不是 confirmed miss;修复必须区分它们(§4.7)。
+EC 在收到 **data 个不同且有效 shard idx** 后取消余下前台 ShardGet 的 context。
+wire client 通过 deadline 中断 socket 操作, 等待取消回调结束后丢弃该连接。
+关闭连接也会取消服务端 handler。EC 无需等待每个 peer 完成。
+被取消的慢 peer 是 unknown,不是 confirmed miss;修复必须区分它们(§4.7)。
 
 #### 不提供的操作
 
@@ -925,3 +927,5 @@ origin 与 tiered 并扫并发。使用 [procmon.sh](../test/scripts/procmon.sh)
 - [README](../README_zh.md) / [Makefile](../Makefile):`make cache-ctl` 自动 deps-rocksdb
   后静态链接 librocksdb,是本仓 CGO 二进制。
 - [系统架构](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox_zh.md):平台缓存模型。
+
+不可变读取错误及 client 恢复见[读取错误与恢复](accelerator-read-recovery_zh.md).
