@@ -67,8 +67,8 @@ func (r *recordSeqReader) Read(dst []byte) (int, error) {
 func (r *recordSeqReader) loadRecord() error {
 	plainSize := int(r.geometry.recordPlainSize(r.index))
 	sealed := r.sealed[:plainSize+recordOverhead]
-	if _, err := io.ReadFull(r.r, sealed); err != nil {
-		return fmt.Errorf("%w: truncated encrypted record", ErrMalformedEnvelope)
+	if _, err := readFixed(r.r, sealed); err != nil {
+		return &canonicalReadError{category: fmt.Errorf("%w: truncated encrypted record", ErrMalformedEnvelope), cause: fixedReadError(err)}
 	}
 	if r.index == ^uint64(0) {
 		return fmt.Errorf("%w: record sequence overflow", ErrMalformedEnvelope)
@@ -76,7 +76,7 @@ func (r *recordSeqReader) loadRecord() error {
 	setRecordAAD(r.aad, r.index, uint32(plainSize))
 	plaintext, err := r.codec.DecryptInPlace(sealed, r.aad, r.index+1)
 	if err != nil {
-		return fmt.Errorf("%w: encrypted data record", ErrAuthentication)
+		return &canonicalReadError{category: fmt.Errorf("%w: encrypted data record", ErrAuthentication), cause: err}
 	}
 	if len(plaintext) != plainSize || plainSize > 0 && &plaintext[0] != &sealed[1] {
 		return fmt.Errorf("%w: codec violated in-place record contract", ErrMalformedEnvelope)
@@ -96,6 +96,6 @@ func (r *recordSeqReader) finishOuter() {
 		return
 	}
 	if err != io.EOF {
-		r.finalErr = fmt.Errorf("%w: outer EOF: %v", ErrMalformedEnvelope, err)
+		r.finalErr = &canonicalReadError{category: ErrMalformedEnvelope, cause: err}
 	}
 }

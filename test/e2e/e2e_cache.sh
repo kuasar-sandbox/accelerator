@@ -882,9 +882,11 @@ fi
 
 # Stop one Redis process without closing its sockets. The corresponding shard
 # cache enters Redis drain after the EC coordinator obtains four fast shards
-# and sends wire CANCEL. The object read must complete before the Redis command
+# and closes the canceled wire read. The object read must complete before the Redis command
 # timeout, and normal cancellation must not reconnect the UDS data worker.
 SLOW_REDIS_PID=${REDIS_SHARD_PIDS[4]}
+CANCEL_BEFORE=$("$BIN/cache-ctl" info --endpoint "127.0.0.1:${REDIS_SHARD_HEALTH_PORTS[4]}" --json |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["redis"]["cancelled"])')
 kill -STOP "$SLOW_REDIS_PID"
 SLOW_START_MS=$(date +%s%3N)
 "$BIN/cache-ctl" object get --endpoint "127.0.0.1:$REDIS_EC_PORT" \
@@ -898,14 +900,14 @@ else
 fi
 CANCEL_SEEN=0
 for _ in $(seq 1 50); do
-    if "$BIN/cache-ctl" info --endpoint "127.0.0.1:$REDIS_EC_HEALTH_PORT" --json | \
-        python3 -c 'import json,sys; d=json.load(sys.stdin); assert any(p["cancelled"] > 0 for p in d["tiered"]["tiers"][0]["peers"])' 2>/dev/null; then
+    if "$BIN/cache-ctl" info --endpoint "127.0.0.1:${REDIS_SHARD_HEALTH_PORTS[4]}" --json | \
+        python3 -c 'import json,sys; assert json.load(sys.stdin)["redis"]["cancelled"] > int(sys.argv[1])' "$CANCEL_BEFORE" 2>/dev/null; then
         CANCEL_SEEN=1
         break
     fi
     sleep 0.1
 done
-assert_eq "1" "$CANCEL_SEEN" "EC slow peer observed wire CANCEL"
+assert_eq "1" "$CANCEL_SEEN" "EC slow peer canceled its Redis operation after wire read cancellation"
 DRAINED=0
 for _ in $(seq 1 50); do
     if "$BIN/cache-ctl" info --endpoint "127.0.0.1:${REDIS_SHARD_HEALTH_PORTS[4]}" --json | \
@@ -929,7 +931,7 @@ for peer_port in "${REDIS_SHARD_PORTS[@]}"; do
         fi
     done
 done
-assert_eq "1" "$ALL_SHARDS_PRESENT" "all Redis shards remain readable after CANCEL drain"
+assert_eq "1" "$ALL_SHARDS_PRESENT" "all Redis shards remain readable after cancellation drain"
 
 # The warm read must now be fully satisfied by EC. Stopping the origin turns
 # any accidental fallthrough into a deterministic test failure.

@@ -497,3 +497,5 @@ Bundle tail-index opening cost at 4K/20K/100K chunks is reported by `BenchmarkBu
 - [guest-runtime flatten](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten.md): image flattening followed by `flatten-ctl export --upload`.
 - [sandboxer](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox.md): disk bases and snapshots referenced with Manifest keys.
 - [system architecture](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox.md): the Manifest abstraction in the overall platform.
+
+Immutable read errors and client recovery are specified in [Read errors and recovery](read-recovery.md).

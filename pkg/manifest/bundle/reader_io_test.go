@@ -445,7 +445,7 @@ func TestRefsCleanMissDoesNotReadChunkIndex(t *testing.T) {
 	}
 }
 
-func TestChunkPreparationCancellationIsShared(t *testing.T) {
+func TestChunkPreparationCancellationCanRecover(t *testing.T) {
 	data := syntheticBundle(t, 20_000, 1)
 	layout := inspectBundleIORanges(t, data)
 	source := &blockingRangeReaderAt{
@@ -468,11 +468,14 @@ func TestChunkPreparationCancellationIsShared(t *testing.T) {
 	if err := <-result; !errors.Is(err, context.Canceled) {
 		t.Fatalf("prepareChunks error = %v, want context.Canceled", err)
 	}
-	if err := reader.prepareChunks(context.Background()); !errors.Is(err, context.Canceled) {
-		t.Fatalf("shared prepare error = %v, want context.Canceled", err)
+	if err := reader.prepareChunks(context.Background()); err != nil {
+		t.Fatalf("retry prepare error = %v", err)
 	}
-	if got := source.reads.Load(); got != 1 {
-		t.Fatalf("Chunk index reads = %d, want 1", got)
+	if err := reader.prepareChunks(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := source.reads.Load(); got != 2 {
+		t.Fatalf("Chunk index reads = %d, want 2 (then successful reuse)", got)
 	}
 }
 
@@ -514,7 +517,7 @@ func TestReaderCloseDuringChunkPreparationDefersCleanup(t *testing.T) {
 	}
 }
 
-func TestCorruptChunkIndexFailureIsSharedWithoutOpenFallback(t *testing.T) {
+func TestCorruptChunkIndexFailuresAreNotCachedOrRerouted(t *testing.T) {
 	data := syntheticBundle(t, 20_000, 1)
 	layout := inspectBundleIORanges(t, data)
 	data = append([]byte(nil), data...)
@@ -549,8 +552,8 @@ func TestCorruptChunkIndexFailureIsSharedWithoutOpenFallback(t *testing.T) {
 		}
 	}
 	reads := source.snapshot()
-	if len(reads) != 1 || exactRangeReadCount(reads, layout.chunkIndex) != 1 {
-		t.Fatalf("corrupt Chunk index triggered fallback/additional reads: %v", reads)
+	if len(reads) != 32 || exactRangeReadCount(reads, layout.chunkIndex) != 32 {
+		t.Fatalf("failed Chunk index must retry only its selected source: %v", reads)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/wire"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
@@ -106,28 +107,36 @@ func (c *impl) Get(ctx context.Context, p store.Partition, key store.ContentKey)
 		Hash:      key,
 	}
 
-	pc.SetOpDeadline(ctx, c.timeout)
+	healthy := false
+	finish := pc.readOperation(ctx, c.timeout)
+	defer func() {
+		finish()
+		c.getPool.Release(pc, healthy && ctx.Err() == nil)
+	}()
 	if err := pc.WriteRequest(req); err != nil {
-		c.getPool.Release(pc, false)
 		return cache.CacheMiss, nil, fmt.Errorf("cache: client.Get write: %w", err)
 	}
 
 	resp, err := pc.ReadResponse(c.blobPool)
 	if err != nil {
-		c.getPool.Release(pc, false)
 		return cache.CacheMiss, nil, fmt.Errorf("cache: client.Get read: %w", err)
 	}
-	c.getPool.Release(pc, true)
+	healthy = true
 
+	if resp.Status != wire.StatusHit && resp.Value != nil {
+		resp.Value.Release()
+	}
 	switch resp.Status {
 	case wire.StatusHit:
 		return cache.CacheHit, resp.Value, nil
 	case wire.StatusMiss:
 		return cache.CacheMiss, nil, nil
+	case wire.StatusCancelled:
+		return cache.CacheMiss, nil, ErrCancelled
 	case wire.StatusError:
 		return cache.CacheMiss, nil, fmt.Errorf("cache: server error: %s", resp.ErrMsg)
 	default:
-		return cache.CacheMiss, nil, fmt.Errorf("cache: unexpected status %d", resp.Status)
+		return cache.CacheMiss, nil, readerr.Mark(fmt.Errorf("cache: unexpected status %d", resp.Status), false)
 	}
 }
 

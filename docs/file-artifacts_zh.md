@@ -233,9 +233,9 @@ preflight 只需发现 location/admission 时可使用 `OpenMetadata`/`ReadMetad
 因此不存在对象级 Bundle fallback Getter；本地 Manifest 错误也不会改读后续
 Bundle/Store。current/refs source selection 只查询 Open 时已经加载的 Manifest map；
 clean miss 不读取 Chunk section。Bundle 一旦被选中，Reader 在返回 Stream 前一次连续
-读取完整 Chunk section，验证 digest/records/ranges 并建立 O(1) 只读 map。并发准备由
-`sync.Once` 合并为一次读取，错误或取消也由所有调用方共享。remote source 没有 Bundle
-Reader，因此不执行这一步。
+读取完整 Chunk section, 验证 digest/records/ranges 并建立 O(1) 只读 map.
+准备阶段串行加载, 只缓存验证成功的索引; 失败或取消后, 后续调用可以重新加载.
+remote source 没有 Bundle Reader, 因此不执行这一步.
 
 准备完成后的 Manifest/Chunk `Get` 直接使用 record 中的 payload `DataOffset/Size`，只
 做一次目标 payload range read；不会读取索引、对象 Local Header 或 Central Directory。
@@ -286,3 +286,5 @@ ManifestKey 与 physical bytes 保持不变。任一 admission 预检、依赖�
 snapshot-specific metadata 后可通过 `ExpectedManifests` 提交精确的本地可达
 Manifest 集，从而拒绝无关 Manifest，而无需让 accelerator 解释
 `snapshot.cfg`。
+
+读取错误分类、初始化所有权和恢复见[读取错误与恢复](read-recovery_zh.md).

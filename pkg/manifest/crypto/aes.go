@@ -10,6 +10,7 @@ import (
 	"fmt"
 
 	"github.com/golang/snappy"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 )
 
 // AESChunkEncryptor implements the fixed adaptive RAW/Snappy chunk format. Its
@@ -146,13 +147,13 @@ func (e *AESChunkEncryptor) DecryptChunkTo(
 	switch object[0] {
 	case ChunkFormatAESRaw:
 		if len(object)-1 != len(dst) {
-			return fmt.Errorf("crypto: RAW payload length %d, want %d", len(object)-1, len(dst))
+			return readerr.Mark(fmt.Errorf("crypto: RAW payload length %d, want %d", len(object)-1, len(dst)), false)
 		}
 		return xorCTR(key, dst, object[1:], 0)
 	case ChunkFormatAESSnappy:
 		return e.decryptSnappyTo(ctx, key, object[1:], dst)
 	default:
-		return fmt.Errorf("crypto: unknown chunk format 0x%02x", object[0])
+		return readerr.Mark(fmt.Errorf("crypto: unknown chunk format 0x%02x", object[0]), false)
 	}
 }
 
@@ -169,10 +170,10 @@ func (e *AESChunkEncryptor) DecryptChunkRangeTo(
 	dst []byte,
 ) error {
 	if plaintextSize < 0 || plaintextSize > MaxChunkDecodedSize {
-		return fmt.Errorf("%w: %d", ErrChunkTooLarge, plaintextSize)
+		return readerr.Mark(fmt.Errorf("%w: %d", ErrChunkTooLarge, plaintextSize), false)
 	}
 	if plaintextOffset < 0 || plaintextOffset > plaintextSize || len(dst) > plaintextSize-plaintextOffset {
-		return fmt.Errorf("crypto: range [%d,%d) outside plaintext size %d", plaintextOffset, plaintextOffset+len(dst), plaintextSize)
+		return readerr.Mark(fmt.Errorf("crypto: range [%d,%d) outside plaintext size %d", plaintextOffset, plaintextOffset+len(dst), plaintextSize), false)
 	}
 	if err := validateChunkDestination(ctx, object, dst); err != nil {
 		return err
@@ -180,21 +181,21 @@ func (e *AESChunkEncryptor) DecryptChunkRangeTo(
 	switch object[0] {
 	case ChunkFormatAESRaw:
 		if len(object)-1 != plaintextSize {
-			return fmt.Errorf("crypto: RAW payload length %d, want %d", len(object)-1, plaintextSize)
+			return readerr.Mark(fmt.Errorf("crypto: RAW payload length %d, want %d", len(object)-1, plaintextSize), false)
 		}
 		return xorCTR(key, dst, object[1+plaintextOffset:1+plaintextOffset+len(dst)], uint64(plaintextOffset))
 	case ChunkFormatAESSnappy:
 		maxEncoded := snappy.MaxEncodedLen(plaintextSize)
 		if maxEncoded < 0 || len(object)-1 > maxEncoded {
-			return fmt.Errorf("crypto: Snappy payload length %d exceeds maximum %d for %d decoded bytes", len(object)-1, maxEncoded, plaintextSize)
+			return readerr.Mark(fmt.Errorf("crypto: Snappy payload length %d exceeds maximum %d for %d decoded bytes", len(object)-1, maxEncoded, plaintextSize), false)
 		}
 		if !compressionBeneficial(uint64(plaintextSize), uint64(len(object)-1)) {
-			return fmt.Errorf("crypto: non-canonical Snappy payload length %d for %d decoded bytes", len(object)-1, plaintextSize)
+			return readerr.Mark(fmt.Errorf("crypto: non-canonical Snappy payload length %d for %d decoded bytes", len(object)-1, plaintextSize), false)
 		}
 		encodedSize := len(object) - 1
 		combinedSize := encodedSize + plaintextSize
 		if combinedSize < encodedSize {
-			return errors.New("crypto: oversized Snappy scratch length overflows")
+			return readerr.Mark(errors.New("crypto: oversized Snappy scratch length overflows"), false)
 		}
 		lease, err := e.decScratch().acquire(ctx, combinedSize)
 		if err != nil {
@@ -219,17 +220,17 @@ func (e *AESChunkEncryptor) DecryptChunkRangeTo(
 		copy(dst, plain[plaintextOffset:plaintextOffset+len(dst)])
 		return nil
 	default:
-		return fmt.Errorf("crypto: unknown chunk format 0x%02x", object[0])
+		return readerr.Mark(fmt.Errorf("crypto: unknown chunk format 0x%02x", object[0]), false)
 	}
 }
 
 func (e *AESChunkEncryptor) decryptSnappyTo(ctx context.Context, key [32]byte, payload, dst []byte) error {
 	maxEncoded := snappy.MaxEncodedLen(len(dst))
 	if maxEncoded < 0 || len(payload) > maxEncoded {
-		return fmt.Errorf("crypto: Snappy payload length %d exceeds maximum %d for %d decoded bytes", len(payload), maxEncoded, len(dst))
+		return readerr.Mark(fmt.Errorf("crypto: Snappy payload length %d exceeds maximum %d for %d decoded bytes", len(payload), maxEncoded, len(dst)), false)
 	}
 	if !compressionBeneficial(uint64(len(dst)), uint64(len(payload))) {
-		return fmt.Errorf("crypto: non-canonical Snappy payload length %d for %d decoded bytes", len(payload), len(dst))
+		return readerr.Mark(fmt.Errorf("crypto: non-canonical Snappy payload length %d for %d decoded bytes", len(payload), len(dst)), false)
 	}
 	lease, err := e.decScratch().acquire(ctx, len(payload))
 	if err != nil {
@@ -255,17 +256,17 @@ func (e *AESChunkEncryptor) decryptSnappyTo(ctx context.Context, key [32]byte, p
 func decodeSnappyExact(encoded, dst []byte) error {
 	decodedLen, err := snappy.DecodedLen(encoded)
 	if err != nil {
-		return fmt.Errorf("crypto: Snappy decoded length: %w", err)
+		return readerr.Mark(fmt.Errorf("crypto: Snappy decoded length: %w", err), false)
 	}
 	if decodedLen != len(dst) {
-		return fmt.Errorf("crypto: Snappy decoded length %d, want %d", decodedLen, len(dst))
+		return readerr.Mark(fmt.Errorf("crypto: Snappy decoded length %d, want %d", decodedLen, len(dst)), false)
 	}
 	decoded, err := snappy.Decode(dst, encoded)
 	if err != nil {
-		return fmt.Errorf("crypto: Snappy decode: %w", err)
+		return readerr.Mark(fmt.Errorf("crypto: Snappy decode: %w", err), false)
 	}
 	if len(decoded) != len(dst) || (len(dst) > 0 && &decoded[0] != &dst[0]) {
-		return errors.New("crypto: Snappy decode did not reuse the exact destination")
+		return readerr.Mark(errors.New("crypto: Snappy decode did not reuse the exact destination"), false)
 	}
 	return nil
 }
@@ -275,24 +276,24 @@ func validateChunkDestination(ctx context.Context, object, dst []byte) error {
 		return err
 	}
 	if len(object) == 0 {
-		return errors.New("crypto: chunk object is empty")
+		return readerr.Mark(errors.New("crypto: chunk object is empty"), false)
 	}
 	if len(dst) > MaxChunkDecodedSize {
-		return fmt.Errorf("%w: %d > %d", ErrChunkTooLarge, len(dst), MaxChunkDecodedSize)
+		return readerr.Mark(fmt.Errorf("%w: %d > %d", ErrChunkTooLarge, len(dst), MaxChunkDecodedSize), false)
 	}
 	if slicesOverlap(object, dst) {
-		return errors.New("crypto: ciphertext and destination overlap")
+		return readerr.Mark(errors.New("crypto: ciphertext and destination overlap"), false)
 	}
 	return nil
 }
 
 func xorCTR(key [32]byte, dst, src []byte, plaintextOffset uint64) error {
 	if len(dst) != len(src) {
-		return fmt.Errorf("crypto: AES source length %d, destination length %d", len(src), len(dst))
+		return readerr.Mark(fmt.Errorf("crypto: AES source length %d, destination length %d", len(src), len(dst)), false)
 	}
 	block, err := aes.NewCipher(key[:])
 	if err != nil {
-		return fmt.Errorf("crypto: aes.NewCipher: %w", err)
+		return readerr.Mark(fmt.Errorf("crypto: aes.NewCipher: %w", err), false)
 	}
 	blockIndex := plaintextOffset / aes.BlockSize
 	var iv [aes.BlockSize]byte
@@ -342,12 +343,12 @@ const gcmNonceSize = 12
 func (e *AESKeyTableEncryptor) Seal(customerKey [32]byte, keys []byte, aad []byte) ([]byte, error) {
 	block, err := aes.NewCipher(customerKey[:])
 	if err != nil {
-		return nil, fmt.Errorf("crypto: aes.NewCipher: %w", err)
+		return nil, readerr.Mark(fmt.Errorf("crypto: aes.NewCipher: %w", err), false)
 	}
 
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, fmt.Errorf("crypto: cipher.NewGCM: %w", err)
+		return nil, readerr.Mark(fmt.Errorf("crypto: cipher.NewGCM: %w", err), false)
 	}
 
 	mac := hmac.New(sha256.New, customerKey[:])
@@ -371,20 +372,20 @@ func (e *AESKeyTableEncryptor) Seal(customerKey [32]byte, keys []byte, aad []byt
 func (e *AESKeyTableEncryptor) Unseal(customerKey [32]byte, sealed []byte, aad []byte) ([]byte, error) {
 	// minimum: flag(1) + nonce(12) + tag(16) = 29
 	if len(sealed) < 1+gcmNonceSize+16 {
-		return nil, errors.New("crypto: sealed data too short")
+		return nil, readerr.Mark(errors.New("crypto: sealed data too short"), false)
 	}
 	if sealed[0] != KeyTableFormatAESGCM {
-		return nil, fmt.Errorf("crypto: unexpected key-table format byte 0x%02x, want 0x%02x", sealed[0], KeyTableFormatAESGCM)
+		return nil, readerr.Mark(fmt.Errorf("crypto: unexpected key-table format byte 0x%02x, want 0x%02x", sealed[0], KeyTableFormatAESGCM), false)
 	}
 
 	block, err := aes.NewCipher(customerKey[:])
 	if err != nil {
-		return nil, fmt.Errorf("crypto: aes.NewCipher: %w", err)
+		return nil, readerr.Mark(fmt.Errorf("crypto: aes.NewCipher: %w", err), false)
 	}
 
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, fmt.Errorf("crypto: cipher.NewGCM: %w", err)
+		return nil, readerr.Mark(fmt.Errorf("crypto: cipher.NewGCM: %w", err), false)
 	}
 
 	nonce := sealed[1 : 1+gcmNonceSize]
@@ -392,7 +393,7 @@ func (e *AESKeyTableEncryptor) Unseal(customerKey [32]byte, sealed []byte, aad [
 
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, aad)
 	if err != nil {
-		return nil, fmt.Errorf("crypto: gcm.Open: %w", err)
+		return nil, readerr.Mark(fmt.Errorf("crypto: gcm.Open: %w", err), false)
 	}
 	return plaintext, nil
 }

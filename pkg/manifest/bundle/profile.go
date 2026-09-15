@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
@@ -35,8 +36,8 @@ const (
 )
 
 var (
-	ErrClosed     = errors.New("manifest bundle: closed")
-	ErrIncomplete = errors.New("manifest bundle: incomplete Manifest Chunk closure")
+	ErrClosed     = readerr.Mark(errors.New("manifest bundle: closed"), false)
+	ErrIncomplete = readerr.Mark(errors.New("manifest bundle: incomplete Manifest Chunk closure"), false)
 )
 
 func admissionName(admission store.WriteAdmission) string {
@@ -50,20 +51,20 @@ func EncodeRefs(refs []string) ([]byte, error) {
 		return nil, nil
 	}
 	if len(refs) > maxBundleRefs {
-		return nil, fmt.Errorf("manifest bundle: %d refs exceed limit %d", len(refs), maxBundleRefs)
+		return nil, readerr.Mark(fmt.Errorf("manifest bundle: %d refs exceed limit %d", len(refs), maxBundleRefs), false)
 	}
 	seen := make(map[string]struct{}, len(refs))
 	var payload bytes.Buffer
 	for index, ref := range refs {
 		if err := validateBundleRef(ref); err != nil {
-			return nil, fmt.Errorf("manifest bundle: ref[%d]: %w", index, err)
+			return nil, readerr.Mark(fmt.Errorf("manifest bundle: ref[%d]: %w", index, err), false)
 		}
 		if _, duplicate := seen[ref]; duplicate {
-			return nil, fmt.Errorf("manifest bundle: duplicate ref %q", ref)
+			return nil, readerr.Mark(fmt.Errorf("manifest bundle: duplicate ref %q", ref), false)
 		}
 		seen[ref] = struct{}{}
 		if payload.Len()+len(ref)+1 > maxRefsPayload {
-			return nil, fmt.Errorf("manifest bundle: refs payload exceeds %d bytes", maxRefsPayload)
+			return nil, readerr.Mark(fmt.Errorf("manifest bundle: refs payload exceeds %d bytes", maxRefsPayload), false)
 		}
 		payload.WriteString(ref)
 		payload.WriteByte('\n')
@@ -74,44 +75,44 @@ func EncodeRefs(refs []string) ([]byte, error) {
 // ParseRefs parses the canonical bundle/refs payload without sorting it.
 func ParseRefs(payload []byte) ([]string, error) {
 	if len(payload) == 0 {
-		return nil, fmt.Errorf("manifest bundle: refs payload must be non-empty")
+		return nil, readerr.Mark(fmt.Errorf("manifest bundle: refs payload must be non-empty"), false)
 	}
 	if len(payload) > maxRefsPayload {
-		return nil, fmt.Errorf("manifest bundle: refs payload exceeds %d bytes", maxRefsPayload)
+		return nil, readerr.Mark(fmt.Errorf("manifest bundle: refs payload exceeds %d bytes", maxRefsPayload), false)
 	}
 	if !utf8.Valid(payload) {
-		return nil, fmt.Errorf("manifest bundle: refs payload is not valid UTF-8")
+		return nil, readerr.Mark(fmt.Errorf("manifest bundle: refs payload is not valid UTF-8"), false)
 	}
 	if bytes.Contains(payload, []byte{0xef, 0xbb, 0xbf}) {
-		return nil, fmt.Errorf("manifest bundle: refs payload must not contain a BOM")
+		return nil, readerr.Mark(fmt.Errorf("manifest bundle: refs payload must not contain a BOM"), false)
 	}
 	if bytes.Contains(payload, []byte{'\r'}) {
-		return nil, fmt.Errorf("manifest bundle: refs payload must use LF line endings")
+		return nil, readerr.Mark(fmt.Errorf("manifest bundle: refs payload must use LF line endings"), false)
 	}
 	if payload[len(payload)-1] != '\n' {
-		return nil, fmt.Errorf("manifest bundle: refs payload must end with LF")
+		return nil, readerr.Mark(fmt.Errorf("manifest bundle: refs payload must end with LF"), false)
 	}
 	lines := strings.Split(string(payload[:len(payload)-1]), "\n")
 	if len(lines) > maxBundleRefs {
-		return nil, fmt.Errorf("manifest bundle: %d refs exceed limit %d", len(lines), maxBundleRefs)
+		return nil, readerr.Mark(fmt.Errorf("manifest bundle: %d refs exceed limit %d", len(lines), maxBundleRefs), false)
 	}
 	seen := make(map[string]struct{}, len(lines))
 	refs := make([]string, 0, len(lines))
 	for index, ref := range lines {
 		if ref == "" {
-			return nil, fmt.Errorf("manifest bundle: ref[%d] is empty", index)
+			return nil, readerr.Mark(fmt.Errorf("manifest bundle: ref[%d] is empty", index), false)
 		}
 		if strings.TrimSpace(ref) != ref {
-			return nil, fmt.Errorf("manifest bundle: ref[%d] has leading or trailing whitespace", index)
+			return nil, readerr.Mark(fmt.Errorf("manifest bundle: ref[%d] has leading or trailing whitespace", index), false)
 		}
 		if strings.HasPrefix(ref, "#") {
-			return nil, fmt.Errorf("manifest bundle: ref[%d] is a comment", index)
+			return nil, readerr.Mark(fmt.Errorf("manifest bundle: ref[%d] is a comment", index), false)
 		}
 		if err := validateBundleRef(ref); err != nil {
-			return nil, fmt.Errorf("manifest bundle: ref[%d]: %w", index, err)
+			return nil, readerr.Mark(fmt.Errorf("manifest bundle: ref[%d]: %w", index, err), false)
 		}
 		if _, duplicate := seen[ref]; duplicate {
-			return nil, fmt.Errorf("manifest bundle: duplicate ref %q", ref)
+			return nil, readerr.Mark(fmt.Errorf("manifest bundle: duplicate ref %q", ref), false)
 		}
 		seen[ref] = struct{}{}
 		refs = append(refs, ref)
@@ -121,37 +122,37 @@ func ParseRefs(payload []byte) ([]string, error) {
 
 func validateBundleRef(raw string) error {
 	if !utf8.ValidString(raw) {
-		return fmt.Errorf("Bundle ref is not valid UTF-8")
+		return readerr.Mark(fmt.Errorf("Bundle ref is not valid UTF-8"), false)
 	}
 	if strings.Contains(raw, "\ufeff") {
-		return fmt.Errorf("Bundle ref must not contain a BOM")
+		return readerr.Mark(fmt.Errorf("Bundle ref must not contain a BOM"), false)
 	}
 	if strings.TrimSpace(raw) != raw {
-		return fmt.Errorf("Bundle ref has leading or trailing whitespace")
+		return readerr.Mark(fmt.Errorf("Bundle ref has leading or trailing whitespace"), false)
 	}
 	for _, character := range raw {
 		if unicode.IsControl(character) {
-			return fmt.Errorf("Bundle ref contains a control character")
+			return readerr.Mark(fmt.Errorf("Bundle ref contains a control character"), false)
 		}
 	}
 	ref, err := manifest.ParseRef(raw)
 	if err != nil {
-		return fmt.Errorf("invalid Bundle file ref %q: %w", raw, err)
+		return readerr.Mark(fmt.Errorf("invalid Bundle file ref %q: %w", raw, err), false)
 	}
 	if ref.String() != raw {
-		return fmt.Errorf("non-canonical Bundle file ref %q", raw)
+		return readerr.Mark(fmt.Errorf("non-canonical Bundle file ref %q", raw), false)
 	}
 	if ref.Scheme != manifest.RefSchemeFile {
-		return fmt.Errorf("Bundle ref %q must use file://", raw)
+		return readerr.Mark(fmt.Errorf("Bundle ref %q must use file://", raw), false)
 	}
 	if ref.DigestScheme != "" || ref.Digest != "" {
-		return fmt.Errorf("Bundle ref %q must not contain an identity selector", raw)
+		return readerr.Mark(fmt.Errorf("Bundle ref %q must not contain an identity selector", raw), false)
 	}
 	if ref.Path == "." || ref.Path == ".." || strings.ContainsAny(ref.Path, `/\\`) {
-		return fmt.Errorf("Bundle ref %q path must be a basename", raw)
+		return readerr.Mark(fmt.Errorf("Bundle ref %q path must be a basename", raw), false)
 	}
 	if !strings.HasSuffix(ref.Path, ".bundle") || ref.Path == ".bundle" {
-		return fmt.Errorf("Bundle ref %q path must name a .bundle file", raw)
+		return readerr.Mark(fmt.Errorf("Bundle ref %q path must name a .bundle file", raw), false)
 	}
 	return nil
 }
@@ -163,18 +164,18 @@ func objectName(partition store.Partition, key store.ContentKey) (string, error)
 	case store.PartitionChunk:
 		return chunkPrefix + hex.EncodeToString(key[:]), nil
 	default:
-		return "", fmt.Errorf("manifest bundle: unsupported partition %q", partition)
+		return "", readerr.Mark(fmt.Errorf("manifest bundle: unsupported partition %q", partition), false)
 	}
 }
 
 func parseLowerHexKey(raw string) (store.ContentKey, error) {
 	var key store.ContentKey
 	if len(raw) != hex.EncodedLen(len(key)) || raw != strings.ToLower(raw) {
-		return key, fmt.Errorf("want %d lowercase hexadecimal characters", hex.EncodedLen(len(key)))
+		return key, readerr.Mark(fmt.Errorf("want %d lowercase hexadecimal characters", hex.EncodedLen(len(key))), false)
 	}
 	decoded, err := hex.DecodeString(raw)
 	if err != nil {
-		return key, err
+		return key, readerr.Mark(err, false)
 	}
 	copy(key[:], decoded)
 	return key, nil
@@ -183,22 +184,22 @@ func parseLowerHexKey(raw string) (store.ContentKey, error) {
 func parseAdmissionName(name string) (store.WriteAdmission, error) {
 	var admission store.WriteAdmission
 	if !strings.HasPrefix(name, admissionPrefix) {
-		return admission, fmt.Errorf("manifest bundle: malformed admission entry %q", name)
+		return admission, readerr.Mark(fmt.Errorf("manifest bundle: malformed admission entry %q", name), false)
 	}
 	parts := strings.Split(strings.TrimPrefix(name, admissionPrefix), "/")
 	if len(parts) != 2 {
-		return admission, fmt.Errorf("manifest bundle: malformed admission entry %q", name)
+		return admission, readerr.Mark(fmt.Errorf("manifest bundle: malformed admission entry %q", name), false)
 	}
 	admission.Generation = store.Generation(parts[0])
 	if err := store.ValidateGeneration(admission.Generation); err != nil {
-		return admission, fmt.Errorf("manifest bundle: admission generation: %w", err)
+		return admission, readerr.Mark(fmt.Errorf("manifest bundle: admission generation: %w", err), false)
 	}
 	if len(parts[1]) != hex.EncodedLen(len(admission.Salt)) || parts[1] != strings.ToLower(parts[1]) {
-		return admission, fmt.Errorf("manifest bundle: admission salt must be %d lowercase hexadecimal characters", hex.EncodedLen(len(admission.Salt)))
+		return admission, readerr.Mark(fmt.Errorf("manifest bundle: admission salt must be %d lowercase hexadecimal characters", hex.EncodedLen(len(admission.Salt))), false)
 	}
 	decoded, err := hex.DecodeString(parts[1])
 	if err != nil {
-		return admission, fmt.Errorf("manifest bundle: admission salt: %w", err)
+		return admission, readerr.Mark(fmt.Errorf("manifest bundle: admission salt: %w", err), false)
 	}
 	copy(admission.Salt[:], decoded)
 	return admission, nil

@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
@@ -208,8 +209,49 @@ func searchError(key string, diagnostics searchDiagnostics, remote error) error 
 		}
 		detail = strings.Join(parts, "; ")
 	}
-	if remote != nil {
-		return fmt.Errorf("manifest bundle: Manifest %s search failed (%s); remote: %w", key, detail, remote)
+	causes := make([]error, 0, len(diagnostics.unavailable)+1)
+	if diagnostics.current != nil {
+		for _, ref := range diagnostics.current.refsView() {
+			if err := diagnostics.unavailable[ref]; err != nil {
+				causes = append(causes, err)
+			}
+		}
 	}
-	return fmt.Errorf("manifest bundle: Manifest %s search failed (%s); remote Fetcher is unavailable", key, detail)
+	message := fmt.Sprintf("manifest bundle: Manifest %s search failed (%s); remote Fetcher is unavailable", key, detail)
+	if remote != nil {
+		message = fmt.Sprintf("manifest bundle: Manifest %s search failed (%s); remote: %v", key, detail, remote)
+		causes = append(causes, remote)
+	} else if len(causes) == 0 {
+		causes = append(causes, readerr.Mark(store.ErrNotFound, false))
+	}
+	err := error(&lookupError{message: message, causes: causes})
+	if len(diagnostics.unavailable) != 0 && (remote == nil || onlyMissing(remote)) {
+		// Remote absence does not establish absence in an unreachable ref.
+		return readerr.Mark(err, true)
+	}
+	return err
 }
+
+// Only a single missing-cause chain can be made ambiguous by an unreachable
+// ref. A joined error may contain a separate integrity failure.
+func onlyMissing(err error) bool {
+	for err != nil {
+		if err == store.ErrNotFound {
+			return true
+		}
+		if _, multiple := err.(interface{ Unwrap() []error }); multiple {
+			return false
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
+}
+
+// Preserve the existing ordered diagnostic without flattening error causes.
+type lookupError struct {
+	message string
+	causes  []error
+}
+
+func (e *lookupError) Error() string   { return e.message }
+func (e *lookupError) Unwrap() []error { return e.causes }

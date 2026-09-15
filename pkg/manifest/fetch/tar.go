@@ -2,10 +2,12 @@ package fetch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"golang.org/x/sys/unix"
@@ -36,6 +38,9 @@ type tarFileStream struct {
 func OpenTarStream(path string, options ...tarstream.ReadOption) (Stream, error) {
 	f, err := os.Open(path)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			err = readerr.Mark(err, false)
+		}
 		return nil, fmt.Errorf("fetch: open %s: %w", path, err)
 	}
 	st, err := f.Stat()
@@ -51,7 +56,7 @@ func OpenTarStream(path string, options ...tarstream.ReadOption) (Stream, error)
 	d, ok := src.(tarstream.Digester)
 	if !ok {
 		_ = f.Close()
-		return nil, fmt.Errorf("fetch: %s: tarstream artifact missing digest marker", path)
+		return nil, readerr.Mark(fmt.Errorf("fetch: %s: tarstream artifact missing digest marker", path), false)
 	}
 	digestScheme, digest := d.Digest()
 	stream := &tarFileStream{

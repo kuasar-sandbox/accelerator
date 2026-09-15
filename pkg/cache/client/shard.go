@@ -9,6 +9,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/wire"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
@@ -106,41 +107,32 @@ func (c *shardImpl) GetShard(ctx context.Context, p store.Partition, key store.C
 		Hash:      key,
 	}
 
-	pc.SetOpDeadline(ctx, c.timeout)
+	healthy := false
+	finish := pc.readOperation(ctx, c.timeout)
+	defer func() {
+		finish()
+		c.getPool.Release(pc, healthy && ctx.Err() == nil)
+	}()
 	if err := pc.WriteRequest(req); err != nil {
-		c.getPool.Release(pc, false)
 		c.errors.Add(1)
 		return cache.CacheMiss, nil, fmt.Errorf("cache: GetShard write: %w", err)
 	}
 
-	// Cancel watcher — started after write completes (no concurrent writes).
-	watchDone := make(chan struct{})
-	watchExited := make(chan struct{})
-	go func() {
-		defer close(watchExited)
-		select {
-		case <-ctx.Done():
-			_ = pc.SendCancel()
-		case <-watchDone:
-		}
-	}()
-
 	resp, err := pc.ReadResponse(c.blobPool)
-	close(watchDone)
-	<-watchExited // ensure watcher exited before Release
-
 	if err != nil {
-		c.getPool.Release(pc, false)
 		c.errors.Add(1)
 		return cache.CacheMiss, nil, fmt.Errorf("cache: GetShard read: %w", err)
 	}
-	c.getPool.Release(pc, true)
+	healthy = true
 
 	switch resp.Status {
 	case wire.StatusHit:
 		c.hits.Add(1)
 		return cache.CacheHit, resp.Value, nil
 	case wire.StatusMiss:
+		if resp.Value != nil {
+			resp.Value.Release()
+		}
 		c.misses.Add(1)
 		return cache.CacheMiss, nil, nil
 	case wire.StatusCancelled:
@@ -160,7 +152,7 @@ func (c *shardImpl) GetShard(ctx context.Context, p store.Partition, key store.C
 		if resp.Value != nil {
 			resp.Value.Release()
 		}
-		return cache.CacheMiss, nil, fmt.Errorf("cache: GetShard unexpected status %d", resp.Status)
+		return cache.CacheMiss, nil, readerr.Mark(fmt.Errorf("cache: GetShard unexpected status %d", resp.Status), false)
 	}
 }
 

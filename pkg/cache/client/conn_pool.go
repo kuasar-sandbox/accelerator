@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -36,9 +36,18 @@ type ConnPool struct {
 	addr    string
 	network string
 	config  ConnPoolConfig
-	current atomic.Int32 // total alive connections (free + in-use)
+	current atomic.Int32 // reserved capacity: free + in-use + dialing
 	closed  atomic.Bool
 	done    chan struct{}
+
+	// Publication and Close share this lock. The idle Acquire path does not
+	// take it, and no network call or retry wait is made while holding it.
+	mu           sync.Mutex
+	ctx          context.Context
+	cancel       context.CancelFunc
+	changed      chan struct{}
+	refillNeeded chan struct{}
+	maintenance  sync.WaitGroup
 }
 
 // PoolConn wraps a single wire.Conn owned by a ConnPool.
@@ -72,25 +81,26 @@ func DialConnPool(addr string, cfg ConnPoolConfig) (*ConnPool, error) {
 		done:    make(chan struct{}),
 	}
 
-	dialTimeout := cfg.Timeout
-	if dialTimeout <= 0 {
-		dialTimeout = 2 * time.Second // bounded connect even when ops are unbounded
-	}
+	p.ctx, p.cancel = context.WithCancel(context.Background())
+	p.changed = make(chan struct{}, 1)
+	p.refillNeeded = make(chan struct{}, 1)
 	for i := 0; i < cfg.PoolSize; i++ {
-		raw, err := net.DialTimeout(network, dialAddr, dialTimeout)
+		p.reserve(cfg.MaxSize)
+		pc, err := p.dial(p.ctx)
 		if err != nil {
+			p.releaseCapacity()
 			p.Close()
 			return nil, fmt.Errorf("dial %s: %w", addr, err)
 		}
-		tcpTune(raw)
-		p.free <- &PoolConn{conn: wire.NewConn(raw), pool: p}
-		p.current.Add(1)
+		p.Release(pc, true)
 	}
 
 	if cfg.PoolSize > 0 {
+		p.maintenance.Add(1)
 		go p.healthLoop()
 	}
 	if cfg.IdleMax > 0 {
+		p.maintenance.Add(1)
 		go p.reaperLoop()
 	}
 
@@ -102,32 +112,72 @@ const (
 	pingTimeout  = 2 * time.Second
 )
 
+// reserve uses the same quota for initial connections, callers and refill.
+func (p *ConnPool) reserve(limit int) bool {
+	for !p.closed.Load() {
+		n := p.current.Load()
+		if int(n) >= limit {
+			return false
+		}
+		if p.current.CompareAndSwap(n, n+1) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *ConnPool) wake() {
+	select {
+	case p.changed <- struct{}{}:
+	default:
+	}
+}
+
+func (p *ConnPool) releaseCapacity() {
+	p.current.Add(-1)
+	p.wake()
+}
+
+func (p *ConnPool) dial(ctx context.Context) (*PoolConn, error) {
+	dialCtx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(p.ctx, cancel)
+	defer stop()
+	defer cancel()
+	timeout := p.config.Timeout
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	raw, err := (&net.Dialer{Timeout: timeout}).DialContext(dialCtx, p.network, p.addr)
+	if err != nil {
+		return nil, err
+	}
+	tcpTune(raw)
+	return &PoolConn{conn: wire.NewConn(raw), pool: p}, nil
+}
+
 func (p *ConnPool) healthLoop() {
+	defer p.maintenance.Done()
 	ticker := time.NewTicker(pingInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-p.done:
 			return
+		case <-p.refillNeeded:
+			p.refill()
 		case <-ticker.C:
-		}
-		select {
-		case pc := <-p.free:
-			if err := pc.Ping(pingTimeout); err != nil {
-				pc.closeConn()
-				p.current.Add(-1)
-				if int(p.current.Load()) < p.config.PoolSize {
-					go p.refill()
-				}
-			} else {
-				p.free <- pc
+			select {
+			case pc := <-p.free:
+				p.Release(pc, pc.Ping(pingTimeout) == nil)
+			default:
 			}
-		default:
+			p.refill()
 		}
 	}
 }
 
 func (p *ConnPool) reaperLoop() {
+	defer p.maintenance.Done()
 	ticker := time.NewTicker(p.config.IdleMax)
 	defer ticker.Stop()
 	for {
@@ -140,7 +190,7 @@ func (p *ConnPool) reaperLoop() {
 			select {
 			case pc := <-p.free:
 				pc.closeConn()
-				p.current.Add(-1)
+				p.releaseCapacity()
 			default:
 				goto done
 			}
@@ -149,67 +199,100 @@ func (p *ConnPool) reaperLoop() {
 	}
 }
 
-// Acquire returns an idle connection, dialling a burst connection if
-// needed and allowed by MaxSize. Blocks if at capacity until a
-// connection is released or ctx expires.
+// Acquire returns an idle connection or makes one bounded dialing attempt.
+// Only genuine capacity exhaustion waits. Capacity released by a bad
+// connection wakes a waiter even when no healthy connection was returned.
 func (p *ConnPool) Acquire(ctx context.Context) (*PoolConn, error) {
-	// Fast path: take from free.
-	select {
-	case pc := <-p.free:
-		return pc, nil
-	default:
-	}
-
-	// Try burst dial.
-	if n := p.current.Add(1); int(n) <= p.config.MaxSize {
-		raw, err := net.DialTimeout(p.network, p.addr, p.config.Timeout)
-		if err == nil {
-			tcpTune(raw)
-			return &PoolConn{conn: wire.NewConn(raw), pool: p}, nil
+	for {
+		if err := ctx.Err(); err != nil {
+			// A cancelled waiter may have consumed the sole capacity wake.
+			if int(p.current.Load()) < p.config.MaxSize {
+				p.wake()
+			}
+			return nil, err
 		}
-		p.current.Add(-1)
-	} else {
-		p.current.Add(-1)
-	}
-
-	// Block until available or ctx done.
-	select {
-	case pc := <-p.free:
-		return pc, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+		if p.closed.Load() {
+			return nil, net.ErrClosed
+		}
+		select {
+		case pc := <-p.free:
+			return p.acquired(ctx, pc)
+		default:
+		}
+		if p.reserve(p.config.MaxSize) {
+			if int(p.current.Load()) < p.config.MaxSize {
+				p.wake()
+			}
+			pc, err := p.dial(ctx)
+			if err != nil {
+				p.releaseCapacity()
+				return nil, err
+			}
+			return p.acquired(ctx, pc)
+		}
+		select {
+		case pc := <-p.free:
+			return p.acquired(ctx, pc)
+		case <-p.changed:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-p.done:
+			return nil, net.ErrClosed
+		}
 	}
 }
 
-// Release returns a connection to the pool.
-func (p *ConnPool) Release(pc *PoolConn, healthy bool) {
+func (p *ConnPool) acquired(ctx context.Context, pc *PoolConn) (*PoolConn, error) {
 	if p.closed.Load() {
-		pc.closeConn()
-		p.current.Add(-1)
-		return
+		p.Release(pc, false)
+		return nil, net.ErrClosed
 	}
-	if !healthy {
-		pc.closeConn()
-		p.current.Add(-1)
-		if int(p.current.Load()) < p.config.PoolSize {
-			go p.refill()
+	if err := ctx.Err(); err != nil {
+		p.Release(pc, true)
+		return nil, err
+	}
+	// This waiter may have consumed a capacity notification before taking
+	// a returned healthy connection. Relay spare capacity to other waiters.
+	if int(p.current.Load()) < p.config.MaxSize {
+		p.wake()
+	}
+	return pc, nil
+}
+
+// Release transfers ownership exactly once. A bad connection is discarded;
+// one existing maintenance worker may refill, never one goroutine per error.
+func (p *ConnPool) Release(pc *PoolConn, healthy bool) {
+	p.mu.Lock()
+	if healthy && !p.closed.Load() {
+		select {
+		case p.free <- pc:
+			p.mu.Unlock()
+			return
+		default:
 		}
-		return
 	}
-	select {
-	case p.free <- pc:
-	default:
-		pc.closeConn()
-		p.current.Add(-1)
+	p.mu.Unlock()
+	pc.closeConn()
+	p.releaseCapacity()
+	if !p.closed.Load() && int(p.current.Load()) < p.config.PoolSize {
+		select {
+		case p.refillNeeded <- struct{}{}:
+		default:
+		}
 	}
 }
 
-// Close shuts down the pool.
+// Close prevents publication, wakes all waiters and cancels maintenance
+// dials. Borrowed connections remain owned by their callers until Release.
 func (p *ConnPool) Close() error {
+	p.mu.Lock()
 	if !p.closed.CompareAndSwap(false, true) {
+		p.mu.Unlock()
+		p.maintenance.Wait()
 		return nil
 	}
 	close(p.done)
+	p.cancel()
 	var firstErr error
 	for {
 		select {
@@ -217,36 +300,26 @@ func (p *ConnPool) Close() error {
 			if err := pc.closeConn(); err != nil && firstErr == nil {
 				firstErr = err
 			}
-			p.current.Add(-1)
+			p.releaseCapacity()
 		default:
+			p.mu.Unlock()
+			p.maintenance.Wait()
 			return firstErr
 		}
 	}
 }
 
+// refill performs single connection attempts under the same reservation
+// limit as Acquire. Failure returns to maintenance; read recovery never waits
+// for another health tick or for a finite background retry window.
 func (p *ConnPool) refill() {
-	backoff := 500 * time.Millisecond
-	const maxRetries = 5
-	for i := 0; i < maxRetries; i++ {
-		if p.closed.Load() {
+	for p.reserve(p.config.PoolSize) {
+		pc, err := p.dial(p.ctx)
+		if err != nil {
+			p.releaseCapacity()
 			return
 		}
-		raw, err := net.DialTimeout(p.network, p.addr, p.config.Timeout)
-		if err == nil {
-			tcpTune(raw)
-			pc := &PoolConn{conn: wire.NewConn(raw), pool: p}
-			p.current.Add(1)
-			select {
-			case p.free <- pc:
-			default:
-				pc.closeConn()
-				p.current.Add(-1)
-			}
-			return
-		}
-		log.Printf("conn_pool: refill %s failed (%d/%d): %v", p.addr, i+1, maxRetries, err)
-		time.Sleep(backoff)
-		backoff *= 2
+		p.Release(pc, true)
 	}
 }
 
@@ -299,6 +372,26 @@ func (pc *PoolConn) closeConn() error {
 		return pc.conn.Close()
 	}
 	return nil
+}
+
+// readOperation makes cancellation interrupt the actual socket operation.
+// Its finish function must run before releasing the connection, including
+// joining a callback that already started; it never abandons a live read.
+func (pc *PoolConn) readOperation(ctx context.Context, timeout time.Duration) func() {
+	pc.SetOpDeadline(ctx, timeout)
+	if ctx.Done() == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = pc.conn.SetDeadline(time.Now())
+		close(done)
+	})
+	return func() {
+		if !stop() {
+			<-done
+		}
+	}
 }
 
 // SetOpDeadline sets read+write deadlines to the earlier of

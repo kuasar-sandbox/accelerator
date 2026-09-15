@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 )
 
 // UnsealKeys decrypts the manifest's sealed key table and expands it
@@ -32,8 +33,8 @@ func UnsealKeys(m *Manifest, sealedKT []byte, customerKey [32]byte, dec crypto.D
 		}
 	}
 	if len(flat) != nonZero*32 {
-		return nil, fmt.Errorf("key table size mismatch: got %d bytes, want %d (non-zero chunks: %d)",
-			len(flat), nonZero*32, nonZero)
+		return nil, readerr.Mark(fmt.Errorf("key table size mismatch: got %d bytes, want %d (non-zero chunks: %d)",
+			len(flat), nonZero*32, nonZero), false)
 	}
 	keys := make([][32]byte, count)
 	pos := 0

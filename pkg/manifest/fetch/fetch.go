@@ -37,6 +37,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
@@ -77,7 +78,7 @@ type prefetchChunkRun interface {
 	prefetch(ctx context.Context) error
 }
 
-var errInvalidRun = errors.New("fetch: invalid run")
+var errInvalidRun = readerr.Mark(errors.New("fetch: invalid run"), false)
 
 // manifestStream is the single-manifest implementation (Stream + Prefetcher).
 type manifestStream struct {
@@ -157,7 +158,7 @@ func (s *manifestStream) RunAt(offset, limit uint64) (sparse.Run, error) {
 	}
 	i := s.chunkIndexForOffset(offset)
 	if i < 0 {
-		return newHoleRun(offset, limEnd), nil // invalid tiling: degrade safely
+		return nil, fmt.Errorf("%w: no entry or authoritative hole at %d", errInvalidRun, offset)
 	}
 	e := s.m.Entries[i]
 	end := e.Offset + uint64(e.Size)
@@ -264,7 +265,7 @@ const (
 // returned on an error or non-hit path is released here.
 func (s *manifestStream) loadChunkAt(ctx context.Context, chunkIdx uint64, kind loadKind) (cache.Blob, error) {
 	if chunkIdx >= uint64(len(s.m.Entries)) {
-		return nil, fmt.Errorf("fetch: chunk index %d out of range", chunkIdx)
+		return nil, readerr.Mark(fmt.Errorf("fetch: chunk index %d out of range", chunkIdx), false)
 	}
 	e := s.m.Entries[chunkIdx]
 	if e.IsZero {
@@ -277,10 +278,10 @@ func (s *manifestStream) loadChunkAt(ctx context.Context, chunkIdx uint64, kind 
 	case loadPrefetch:
 		getter = s.prefetchGetter
 	default:
-		return nil, fmt.Errorf("fetch: chunk %d: invalid load kind %d", chunkIdx, kind)
+		return nil, readerr.Mark(fmt.Errorf("fetch: chunk %d: invalid load kind %d", chunkIdx, kind), false)
 	}
 	if getter == nil {
-		return nil, fmt.Errorf("fetch: chunk %d: cache getter is nil", chunkIdx)
+		return nil, readerr.Mark(fmt.Errorf("fetch: chunk %d: cache getter is nil", chunkIdx), false)
 	}
 	result, blob, err := getter.Get(ctx, store.PartitionChunk, store.ContentKey(e.CiphertextHash))
 	if err != nil {
@@ -293,10 +294,10 @@ func (s *manifestStream) loadChunkAt(ctx context.Context, chunkIdx uint64, kind 
 		if blob != nil {
 			blob.Release()
 		}
-		return nil, fmt.Errorf("chunk %d: not found", chunkIdx)
+		return nil, readerr.Mark(fmt.Errorf("chunk %d: not found", chunkIdx), false)
 	}
 	if blob == nil {
-		return nil, fmt.Errorf("chunk %d: cache hit returned nil blob", chunkIdx)
+		return nil, readerr.Mark(fmt.Errorf("chunk %d: cache hit returned nil blob", chunkIdx), false)
 	}
 	return blob, nil
 }
@@ -306,35 +307,35 @@ func (s *manifestStream) loadChunkAt(ctx context.Context, chunkIdx uint64, kind 
 // chunks larger than the byte budget retain the direct path.
 func (s *manifestStream) readChunkAt(ctx context.Context, buf []byte, chunkIdx, offset uint64) (int, error) {
 	if chunkIdx >= uint64(len(s.m.Entries)) {
-		return 0, fmt.Errorf("fetch: chunk index %d out of range", chunkIdx)
+		return 0, readerr.Mark(fmt.Errorf("fetch: chunk index %d out of range", chunkIdx), false)
 	}
 	e := s.m.Entries[chunkIdx]
 	entryEnd := e.Offset + uint64(e.Size)
 	if entryEnd < e.Offset {
-		return 0, fmt.Errorf("fetch: chunk %d range overflows", chunkIdx)
+		return 0, readerr.Mark(fmt.Errorf("fetch: chunk %d range overflows", chunkIdx), false)
 	}
 	if uint64(len(buf)) > ^uint64(0)-offset {
-		return 0, fmt.Errorf("fetch: chunk %d: read offset %d length %d overflows", chunkIdx, offset, len(buf))
+		return 0, readerr.Mark(fmt.Errorf("fetch: chunk %d: read offset %d length %d overflows", chunkIdx, offset, len(buf)), false)
 	}
 	end := offset + uint64(len(buf))
 	if offset < e.Offset || end > entryEnd {
-		return 0, fmt.Errorf("fetch: chunk %d: range [%d,%d) outside entry [%d,%d)", chunkIdx, offset, end, e.Offset, entryEnd)
+		return 0, readerr.Mark(fmt.Errorf("fetch: chunk %d: range [%d,%d) outside entry [%d,%d)", chunkIdx, offset, end, e.Offset, entryEnd), false)
 	}
 	if len(buf) == 0 {
 		return 0, nil
 	}
 	if uint64(e.Size) > uint64(crypto.MaxChunkDecodedSize) {
-		return 0, fmt.Errorf("fetch: chunk %d: plaintext size %d exceeds hard limit %d", chunkIdx, e.Size, crypto.MaxChunkDecodedSize)
+		return 0, readerr.Mark(fmt.Errorf("fetch: chunk %d: plaintext size %d exceeds hard limit %d", chunkIdx, e.Size, crypto.MaxChunkDecodedSize), false)
 	}
 	if e.IsZero {
 		clearSlice(buf)
 		return len(buf), nil
 	}
 	if chunkIdx >= uint64(len(s.keys)) {
-		return 0, fmt.Errorf("fetch: chunk %d: missing decryption key", chunkIdx)
+		return 0, readerr.Mark(fmt.Errorf("fetch: chunk %d: missing decryption key", chunkIdx), false)
 	}
 	if s.decryptor == nil {
-		return 0, fmt.Errorf("fetch: chunk %d: decryptor is nil", chunkIdx)
+		return 0, readerr.Mark(fmt.Errorf("fetch: chunk %d: decryptor is nil", chunkIdx), false)
 	}
 	key := decryptedChunkKey{
 		ciphertextHash: e.CiphertextHash,
@@ -378,7 +379,7 @@ func (s *manifestStream) readChunkDirect(
 	// attacker-chosen ciphertext into attacker-chosen plaintext. Hash the bytes
 	// as received and keep the borrowed Blob bytes immutable throughout decode.
 	if s.verifyContent && sha256.Sum256(ciphertext) != e.CiphertextHash {
-		return 0, fmt.Errorf("chunk %d: ciphertext hash mismatch (corrupt or tampered store/cache)", chunkIdx)
+		return 0, readerr.Mark(fmt.Errorf("chunk %d: ciphertext hash mismatch (corrupt or tampered store/cache)", chunkIdx), false)
 	}
 	if offset == e.Offset && uint64(len(buf)) == uint64(e.Size) {
 		if err := s.decryptor.DecryptChunkTo(ctx, s.keys[chunkIdx], ciphertext, buf); err != nil {
@@ -388,11 +389,11 @@ func (s *manifestStream) readChunkDirect(
 	}
 	rangeDecryptor, ok := s.decryptor.(chunkRangeDecryptor)
 	if !ok {
-		return 0, fmt.Errorf("chunk %d: decryptor cannot serve an oversized partial range", chunkIdx)
+		return 0, readerr.Mark(fmt.Errorf("chunk %d: decryptor cannot serve an oversized partial range", chunkIdx), false)
 	}
 	innerOffset := offset - e.Offset
 	if innerOffset > uint64(^uint(0)>>1) || uint64(e.Size) > uint64(^uint(0)>>1) {
-		return 0, fmt.Errorf("chunk %d: plaintext offset %d overflows int", chunkIdx, innerOffset)
+		return 0, readerr.Mark(fmt.Errorf("chunk %d: plaintext offset %d overflows int", chunkIdx, innerOffset), false)
 	}
 	if err := rangeDecryptor.DecryptChunkRangeTo(ctx, s.keys[chunkIdx], ciphertext, int(e.Size), int(innerOffset), buf); err != nil {
 		return 0, fmt.Errorf("chunk %d: range decrypt: %w", chunkIdx, err)
@@ -410,7 +411,7 @@ func (s *manifestStream) loadOwnedPlainChunk(ctx context.Context, chunkIdx uint6
 	ciphertext := blob.Bytes()
 	if s.verifyContent && sha256.Sum256(ciphertext) != e.CiphertextHash {
 		blob.Release()
-		return nil, fmt.Errorf("chunk %d: ciphertext hash mismatch (corrupt or tampered store/cache)", chunkIdx)
+		return nil, readerr.Mark(fmt.Errorf("chunk %d: ciphertext hash mismatch (corrupt or tampered store/cache)", chunkIdx), false)
 	}
 	plain := make([]byte, e.Size)
 	err = s.decryptor.DecryptChunkTo(ctx, s.keys[chunkIdx], ciphertext, plain)
@@ -429,7 +430,7 @@ func copyChunkRange(
 	offset, end uint64,
 ) (int, error) {
 	if uint64(len(plain)) < uint64(e.Size) {
-		return 0, fmt.Errorf("chunk %d: decrypted data has %d bytes, need %d", chunkIdx, len(plain), e.Size)
+		return 0, readerr.Mark(fmt.Errorf("chunk %d: decrypted data has %d bytes, need %d", chunkIdx, len(plain), e.Size), false)
 	}
 	lo := int(offset - e.Offset)
 	hi := int(end - e.Offset)

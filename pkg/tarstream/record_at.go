@@ -6,6 +6,8 @@ import (
 	"math/bits"
 	"sync"
 	"sync/atomic"
+
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 )
 
 const encryptedDataOffset = envelopePrefixSize + envelopeHeaderSealed
@@ -49,7 +51,7 @@ func openRecordReaderAt(ra io.ReaderAt, artifactSize int64, codec Codec) (*recor
 	}
 	var prefix [envelopePrefixSize]byte
 	if err := readAtFull(ra, prefix[:], 0); err != nil {
-		return nil, fmt.Errorf("%w: read clear prefix", ErrMalformedEnvelope)
+		return nil, &canonicalReadError{fmt.Errorf("%w: read clear prefix", ErrMalformedEnvelope), err}
 	}
 	if err := validatePrefix(prefix); err != nil {
 		return nil, err
@@ -63,11 +65,11 @@ func openRecordReaderAt(ra io.ReaderAt, artifactSize int64, codec Codec) (*recor
 	}
 	sealed := make([]byte, envelopeHeaderSealed)
 	if err := readAtFull(ra, sealed, envelopePrefixSize); err != nil {
-		return nil, fmt.Errorf("%w: read encrypted header", ErrMalformedEnvelope)
+		return nil, &canonicalReadError{fmt.Errorf("%w: read encrypted header", ErrMalformedEnvelope), err}
 	}
 	plaintext, err := recordCodec.DecryptInPlace(sealed, headerAAD(prefix), 0)
 	if err != nil {
-		return nil, fmt.Errorf("%w: encrypted header", ErrAuthentication)
+		return nil, &canonicalReadError{fmt.Errorf("%w: encrypted header", ErrAuthentication), err}
 	}
 	if len(plaintext) != envelopeHeaderSize || &plaintext[0] != &sealed[1] {
 		return nil, fmt.Errorf("%w: codec violated in-place header contract", ErrMalformedEnvelope)
@@ -197,7 +199,7 @@ func (r *recordReaderAt) ReadAt(dst []byte, offset int64) (int, error) {
 			return written, err
 		}
 		if n == 0 {
-			return written, io.ErrNoProgress
+			return written, readerr.Mark(io.ErrNoProgress, false)
 		}
 		written += n
 		plainOffset += uint64(n)
@@ -207,7 +209,7 @@ func (r *recordReaderAt) ReadAt(dst []byte, offset int64) (int, error) {
 
 func (r *recordReaderAt) checkOpen() error {
 	if r.closed.Load() {
-		return fmt.Errorf("tarstream: encrypted reader is closed")
+		return readerr.Mark(fmt.Errorf("tarstream: encrypted reader is closed"), false)
 	}
 	return nil
 }
@@ -239,7 +241,7 @@ func (r *recordReaderAt) readBatch(dst []byte, plainOffset, last uint64) (int, e
 	buffer := work.data
 	slab := buffer[:total:total]
 	if err := readAtFull(r.ra, slab, physical); err != nil {
-		return 0, fmt.Errorf("%w: truncated encrypted record", ErrMalformedEnvelope)
+		return 0, &canonicalReadError{fmt.Errorf("%w: truncated encrypted record", ErrMalformedEnvelope), err}
 	}
 
 	aad := buffer[total:]
@@ -256,7 +258,7 @@ func (r *recordReaderAt) readBatch(dst []byte, plainOffset, last uint64) (int, e
 		setRecordAAD(aad, index, uint32(plainSize))
 		plaintext, err := r.codec.DecryptInPlace(part, aad, index+1)
 		if err != nil {
-			return written, fmt.Errorf("%w: encrypted data record", ErrAuthentication)
+			return written, &canonicalReadError{fmt.Errorf("%w: encrypted data record", ErrAuthentication), err}
 		}
 		if len(plaintext) != plainSize || plainSize > 0 && &plaintext[0] != &part[1] {
 			return written, fmt.Errorf("%w: codec violated in-place record contract", ErrMalformedEnvelope)
@@ -328,22 +330,21 @@ func (r *recordReaderAt) Close() error {
 }
 
 func readAtFull(reader io.ReaderAt, dst []byte, offset int64) error {
-	for len(dst) > 0 {
-		n, err := reader.ReadAt(dst, offset)
-		if n < 0 || n > len(dst) {
-			return io.ErrUnexpectedEOF
-		}
-		dst = dst[n:]
-		offset += int64(n)
-		if err != nil {
-			if len(dst) == 0 && err == io.EOF {
-				return nil
-			}
-			return err
-		}
-		if n == 0 {
-			return io.ErrUnexpectedEOF
-		}
+	if len(dst) == 0 {
+		return nil
 	}
-	return nil
+	n, err := reader.ReadAt(dst, offset)
+	if readerr.IsPermanent(err) {
+		return err
+	}
+	if n < 0 || n > len(dst) {
+		return readerr.Mark(fmt.Errorf("tarstream: invalid ReaderAt count %d: %w", n, io.ErrUnexpectedEOF), false)
+	}
+	if n == len(dst) && (err == nil || err == io.EOF) {
+		return nil
+	}
+	if err == nil || err == io.EOF || err == io.ErrUnexpectedEOF {
+		return readerr.Mark(fmt.Errorf("tarstream: read %d of %d bytes: %w", n, len(dst), io.ErrUnexpectedEOF), false)
+	}
+	return err
 }

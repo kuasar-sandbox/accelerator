@@ -38,6 +38,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
 
@@ -156,12 +157,12 @@ type ReadSeeker interface {
 
 // ErrNotFound reports that the named entry (or, for an empty name, any
 // regular file entry) is not present in the stream.
-var ErrNotFound = errors.New("tarstream: entry not found")
+var ErrNotFound = readerr.Mark(errors.New("tarstream: entry not found"), false)
 
 // ErrUnsupportedEncoding reports a sparse member in the legacy GNU
 // binary format or a PAX 0.x map, which this package does not decode;
 // re-create the archive with `tar --format=posix --sparse` or WriteTo.
-var ErrUnsupportedEncoding = errors.New("tarstream: unsupported sparse encoding (use GNU posix sparse 1.0)")
+var ErrUnsupportedEncoding = readerr.Mark(errors.New("tarstream: unsupported sparse encoding (use GNU posix sparse 1.0)"), false)
 
 // extent is one data run of the logical file: bytes
 // [Offset, Offset+Size) hold data.

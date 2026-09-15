@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"io"
 	"net"
 
@@ -12,8 +13,8 @@ import (
 )
 
 var (
-	ErrFrameTooLarge = errors.New("wire: frame exceeds MaxFrameSize")
-	ErrFrameTooSmall = errors.New("wire: frame smaller than minimum header")
+	ErrFrameTooLarge = readerr.Mark(errors.New("wire: frame exceeds MaxFrameSize"), false)
+	ErrFrameTooSmall = readerr.Mark(errors.New("wire: frame smaller than minimum header"), false)
 )
 
 // ---------------------------------------------------------------------------
@@ -137,7 +138,7 @@ func ReadResponse(r io.Reader, pool cache.BlobPool) (*Response, error) {
 	// 3. Read error message if present.
 	if errLen > 0 {
 		if errLen > remaining {
-			return nil, fmt.Errorf("wire: errLen %d exceeds remaining %d", errLen, remaining)
+			return nil, readerr.Mark(fmt.Errorf("wire: errLen %d exceeds remaining %d", errLen, remaining), false)
 		}
 		errBuf := make([]byte, errLen)
 		if _, err := io.ReadFull(r, errBuf); err != nil {
@@ -194,7 +195,7 @@ func readResponseFast(br *bufio.Reader, raw io.Reader, pool cache.BlobPool) (*Re
 
 	if errLen > 0 {
 		if errLen > remaining {
-			return nil, fmt.Errorf("wire: errLen %d exceeds remaining %d", errLen, remaining)
+			return nil, readerr.Mark(fmt.Errorf("wire: errLen %d exceeds remaining %d", errLen, remaining), false)
 		}
 		errBuf := make([]byte, errLen)
 		if _, err := io.ReadFull(br, errBuf); err != nil {
