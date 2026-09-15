@@ -232,15 +232,25 @@ func searchError(key string, diagnostics searchDiagnostics, remote error) error 
 	return err
 }
 
-// Only a single missing-cause chain can be made ambiguous by an unreachable
-// ref. A joined error may contain a separate integrity failure.
+// An unreachable ref makes absence ambiguous only when every remote cause
+// is a confirmed miss. A joined integrity or access failure must survive.
 func onlyMissing(err error) bool {
 	for err != nil {
 		if err == store.ErrNotFound {
 			return true
 		}
-		if _, multiple := err.(interface{ Unwrap() []error }); multiple {
-			return false
+		if multiple, ok := err.(interface{ Unwrap() []error }); ok {
+			found := false
+			for _, cause := range multiple.Unwrap() {
+				if cause == nil {
+					continue
+				}
+				if !onlyMissing(cause) {
+					return false
+				}
+				found = true
+			}
+			return found
 		}
 		err = errors.Unwrap(err)
 	}

@@ -199,7 +199,7 @@ func (s *denseSource) ReadAt(ctx context.Context, buf []byte, offset uint64) (in
 		return 0, io.EOF
 	}
 	if offset < s.pos {
-		return 0, fmt.Errorf("sparse: dense source: backward read @ %d (consumed through %d)", offset, s.pos)
+		return 0, readerr.Mark(fmt.Errorf("sparse: dense source: backward read @ %d (consumed through %d)", offset, s.pos), false)
 	}
 	if offset > s.pos {
 		if _, err := io.CopyN(io.Discard, s.r, int64(offset-s.pos)); err != nil {
@@ -216,14 +216,14 @@ func (s *denseSource) ReadAt(ctx context.Context, buf []byte, offset uint64) (in
 	// io.ReadFull suppresses any error accompanying a full buffer, including
 	// an explicit source failure. Observe that cause before accepting bytes.
 	reader := &observedReader{Reader: s.r}
-	_, err := io.ReadFull(reader, buf[:n])
+	consumed, err := io.ReadFull(reader, buf[:n])
+	s.pos += uint64(consumed)
 	if err == nil && reader.err != io.EOF {
 		err = reader.err
 	}
 	if err != nil {
 		return 0, s.short(err)
 	}
-	s.pos = offset + uint64(n)
 	return n, eof
 }
 

@@ -186,6 +186,9 @@ func readFullAt(source io.ReaderAt, dst []byte, offset int64) error {
 		if err == nil || err == io.EOF {
 			return nil
 		}
+		if err == io.ErrUnexpectedEOF {
+			return readerr.Mark(err, false)
+		}
 		return err
 	}
 	if err == nil || err == io.EOF || err == io.ErrUnexpectedEOF {
