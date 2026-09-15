@@ -168,6 +168,7 @@ func TestReadAtRangeContract(t *testing.T) {
 		{"short EOF", 7, io.EOF, true, false},
 		{"short unexpected EOF", 7, io.ErrUnexpectedEOF, true, false},
 		{"full EOF", 8, io.EOF, false, true},
+		{"full unexpected EOF", 8, io.ErrUnexpectedEOF, true, false},
 		{"full retryable EOF", 8, readerr.Mark(io.EOF, true), false, false},
 		{"full permanent EOF", 8, readerr.Mark(io.EOF, false), true, false},
 	}

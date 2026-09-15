@@ -212,7 +212,7 @@ func readStreamAt(ctx context.Context, stream Stream, buf []byte, offset uint64)
 			if n == len(dst) && !readerr.IsPermanent(err) && err == io.EOF {
 				err = nil
 			}
-			if n < len(dst) && (err == io.EOF || err == io.ErrUnexpectedEOF) {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				err = readerr.Mark(err, false)
 			}
 			if err != nil {
