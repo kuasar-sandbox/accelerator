@@ -1,4 +1,4 @@
-[English](read-recovery.md) | [简体中文](read-recovery_zh.md)
+[English](accelerator-read-recovery.md) | [简体中文](accelerator-read-recovery_zh.md)
 
 # Read errors and recovery
 
@@ -50,5 +50,5 @@ The idle Acquire path uses the existing connection channel without the publicati
 - [Store](store.md)
 - [Manifest](manifest.md)
 - [File artifacts](file-artifacts.md)
-- [Sandboxer synchronous recovery](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/read-recovery.md)
+- [Sandboxer synchronous recovery](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandboxer-read-recovery.md)
 - [Proposal and acceptance checklist](https://github.com/kuasar-sandbox/sandboxer/issues/225)

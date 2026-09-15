@@ -193,4 +193,4 @@ Each object uses its source Bundle's recorded admission. Upload neither redirect
 
 FullVerify also rejects chunks unreferenced by any local Manifest. After parsing snapshot-specific metadata, the caller can supply `ExpectedManifests` as the exact locally reachable Manifest set, rejecting unrelated Manifests without making accelerator interpret `snapshot.cfg`.
 
-Read error classification, initialization ownership and recovery are specified in [Read errors and recovery](read-recovery.md).
+Read error classification, initialization ownership and recovery are specified in [Read errors and recovery](accelerator-read-recovery.md).

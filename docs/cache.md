@@ -784,4 +784,4 @@ Record workload controls `VALUE_SIZE`, `PREFILL`, `COLD_PREFILL`, `MISS_RATIO`, 
 - [README](../README.md) / [Makefile](../Makefile): `make cache-ctl` builds the repository's CGO binary after deps-rocksdb, statically linking librocksdb.
 - [system architecture](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox.md): the cache model in the platform.
 
-Immutable read errors and client recovery are specified in [Read errors and recovery](read-recovery.md).
+Immutable read errors and client recovery are specified in [Read errors and recovery](accelerator-read-recovery.md).

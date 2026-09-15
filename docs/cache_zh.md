@@ -928,4 +928,4 @@ origin 与 tiered 并扫并发。使用 [procmon.sh](../test/scripts/procmon.sh)
   后静态链接 librocksdb,是本仓 CGO 二进制。
 - [系统架构](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox_zh.md):平台缓存模型。
 
-不可变读取错误及 client 恢复见[读取错误与恢复](read-recovery_zh.md).
+不可变读取错误及 client 恢复见[读取错误与恢复](accelerator-read-recovery_zh.md).

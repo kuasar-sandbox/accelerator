@@ -382,4 +382,4 @@ race detector 需要启用 CGO 并具备可用 C 工具链。上面的普通测�
 - [cache_zh.md](cache_zh.md) — tiered cache、origin 和 wire protocol
 - 仓库根目录 `README.md` / `Makefile` — 构建和完整测试入口
 
-不可变读取错误及 client 恢复见[读取错误与恢复](read-recovery_zh.md).
+不可变读取错误及 client 恢复见[读取错误与恢复](accelerator-read-recovery_zh.md).

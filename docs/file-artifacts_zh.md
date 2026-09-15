@@ -287,4 +287,4 @@ snapshot-specific metadata 后可通过 `ExpectedManifests` 提交精确的本�
 Manifest 集，从而拒绝无关 Manifest，而无需让 accelerator 解释
 `snapshot.cfg`。
 
-读取错误分类、初始化所有权和恢复见[读取错误与恢复](read-recovery_zh.md).
+读取错误分类、初始化所有权和恢复见[读取错误与恢复](accelerator-read-recovery_zh.md).
