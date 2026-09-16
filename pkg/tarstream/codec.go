@@ -3,6 +3,8 @@ package tarstream
 import (
 	"errors"
 	"fmt"
+
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 )
 
 // Codec binds the customer-key-backed primitive to one encrypted tarstream v1
@@ -42,13 +44,13 @@ func bindRecordCodec(codec Codec, salt [32]byte) (RecordCodec, error) {
 }
 
 var (
-	ErrInvalidOption             = errors.New("tarstream: invalid option")
-	ErrCodecRequired             = errors.New("tarstream: codec required")
-	ErrPlaintextForbidden        = errors.New("tarstream: plaintext forbidden")
-	ErrUnsupportedVersion        = errors.New("tarstream: unsupported encrypted version")
-	ErrMalformedEnvelope         = errors.New("tarstream: malformed encrypted envelope")
-	ErrAuthentication            = errors.New("tarstream: authentication failed")
-	ErrInvalidDigest             = errors.New("tarstream: invalid digest")
-	ErrDigestMismatch            = errors.New("tarstream: digest mismatch")
-	ErrInvalidCanonicalTarstream = errors.New("tarstream: invalid canonical artifact")
+	ErrInvalidOption             = readerr.Mark(errors.New("tarstream: invalid option"), false)
+	ErrCodecRequired             = readerr.Mark(errors.New("tarstream: codec required"), false)
+	ErrPlaintextForbidden        = readerr.Mark(errors.New("tarstream: plaintext forbidden"), false)
+	ErrUnsupportedVersion        = readerr.Mark(errors.New("tarstream: unsupported encrypted version"), false)
+	ErrMalformedEnvelope         = readerr.Mark(errors.New("tarstream: malformed encrypted envelope"), false)
+	ErrAuthentication            = readerr.Mark(errors.New("tarstream: authentication failed"), false)
+	ErrInvalidDigest             = readerr.Mark(errors.New("tarstream: invalid digest"), false)
+	ErrDigestMismatch            = readerr.Mark(errors.New("tarstream: digest mismatch"), false)
+	ErrInvalidCanonicalTarstream = readerr.Mark(errors.New("tarstream: invalid canonical artifact"), false)
 )

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
 
@@ -104,8 +105,10 @@ func ReadSeekFromIndex(rs io.ReadSeeker, index int) (ReadSeeker, error) {
 // callers needing full-file validation must consume SourceFrom instead.
 func SourceAt(ra io.ReaderAt, size int64, name string, options ...ReadOption) (sparse.Source, string, error) {
 	if size < 0 || size > 1<<62 {
-		return nil, "", fmt.Errorf("tarstream: invalid artifact size %d", size)
+		return nil, "", readerr.Mark(fmt.Errorf("tarstream: invalid artifact size %d", size), false)
 	}
+	ra = artifactReaderAt{ra}
+
 	opts, err := parseReadOptions(options)
 	if err != nil {
 		return nil, "", err
@@ -120,7 +123,7 @@ func SourceAt(ra io.ReaderAt, size int64, name string, options ...ReadOption) (s
 		}
 		records, err := openRecordReaderAt(ra, size, opts.codec)
 		if err != nil {
-			return nil, "", err
+			return nil, "", keyBoundCanonicalError(opts, err)
 		}
 		result, err := sourceAtPlain(records, int64(records.geometry.plaintextSize), name)
 		if err != nil {
@@ -182,11 +185,18 @@ func keyBoundCanonicalError(options readOptions, err error) error {
 		ErrInvalidCanonicalTarstream,
 	} {
 		if errors.Is(err, safe) {
-			return safe
+			return &canonicalReadError{safe, err}
 		}
 	}
-	return ErrInvalidCanonicalTarstream
+	return &canonicalReadError{ErrInvalidCanonicalTarstream, err}
 }
+
+// Keep the existing value-free diagnostic while retaining the actual cause.
+type canonicalReadError struct{ category, cause error }
+
+func (e *canonicalReadError) Error() string        { return e.category.Error() }
+func (e *canonicalReadError) Unwrap() error        { return e.cause }
+func (e *canonicalReadError) Is(target error) bool { return errors.Is(e.category, target) }
 
 type plainAtResult struct {
 	source    sparse.Source
@@ -197,7 +207,12 @@ type plainAtResult struct {
 	hasDigest bool
 }
 
-func sourceAtPlain(ra io.ReaderAt, size int64, name string) (plainAtResult, error) {
+func sourceAtPlain(ra io.ReaderAt, size int64, name string) (result plainAtResult, retErr error) {
+	defer func() {
+		if retErr == io.EOF || retErr == io.ErrUnexpectedEOF {
+			retErr = readerr.Mark(retErr, false)
+		}
+	}()
 	sr := io.NewSectionReader(ra, 0, size)
 	m, err := locate(sr, name, seekSkip(sr))
 	if err != nil {
@@ -284,7 +299,7 @@ func discoverDigest(ra io.ReaderAt, size int64, first *meta, dataStart int64) (c
 	if padding > 0 {
 		var payloadPadding [512]byte
 		if err := readAtFull(ra, payloadPadding[:padding], expectedMarkerStart); err != nil {
-			return zero, false, fmt.Errorf("%w: read payload padding", ErrInvalidCanonicalTarstream)
+			return zero, false, fmt.Errorf("tarstream: read payload padding: %w", err)
 		}
 		if !isZeroBlock(payloadPadding[:padding]) {
 			return zero, false, fmt.Errorf("%w: invalid payload padding", ErrInvalidCanonicalTarstream)
@@ -319,11 +334,11 @@ func discoverDigest(ra io.ReaderAt, size int64, first *meta, dataStart int64) (c
 	}
 	var markerBlock [512]byte
 	if err := readAtFull(ra, markerBlock[:], expectedMarkerStart); err != nil {
-		return zero, false, fmt.Errorf("%w: read digest marker", ErrInvalidCanonicalTarstream)
+		return zero, false, fmt.Errorf("tarstream: read digest marker: %w", err)
 	}
 	var markerBody [512]byte
 	if err := readAtFull(ra, markerBody[:], expectedMarkerStart+512); err != nil {
-		return zero, false, fmt.Errorf("%w: read digest marker body", ErrInvalidCanonicalTarstream)
+		return zero, false, fmt.Errorf("tarstream: read digest marker body: %w", err)
 	}
 	identity, err := parseCanonicalMarker(markerBlock[:], markerBody[:])
 	if err != nil {
@@ -345,8 +360,11 @@ func discoverDigest(ra io.ReaderAt, size int64, first *meta, dataStart int64) (c
 	}
 	tailHasher := newTailHasher(uint64(tailSize))
 	copied, err := io.Copy(tailHasher, io.NewSectionReader(ra, dataStart+payloadPacked, tailSize))
-	if err != nil || copied != tailSize {
-		return zero, false, fmt.Errorf("%w: read metadata tail", ErrInvalidCanonicalTarstream)
+	if err != nil {
+		return zero, false, fmt.Errorf("tarstream: read metadata tail: %w", err)
+	}
+	if copied != tailSize {
+		return zero, false, readerr.Mark(fmt.Errorf("tarstream: short metadata tail: %w", io.ErrUnexpectedEOF), false)
 	}
 	var tailDigest [32]byte
 	copy(tailDigest[:], tailHasher.Sum(nil))
@@ -356,7 +374,7 @@ func discoverDigest(ra io.ReaderAt, size int64, first *meta, dataStart int64) (c
 	}
 	var trailer [1024]byte
 	if err := readAtFull(ra, trailer[:], markerEnd); err != nil {
-		return zero, false, fmt.Errorf("%w: read end-of-archive", ErrInvalidCanonicalTarstream)
+		return zero, false, fmt.Errorf("tarstream: read end-of-archive: %w", err)
 	}
 	if !isZeroBlock(trailer[:512]) || !isZeroBlock(trailer[512:]) {
 		return zero, false, fmt.Errorf("%w: invalid end-of-archive", ErrInvalidCanonicalTarstream)
@@ -460,7 +478,7 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 	var paxHeader [512]byte
 	paxHeaderSeen := false
 	for {
-		if _, err := io.ReadFull(r, blk[:]); err != nil {
+		if _, err := readFixed(r, blk[:]); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				return nil, ErrNotFound
 			}
@@ -478,19 +496,19 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 		}
 		sawZero = false
 		if string(blk[257:262]) != "ustar" {
-			return nil, fmt.Errorf("tarstream: not a tar header (bad magic)")
+			return nil, readerr.Mark(fmt.Errorf("tarstream: not a tar header (bad magic)"), false)
 		}
 		if !validHeaderChecksum(blk[:]) {
-			return nil, fmt.Errorf("tarstream: not a tar header (bad checksum)")
+			return nil, readerr.Mark(fmt.Errorf("tarstream: not a tar header (bad checksum)"), false)
 		}
 
 		typeflag := blk[156]
 		size, err := parseNumeric(blk[124:136])
 		if err != nil {
-			return nil, fmt.Errorf("tarstream: bad size field: %w", err)
+			return nil, readerr.Mark(fmt.Errorf("tarstream: bad size field: %w", err), false)
 		}
 		if size < 0 || size > 1<<62 {
-			return nil, fmt.Errorf("tarstream: bad size field %d", size)
+			return nil, readerr.Mark(fmt.Errorf("tarstream: bad size field %d", size), false)
 		}
 		padded := (size + 511) &^ 511
 
@@ -516,10 +534,10 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 		case 'L': // GNU longname: data is the next entry's name
 			canonicalMeta = false
 			if size > 1<<20 {
-				return nil, fmt.Errorf("tarstream: absurd GNU longname size %d", size)
+				return nil, readerr.Mark(fmt.Errorf("tarstream: absurd GNU longname size %d", size), false)
 			}
 			data := make([]byte, size)
-			if _, err := io.ReadFull(r, data); err != nil {
+			if _, err := readFixed(r, data); err != nil {
 				return nil, err
 			}
 			if err := skip(padded - size); err != nil {
@@ -553,10 +571,10 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 		if s, ok := pax["size"]; ok {
 			v, err := strconv.ParseInt(s, 10, 64)
 			if err != nil {
-				return nil, fmt.Errorf("tarstream: bad pax size: %w", err)
+				return nil, readerr.Mark(fmt.Errorf("tarstream: bad pax size: %w", err), false)
 			}
 			if v < 0 || v > 1<<62 {
-				return nil, fmt.Errorf("tarstream: bad pax size %d", v)
+				return nil, readerr.Mark(fmt.Errorf("tarstream: bad pax size %d", v), false)
 			}
 			stored = v
 		}
@@ -580,7 +598,7 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 			continue
 		}
 		if !regular {
-			return nil, fmt.Errorf("tarstream: entry %q is not a regular file", effName)
+			return nil, readerr.Mark(fmt.Errorf("tarstream: entry %q is not a regular file", effName), false)
 		}
 		if _, old := entryPAX["GNU.sparse.numblocks"]; old {
 			return nil, ErrUnsupportedEncoding
@@ -593,27 +611,27 @@ func locateMatch(r io.Reader, skip func(n int64) error, match func(name string, 
 		if entryPAX["GNU.sparse.major"] == "1" && entryPAX["GNU.sparse.minor"] == "0" {
 			realsize, err := strconv.ParseInt(entryPAX["GNU.sparse.realsize"], 10, 64)
 			if err != nil {
-				return nil, fmt.Errorf("tarstream: bad GNU.sparse.realsize: %w", err)
+				return nil, readerr.Mark(fmt.Errorf("tarstream: bad GNU.sparse.realsize: %w", err), false)
 			}
 			if realsize < 0 || realsize > 1<<62 {
-				return nil, fmt.Errorf("tarstream: bad GNU.sparse.realsize %d", realsize)
+				return nil, readerr.Mark(fmt.Errorf("tarstream: bad GNU.sparse.realsize %d", realsize), false)
 			}
 			extents, mapLen, err := readSparseMap(r, realsize)
 			if err != nil {
 				return nil, err
 			}
 			if mapLen > stored {
-				return nil, fmt.Errorf("tarstream: sparse map exceeds stored size")
+				return nil, readerr.Mark(fmt.Errorf("tarstream: sparse map exceeds stored size"), false)
 			}
 			packedSize := int64(0)
 			for _, extent := range extents {
 				if extent.Size > stored-mapLen-packedSize {
-					return nil, fmt.Errorf("tarstream: sparse extents do not match stored size")
+					return nil, readerr.Mark(fmt.Errorf("tarstream: sparse extents do not match stored size"), false)
 				}
 				packedSize += extent.Size
 			}
 			if packedSize != stored-mapLen {
-				return nil, fmt.Errorf("tarstream: sparse extents do not match stored size")
+				return nil, readerr.Mark(fmt.Errorf("tarstream: sparse extents do not match stored size"), false)
 			}
 			payloadSize, err := parsePayloadSize(payloadValue, hasPayloadSize, realsize)
 			if err != nil {
@@ -667,7 +685,7 @@ func parsePayloadSize(raw string, present bool, logical int64) (int64, error) {
 	}
 	value, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || value < 0 || value > logical {
-		return 0, fmt.Errorf("tarstream: invalid %s %q", payloadSizePAX, raw)
+		return 0, readerr.Mark(fmt.Errorf("tarstream: invalid %s %q", payloadSizePAX, raw), false)
 	}
 	return value, nil
 }
@@ -687,16 +705,16 @@ func readSparseMap(r io.Reader, realsize int64) ([]extent, int64, error) {
 			if i := bytes.IndexByte(buf, '\n'); i >= 0 {
 				v, err := strconv.ParseInt(string(buf[:i]), 10, 64)
 				if err != nil || v < 0 {
-					return 0, fmt.Errorf("tarstream: bad sparse map value %q", buf[:i])
+					return 0, readerr.Mark(fmt.Errorf("tarstream: bad sparse map value %q", buf[:i]), false)
 				}
 				buf = buf[i+1:]
 				return v, nil
 			}
 			if len(buf) > 64 { // a decimal never runs this long
-				return 0, fmt.Errorf("tarstream: malformed sparse map")
+				return 0, readerr.Mark(fmt.Errorf("tarstream: malformed sparse map"), false)
 			}
-			if _, err := io.ReadFull(r, blk[:]); err != nil {
-				return 0, fmt.Errorf("tarstream: sparse map: %w", err)
+			if _, err := readFixed(r, blk[:]); err != nil {
+				return 0, fmt.Errorf("tarstream: sparse map: %w", fixedReadError(err))
 			}
 			mapLen += 512
 			buf = append(buf, blk[:]...)
@@ -707,7 +725,7 @@ func readSparseMap(r io.Reader, realsize int64) ([]extent, int64, error) {
 		return nil, 0, err
 	}
 	if count > 1<<20 {
-		return nil, 0, fmt.Errorf("tarstream: absurd sparse extent count %d", count)
+		return nil, 0, readerr.Mark(fmt.Errorf("tarstream: absurd sparse extent count %d", count), false)
 	}
 	var extents []extent
 	var pos int64
@@ -724,7 +742,7 @@ func readSparseMap(r io.Reader, realsize int64) ([]extent, int64, error) {
 			continue // sentinel
 		}
 		if off < pos || off > realsize || sz > realsize-off {
-			return nil, 0, fmt.Errorf("tarstream: sparse extent [%d,+%d) out of order or bounds", off, sz)
+			return nil, 0, readerr.Mark(fmt.Errorf("tarstream: sparse extent [%d,+%d) out of order or bounds", off, sz), false)
 		}
 		extents = append(extents, extent{Offset: off, Size: sz})
 		pos = off + sz
@@ -735,10 +753,10 @@ func readSparseMap(r io.Reader, realsize int64) ([]extent, int64, error) {
 // readPAX reads and parses a PAX extended header's records.
 func readPAX(r io.Reader, size, padded int64) (map[string]string, bool, error) {
 	if size < 0 || padded < size || size > 1<<20 {
-		return nil, false, fmt.Errorf("tarstream: absurd PAX header size %d", size)
+		return nil, false, readerr.Mark(fmt.Errorf("tarstream: absurd PAX header size %d", size), false)
 	}
 	data := make([]byte, padded)
-	if _, err := io.ReadFull(r, data); err != nil {
+	if _, err := readFixed(r, data); err != nil {
 		return nil, false, err
 	}
 	paddingZero := isZeroBlock(data[size:])
@@ -748,16 +766,16 @@ func readPAX(r io.Reader, size, padded int64) (map[string]string, bool, error) {
 	for len(data) > 0 {
 		sp := bytes.IndexByte(data, ' ')
 		if sp <= 0 {
-			return nil, false, fmt.Errorf("tarstream: malformed PAX record")
+			return nil, false, readerr.Mark(fmt.Errorf("tarstream: malformed PAX record"), false)
 		}
 		n, err := strconv.Atoi(string(data[:sp]))
 		if err != nil || n <= sp || int64(n) > int64(len(data)) || data[n-1] != '\n' {
-			return nil, false, fmt.Errorf("tarstream: malformed PAX record length")
+			return nil, false, readerr.Mark(fmt.Errorf("tarstream: malformed PAX record length"), false)
 		}
 		kv := data[sp+1 : n-1]
 		eq := bytes.IndexByte(kv, '=')
 		if eq < 0 {
-			return nil, false, fmt.Errorf("tarstream: malformed PAX record (no =)")
+			return nil, false, readerr.Mark(fmt.Errorf("tarstream: malformed PAX record (no =)"), false)
 		}
 		recs[string(kv[:eq])] = string(kv[eq+1:])
 		data = data[n:]
@@ -917,11 +935,11 @@ func (v *seekView) Seek(offset int64, whence int) (int64, error) {
 	case io.SeekEnd:
 		base = v.logical
 	default:
-		return 0, fmt.Errorf("tarstream: bad whence %d", whence)
+		return 0, readerr.Mark(fmt.Errorf("tarstream: bad whence %d", whence), false)
 	}
 	n := base + offset
 	if n < 0 {
-		return 0, fmt.Errorf("tarstream: negative seek position")
+		return 0, readerr.Mark(fmt.Errorf("tarstream: negative seek position"), false)
 	}
 	v.pos = n
 	return n, nil
@@ -956,7 +974,7 @@ func (v *seekView) readAtPos(p []byte, pos int64) (int, error) {
 		if _, err := v.rs.Seek(v.dataStart+packed, io.SeekStart); err != nil {
 			return 0, err
 		}
-		read, err := io.ReadFull(v.rs, p[:n])
+		read, err := readFixed(v.rs, p[:n])
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
 		}
@@ -1004,7 +1022,7 @@ func (m *meta) runAt(offset, limit uint64) (sparse.RunKind, uint64, error) {
 		return 0, 0, io.EOF
 	}
 	if limit == 0 {
-		return 0, 0, fmt.Errorf("tarstream: invalid run: zero limit at offset %d", offset)
+		return 0, 0, readerr.Mark(fmt.Errorf("tarstream: invalid run: zero limit at offset %d", offset), false)
 	}
 	limEnd := offset + limit
 	if limEnd < offset || limEnd > size {
@@ -1084,11 +1102,11 @@ func (r tarSourceRun[S]) Kind() sparse.RunKind { return r.kind }
 
 func (r tarSourceRun[S]) ReadAt(ctx context.Context, buf []byte, innerOffset uint64) (int, error) {
 	if r.end <= r.offset {
-		return 0, fmt.Errorf("tarstream: invalid run [%d,%d)", r.offset, r.end)
+		return 0, readerr.Mark(fmt.Errorf("tarstream: invalid run [%d,%d)", r.offset, r.end), false)
 	}
 	runLength := r.end - r.offset
 	if innerOffset > runLength || uint64(len(buf)) > runLength-innerOffset {
-		return 0, fmt.Errorf("tarstream: run read offset %d length %d outside [0,%d)", innerOffset, len(buf), runLength)
+		return 0, readerr.Mark(fmt.Errorf("tarstream: run read offset %d length %d outside [0,%d)", innerOffset, len(buf), runLength), false)
 	}
 	if len(buf) == 0 {
 		return 0, nil
@@ -1107,7 +1125,7 @@ func (r tarSourceRun[S]) ReadAt(ctx context.Context, buf []byte, innerOffset uin
 	if err != nil {
 		return n, err
 	}
-	return n, fmt.Errorf("tarstream: short run read @ %d: %d of %d bytes", r.offset+innerOffset, n, len(buf))
+	return n, readerr.Mark(fmt.Errorf("tarstream: short run read @ %d: %d of %d bytes", r.offset+innerOffset, n, len(buf)), false)
 }
 
 func (s *readerAtSource) ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error) {
@@ -1184,7 +1202,7 @@ func (s *sourceView) ReadAt(ctx context.Context, buf []byte, offset uint64) (int
 	// underlying source.
 	pos := uint64(s.seq.pos)
 	if offset < pos {
-		return 0, fmt.Errorf("tarstream: backward ReadAt @ %d (position %d) on one-pass source", offset, pos)
+		return 0, readerr.Mark(fmt.Errorf("tarstream: backward ReadAt @ %d (position %d) on one-pass source", offset, pos), false)
 	}
 	if offset > pos {
 		if _, err := io.CopyN(io.Discard, s.seq, int64(offset-pos)); err != nil {
@@ -1194,7 +1212,7 @@ func (s *sourceView) ReadAt(ctx context.Context, buf []byte, offset uint64) (int
 			return 0, s.seq.finalErr
 		}
 	}
-	read, err := io.ReadFull(s.seq, buf[:n])
+	read, err := readFixed(s.seq, buf[:n])
 	if err != nil {
 		return read, err
 	}
@@ -1202,4 +1220,52 @@ func (s *sourceView) ReadAt(ctx context.Context, buf []byte, offset uint64) (int
 		return read, s.seq.finalErr
 	}
 	return n, eof
+}
+
+// artifactReaderAt enforces one complete random-access attempt before the
+// sequential metadata parser sees it. io.ReadFull must not consume a full
+// buffer accompanied by a terminal source error, nor stitch short attempts.
+type artifactReaderAt struct{ io.ReaderAt }
+
+func (r artifactReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if err := readAtFull(r.ReaderAt, p, off); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// A declared fixed-size field ending early is malformed. Wrapped transport
+// errors keep their own retry classification, including internal cancellation.
+func fixedReadError(err error) error {
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return readerr.Mark(err, false)
+	}
+	return err
+}
+
+// readFixed consumes one sequential field, preserving even a full-length
+// source failure. Partial successful Reader reads remain ordinary streaming.
+func readFixed(r io.Reader, p []byte) (n int, err error) {
+	for n < len(p) {
+		m, e := r.Read(p[n:])
+		if m < 0 || m > len(p)-n {
+			return n, readerr.Mark(fmt.Errorf("tarstream: invalid Reader count %d", m), false)
+		}
+		n += m
+		if e != nil {
+			if e == io.EOF {
+				if n == len(p) {
+					return n, nil
+				}
+				if n > 0 {
+					e = io.ErrUnexpectedEOF
+				}
+			}
+			if n == len(p) && e == io.ErrUnexpectedEOF {
+				e = readerr.Mark(e, false)
+			}
+			return n, e
+		}
+	}
+	return n, nil
 }

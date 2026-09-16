@@ -10,6 +10,7 @@ import (
 	"sort"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
@@ -60,35 +61,35 @@ type indexFooter struct {
 
 func checkedAdd64(left, right uint64) (uint64, error) {
 	if right > math.MaxUint64-left {
-		return 0, fmt.Errorf("unsigned addition overflows: %d + %d", left, right)
+		return 0, readerr.Mark(fmt.Errorf("unsigned addition overflows: %d + %d", left, right), false)
 	}
 	return left + right, nil
 }
 
 func checkedMul64(left, right uint64) (uint64, error) {
 	if left != 0 && right > math.MaxUint64/left {
-		return 0, fmt.Errorf("unsigned multiplication overflows: %d * %d", left, right)
+		return 0, readerr.Mark(fmt.Errorf("unsigned multiplication overflows: %d * %d", left, right), false)
 	}
 	return left * right, nil
 }
 
 func uint64AsInt(value uint64, field string) (int, error) {
 	if value > uint64(maxInt()) {
-		return 0, fmt.Errorf("manifest bundle: %s %d exceeds platform int", field, value)
+		return 0, readerr.Mark(fmt.Errorf("manifest bundle: %s %d exceeds platform int", field, value), false)
 	}
 	return int(value), nil
 }
 
 func uint64AsInt64(value uint64, field string) (int64, error) {
 	if value > math.MaxInt64 {
-		return 0, fmt.Errorf("manifest bundle: %s %d exceeds ReaderAt offset range", field, value)
+		return 0, readerr.Mark(fmt.Errorf("manifest bundle: %s %d exceeds ReaderAt offset range", field, value), false)
 	}
 	return int64(value), nil
 }
 
 func encodeIndexRecord(dst []byte, record indexRecord) error {
 	if len(dst) != indexRecordSize {
-		return fmt.Errorf("manifest bundle: index record buffer has %d bytes, want %d", len(dst), indexRecordSize)
+		return readerr.Mark(fmt.Errorf("manifest bundle: index record buffer has %d bytes, want %d", len(dst), indexRecordSize), false)
 	}
 	copy(dst[:32], record.Key[:])
 	binary.LittleEndian.PutUint64(dst[32:40], record.DataOffset)
@@ -100,7 +101,7 @@ func encodeIndexRecord(dst []byte, record indexRecord) error {
 func decodeIndexRecord(src []byte) (indexRecord, error) {
 	var record indexRecord
 	if len(src) != indexRecordSize {
-		return record, fmt.Errorf("manifest bundle: index record has %d bytes, want %d", len(src), indexRecordSize)
+		return record, readerr.Mark(fmt.Errorf("manifest bundle: index record has %d bytes, want %d", len(src), indexRecordSize), false)
 	}
 	copy(record.Key[:], src[:32])
 	record.DataOffset = binary.LittleEndian.Uint64(src[32:40])
@@ -140,26 +141,26 @@ func encodeIndexFooter(footer indexFooter) ([indexFooterSize]byte, error) {
 func decodeIndexFooter(encoded []byte, directoryOffset uint64) (indexFooter, error) {
 	var footer indexFooter
 	if len(encoded) != indexFooterSize {
-		return footer, fmt.Errorf("manifest bundle: index footer has %d bytes, want %d", len(encoded), indexFooterSize)
+		return footer, readerr.Mark(fmt.Errorf("manifest bundle: index footer has %d bytes, want %d", len(encoded), indexFooterSize), false)
 	}
 	if !bytes.Equal(encoded[:16], indexMagic[:]) {
-		return footer, fmt.Errorf("manifest bundle: invalid index footer magic")
+		return footer, readerr.Mark(fmt.Errorf("manifest bundle: invalid index footer magic"), false)
 	}
 	if version := binary.LittleEndian.Uint16(encoded[16:18]); version != indexVersion {
-		return footer, fmt.Errorf("manifest bundle: unsupported index version %d", version)
+		return footer, readerr.Mark(fmt.Errorf("manifest bundle: unsupported index version %d", version), false)
 	}
 	if size := binary.LittleEndian.Uint16(encoded[18:20]); size != indexFooterSize {
-		return footer, fmt.Errorf("manifest bundle: index footer size %d, want %d", size, indexFooterSize)
+		return footer, readerr.Mark(fmt.Errorf("manifest bundle: index footer size %d, want %d", size, indexFooterSize), false)
 	}
 	if size := binary.LittleEndian.Uint16(encoded[20:22]); size != indexRecordSize {
-		return footer, fmt.Errorf("manifest bundle: index record size %d, want %d", size, indexRecordSize)
+		return footer, readerr.Mark(fmt.Errorf("manifest bundle: index record size %d, want %d", size, indexRecordSize), false)
 	}
 	if encoded[22] != 0 || encoded[23] != 0 || !allZero(encoded[168:252]) {
-		return footer, fmt.Errorf("manifest bundle: index footer reserved bytes are non-zero")
+		return footer, readerr.Mark(fmt.Errorf("manifest bundle: index footer reserved bytes are non-zero"), false)
 	}
 	wantChecksum := binary.LittleEndian.Uint32(encoded[252:256])
 	if got := crc32.Checksum(encoded[:252], indexCRCTable); got != wantChecksum {
-		return footer, fmt.Errorf("manifest bundle: index footer checksum mismatch")
+		return footer, readerr.Mark(fmt.Errorf("manifest bundle: index footer checksum mismatch"), false)
 	}
 	footer.IndexPayloadOffset = binary.LittleEndian.Uint64(encoded[24:32])
 	footer.IndexPayloadSize = binary.LittleEndian.Uint64(encoded[32:40])
@@ -178,63 +179,63 @@ func decodeIndexFooter(encoded []byte, directoryOffset uint64) (indexFooter, err
 	}
 	payloadEnd, _ := checkedAdd64(footer.IndexPayloadOffset, footer.IndexPayloadSize)
 	if payloadEnd != directoryOffset {
-		return indexFooter{}, fmt.Errorf("manifest bundle: index payload end %d differs from Central Directory offset %d", payloadEnd, directoryOffset)
+		return indexFooter{}, readerr.Mark(fmt.Errorf("manifest bundle: index payload end %d differs from Central Directory offset %d", payloadEnd, directoryOffset), false)
 	}
 	footerOffset, _ := checkedAdd64(footer.Manifest.Offset, footer.Manifest.Size)
 	footerEnd, err := checkedAdd64(footerOffset, indexFooterSize)
 	if err != nil || footerEnd != directoryOffset {
-		return indexFooter{}, fmt.Errorf("manifest bundle: index footer is not adjacent to the Central Directory")
+		return indexFooter{}, readerr.Mark(fmt.Errorf("manifest bundle: index footer is not adjacent to the Central Directory"), false)
 	}
 	return footer, nil
 }
 
 func validateIndexFooterFields(footer indexFooter) error {
 	if footer.MetadataPrefixEnd == 0 || footer.MetadataPrefixEnd > maxMetadataPrefixBytes {
-		return fmt.Errorf("manifest bundle: metadata prefix end %d is outside limit %d", footer.MetadataPrefixEnd, maxMetadataPrefixBytes)
+		return readerr.Mark(fmt.Errorf("manifest bundle: metadata prefix end %d is outside limit %d", footer.MetadataPrefixEnd, maxMetadataPrefixBytes), false)
 	}
 	if footer.IndexPayloadSize < indexFooterSize || footer.IndexPayloadSize > maxIndexPayloadSize {
-		return fmt.Errorf("manifest bundle: index payload size %d is outside [%d,%d]", footer.IndexPayloadSize, indexFooterSize, maxIndexPayloadSize)
+		return readerr.Mark(fmt.Errorf("manifest bundle: index payload size %d is outside [%d,%d]", footer.IndexPayloadSize, indexFooterSize, maxIndexPayloadSize), false)
 	}
 	payloadOffset, err := checkedAdd64(footer.IndexHeaderOffset, uint64(indexLocalHeaderSize))
 	if err != nil || payloadOffset != footer.IndexPayloadOffset {
-		return fmt.Errorf("manifest bundle: index payload offset does not follow its canonical Local Header")
+		return readerr.Mark(fmt.Errorf("manifest bundle: index payload offset does not follow its canonical Local Header"), false)
 	}
 	if footer.IndexHeaderOffset < footer.MetadataPrefixEnd {
-		return fmt.Errorf("manifest bundle: index Local Header overlaps metadata prefix")
+		return readerr.Mark(fmt.Errorf("manifest bundle: index Local Header overlaps metadata prefix"), false)
 	}
 	manifestSize, err := checkedMul64(footer.Manifest.Count, indexRecordSize)
 	if err != nil || manifestSize != footer.Manifest.Size {
-		return fmt.Errorf("manifest bundle: Manifest index section size/count mismatch")
+		return readerr.Mark(fmt.Errorf("manifest bundle: Manifest index section size/count mismatch"), false)
 	}
 	chunkSize, err := checkedMul64(footer.Chunk.Count, indexRecordSize)
 	if err != nil || chunkSize != footer.Chunk.Size {
-		return fmt.Errorf("manifest bundle: Chunk index section size/count mismatch")
+		return readerr.Mark(fmt.Errorf("manifest bundle: Chunk index section size/count mismatch"), false)
 	}
 	if footer.Manifest.Count == 0 {
-		return fmt.Errorf("manifest bundle: index must contain at least one Manifest record")
+		return readerr.Mark(fmt.Errorf("manifest bundle: index must contain at least one Manifest record"), false)
 	}
 	totalCount, err := checkedAdd64(footer.Manifest.Count, footer.Chunk.Count)
 	if err != nil || totalCount > maxIndexRecords {
-		return fmt.Errorf("manifest bundle: index record count exceeds limit %d", maxIndexRecords)
+		return readerr.Mark(fmt.Errorf("manifest bundle: index record count exceeds limit %d", maxIndexRecords), false)
 	}
 	if footer.Chunk.Offset != footer.IndexPayloadOffset {
-		return fmt.Errorf("manifest bundle: Chunk index section is not first in index payload")
+		return readerr.Mark(fmt.Errorf("manifest bundle: Chunk index section is not first in index payload"), false)
 	}
 	chunkEnd, err := checkedAdd64(footer.Chunk.Offset, footer.Chunk.Size)
 	if err != nil || footer.Manifest.Offset != chunkEnd {
-		return fmt.Errorf("manifest bundle: index sections overlap or contain a gap")
+		return readerr.Mark(fmt.Errorf("manifest bundle: index sections overlap or contain a gap"), false)
 	}
 	manifestEnd, err := checkedAdd64(footer.Manifest.Offset, footer.Manifest.Size)
 	if err != nil {
-		return fmt.Errorf("manifest bundle: Manifest index section range overflows")
+		return readerr.Mark(fmt.Errorf("manifest bundle: Manifest index section range overflows"), false)
 	}
 	payloadEnd, err := checkedAdd64(footer.IndexPayloadOffset, footer.IndexPayloadSize)
 	if err != nil {
-		return fmt.Errorf("manifest bundle: index payload range overflows")
+		return readerr.Mark(fmt.Errorf("manifest bundle: index payload range overflows"), false)
 	}
 	footerEnd, err := checkedAdd64(manifestEnd, indexFooterSize)
 	if err != nil || footerEnd != payloadEnd {
-		return fmt.Errorf("manifest bundle: index sections do not exactly precede the footer")
+		return readerr.Mark(fmt.Errorf("manifest bundle: index sections do not exactly precede the footer"), false)
 	}
 	if _, err := uint64AsInt64(payloadEnd, "index payload end"); err != nil {
 		return err
@@ -264,7 +265,7 @@ func buildIndexPayload(metadataPrefixEnd, indexHeaderOffset uint64, manifestReco
 	}
 	totalCount, err := checkedAdd64(uint64(len(manifests)), uint64(len(chunks)))
 	if err != nil || totalCount > maxIndexRecords {
-		return nil, indexFooter{}, fmt.Errorf("manifest bundle: index record count exceeds limit %d", maxIndexRecords)
+		return nil, indexFooter{}, readerr.Mark(fmt.Errorf("manifest bundle: index record count exceeds limit %d", maxIndexRecords), false)
 	}
 	chunkBytes, err := encodeIndexRecords(chunks)
 	if err != nil {
@@ -276,15 +277,15 @@ func buildIndexPayload(metadataPrefixEnd, indexHeaderOffset uint64, manifestReco
 	}
 	payloadOffset, err := checkedAdd64(indexHeaderOffset, uint64(indexLocalHeaderSize))
 	if err != nil {
-		return nil, indexFooter{}, fmt.Errorf("manifest bundle: index Local Header range overflows")
+		return nil, indexFooter{}, readerr.Mark(fmt.Errorf("manifest bundle: index Local Header range overflows"), false)
 	}
 	manifestOffset, err := checkedAdd64(payloadOffset, uint64(len(chunkBytes)))
 	if err != nil {
-		return nil, indexFooter{}, fmt.Errorf("manifest bundle: Chunk index section range overflows")
+		return nil, indexFooter{}, readerr.Mark(fmt.Errorf("manifest bundle: Chunk index section range overflows"), false)
 	}
 	payloadSize, err := checkedAdd64(uint64(len(chunkBytes)+len(manifestBytes)), indexFooterSize)
 	if err != nil || payloadSize > maxIndexPayloadSize {
-		return nil, indexFooter{}, fmt.Errorf("manifest bundle: index payload exceeds %d bytes", maxIndexPayloadSize)
+		return nil, indexFooter{}, readerr.Mark(fmt.Errorf("manifest bundle: index payload exceeds %d bytes", maxIndexPayloadSize), false)
 	}
 	footer := indexFooter{
 		IndexPayloadOffset: payloadOffset,
@@ -324,7 +325,7 @@ func sortIndexRecords(records []indexRecord) {
 func encodeIndexRecords(records []indexRecord) ([]byte, error) {
 	size, err := checkedMul64(uint64(len(records)), indexRecordSize)
 	if err != nil || size > maxIndexPayloadSize {
-		return nil, fmt.Errorf("manifest bundle: index record section is too large")
+		return nil, readerr.Mark(fmt.Errorf("manifest bundle: index record section is too large"), false)
 	}
 	length, err := uint64AsInt(size, "index record section")
 	if err != nil {
@@ -341,10 +342,10 @@ func encodeIndexRecords(records []indexRecord) ([]byte, error) {
 
 func decodeIndexRecords(encoded []byte, section indexSection, partition store.Partition, footer indexFooter) (map[store.ContentKey]archiveEntry, error) {
 	if uint64(len(encoded)) != section.Size {
-		return nil, fmt.Errorf("manifest bundle: %s index read %d bytes, want %d", partition, len(encoded), section.Size)
+		return nil, readerr.Mark(fmt.Errorf("manifest bundle: %s index read %d bytes, want %d", partition, len(encoded), section.Size), false)
 	}
 	if sha256.Sum256(encoded) != section.Digest {
-		return nil, fmt.Errorf("manifest bundle: %s index section digest mismatch", partition)
+		return nil, readerr.Mark(fmt.Errorf("manifest bundle: %s index section digest mismatch", partition), false)
 	}
 	count, err := uint64AsInt(section.Count, string(partition)+" index count")
 	if err != nil {
@@ -370,30 +371,30 @@ func decodeIndexRecords(encoded []byte, section indexSection, partition store.Pa
 
 func validateIndexRecords(records []indexRecord, partition store.Partition, metadataPrefixEnd, indexHeaderOffset uint64) error {
 	if len(records) > maxIndexRecords {
-		return fmt.Errorf("manifest bundle: %s index record count exceeds limit %d", partition, maxIndexRecords)
+		return readerr.Mark(fmt.Errorf("manifest bundle: %s index record count exceeds limit %d", partition, maxIndexRecords), false)
 	}
 	for index, record := range records {
 		if index != 0 && bytes.Compare(records[index-1].Key[:], record.Key[:]) >= 0 {
-			return fmt.Errorf("manifest bundle: %s index records are not strictly sorted at record %d", partition, index)
+			return readerr.Mark(fmt.Errorf("manifest bundle: %s index records are not strictly sorted at record %d", partition, index), false)
 		}
 		switch partition {
 		case store.PartitionManifest:
 			if record.Size < 5 || uint64(record.Size) > uint64(codec.MaxManifestDecodedSize)+1 {
-				return fmt.Errorf("manifest bundle: Manifest %x physical size %d is invalid", record.Key, record.Size)
+				return readerr.Mark(fmt.Errorf("manifest bundle: Manifest %x physical size %d is invalid", record.Key, record.Size), false)
 			}
 		case store.PartitionChunk:
 			if record.Size == 0 || uint64(record.Size) > uint64(codec.MaxChunkDecodedSize)+1 {
-				return fmt.Errorf("manifest bundle: Chunk %x physical size %d is invalid", record.Key, record.Size)
+				return readerr.Mark(fmt.Errorf("manifest bundle: Chunk %x physical size %d is invalid", record.Key, record.Size), false)
 			}
 		default:
-			return fmt.Errorf("manifest bundle: unsupported index partition %q", partition)
+			return readerr.Mark(fmt.Errorf("manifest bundle: unsupported index partition %q", partition), false)
 		}
 		end, err := checkedAdd64(record.DataOffset, uint64(record.Size))
 		if err != nil {
-			return fmt.Errorf("manifest bundle: %s %x data range overflows", partition, record.Key)
+			return readerr.Mark(fmt.Errorf("manifest bundle: %s %x data range overflows", partition, record.Key), false)
 		}
 		if record.DataOffset < metadataPrefixEnd || end > indexHeaderOffset {
-			return fmt.Errorf("manifest bundle: %s %x data range [%d,%d) is outside the object region", partition, record.Key, record.DataOffset, end)
+			return readerr.Mark(fmt.Errorf("manifest bundle: %s %x data range [%d,%d) is outside the object region", partition, record.Key, record.DataOffset, end), false)
 		}
 	}
 	return nil
@@ -412,7 +413,7 @@ func validateArchiveEntryRanges(manifests, chunks map[store.ContentKey]archiveEn
 		for key, entry := range entries {
 			end, err := checkedAdd64(entry.dataOffset, uint64(entry.size))
 			if err != nil {
-				return fmt.Errorf("manifest bundle: %s %x data range overflows", partition, key)
+				return readerr.Mark(fmt.Errorf("manifest bundle: %s %x data range overflows", partition, key), false)
 			}
 			ranges = append(ranges, indexedObjectRange{start: entry.dataOffset, end: end, partition: partition, key: key})
 		}
@@ -434,7 +435,7 @@ func validateArchiveEntryRanges(manifests, chunks map[store.ContentKey]archiveEn
 		previous := ranges[index-1]
 		current := ranges[index]
 		if current.start < previous.end {
-			return fmt.Errorf("manifest bundle: indexed object ranges overlap: %s %x and %s %x", previous.partition, previous.key, current.partition, current.key)
+			return readerr.Mark(fmt.Errorf("manifest bundle: indexed object ranges overlap: %s %x and %s %x", previous.partition, previous.key, current.partition, current.key), false)
 		}
 	}
 	return nil

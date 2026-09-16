@@ -41,6 +41,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"io"
 )
 
@@ -157,11 +158,14 @@ func (s *staticSource) ReadAt(_ context.Context, buf []byte, offset uint64) (int
 		eof = io.EOF
 	}
 	m, err := s.ra.ReadAt(buf[:n], int64(offset))
+	if err == io.ErrUnexpectedEOF {
+		err = readerr.Mark(err, false)
+	}
 	if err != nil && err != io.EOF {
 		return m, fmt.Errorf("sparse: read @ %d: %w", offset, err)
 	}
 	if m < n {
-		return m, fmt.Errorf("sparse: short read @ %d: %d of %d bytes", offset, m, n)
+		return m, readerr.Mark(fmt.Errorf("sparse: short read @ %d: %d of %d bytes", offset, m, n), false)
 	}
 	return n, eof
 }
@@ -198,7 +202,7 @@ func (s *denseSource) ReadAt(ctx context.Context, buf []byte, offset uint64) (in
 		return 0, io.EOF
 	}
 	if offset < s.pos {
-		return 0, fmt.Errorf("sparse: dense source: backward read @ %d (consumed through %d)", offset, s.pos)
+		return 0, readerr.Mark(fmt.Errorf("sparse: dense source: backward read @ %d (consumed through %d)", offset, s.pos), false)
 	}
 	if offset > s.pos {
 		if _, err := io.CopyN(io.Discard, s.r, int64(offset-s.pos)); err != nil {
@@ -212,11 +216,29 @@ func (s *denseSource) ReadAt(ctx context.Context, buf []byte, offset uint64) (in
 		n = int(s.size - offset)
 		eof = io.EOF
 	}
-	if _, err := io.ReadFull(s.r, buf[:n]); err != nil {
+	// io.ReadFull suppresses any error accompanying a full buffer, including
+	// an explicit source failure. Observe that cause before accepting bytes.
+	reader := &observedReader{Reader: s.r}
+	consumed, err := io.ReadFull(reader, buf[:n])
+	s.pos += uint64(consumed)
+	if err == nil && reader.err != io.EOF {
+		err = reader.err
+	}
+	if err != nil {
 		return 0, s.short(err)
 	}
-	s.pos = offset + uint64(n)
 	return n, eof
+}
+
+type observedReader struct {
+	io.Reader
+	err error
+}
+
+func (r *observedReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	r.err = err
+	return n, err
 }
 
 // short maps an early end of the underlying reader to a hard error:
@@ -224,12 +246,12 @@ func (s *denseSource) ReadAt(ctx context.Context, buf []byte, offset uint64) (in
 // not EOF.
 func (s *denseSource) short(err error) error {
 	if err == io.EOF || err == io.ErrUnexpectedEOF {
-		return fmt.Errorf("sparse: dense source ended early (declared %d bytes): %w", s.size, io.ErrUnexpectedEOF)
+		return readerr.Mark(fmt.Errorf("sparse: dense source ended early (declared %d bytes): %w", s.size, io.ErrUnexpectedEOF), false)
 	}
 	return err
 }
 
-var errInvalidRun = errors.New("sparse: invalid run")
+var errInvalidRun = readerr.Mark(errors.New("sparse: invalid run"), false)
 
 // sourceRun is the lightweight Run used by the built-in Sources. Data reads
 // delegate to Source.ReadAt so one-pass and concurrency guarantees are
@@ -271,7 +293,7 @@ func (r sourceRun[S]) ReadAt(ctx context.Context, buf []byte, innerOffset uint64
 	if err != nil {
 		return n, err
 	}
-	return n, fmt.Errorf("sparse: short run read @ %d: %d of %d bytes", r.offset+innerOffset, n, len(buf))
+	return n, readerr.Mark(fmt.Errorf("sparse: short run read @ %d: %d of %d bytes", r.offset+innerOffset, n, len(buf)), false)
 }
 
 func boundedRunEnd(size, offset, limit uint64) (uint64, error) {

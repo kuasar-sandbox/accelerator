@@ -2,10 +2,12 @@ package fetch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
 
@@ -182,13 +184,17 @@ func readStreamAt(ctx context.Context, stream Stream, buf []byte, offset uint64)
 	cctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
-	errCh := make(chan error, 1)
-	var once sync.Once
+	var errorsMu sync.Mutex
+	var readErrors []error
 	report := func(err error) {
-		once.Do(func() {
-			errCh <- err
-			cancel()
-		})
+		errorsMu.Lock()
+		// A peer's derived cancellation adds no cause. Keep the first actual
+		// error and every later error that may contain a permanent cause.
+		if len(readErrors) == 0 || !errors.Is(err, context.Canceled) || readerr.IsPermanent(err) {
+			readErrors = append(readErrors, err)
+		}
+		cancel()
+		errorsMu.Unlock()
 	}
 
 	for _, run := range plan {
@@ -203,21 +209,25 @@ func readStreamAt(ctx context.Context, stream Stream, buf []byte, offset uint64)
 		go func(run sparse.Run, dst []byte) {
 			defer wg.Done()
 			n, err := run.ReadAt(cctx, dst, 0)
+			if n == len(dst) && !readerr.IsPermanent(err) && err == io.EOF {
+				err = nil
+			}
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				err = readerr.Mark(err, false)
+			}
 			if err != nil {
 				report(fmt.Errorf("fetch: read [%d,%d): %w", run.Offset(), run.End(), err))
 				return
 			}
 			if n != len(dst) {
-				report(fmt.Errorf("fetch: short read [%d,%d): got %d of %d bytes", run.Offset(), run.End(), n, len(dst)))
+				report(readerr.Mark(fmt.Errorf("fetch: short read [%d,%d): got %d of %d bytes", run.Offset(), run.End(), n, len(dst)), false))
 			}
 		}(run, dst)
 	}
 
 	wg.Wait()
-	select {
-	case err := <-errCh:
+	if err := errors.Join(readErrors...); err != nil {
 		return 0, err
-	default:
 	}
 	return int(readLen), eof
 }

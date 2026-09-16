@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/accelerator/pkg/store/pb"
 )
@@ -162,16 +163,18 @@ func (c *Client) admitWrite(ctx context.Context, requested store.Generation) (st
 // callers materialise anyway. Miss is translated from gRPC NotFound
 // to (false, nil, nil).
 func (c *Client) Get(ctx context.Context, partition store.Partition, key store.ContentKey) (bool, []byte, error) {
+	ctx, endAttempt := context.WithCancel(ctx)
+	defer endAttempt()
 	ctx, cancel := c.withTimeout(ctx)
 	defer cancel()
 
 	pp, err := storePartitionToProto(partition)
 	if err != nil {
-		return false, nil, err
+		return false, nil, readerr.Mark(err, false)
 	}
 	stream, err := c.pickStub().Get(ctx, &pb.GetRequest{Partition: pp, Key: key[:]})
 	if err != nil {
-		return false, nil, fmt.Errorf("store: Get open: %w", err)
+		return false, nil, fmt.Errorf("store: Get open: %w", classifyGetError(err))
 	}
 
 	var buf bytes.Buffer
@@ -184,11 +187,20 @@ func (c *Client) Get(ctx context.Context, partition store.Partition, key store.C
 			if status.Code(err) == codes.NotFound {
 				return false, nil, nil
 			}
-			return false, nil, fmt.Errorf("store: Get recv: %w", err)
+			return false, nil, fmt.Errorf("store: Get recv: %w", classifyGetError(err))
 		}
 		buf.Write(msg.GetData())
 	}
 	return true, buf.Bytes(), nil
+}
+
+// Only the read protocol's definite request/closed-client failures are final.
+// Internal timeouts, cancellations and opaque server errors remain access errors.
+func classifyGetError(err error) error {
+	if status.Code(err) == codes.InvalidArgument || errors.Is(err, grpc.ErrClientConnClosing) {
+		return readerr.Mark(err, false)
+	}
+	return err
 }
 
 // Put streams a byte payload to the store. The caller-supplied key is

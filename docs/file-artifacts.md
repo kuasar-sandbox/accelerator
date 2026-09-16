@@ -164,7 +164,7 @@ A caller-supplied `bundle.SourceResolver` resolves paths and locations. Accelera
 
 There is no per-object fallback Getter mixing Bundles. A corrupt local Manifest does not cause a retry from another Bundle or Store. Current/refs source selection only queries the Manifest maps loaded at Open; a clean miss does not read a Chunk section.
 
-Once a Bundle is selected, its Reader loads the entire Chunk section contiguously **before returning a Stream**, validates its digest/records/ranges and builds an O(1) immutable map. `sync.Once` combines concurrent preparation into one read; its error or cancellation is shared by all callers. A remote source has no Bundle Reader and skips this preparation.
+Once a Bundle is selected, its Reader loads the entire Chunk section contiguously **before returning a Stream**, validates its digest/records/ranges and builds an O(1) immutable map. Preparation serializes concurrent loaders and caches only a successful validated index; after failure or cancellation, later calls can load it again. A remote source has no Bundle Reader and skips this preparation.
 
 After preparation, Manifest/Chunk Get uses the record's payload DataOffset/Size for one target-payload range read, without rereading the index, object Local Header or Central Directory. The Stream's first data read therefore does not pay an O(Chunk-record-count) initialization cost.
 
@@ -192,3 +192,5 @@ Strict paths then verify the full closure and object content. A missing but unac
 Each object uses its source Bundle's recorded admission. Upload neither redirects objects to the newest generation nor rechunks, recompresses, re-encrypts, reseals the table or rewrites upper-level `snapshot.cfg`. Root ManifestKey and physical bytes remain unchanged. Failure in admission preflight, dependency verification or Put prevents final root publication. Refs and admission entries are container metadata, not Store objects, and are not uploaded.
 
 FullVerify also rejects chunks unreferenced by any local Manifest. After parsing snapshot-specific metadata, the caller can supply `ExpectedManifests` as the exact locally reachable Manifest set, rejecting unrelated Manifests without making accelerator interpret `snapshot.cfg`.
+
+Read error classification, initialization ownership and recovery are specified in [Read errors and recovery](accelerator-read-recovery.md).

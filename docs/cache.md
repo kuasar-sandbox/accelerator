@@ -305,7 +305,7 @@ Individual backends can have their own quorum semantics. For example, insufficie
 
 A client can send CancelRequest (0x06) while an operation is in flight. The server cancels the handler context and responds with StatusCancelled (0x03), also cancelling pending queued requests on that connection. Context-aware remote hops and origin I/O can stop; synchronous RocksDB CGO cannot be interrupted in the middle of its call, so cancellation is not a universal instantaneous backend-stop guarantee.
 
-EC uses this mechanism to cancel remaining foreground ShardGets once **data distinct valid shard indexes** have arrived. It need not wait for every peer to serve the read. A cancelled slow peer is unknown, not a confirmed miss; repair handles that distinction (§4.7).
+Once **data distinct valid shard indexes** have arrived, EC cancels the remaining foreground ShardGet contexts. The wire client interrupts the socket operation through its deadline, joins the cancellation callback and discards that connection. Closing it also cancels the server handler. EC need not wait for every peer to serve the read. A cancelled slow peer is unknown, not a confirmed miss; repair handles that distinction (§4.7).
 
 #### Operations not provided
 
@@ -783,3 +783,5 @@ Record workload controls `VALUE_SIZE`, `PREFILL`, `COLD_PREFILL`, `MISS_RATIO`, 
 - [project performance guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf.md): cache measurement and evidence limits.
 - [README](../README.md) / [Makefile](../Makefile): `make cache-ctl` builds the repository's CGO binary after deps-rocksdb, statically linking librocksdb.
 - [system architecture](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox.md): the cache model in the platform.
+
+Immutable read errors and client recovery are specified in [Read errors and recovery](accelerator-read-recovery.md).
