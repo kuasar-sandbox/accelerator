@@ -276,15 +276,19 @@ func prefetchStream(ctx context.Context, stream Stream) error {
 			walkErr = err
 			break
 		}
+		// A resolver failure must abort Gets already in flight, otherwise
+		// Prefetch waits for the backend before it can return walkErr.
 		run, err := stream.RunAt(offset, end-offset)
 		if err != nil {
 			releaseRun(run)
 			walkErr = err
+			cancel()
 			break
 		}
 		if err := validateRun(run, offset, end); err != nil {
 			releaseRun(run)
 			walkErr = err
+			cancel()
 			break
 		}
 		next := run.End()
@@ -306,13 +310,16 @@ func prefetchStream(ctx context.Context, stream Stream) error {
 	}
 	close(jobs)
 	wg.Wait()
-	if walkErr != nil {
-		return walkErr
-	}
+	// report stores the worker's Get error and cancels the derived context so
+	// the walk can stop. That cancel is not the cause; prefer the buffered
+	// worker error unless the walk failed independently.
 	select {
 	case err := <-errCh:
-		return err
+		if walkErr == nil || errors.Is(walkErr, context.Canceled) {
+			return err
+		}
+		return walkErr
 	default:
-		return nil
+		return walkErr
 	}
 }
