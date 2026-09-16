@@ -18,6 +18,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	ggcrremote "github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
+	"github.com/google/go-containerregistry/pkg/v1/static"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 )
 
@@ -29,6 +30,15 @@ const (
 	AnnOwner   = "vnd.kuasar.flatten-manifest.owner"
 	AnnID      = "vnd.kuasar.flatten-manifest.id"
 	AnnValidAt = "vnd.kuasar.flatten-manifest.valid_at"
+)
+
+// The OCI 1.1 "empty descriptor" layer carried by the referrer artifact: the
+// fixed 2-byte "{}" blob under the empty media type. Spec guidance for
+// artifact manifests; some registries (e.g. SWR) reject zero-layer manifests
+// with MANIFEST_INVALID. The well-known digest makes it free to store.
+var (
+	emptyLayerBlob      = []byte("{}")
+	emptyLayerMediaType = types.MediaType("application/vnd.oci.empty.v1+json")
 )
 
 var ErrReferrersUnsupported = errors.New("remote: registry does not support OCI referrers")
@@ -249,22 +259,9 @@ func (c *Config) PutReferrerByOwner(ctx context.Context, subj *Resolved, id, own
 		return fmt.Errorf("remote: subject descriptor %s: %w", subj.Digest, err)
 	}
 
-	// No mutate.ArtifactType in this ggcr version: carry the artifactType as
-	// the config media type. Registries surface a referrer's config media
-	// type as its artifactType when the artifactType field is absent, so the
-	// WithFilter("artifactType", ...) lookup in FindReferrer still matches.
-	art := mutate.ConfigMediaType(empty.Image, types.MediaType(RefererArtifactType))
-	// Force an OCI image manifest. empty.Image serialises as a Docker schema2
-	// manifest by default, which has no `subject` field semantics — a compliant
-	// OCI 1.1 registry (e.g. zot) then ignores the subject and never indexes the
-	// referrer (the in-memory test registry's tag-schema fallback hides this).
-	// Only an OCI image manifest carries a subject the Referrers API honours.
-	art = mutate.MediaType(art, types.OCIManifestSchema1)
-	annotated := mutate.Annotations(art, anns)
-	withSubject := mutate.Subject(annotated, sd.Descriptor)
-	img, ok := withSubject.(v1.Image)
-	if !ok {
-		return errors.New("remote: referrer artifact is not an image")
+	img, err := referrerArtifact(anns, sd.Descriptor)
+	if err != nil {
+		return err
 	}
 
 	d, err := img.Digest()
@@ -276,6 +273,40 @@ func (c *Config) PutReferrerByOwner(ctx context.Context, subj *Resolved, id, own
 		return fmt.Errorf("remote: write referrer (needs push access to %s): %w", subj.Repo, err)
 	}
 	return nil
+}
+
+// referrerArtifact builds the OCI image manifest that registers a
+// flatten-manifest referrer on a subject image.
+//
+// No mutate.ArtifactType in this ggcr version: the artifactType is carried as
+// the config media type. Registries surface a referrer's config media type as
+// its artifactType when the artifactType field is absent, so the
+// WithFilter("artifactType", ...) lookup in FindReferrer still matches.
+//
+// The manifest is forced to OCI (empty.Image serialises as Docker schema2 by
+// default, which has no subject semantics — a compliant OCI 1.1 registry then
+// ignores the subject and never indexes the referrer), and carries the OCI 1.1
+// "empty descriptor" layer: some registries (e.g. SWR) reject zero-layer
+// manifests outright with MANIFEST_INVALID. The layer is the fixed well-known
+// 2-byte blob, so stores dedup it to nothing.
+//
+// Order matters: mutate wrappers overwrite Subject (mutate.image.compute
+// assigns it unconditionally), so the layer must be appended BEFORE Subject
+// wraps the image. Annotations merges and is order-safe.
+func referrerArtifact(anns map[string]string, subject v1.Descriptor) (v1.Image, error) {
+	art := mutate.ConfigMediaType(empty.Image, types.MediaType(RefererArtifactType))
+	art = mutate.MediaType(art, types.OCIManifestSchema1)
+	withLayer, err := mutate.AppendLayers(art, static.NewLayer(emptyLayerBlob, emptyLayerMediaType))
+	if err != nil {
+		return nil, fmt.Errorf("remote: referrer empty layer: %w", err)
+	}
+	annotated := mutate.Annotations(withLayer, anns)
+	withSubject := mutate.Subject(annotated, subject)
+	img, ok := withSubject.(v1.Image)
+	if !ok {
+		return nil, errors.New("remote: referrer artifact is not an image")
+	}
+	return img, nil
 }
 
 func validManifestID(id string) bool {
