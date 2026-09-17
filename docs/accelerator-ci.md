@@ -1,6 +1,6 @@
 # CI portability preparation
 
-[English](ci.md) | [简体中文](ci_zh.md)
+[English](accelerator-ci.md) | [简体中文](accelerator-ci_zh.md)
 
 Accelerator#134 / platform#128 is **prepared, not activated** while the repositories
 are private. This change does not publish source, change visibility, billing or
@@ -78,3 +78,5 @@ release bootstrap checkouts to its immutable upstream SHA, and qualify actual
 candidate source/build/release behavior on a standard runner. Refresh pins after
 squash or rebase. Passing offline fixtures or preparing a private repository
 does not establish that its Public CI route is active or accepted.
+
+Normal Go RocksDB tests retain the upstream binding’s compression-library link flags; the accelerator profile explicitly supplies Snappy, LZ4, Zstandard and zlib development libraries. This does not enable compression in the existing native RocksDB recipe.

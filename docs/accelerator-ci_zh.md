@@ -1,6 +1,6 @@
 # CI 可移植性准备
 
-[English](ci.md) | [简体中文](ci_zh.md)
+[English](accelerator-ci.md) | [简体中文](accelerator-ci_zh.md)
 
 仓库仍为 private 时,accelerator#134 / platform#128 仅为**已准备,未激活**。
 本变更不发布源码,不调整可见性、计费或 quota,也不建立 private CI 的 public relay。
@@ -66,3 +66,5 @@ binary/link-map fixture 与模拟 API 响应,不等于真实 RocksDB/云资格�
 不可变 upstream SHA,并在标准 runner 验证真实候选源码、构建和发布行为。
 Squash/rebase 后需更新 pin。Private 仓的准备或离线 fixture 通过,不代表 Public
 CI 路由已经激活或已经验收。
+
+普通 Go RocksDB 测试保留上游绑定的压缩库链接参数;accelerator profile 显式提供 Snappy、LZ4、Zstandard 与 zlib 开发库,并不启用原有 native RocksDB recipe 的压缩功能。

@@ -57,7 +57,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: kuasar-sandbox/kuasar-sandbox
-          ref: d453b25008de9ada247e68def2b5c1e8429ca9f4
+          ref: 6404939c1c71f04f76a7ec4f24426d0dc76f56f0
           token: ${{ github.token }}
           path: trusted/platform
           sparse-checkout: |
@@ -109,7 +109,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: kuasar-sandbox/kuasar-sandbox
-          ref: d453b25008de9ada247e68def2b5c1e8429ca9f4
+          ref: 6404939c1c71f04f76a7ec4f24426d0dc76f56f0
           token: ${{ github.token }}
           path: trusted/platform
           sparse-checkout: |
@@ -235,7 +235,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: kuasar-sandbox/kuasar-sandbox
-          ref: d453b25008de9ada247e68def2b5c1e8429ca9f4
+          ref: 6404939c1c71f04f76a7ec4f24426d0dc76f56f0
           token: ${{ github.token }}
           path: trusted/platform
           sparse-checkout: |
@@ -291,7 +291,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: kuasar-sandbox/kuasar-sandbox
-          ref: d453b25008de9ada247e68def2b5c1e8429ca9f4
+          ref: 6404939c1c71f04f76a7ec4f24426d0dc76f56f0
           token: ${{ github.token }}
           path: trusted/platform
           sparse-checkout: |
