@@ -34,7 +34,7 @@ concurrency:
 
 jobs:
   preflight:
-    runs-on: [self-hosted, Linux, X64, kuasar-control]
+    runs-on: ${{ fromJSON(github.event.repository.private == false && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","kuasar-control"]') }}
     outputs:
       source_ref: ${{ steps.request.outputs.source_ref }}
       source_sha: ${{ steps.request.outputs.source_sha }}
@@ -50,6 +50,24 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # Pinned shared implementation; refresh after its normal squash merge.
+      - name: Check out pinned hosted bootstrap
+        if: github.event.repository.private == false
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kuasar-sandbox/kuasar-sandbox
+          ref: d453b25008de9ada247e68def2b5c1e8429ca9f4
+          token: ${{ github.token }}
+          path: trusted/platform
+          sparse-checkout: |
+            ci/hosted
+            .github/workflows
+          persist-credentials: false
+
+      - name: Bootstrap standard runner
+        if: github.event.repository.private == false
+        run: bash trusted/platform/ci/hosted/bootstrap.sh --profile release-control
 
       - name: Install pinned GitHub CLI
         run: bash scripts/install-gh-cli.sh
@@ -79,20 +97,58 @@ jobs:
 
   build:
     needs: preflight
-    runs-on: [self-hosted, Linux, X64, kuasar-e2e]
-    timeout-minutes: 45
+    runs-on: ${{ fromJSON(github.event.repository.private == false && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","kuasar-e2e"]') }}
+    timeout-minutes: ${{ github.event.repository.private == false && 90 || 45 }}
     env:
       TARGET_ARCH: x86_64
-      GOPROXY: https://goproxy.cn,direct
-      GOSUMDB: sum.golang.google.cn
-      GOTOOLCHAIN: local
+      KUASAR_HOSTED: ${{ github.event.repository.private == false }}
     steps:
+      # Pinned shared implementation; refresh after its normal squash merge.
+      - name: Check out pinned hosted bootstrap
+        if: github.event.repository.private == false
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kuasar-sandbox/kuasar-sandbox
+          ref: d453b25008de9ada247e68def2b5c1e8429ca9f4
+          token: ${{ github.token }}
+          path: trusted/platform
+          sparse-checkout: |
+            ci/hosted
+            .github/workflows
+          persist-credentials: false
+
+      - name: Bootstrap standard runner
+        if: github.event.repository.private == false
+        run: bash trusted/platform/ci/hosted/bootstrap.sh --profile accelerator
+
+      - name: Check out trusted build checks
+        if: env.KUASAR_HOSTED == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted/accelerator
+          persist-credentials: false
+
+      - name: Check hosted CI regression contracts
+        if: env.KUASAR_HOSTED == 'true'
+        run: python3 trusted/accelerator/scripts/ci-test-workflows.py trusted/platform
+
+      - name: Configure persistent runner environment
+        if: env.KUASAR_HOSTED != 'true'
+        run: |
+          cat >> "$GITHUB_ENV" <<'EOF'
+          GOPROXY=https://goproxy.cn,direct
+          GOSUMDB=sum.golang.google.cn
+          GOTOOLCHAIN=local
+          EOF
+
       - name: Check out exact component source
         id: checkout-source
         continue-on-error: true
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.preflight.outputs.source_sha }}
+          path: src/accelerator
           persist-credentials: false
 
       - name: Retry exact component source checkout
@@ -100,27 +156,54 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.preflight.outputs.source_sha }}
+          path: src/accelerator
           persist-credentials: false
 
       - name: Attach native source cache
+        if: env.KUASAR_HOSTED != 'true'
+        working-directory: src/accelerator
         run: |
           set -euo pipefail
           install -d -m 0755 /var/cache/kuasar/tarballs
           mkdir -p build
           ln -sfn /var/cache/kuasar/tarballs build/tarball
 
-      - name: Build and test accelerator
+      - name: Attach job-local native source cache
+        if: env.KUASAR_HOSTED == 'true'
+        working-directory: src/accelerator
         run: |
           set -euo pipefail
+          mkdir -p build
+          ln -sfn "$KUASAR_TARBALL_CACHE" build/tarball
+
+      - name: Build and test accelerator
+        working-directory: src/accelerator
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          if [ "$KUASAR_HOSTED" = true ]; then
+            taskset -pc "$KUASAR_BUILD_CPUS" "$$" >/dev/null
+          fi
           make test
           make vet
           make build
+          make test-release
+
+      - name: Check the released accelerator ABI
+        if: env.KUASAR_HOSTED == 'true'
+        run: python3 trusted/accelerator/scripts/ci-check-abi.py src/accelerator/bin/x86_64
 
       - name: Package the component release
+        working-directory: src/accelerator
+        shell: bash
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           set -euo pipefail
+          if [ "$KUASAR_HOSTED" = true ]; then
+            taskset -pc "$KUASAR_BUILD_CPUS" "$$" >/dev/null
+          fi
           export SOURCE_DATE_EPOCH
           [ "$(git rev-parse HEAD)" = "${{ needs.preflight.outputs.source_sha }}" ]
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct "${{ needs.preflight.outputs.source_sha }}")
@@ -130,13 +213,13 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: component-release-${{ needs.preflight.outputs.version }}-${{ github.run_id }}
-          path: release-bundle
+          path: src/accelerator/release-bundle
           if-no-files-found: error
           retention-days: 1
 
   publish:
     needs: [preflight, build]
-    runs-on: [self-hosted, Linux, X64, kuasar-control]
+    runs-on: ${{ fromJSON(github.event.repository.private == false && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","kuasar-control"]') }}
     permissions:
       actions: read
       contents: write
@@ -145,6 +228,24 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # Pinned shared implementation; refresh after its normal squash merge.
+      - name: Check out pinned hosted bootstrap
+        if: github.event.repository.private == false
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kuasar-sandbox/kuasar-sandbox
+          ref: d453b25008de9ada247e68def2b5c1e8429ca9f4
+          token: ${{ github.token }}
+          path: trusted/platform
+          sparse-checkout: |
+            ci/hosted
+            .github/workflows
+          persist-credentials: false
+
+      - name: Bootstrap standard runner
+        if: github.event.repository.private == false
+        run: bash trusted/platform/ci/hosted/bootstrap.sh --profile release-control
 
       - name: Install pinned GitHub CLI
         run: bash scripts/install-gh-cli.sh
@@ -173,7 +274,7 @@ jobs:
 
   cleanup:
     needs: publish
-    runs-on: [self-hosted, Linux, X64, kuasar-control]
+    runs-on: ${{ fromJSON(github.event.repository.private == false && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","kuasar-control"]') }}
     timeout-minutes: 30
     permissions:
       actions: write
@@ -183,6 +284,24 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # Pinned shared implementation; refresh after its normal squash merge.
+      - name: Check out pinned hosted bootstrap
+        if: github.event.repository.private == false
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kuasar-sandbox/kuasar-sandbox
+          ref: d453b25008de9ada247e68def2b5c1e8429ca9f4
+          token: ${{ github.token }}
+          path: trusted/platform
+          sparse-checkout: |
+            ci/hosted
+            .github/workflows
+          persist-credentials: false
+
+      - name: Bootstrap standard runner
+        if: github.event.repository.private == false
+        run: bash trusted/platform/ci/hosted/bootstrap.sh --profile control
 
       - name: Install pinned GitHub CLI
         run: bash scripts/install-gh-cli.sh

@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   reconcile:
-    runs-on: [self-hosted, Linux, X64, kuasar-control]
+    runs-on: ${{ fromJSON(github.event.repository.private == false && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","kuasar-control"]') }}
     timeout-minutes: 10
     permissions:
       contents: write
@@ -43,6 +43,24 @@ jobs:
         with:
           ref: main
           persist-credentials: false
+
+      # Pinned shared implementation; refresh after its normal squash merge.
+      - name: Check out pinned hosted bootstrap
+        if: github.event.repository.private == false
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kuasar-sandbox/kuasar-sandbox
+          ref: d453b25008de9ada247e68def2b5c1e8429ca9f4
+          token: ${{ github.token }}
+          path: trusted/platform
+          sparse-checkout: |
+            ci/hosted
+            .github/workflows
+          persist-credentials: false
+
+      - name: Bootstrap standard runner
+        if: github.event.repository.private == false
+        run: bash trusted/platform/ci/hosted/bootstrap.sh --profile control
 
       - name: Install pinned GitHub CLI
         run: bash scripts/install-gh-cli.sh

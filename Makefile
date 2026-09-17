@@ -10,7 +10,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all build manifest-ctl store-ctl cache-ctl deps-rocksdb test test-no-rocksdb vet bench test-e2e perf-cache perf-cache-remote dedup-report release test-release clean help
+.PHONY: all build manifest-ctl store-ctl cache-ctl deps-rocksdb test test-no-rocksdb vet bench test-e2e test-e2e-scripts perf-cache perf-cache-remote dedup-report release test-release clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -113,7 +113,7 @@ test-no-rocksdb:
 	CGO_ENABLED=0 $(GO) test -tags no_rocksdb ./pkg/cache/rocks
 
 # Unit tests. cache/rocks tests need librocksdb (dynamic link is fine here).
-test: deps-rocksdb
+test: test-e2e-scripts deps-rocksdb
 	CGO_CFLAGS="$(CGO_CFLAGS)" \
 	CGO_LDFLAGS="-L$(ROCKS_PREFIX)/lib -lrocksdb -lstdc++ -lm -lpthread -ldl" \
 		$(GO) test ./...
@@ -142,6 +142,11 @@ bench: deps-rocksdb
 
 test-e2e:
 	BIN="$(E2E_BIN)" bash test/e2e/run_all.sh
+
+# Offline shell/fixture checks; no Go/native build or assembled binaries needed.
+test-e2e-scripts:
+	bash test/e2e/port_lease_test.sh
+	python3 test/scripts/test_e2e_manifest.py
 
 perf-cache:
 	BIN=$(E2E_BIN) bash test/scripts/bench_cache.sh
@@ -172,6 +177,7 @@ help:
 	@echo "  test          unit tests (needs librocksdb for cache/rocks)"
 	@echo "  vet           vet the CGO-free client surface"
 	@echo "  test-e2e      run the accelerator-owned E2E suite with E2E_BIN"
+	@echo "  test-e2e-scripts  offline E2E script/fixture regressions (no builds)"
 	@echo "  release       build a validated component release bundle"
 	@echo "  test-release  test component release packaging"
 	@echo "  clean         remove bin/ + build/"
