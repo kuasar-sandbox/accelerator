@@ -149,6 +149,13 @@ Chunk encoding can run concurrently, but bounded ordinal reordering waits for lo
 
 `Config.NewBundleIngester` connects the writer to the configured ingest path without extra salt for compatibility. `Config.NewBundleIngesterWithExtraSalt` accepts the same optional extra-salt resolver as Store ingest. The Bundle records the base admission, while each actual Chunk key is authenticated in the encrypted Manifest key table. Full verification and exact upload therefore decrypt with the authenticated key and do not attempt to derive it again from the base admission salt; readers never need the extra salt. Physical ContentKeys, the key-table AAD, decoded sizes, layout, closure, and the target admission are still verified before the root is published.
 
+`manifest-ctl load --output-mode=bundle` is the executable producer for this
+profile. Its positional inputs are layered top-to-bottom; a file reference of
+the form `file://NAME.bundle@manifest:KEY[@location:NAME]` selects and proves a
+root in that Bundle. `--ref-location NAME=file:///absolute/directory` keeps
+host paths out of persistent references. Tail stripping/replacement is applied
+to the selected logical stream, not to this outer ZIP carrier.
+
 The read side chooses a source **only at `Fetcher.OpenManifest`**, in this order:
 
 ```text
@@ -194,3 +201,41 @@ Each object uses its source Bundle's recorded admission. Upload neither redirect
 FullVerify also rejects chunks unreferenced by any local Manifest. After parsing snapshot-specific metadata, the caller can supply `ExpectedManifests` as the exact locally reachable Manifest set, rejecting unrelated Manifests without making accelerator interpret `snapshot.cfg`.
 
 Read error classification, initialization ownership and recovery are specified in [Read errors and recovery](accelerator-read-recovery.md).
+
+## 3. Shared suffix-ZIP handling
+
+`pkg/tailzip` is the format-neutral implementation for a ZIP appended to logical
+image bytes. `Locate(io.ReaderAt, size, Options)` returns the payload boundary
+and suffix length, `Read` returns a bounded copy for extraction, `Prefix`
+exposes the unchanged sparse payload, and `Append` composes a validated suffix
+while retaining Hole, explicit Zero, and Data runs in the payload. These
+operations apply to logical image bytes, never to an outer Manifest Bundle.
+
+The default profile accepts ZIP trailers produced by existing image writers and
+limits both the suffix and its decoded entry total to 64 MiB. Callers with a protocol schema can set entry-count,
+known-entry, order, and STORED-method requirements. Locating requires an EOCD
+which ends exactly at logical EOF, rejects multi-disk and unsupported ZIP64
+suffixes, checks integer and central-directory bounds through `archive/zip`, and
+reads every entry to verify its CRC. Absence is distinguishable with
+`tailzip.ErrNotFound`; a recognizable malformed or truncated archive is an
+error rather than an absent tail.
+
+`pkg/image.AppendConfigZip`, `ReadConfig`, and `ReadConfigFromFile` use this
+common mechanism. The writer retains the historical deterministic entry name,
+STORED method, timestamp and byte layout, while readers continue to accept the
+supported image ZIP profile. Both `flatten.Build` and `flatten.BuildFromDir`
+therefore produce their trailers through `pkg/tailzip` indirectly and all image
+config reads share the same payload-boundary implementation.
+
+
+### Shared readers, writers and strict profiles
+
+`pkg/manifest/transfer.Reader` opens the selected logical source and retains source ownership and verification. `transfer.Write` accepts a sparse source plus `WriteOptions`; its `BeforeCommit` hook completes caller-owned source/output validation before the Store root is emitted. `manifest.RefLocations` supplies the shared validated location mapping used by manifest-ctl and sandboxer.
+
+`tailzip.ReadCanonical` and `EncodeCanonical` implement the fixed raw-header profile used by S/E; `ReadFooter` and `Names` provide bounded geometry and role-detection metadata. Application modules supply ordered entry names, size limits and their config/schema validation. `tailzip.Section` preserves borrowed run lifetimes and unchanged prefix ChunkRun capabilities; `Append` preserves the authoritative payload boundary and compatible digest commitments.
+
+The image reader/writer, both flatten builders, flatten-ctl packing, sandboxer S/E readers/builders and their image assembly/capture/restore callers share these helpers. Image ZIP bytes retain their existing writer profile; S/E keep their strict profile. New image tarstream envelopes declare the EROFS prefix as payload and the config ZIP as metadata tail. Existing carriers remain readable under their original identity declarations.
+
+Suffix ZIP processing checks the EOCD entry count and bounded directory geometry before constructing the ZIP reader. Local offsets are relative to the suffix; absolute-prefix archives are rejected rather than treating payload as metadata. Full ReaderAt buffers accompanied by ordinary EOF are accepted. Short reads and marked source failures remain errors.
+
+Canonical footer/name/body readers explicitly accept io.ReaderAt and a logical size. Their footer-first access requires genuine random access; monotone sparse sources use the sequential transfer path. Canonical encoding rejects ZIP64 entry counts before output. Complete bounded suffix reads retain backend failures even when the returned buffer is full.

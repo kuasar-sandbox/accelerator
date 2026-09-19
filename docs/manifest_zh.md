@@ -86,18 +86,17 @@ location 时 path 必须是 basename,location 匹配
 ### 2.3 `manifest-ctl store` — 数据写入
 
 ```
-manifest-ctl store [flags] <path|->        # <path|-> 省略或 - = stdin
+manifest-ctl store [flags] <REF|->        # <path|-> 省略或 - = stdin
 
 Flags:
   --extra-salt string         额外 salt 字节,叠加到 store 提供的 opaque salt
   --no-progress               禁用进度输出
 ```
 
-输入是 **tarstream 工件**(平台镜像/快照的统一容器):size 与洞图都在信封里,
-stdin 与文件都通过 `SourceFrom` 单遍完整验证,不物化中间文件;洞永远来自信封
-元数据,不做文件系统探测或内容零扫描。`crypto.local=off|auto|required` 分别对应
-plaintext-only、兼容 plaintext/encrypted、encrypted-only;ingest 结果发布前会验证
-inner digest、marker、trailer 和 outer EOF。
+输入是一个已选定的逻辑 source：本地 tarstream 路径、带身份或 location 的 file ref、Bundle selector，或者 Manifest key/ref。多 Manifest Bundle 必须指定 `@manifest:<key>`。文件提供有界随机读取视图，stdin 使用 tarstream 的单遍 `SourceFrom` 协议；两者共用 `pkg/manifest/transfer` 的 reader/writer。空洞来自 carrier 的权威元数据。`crypto.local=off|auto|required` 沿用已有本地 tarstream 加密策略。
+
+Store 同样接受 `--ref-location`、`--strip-tail`、`--extract-tail PATH` 和 `--append-tail PATH`，语义与下述 load 一致。发布 Store 根 Manifest 前，完成源完整性、原始顺序输入的 marker/trailer/EOF 和所请求输出文件的收尾检查。
+
 
 stdout 输出一行 64 字符 hex,即已上传 Manifest 的 content key。stderr 输出动态进度
 与最终人类可读摘要。**`--no-progress` 只关闭动态进度,最终摘要仍输出**。以下为示意:
@@ -133,33 +132,55 @@ manifest-ctl store --extra-salt "tenant-xyz" snap.bin
 ### 2.4 `manifest-ctl load` — 数据读取
 
 ```
-manifest-ctl load [flags] <hex|manifest://hex>
+manifest-ctl load [flags] REF...
 
 Args:
-  <hex|manifest://hex>        要加载的 manifest content key(必填;可带可选
-                              manifest:// 前缀)
+  REF...                       自上而下的层：bare key、manifest://、本地路径、
+                               file:// tarstream 或 Bundle @manifest 引用
 Flags:
   --output string             输出路径 (default "-", stdout;终端拒写)
+  --output-mode string        none|tarstream|bundle（默认 tarstream；带
+                              --store 时默认 none）
+  --store                     写入最终变换后的逻辑 source
+  --extra-salt string         Store/Bundle ingest 的域隔离
+  --ref-location N=file:///P  显式映射 location（可重复，P 必须绝对路径）
+  --strip-tail                layering 前从每个 source 去掉 suffix ZIP
+  --extract-tail PATH         保存第一个输入的原始 suffix ZIP
+  --append-tail PATH          最后追加已验证 suffix；原有 tail 时要求 strip
   --name string               产物 tar 条目名 (default "image")
   --offset uint               窗口起始偏移
   --length uint               窗口长度 (0 = 余下全部)
   --no-progress               禁用进度输出
 ```
 
-输出是 **tarstream 工件**:manifest 空洞无损进信封洞图(没有"落洞还是填零"
-的策略问题,原 `--hole` 旗标随之取消),IsZero chunk 由写出端本地合成零字节、
-不取数。`crypto.local=off` 输出 byte-compatible plaintext,`auto|required` 输出
-encrypted v1。要 raw 字节用 `flatten-ctl tar extract` 解包。
+REF 按参数顺序通过 `fetch.NewLayered` 组合，第一个为顶层。Data 和显式零值覆盖低层，Hole 向下透传。普通本地路径可直接输入；64 字符十六进制 key 保持 Manifest 语义。同名本地文件可用 `./<name>` 指定。文件身份 qualifier 会被验证，named location 共用 `manifest.RefLocations` 解析。
+
+固定顺序为：检查/提取原始 top tail；按需分别 strip 每个 source；分层读取；offset/length 窗口；append 新 tail。裸 source 可直接使用 `--append-tail`，原有 tail 时必须同时给出 `--strip-tail`；可识别的损坏 tail 报错。`--output-mode=none --extract-tail PATH` 仅提取有界原始元数据。tail 操作作用于逻辑内容而非外层 Bundle ZIP。保留的旧/新 tail 共用 64 MiB 预算，解码 ZIP 元数据另受限额约束。
+
+`--store` 写入最终变换后的 source，缺省文件输出模式为 `none`，并可与两种文件输出组合。Store+Bundle 取得一次 admission，通过同一 Chunk/Manifest 编码流和有界背压写入两端；同配置得到相同物理对象及根 key。`--extra-salt` 同时适用于 Bundle-only 和 Store。Store+tarstream 通过有界管道接入既有 ingest 协议，也支持 stdin 输入。
+
+使用命名输出文件时 Store key 输出到 stdout；二进制内容使用 stdout 时，标识和诊断输出到 stderr。Bundle root key 输出到 stderr。请求的文件以 exclusive create 直接写入；失败仅清理本次仍拥有的不完整文件。既有文件、输入输出 alias、输出路径冲突在写入前拒绝。成功结果包含源校验、文件关闭及 Store 根发布。后续目标失败可能留下已经独立完成的文件或已写入 Chunk，不影响旧源。
+
+Tarstream 输出保留稀疏元数据。`crypto.local=off` 输出 plaintext；`auto|required` 输出 encrypted v1。不可寻址 stdin 使用 tarstream，Bundle 随机读取通过文件/ref 提供。上述 transfer 路径不生成完整镜像缓存或 staging 文件。
 
 ```bash
-# 全量还原为工件(flags 在位置参数前)
-manifest-ctl load --output disk.img a1b2c3d4...
+# 按 top → bottom 读取、合并层
+manifest-ctl load --output merged.tar A B C
 
-# 窗口切片(切片本身也是合法工件)
-manifest-ctl load --offset 4096 --length 65536 --output slice.img a1b2c3d4...
+# 同一次操作生成相同的 Bundle 和 Store 对象
+manifest-ctl load --store --output-mode=bundle --extra-salt tenant-a \
+  --output merged.bundle A B C
 
-# 也可带 manifest:// 前缀
-manifest-ctl load --output disk.img manifest://a1b2c3d4...
+# 合并 payload 后替换元数据尾部
+manifest-ctl load --strip-tail --append-tail new-tail.zip \
+  --output-mode=bundle --output merged.bundle A B C
+
+# 只提取元数据，不输出 payload
+manifest-ctl load --output-mode=none --extract-tail metadata.zip SOURCE
+
+# stdin 同时写入 Store 和 tarstream 文件
+cat source.tar | manifest-ctl load --store --output-mode=tarstream \
+  --output copied.tar -
 ```
 
 ### 2.5 `manifest-ctl get-manifest` — 取回 manifest 字节
@@ -664,3 +685,9 @@ metadata 读取及其与 chunk 数的关系。benchmark fixture 名称不覆盖�
 - [系统架构](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox_zh.md):Manifest 抽象在平台中的位置。
 
 不可变读取错误及 client 恢复见[读取错误与恢复](accelerator-read-recovery_zh.md).
+
+### 传输身份与边界重建
+
+显式 tarstream `@digest`/`@hmac` 身份和 Bundle `@manifest` selector 在关闭普通 `manifest.verify_content` 时仍然生效。内容转换完成载体校验后才报告成功。载体按字节格式或显式 selector 识别，与文件扩展名无关。载体声明 tail 时，提取和剥离要求该边界与合法 ZIP 后缀起点一致。
+
+对未经修改的完整 Manifest/Bundle 根，tarstream 输出恢复合法相对偏移 ZIP 后缀的边界，使规范镜像信封身份在 Store 往返中保持一致；既有 tarstream 声明和显式窗口维持各自边界。Store 统计仅在最终 Put 实际创建 Manifest 时计入新增字节。tarstream-only load 报告逻辑进度，`--no-progress` 可关闭动态进度。

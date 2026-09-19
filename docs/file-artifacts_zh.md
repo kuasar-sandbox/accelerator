@@ -216,6 +216,12 @@ resolver。Bundle 记录基础 admission，实际 Chunk key 则由加密 Manifes
 重复派生，因此读取方无需 extra salt。发布根之前仍验证物理 ContentKey、key-table
 AAD、解码尺寸、布局、依赖闭包和目标 admission。
 
+`manifest-ctl load --output-mode=bundle` 是该 profile 的可执行生产端。位置参数按
+自上而下顺序 layering；`file://NAME.bundle@manifest:KEY[@location:NAME]` 会选择并
+证明该 Bundle 内的 root。`--ref-location NAME=file:///absolute/directory` 避免把
+host 路径写入持久引用。tail 去除/替换作用于所选逻辑 stream，而非此 Bundle 外层
+ZIP carrier。
+
 读侧仅在 `Fetcher.OpenManifest` 按以下顺序选择来源：
 
 ```text
@@ -292,3 +298,36 @@ Manifest 集，从而拒绝无关 Manifest，而无需让 accelerator 解释
 `snapshot.cfg`。
 
 读取错误分类、初始化所有权和恢复见[读取错误与恢复](accelerator-read-recovery_zh.md).
+
+## 3. 共享后缀 ZIP 处理
+
+`pkg/tailzip` 是追加在逻辑镜像字节之后的 ZIP 的格式无关实现。
+`Locate(io.ReaderAt, size, Options)` 返回 payload 边界和后缀长度，`Read` 返回用于
+提取的有界副本，`Prefix` 暴露未改变的稀疏 payload，`Append` 组合经过验证的后缀，
+并保留 payload 中的 Hole、显式 Zero 和 Data run。这些操作针对 carrier 内部的逻辑
+镜像字节，而不是外层 Manifest Bundle。
+
+默认 profile 接受既有镜像 writer 生成的 ZIP trailer，并把后缀及解码后的条目总量分别限制为 64 MiB。具有
+协议 schema 的调用方可以要求 entry 数量、已知 entry、顺序以及 STORED method。
+定位要求 EOCD 恰好结束于逻辑 EOF，拒绝 multi-disk 和不支持的 ZIP64 后缀，通过
+`archive/zip` 检查整数与 Central Directory 边界，并读取每个 entry 验证 CRC。
+调用方可通过 `tailzip.ErrNotFound` 区分不存在；可识别但损坏或截断的 archive 会报错，
+不会被当作无 tail。
+
+`pkg/image.AppendConfigZip`、`ReadConfig` 和 `ReadConfigFromFile` 使用这一公共机制。
+writer 保持历史确定性 entry 名称、STORED method、时间戳和字节布局；reader 继续接受
+已支持的 image ZIP profile。因此 `flatten.Build` 与 `flatten.BuildFromDir` 都间接通过
+`pkg/tailzip` 生成 trailer，所有 image config 读取也共享同一 payload 边界实现。
+
+
+### 共享 reader/writer 与严格 profile
+
+`pkg/manifest/transfer.Reader` 打开选定的逻辑 source，并保留源所有权和验证能力。`transfer.Write` 接受 sparse source 与 `WriteOptions`；`BeforeCommit` 在写出 Store 根之前完成调用方源/输出校验。`manifest.RefLocations` 为 manifest-ctl 和 sandboxer 提供统一的合法 location 映射。
+
+`tailzip.ReadCanonical` 与 `EncodeCanonical` 实现 S/E 使用的固定 raw-header profile；`ReadFooter` 和 `Names` 提供有界几何信息与角色探测元数据。应用模块传入有序条目名、大小上限，并负责配置/schema 校验。`tailzip.Section` 保持 borrowed run 生命周期及未偏移 prefix 的 ChunkRun 能力；`Append` 保留权威 payload 边界和可复用的摘要 commitment。
+
+Image reader/writer、两个 flatten builder、flatten-ctl 打包、sandboxer S/E reader/builder 及 image assembly/capture/restore 调用方共用这些 helper。Image ZIP 保持原有 writer profile，S/E 保持严格 profile。新 image tarstream envelope 将 EROFS prefix 声明为 payload、config ZIP 声明为 metadata tail；已有 carrier 继续按其原始身份声明读取。
+
+Suffix ZIP 在构造 ZIP reader 前检查 EOCD 条目数量与有界目录布局。local offset 相对后缀起点；带绝对前缀偏移的归档明确报错，避免将 payload 当作元数据。ReaderAt 返回完整缓冲并附带普通 EOF 时接受数据；短读和标记过的源故障仍然返回错误。
+
+规范后缀的 footer、名称和正文读取接口显式接受 io.ReaderAt 与逻辑大小。先读 footer 的流程要求真正随机访问；单调 sparse source 使用顺序传输路径。规范编码在输出前拒绝 ZIP64 条目数量。读取完整有界后缀时，即使已返回完整缓冲，也保留后端故障。
