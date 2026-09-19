@@ -39,8 +39,11 @@ type chunkReference struct {
 }
 
 // FullVerify force-checks physical ContentKeys, every Manifest closure and key
-// table, the recorded admission salt domain, unique Chunk plaintext, and the
-// absence of unreferenced Chunk entries. It ignores runtime verify_content.
+// table, unique Chunk plaintext, and the absence of unreferenced Chunk entries.
+// Chunk decryption uses the authenticated keys from each Manifest key table;
+// those keys can include writer-side extra-salt domain separation and therefore
+// must not be re-derived from the Bundle's base WriteAdmission salt. It ignores
+// runtime verify_content.
 func (r *Reader) FullVerify(ctx context.Context, root store.ContentKey, customerKey [32]byte, decryptor manifestcrypto.Decryptor, opts VerifyOptions) error {
 	return r.verifyAndUpload(ctx, root, customerKey, decryptor, nil, opts)
 }
@@ -245,12 +248,6 @@ func (r *Reader) verifyChunks(ctx context.Context, keys []store.ContentKey, refs
 					blob.Release()
 					clear(plain)
 					fail(fmt.Errorf("manifest bundle: Chunk %s decrypt/decompress: %w", hex.EncodeToString(key[:]), err))
-					continue
-				}
-				if derived := manifestcrypto.DeriveKey(r.admission.Salt, plain); derived != reference.decryptKey {
-					blob.Release()
-					clear(plain)
-					fail(fmt.Errorf("manifest bundle: Chunk %s key is outside recorded admission salt domain", hex.EncodeToString(key[:])))
 					continue
 				}
 				if target != nil {

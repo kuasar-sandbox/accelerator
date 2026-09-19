@@ -147,7 +147,7 @@ A Bundle can hold the root memory Manifest, current root/data-disk layer Manifes
 
 Chunk encoding can run concurrently, but bounded ordinal reordering waits for logical order and appends ZIP bytes serially, avoiding an unbounded completion queue.
 
-`Config.NewBundleIngester` connects the writer to the configured ingest path. This entry point deliberately adds **no extra salt**: chunk keys must belong to the recorded admission's canonical salt domain so exact upload can verify/copy each object without rewriting it.
+`Config.NewBundleIngester` connects the writer to the configured ingest path without extra salt for compatibility. `Config.NewBundleIngesterWithExtraSalt` accepts the same optional extra-salt resolver as Store ingest. The Bundle records the base admission, while each actual Chunk key is authenticated in the encrypted Manifest key table. Full verification and exact upload therefore decrypt with the authenticated key and do not attempt to derive it again from the base admission salt; readers never need the extra salt. Physical ContentKeys, the key-table AAD, decoded sizes, layout, closure, and the target admission are still verified before the root is published.
 
 The read side chooses a source **only at `Fetcher.OpenManifest`**, in this order:
 
@@ -186,7 +186,7 @@ Strict paths then verify the full closure and object content. A missing but unac
 2. Before any admission or Put, run the complete CD/LFH/index container verifier on every actual source in that plan.
 3. Before any Put, call `AdmitWriteFor(recorded.Generation)` for all actual source admissions. Returned Generation and Salt must match the recorded bytes exactly.
 4. Force verification of every selected Manifest's physical ContentKey, parse it, unseal its table with the customer key, and prove its entire chunk closure resides in that same source Bundle. Before any Put, reject one ContentKey associated with inconsistent keys or plaintext sizes across Manifests.
-5. Concurrent workers process every actually used unique chunk in each source: force physical ContentKey verification, decrypt/decompress to original plaintext, and require `DeriveKey(sourceAdmission.Salt, plaintext)` to equal the table's key, then Put that verified chunk. This is per-chunk verify-then-upload, not a global plaintext-verification barrier.
+5. Concurrent workers process every actually used unique chunk in each source: force physical ContentKey verification, decrypt/decompress with the authenticated key-table key, validate the decoded length, then Put that verified physical chunk. The actual keys already include any writer-side extra salt. This is per-chunk verify-then-upload, not a global plaintext-verification barrier.
 6. Only after all chunk workers succeed, upload dependency Manifests and publish the caller-specified current root last. A later chunk verification or upload failure can leave earlier verified chunks in Store, but prevents publication of the root.
 
 Each object uses its source Bundle's recorded admission. Upload neither redirects objects to the newest generation nor rechunks, recompresses, re-encrypts, reseals the table or rewrites upper-level `snapshot.cfg`. Root ManifestKey and physical bytes remain unchanged. Failure in admission preflight, dependency verification or Put prevents final root publication. Refs and admission entries are container metadata, not Store objects, and are not uploaded.
