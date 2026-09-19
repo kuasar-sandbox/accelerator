@@ -292,3 +292,23 @@ Manifest 集，从而拒绝无关 Manifest，而无需让 accelerator 解释
 `snapshot.cfg`。
 
 读取错误分类、初始化所有权和恢复见[读取错误与恢复](accelerator-read-recovery_zh.md).
+
+## 3. 共享后缀 ZIP 处理
+
+`pkg/tailzip` 是追加在逻辑镜像字节之后的 ZIP 的格式无关实现。
+`Locate(io.ReaderAt, size, Options)` 返回 payload 边界和后缀长度，`Read` 返回用于
+提取的有界副本，`Prefix` 暴露未改变的稀疏 payload，`Append` 组合经过验证的后缀，
+并保留 payload 中的 Hole、显式 Zero 和 Data run。这些操作针对 carrier 内部的逻辑
+镜像字节，而不是外层 Manifest Bundle。
+
+默认 profile 接受既有镜像 writer 生成的 ZIP trailer，并把后缀及解码后的条目总量分别限制为 64 MiB。具有
+协议 schema 的调用方可以要求 entry 数量、已知 entry、顺序以及 STORED method。
+定位要求 EOCD 恰好结束于逻辑 EOF，拒绝 multi-disk 和不支持的 ZIP64 后缀，通过
+`archive/zip` 检查整数与 Central Directory 边界，并读取每个 entry 验证 CRC。
+调用方可通过 `tailzip.ErrNotFound` 区分不存在；可识别但损坏或截断的 archive 会报错，
+不会被当作无 tail。
+
+`pkg/image.AppendConfigZip`、`ReadConfig` 和 `ReadConfigFromFile` 使用这一公共机制。
+writer 保持历史确定性 entry 名称、STORED method、时间戳和字节布局；reader 继续接受
+已支持的 image ZIP profile。因此 `flatten.Build` 与 `flatten.BuildFromDir` 都间接通过
+`pkg/tailzip` 生成 trailer，所有 image config 读取也共享同一 payload 边界实现。

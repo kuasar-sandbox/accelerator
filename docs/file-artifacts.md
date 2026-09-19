@@ -194,3 +194,28 @@ Each object uses its source Bundle's recorded admission. Upload neither redirect
 FullVerify also rejects chunks unreferenced by any local Manifest. After parsing snapshot-specific metadata, the caller can supply `ExpectedManifests` as the exact locally reachable Manifest set, rejecting unrelated Manifests without making accelerator interpret `snapshot.cfg`.
 
 Read error classification, initialization ownership and recovery are specified in [Read errors and recovery](accelerator-read-recovery.md).
+
+## 3. Shared suffix-ZIP handling
+
+`pkg/tailzip` is the format-neutral implementation for a ZIP appended to logical
+image bytes. `Locate(io.ReaderAt, size, Options)` returns the payload boundary
+and suffix length, `Read` returns a bounded copy for extraction, `Prefix`
+exposes the unchanged sparse payload, and `Append` composes a validated suffix
+while retaining Hole, explicit Zero, and Data runs in the payload. These
+operations apply to logical image bytes, never to an outer Manifest Bundle.
+
+The default profile accepts ZIP trailers produced by existing image writers and
+limits both the suffix and its decoded entry total to 64 MiB. Callers with a protocol schema can set entry-count,
+known-entry, order, and STORED-method requirements. Locating requires an EOCD
+which ends exactly at logical EOF, rejects multi-disk and unsupported ZIP64
+suffixes, checks integer and central-directory bounds through `archive/zip`, and
+reads every entry to verify its CRC. Absence is distinguishable with
+`tailzip.ErrNotFound`; a recognizable malformed or truncated archive is an
+error rather than an absent tail.
+
+`pkg/image.AppendConfigZip`, `ReadConfig`, and `ReadConfigFromFile` use this
+common mechanism. The writer retains the historical deterministic entry name,
+STORED method, timestamp and byte layout, while readers continue to accept the
+supported image ZIP profile. Both `flatten.Build` and `flatten.BuildFromDir`
+therefore produce their trailers through `pkg/tailzip` indirectly and all image
+config reads share the same payload-boundary implementation.
