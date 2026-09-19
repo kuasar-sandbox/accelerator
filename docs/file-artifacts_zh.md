@@ -216,6 +216,12 @@ resolver。Bundle 记录基础 admission，实际 Chunk key 则由加密 Manifes
 重复派生，因此读取方无需 extra salt。发布根之前仍验证物理 ContentKey、key-table
 AAD、解码尺寸、布局、依赖闭包和目标 admission。
 
+`manifest-ctl load --output-mode=bundle` 是该 profile 的可执行生产端。位置参数按
+自上而下顺序 layering；`file://NAME.bundle@manifest:KEY[@location:NAME]` 会选择并
+证明该 Bundle 内的 root。`--ref-location NAME=file:///absolute/directory` 避免把
+host 路径写入持久引用。tail 去除/替换作用于所选逻辑 stream，而非此 Bundle 外层
+ZIP carrier。
+
 读侧仅在 `Fetcher.OpenManifest` 按以下顺序选择来源：
 
 ```text
@@ -312,3 +318,12 @@ Manifest 集，从而拒绝无关 Manifest，而无需让 accelerator 解释
 writer 保持历史确定性 entry 名称、STORED method、时间戳和字节布局；reader 继续接受
 已支持的 image ZIP profile。因此 `flatten.Build` 与 `flatten.BuildFromDir` 都间接通过
 `pkg/tailzip` 生成 trailer，所有 image config 读取也共享同一 payload 边界实现。
+
+
+### 共享 reader/writer 与严格 profile
+
+`pkg/manifest/transfer.Reader` 打开选定的逻辑 source，并保留源所有权和验证能力。`transfer.Write` 接受 sparse source 与 `WriteOptions`；`BeforeCommit` 在写出 Store 根之前完成调用方源/输出校验。`manifest.RefLocations` 为 manifest-ctl 和 sandboxer 提供统一的合法 location 映射。
+
+`tailzip.ReadCanonical` 与 `EncodeCanonical` 实现 S/E 使用的固定 raw-header profile；`ReadFooter` 和 `Names` 提供有界几何信息与角色探测元数据。应用模块传入有序条目名、大小上限，并负责配置/schema 校验。`tailzip.Section` 保持 borrowed run 生命周期及未偏移 prefix 的 ChunkRun 能力；`Append` 保留权威 payload 边界和可复用的摘要 commitment。
+
+Image reader/writer、两个 flatten builder、flatten-ctl 打包、sandboxer S/E reader/builder 及 image assembly/capture/restore 调用方共用这些 helper。Image ZIP 保持原有 writer profile，S/E 保持严格 profile。新 image tarstream envelope 将 EROFS prefix 声明为 payload、config ZIP 声明为 metadata tail；已有 carrier 继续按其原始身份声明读取。

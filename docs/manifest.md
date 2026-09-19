@@ -73,14 +73,16 @@ The three identity qualifiers are mutually exclusive. `@manifest` selects a root
 ### 2.3 `manifest-ctl store` — ingest
 
 ```text
-manifest-ctl store [flags] <path|->        # omitted input or "-" means stdin
+manifest-ctl store [flags] <REF|->        # omitted input or "-" means stdin
 
 Flags:
   --extra-salt string         Extra salt bytes mixed into the store's opaque salt
   --no-progress              Suppress live progress
 ```
 
-The input is a **tarstream artifact**, the platform container for images and snapshots. Its envelope carries size and holes. Files and stdin use the same one-pass, fully validating `SourceFrom` path, without an intermediate materialization. Holes come from envelope metadata, never filesystem probing or zero-content scanning. `crypto.local=off|auto|required` respectively accepts plaintext only, plaintext or encrypted carriers, and encrypted carriers only. Before publishing the Manifest, ingest must finish validation of the inner digest, marker, trailer and outer EOF.
+The input is one selected logical source: a local tarstream path, an identity-bearing or located file reference, a Bundle selector, or a Manifest key/ref. A Bundle with multiple Manifests requires `@manifest:<key>`. Files are opened as bounded random-access views; stdin uses tarstream's one-pass `SourceFrom` protocol. Both paths use the shared `pkg/manifest/transfer` reader and writer. Holes come from authoritative carrier metadata. `crypto.local=off|auto|required` selects the existing local tarstream encryption policy.
+
+Store also accepts `--ref-location`, `--strip-tail`, `--extract-tail PATH` and `--append-tail PATH` with the same meanings as load below. Source integrity, original sequential marker/trailer/EOF and requested output-file completion are checked before publishing the Store root Manifest.
 
 Stdout contains one 64-character hex line: the uploaded Manifest content key. Stderr contains live progress and a human-readable final summary. **`--no-progress` suppresses live progress, not the final summary.** An illustrative summary is:
 
@@ -114,29 +116,55 @@ manifest-ctl store --extra-salt "tenant-xyz" snap.bin
 ### 2.4 `manifest-ctl load` — read data
 
 ```text
-manifest-ctl load [flags] <hex|manifest://hex>
+manifest-ctl load [flags] REF...
 
 Args:
-  <hex|manifest://hex>        Required Manifest content key
+  REF...                      Top-to-bottom layers: a bare key, manifest://,
+                              local paths/file:// tarstream, or Bundle @manifest ref
 Flags:
   --output string            Output path (default "-", stdout; refuses a terminal)
+  --output-mode string       none, tarstream, or bundle (default tarstream, or
+                             none when --store is present)
+  --store                    ingest the final transformed logical source
+  --extra-salt string        domain separation for Store and/or Bundle ingest
+  --ref-location N=file:///P map a named file location (repeatable; P absolute)
+  --strip-tail               remove a suffix ZIP from every input before layering
+  --extract-tail PATH        save the original first input suffix ZIP
+  --append-tail PATH         append a validated suffix last; existing tails require strip
   --name string              Payload tar entry name (default "image")
   --offset uint              Start of the logical window
   --length uint              Window length (0 = the remaining bytes)
   --no-progress              Suppress live progress
 ```
 
-The output is a **tarstream artifact**. Manifest holes pass losslessly into its envelope map, so there is no choice between filling and preserving holes; the old `--hole` flag was removed. The writer synthesizes IsZero chunks locally without fetching them. `crypto.local=off` emits the compatible plaintext format; `auto|required` emit encrypted v1. Use `flatten-ctl tar extract` to obtain raw payload bytes.
+References are layered in argument order with `fetch.NewLayered` (first is topmost). Data and explicit zero bytes cover lower layers; holes remain transparent. An ordinary local path is accepted directly; a 64-character hexadecimal key retains its Manifest meaning. Use `./<name>` for a local filename that is itself a complete key. File identity qualifiers are verified and named locations use the shared `manifest.RefLocations` parser.
+
+The operation order is: inspect/extract the original top tail; strip each source tail when requested; layer; apply offset/length; append the new tail. A bare source can accept `--append-tail` directly. Existing tails require `--strip-tail`; recognizable malformed tails fail. `--output-mode=none --extract-tail PATH` extracts only the bounded original metadata. Tail operations address the logical content, not the outer Bundle archive. Retained old/new tail bytes share a 64 MiB budget; decoded ZIP metadata is bounded separately.
+
+`--store` writes the final transformed source and defaults file output to `none`. It combines with either file output mode. Store+Bundle obtains one admission and uses one Chunk/Manifest encoding stream with bounded backpressure, so both outputs have identical physical objects and root keys for the same options. `--extra-salt` applies to both Bundle-only and Store writes. Store+tarstream uses a bounded pipe to feed the existing ingest protocol, including when input is stdin.
+
+With a named output file, the Store key is printed on stdout. With binary stdout, identifiers and diagnostics go to stderr. Bundle output reports its root key on stderr. Requested files are created exclusively and written directly; failures clean up only still-owned incomplete files. Existing files, input/output aliases and conflicting output paths are rejected before writing. The returned success covers source validation, file closure and Store-root publication. A later target failure may leave an independently completed file or already-written chunks; it never authorizes changing an old source.
+
+Tarstream output preserves sparse metadata. `crypto.local=off` emits plaintext; `auto|required` emit encrypted v1. Non-seekable stdin uses tarstream; random-access Bundle input is supplied by a file/ref. No complete image buffer or staging file is created by these transfer paths.
 
 ```bash
-# Reconstruct the full artifact; flags precede the key
-manifest-ctl load --output disk.img a1b2c3d4...
+# Read and merge explicit top-to-bottom layers
+manifest-ctl load --output merged.tar A B C
 
-# A window is also emitted as a valid artifact
-manifest-ctl load --offset 4096 --length 65536 --output slice.img a1b2c3d4...
+# Write matching Bundle and Store objects in one operation
+manifest-ctl load --store --output-mode=bundle --extra-salt tenant-a \
+  --output merged.bundle A B C
 
-# The manifest:// prefix is also accepted
-manifest-ctl load --output disk.img manifest://a1b2c3d4...
+# Replace the metadata tail after payload merging
+manifest-ctl load --strip-tail --append-tail new-tail.zip \
+  --output-mode=bundle --output merged.bundle A B C
+
+# Extract metadata without writing payload bytes
+manifest-ctl load --output-mode=none --extract-tail metadata.zip SOURCE
+
+# stdin can feed Store and a tarstream output together
+cat source.tar | manifest-ctl load --store --output-mode=tarstream \
+  --output copied.tar -
 ```
 
 ### 2.5 `manifest-ctl get-manifest` — retrieve Manifest bytes

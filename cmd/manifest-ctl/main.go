@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,9 +16,9 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
-	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/tailzip"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 )
 
@@ -182,199 +181,14 @@ func localWriteOptions(codec tarstream.Codec, required bool) []tarstream.WriteOp
 // store command
 // ---------------------------------------------------------------------------
 
-func cmdStore(args []string) {
-	fs := flag.NewFlagSet("store", flag.ExitOnError)
-	extraSalt := fs.String("extra-salt", "", "optional extra-salt bytes mixed with the store-supplied salt")
-	noProgress := fs.Bool("no-progress", false, "suppress progress output")
-	gf := addGlobalFlags(fs)
-	fs.Parse(args)
-	input := fs.Arg(0)
-	if input == "" {
-		input = "-" // default: read the artifact from stdin
-	}
-
-	cfg := loadCfg(*gf.configPath)
-	customerKey, err := cfg.CustomerKey()
-	if err != nil {
-		fatal("customer key: %v", err)
-	}
-	localCodec, localRequired, err := localTarStreamCodec(cfg, customerKey)
-	if err != nil {
-		fatal("local tarstream policy: %v", err)
-	}
-
-	// The input is a tarstream artifact (the platform container for
-	// images and snapshots): the envelope carries size + hole map, so
-	// stdin and files stream through the same one-pass full-validation
-	// path with nothing materialized. Holes come from the envelope —
-	// never detected from the filesystem or content.
-	var inputReader io.Reader = os.Stdin
-	if input != "-" {
-		inputFile, err := os.Open(input)
-		if err != nil {
-			fatal("open input: %v", err)
-		}
-		defer inputFile.Close()
-		inputReader = inputFile
-	}
-	src, _, err := tarstream.SourceFrom(inputReader, "", localReadOptions(localCodec, localRequired)...)
-	if err != nil {
-		fatal("%s: not a tarstream artifact: %v", input, err)
-	}
-	size := src.Size()
-
-	// Optional extra-salt closure — nil when --extra-salt is empty.
-	var extraSaltFn ingest.ExtraSaltFunc
-	if *extraSalt != "" {
-		bs := []byte(*extraSalt)
-		extraSaltFn = func() ([]byte, error) { return bs, nil }
-	}
-
-	fixedKeyFn := func() ([32]byte, error) { return customerKey, nil }
-	ing, err := cfg.NewIngester(fixedKeyFn, extraSaltFn)
-	if err != nil {
-		fatal("ingester: %v", err)
-	}
-	defer ing.Close()
-
-	var onProgress func(processed, total uint64)
-	if !*noProgress {
-		onProgress = func(processed, total uint64) {
-			if total > 0 {
-				pct := float64(processed) / float64(total) * 100
-				fmt.Fprintf(os.Stderr, "\rstore: %s / %s (%.1f%%)", formatSize(processed), formatSize(total), pct)
-			} else {
-				fmt.Fprintf(os.Stderr, "\rstore: %s", formatSize(processed))
-			}
-		}
-	}
-
-	ctx := context.Background()
-	result, err := ing.Ingest(ctx, src, ingest.IngestOption{
-		OnProgress: onProgress,
-	})
-	if err != nil {
-		fatal("ingest: %v", err)
-	}
-
-	if !*noProgress {
-		fmt.Fprintln(os.Stderr)
-	}
-
-	// Print the manifest content key on stdout (the consumer-friendly
-	// short form — no separate --manifest output file).
-	fmt.Println(hex.EncodeToString(result.ManifestKey[:]))
-
-	fmt.Fprintf(os.Stderr, "image size:   %s\n", formatSize(size))
-	fmt.Fprintf(os.Stderr, "stored bytes: %s\n", formatSize(result.StoredBytes))
-	fmt.Fprintf(os.Stderr, "chunks:       stored=%d dedup=%d zero=%d\n",
-		result.StoredChunks, result.DedupChunks, result.ZeroChunks)
-	fmt.Fprintf(os.Stderr, "compression:  raw=%d snappy=%d logical=%s encoded=%s saved=%s\n",
-		result.RawChunks, result.CompressedChunks,
-		formatSize(result.LogicalChunkBytes), formatSize(result.EncodedChunkBytes), formatSize(result.CompressionSavedBytes))
-	manifestEncoding := "raw"
-	if result.ManifestCompressed {
-		manifestEncoding = "snappy"
-	}
-	fmt.Fprintf(os.Stderr, "manifest:     encoding=%s logical=%s stored=%s\n",
-		manifestEncoding, formatSize(result.ManifestLogicalBytes), formatSize(result.ManifestStoredBytes))
-	fmt.Fprintf(os.Stderr, "manifest key: %s\n", hex.EncodeToString(result.ManifestKey[:]))
-}
+func cmdStore(args []string) { cmdStoreTransform(args) }
 
 // ---------------------------------------------------------------------------
 // load command
 // ---------------------------------------------------------------------------
 
 func cmdLoad(args []string) {
-	fs := flag.NewFlagSet("load", flag.ExitOnError)
-	output := fs.String("output", "-", "output file (- for stdout)")
-	name := fs.String("name", "image", "entry name inside the emitted tarstream artifact")
-	offset := fs.Uint64("offset", 0, "byte offset of the window to load")
-	length := fs.Uint64("length", 0, "window length (0 = remainder)")
-	noProgress := fs.Bool("no-progress", false, "suppress progress output")
-	gf := addGlobalFlags(fs)
-	fs.Parse(args)
-
-	keyArg := fs.Arg(0)
-	if keyArg == "" {
-		fatal("usage: manifest-ctl load [flags] <hex|manifest://hex>")
-	}
-	cfg := loadCfg(*gf.configPath)
-	customerKey, err := cfg.CustomerKey()
-	if err != nil {
-		fatal("customer key: %v", err)
-	}
-	localCodec, localRequired, err := localTarStreamCodec(cfg, customerKey)
-	if err != nil {
-		fatal("local tarstream policy: %v", err)
-	}
-
-	fc, err := cfg.NewFetcher()
-	if err != nil {
-		fatal("fetcher: %v", err)
-	}
-	defer fc.Close()
-
-	key, err := manifest.ParseKeyRef(keyArg)
-	if err != nil {
-		fatal("%v", err)
-	}
-
-	ctx := context.Background()
-	stream, err := fc.OpenManifest(ctx, key)
-	if err != nil {
-		fatal("fetch manifest: %v", err)
-	}
-	defer stream.Close()
-
-	imageSize := stream.Size()
-	readOffset := *offset
-	readLength := *length
-	if readLength == 0 && imageSize > readOffset {
-		readLength = imageSize - readOffset
-	}
-	if readOffset >= imageSize {
-		fatal("offset %d is at or beyond image size %d", readOffset, imageSize)
-	}
-	if readOffset+readLength > imageSize {
-		readLength = imageSize - readOffset
-	}
-
-	out, err := createOutput(*output)
-	if err != nil {
-		fatal("create output: %v", err)
-	}
-	defer func() {
-		if out != os.Stdout {
-			out.Close()
-		}
-	}()
-	if out == os.Stdout {
-		if st, err := os.Stdout.Stat(); err == nil && st.Mode()&os.ModeCharDevice != 0 {
-			fatal("load: refusing to write a tarstream artifact to a terminal (use --output FILE or redirect stdout)")
-		}
-	}
-
-	// The output is a tarstream artifact: holes ride the envelope's
-	// map losslessly (no materialization policy to choose), Zero
-	// chunks are synthesized by the writer without fetching, and Data
-	// chunks flow through the fetch path. A window (--offset/--length)
-	// loads that slice as its own artifact.
-	var src sparse.Source = stream
-	if readOffset != 0 || readLength != imageSize {
-		src = &windowSource{s: stream, base: readOffset, size: readLength}
-	}
-	var w io.Writer = out
-	if !*noProgress {
-		w = &progressWriter{w: out, label: "load"}
-	}
-	if _, _, err := tarstream.WriteTo(ctx, w, *name, src, localWriteOptions(localCodec, localRequired)...); err != nil {
-		fatal("%v", err)
-	}
-	if !*noProgress {
-		fmt.Fprintln(os.Stderr)
-	}
-	fmt.Fprintf(os.Stderr, "loaded %s from offset %d as %q\n", formatSize(readLength), readOffset, *name)
+	cmdLoadTransform(args)
 }
 
 // windowSource exposes [base, base+size) of s as a source of its own.
@@ -386,45 +200,10 @@ type windowSource struct {
 func (w *windowSource) Size() uint64 { return w.size }
 
 func (w *windowSource) RunAt(off, limit uint64) (sparse.Run, error) {
-	if off >= w.size {
-		return nil, io.EOF
-	}
-	if limit == 0 {
-		return nil, fmt.Errorf("manifest-ctl: zero RunAt limit at offset %d", off)
-	}
-	if limit > w.size-off {
-		limit = w.size - off
-	}
-	run, err := w.s.RunAt(w.base+off, limit)
-	if err != nil {
-		return nil, err
-	}
-	return windowRun{Run: run, offset: off, end: run.End() - w.base}, nil
+	return (tailzip.Section{Source: w.s, Base: w.base, Length: w.size}).RunAt(off, limit)
 }
-
-type windowRun struct {
-	sparse.Run
-	offset uint64
-	end    uint64
-}
-
-func (r windowRun) Offset() uint64 { return r.offset }
-func (r windowRun) End() uint64    { return r.end }
-
 func (w *windowSource) ReadAt(ctx context.Context, buf []byte, off uint64) (int, error) {
-	if off >= w.size {
-		return 0, io.EOF
-	}
-	var eof error
-	if off+uint64(len(buf)) > w.size {
-		buf = buf[:w.size-off]
-		eof = io.EOF
-	}
-	n, err := w.s.ReadAt(ctx, buf, w.base+off)
-	if err != nil && err != io.EOF {
-		return 0, err
-	}
-	return n, eof
+	return (tailzip.Section{Source: w.s, Base: w.base, Length: w.size}).ReadAt(ctx, buf, off)
 }
 
 // progressWriter logs running byte counts to stderr (throttled).

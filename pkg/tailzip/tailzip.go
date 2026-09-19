@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"math"
 	"time"
 
@@ -49,7 +48,16 @@ func (t Tail) PayloadSize() int64 { return t.Offset }
 
 // Locate finds a ZIP whose EOCD ends exactly at size. Random reads are bounded
 // by the ZIP format's 64 KiB comment window plus central-directory metadata.
-func Locate(r io.ReaderAt, size int64, opt Options) (Tail, error) {
+func Locate(r io.ReaderAt, size int64, opt Options) (found Tail, retErr error) {
+	observed := &checkedReaderAt{ReaderAt: r}
+	defer func() {
+		if observed.err != nil {
+			retErr = errors.Join(retErr, observed.err)
+		}
+	}()
+	return locate(observed, size, opt)
+}
+func locate(r io.ReaderAt, size int64, opt Options) (Tail, error) {
 	if r == nil {
 		return Tail{}, fmt.Errorf("tailzip: reader is required")
 	}
@@ -79,21 +87,12 @@ func Locate(r io.ReaderAt, size int64, opt Options) (Tail, error) {
 		if i+22+comment != len(buf) {
 			continue
 		}
-		e := buf[i : i+22]
-		if binary.LittleEndian.Uint16(e[4:6]) != 0 || binary.LittleEndian.Uint16(e[6:8]) != 0 ||
-			binary.LittleEndian.Uint16(e[8:10]) != binary.LittleEndian.Uint16(e[10:12]) {
-			return Tail{}, fmt.Errorf("tailzip: multi-disk ZIP is unsupported")
+		footer, err := parseEndRecord(buf[i:i+22], uint64(size-n+int64(i)))
+		if err != nil {
+			return Tail{}, err
 		}
-		cdSize, cdOff := int64(binary.LittleEndian.Uint32(e[12:16])), int64(binary.LittleEndian.Uint32(e[16:20]))
-		if cdSize == math.MaxUint32 || cdOff == math.MaxUint32 || binary.LittleEndian.Uint16(e[10:12]) == math.MaxUint16 {
-			return Tail{}, fmt.Errorf("tailzip: ZIP64 suffix is unsupported")
-		}
-		eocdAbs := size - n + int64(i)
-		base := eocdAbs - cdSize - cdOff
-		if base < 0 {
-			return Tail{}, fmt.Errorf("tailzip: invalid central-directory offsets")
-		}
-		t := Tail{Offset: base, Size: size - base}
+		t := Tail{Offset: int64(footer.Base), Size: size - int64(footer.Base)}
+
 		limit := opt.MaxSize
 		if limit == 0 {
 			limit = defaultLimit
@@ -162,7 +161,16 @@ func validateAt(r io.ReaderAt, t Tail, opt Options) error {
 }
 
 // Open validates and returns an archive/zip reader scoped to the suffix.
-func Open(r io.ReaderAt, size int64, opt Options) (*zip.Reader, Tail, error) {
+func Open(r io.ReaderAt, size int64, opt Options) (reader *zip.Reader, found Tail, retErr error) {
+	observed := &checkedReaderAt{ReaderAt: r}
+	defer func() {
+		if observed.err != nil {
+			retErr = errors.Join(retErr, observed.err)
+		}
+	}()
+	return open(observed, size, opt)
+}
+func open(r io.ReaderAt, size int64, opt Options) (*zip.Reader, Tail, error) {
 	t, err := Locate(r, size, opt)
 	if err != nil {
 		return nil, Tail{}, err
@@ -240,16 +248,14 @@ func Validate(data []byte, opt Options) error {
 
 // Prefix exposes the logical payload before a located tail without reading it.
 func Prefix(src sparse.Source, size uint64) (sparse.Source, error) {
-	if src == nil {
-		return nil, fmt.Errorf("tailzip: source is required")
+	section := Section{Source: src, Length: size}
+	if err := section.valid(); err != nil {
+		return nil, err
 	}
 	if size == src.Size() {
 		return src, nil
 	}
-	if size > src.Size() {
-		return nil, fmt.Errorf("tailzip: payload boundary exceeds source")
-	}
-	return &prefixSource{src, size}, nil
+	return section, nil
 }
 
 // Append composes a validated standalone suffix after src. Payload runs are
@@ -286,7 +292,14 @@ func (a *appendSource) RunAt(off, limit uint64) (sparse.Run, error) {
 		if limit > a.s.Size()-off {
 			limit = a.s.Size() - off
 		}
-		return a.s.RunAt(off, limit)
+		run, err := a.s.RunAt(off, limit)
+		if err != nil {
+			return nil, err
+		}
+		if run == nil || run.Offset() != off || run.End() <= off || run.End() > off+limit {
+			return nil, fmt.Errorf("tailzip: payload returned invalid run")
+		}
+		return run, nil
 	}
 	end := off + limit
 	if end < off || end > a.size {
@@ -363,63 +376,25 @@ func (r *tailRun) ReadAt(ctx context.Context, b []byte, inner uint64) (int, erro
 	return len(b), nil
 }
 
-type prefixSource struct {
-	s    sparse.Source
-	size uint64
-}
-
-func (p *prefixSource) Size() uint64 { return p.size }
-func (p *prefixSource) RunAt(off, limit uint64) (sparse.Run, error) {
-	if off >= p.size {
-		return nil, io.EOF
-	}
-	if limit == 0 {
-		return nil, fmt.Errorf("tailzip: zero run limit")
-	}
-	if limit > p.size-off {
-		limit = p.size - off
-	}
-	return p.s.RunAt(off, limit)
-}
-func (p *prefixSource) ReadAt(ctx context.Context, b []byte, off uint64) (int, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	if off >= p.size {
-		return 0, io.EOF
-	}
-	eof := error(nil)
-	if uint64(len(b)) > p.size-off {
-		b = b[:p.size-off]
-		eof = io.EOF
-	}
-	n, err := p.s.ReadAt(ctx, b, off)
-	if err != nil && err != io.EOF {
-		return n, err
-	}
-	if n != len(b) {
-		return n, io.ErrUnexpectedEOF
-	}
-	return n, eof
-}
-
-func (p *prefixSource) PayloadCommitment() (uint64, [32]byte, bool) {
-	if provider, ok := p.s.(tarstream.IdentityProvider); ok {
-		size, digest, valid := provider.PayloadCommitment()
-		if valid && size == p.size {
-			return p.size, digest, true
-		}
-	}
-	return p.size, [32]byte{}, false
-}
-func (p *prefixSource) TarStreamDigest(name string) ([32]byte, bool) {
-	size, digest, ok := p.PayloadCommitment()
-	if !ok {
-		return [32]byte{}, false
-	}
-	out, err := tarstream.ComposeDigest(name, size, size, digest, nil)
-	return out, err == nil
-}
-
 // IsNotFound reports absence rather than malformed ZIP data.
-func IsNotFound(err error) bool { return errors.Is(err, ErrNotFound) || errors.Is(err, fs.ErrNotExist) }
+func IsNotFound(err error) bool { return errors.Is(err, ErrNotFound) }
+
+// Preserve source errors accompanying full buffers across ZIP metadata reads.
+type checkedReaderAt struct {
+	io.ReaderAt
+	err error
+}
+
+func (r *checkedReaderAt) ReadAt(b []byte, off int64) (int, error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+	if r.ReaderAt == nil {
+		return 0, errors.New("tailzip: reader is required")
+	}
+	n, err := r.ReaderAt.ReadAt(b, off)
+	if err != nil && (err != io.EOF || n == len(b)) {
+		r.err = err
+	}
+	return n, err
+}

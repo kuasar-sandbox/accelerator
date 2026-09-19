@@ -149,6 +149,13 @@ Chunk encoding can run concurrently, but bounded ordinal reordering waits for lo
 
 `Config.NewBundleIngester` connects the writer to the configured ingest path without extra salt for compatibility. `Config.NewBundleIngesterWithExtraSalt` accepts the same optional extra-salt resolver as Store ingest. The Bundle records the base admission, while each actual Chunk key is authenticated in the encrypted Manifest key table. Full verification and exact upload therefore decrypt with the authenticated key and do not attempt to derive it again from the base admission salt; readers never need the extra salt. Physical ContentKeys, the key-table AAD, decoded sizes, layout, closure, and the target admission are still verified before the root is published.
 
+`manifest-ctl load --output-mode=bundle` is the executable producer for this
+profile. Its positional inputs are layered top-to-bottom; a file reference of
+the form `file://NAME.bundle@manifest:KEY[@location:NAME]` selects and proves a
+root in that Bundle. `--ref-location NAME=file:///absolute/directory` keeps
+host paths out of persistent references. Tail stripping/replacement is applied
+to the selected logical stream, not to this outer ZIP carrier.
+
 The read side chooses a source **only at `Fetcher.OpenManifest`**, in this order:
 
 ```text
@@ -219,3 +226,12 @@ STORED method, timestamp and byte layout, while readers continue to accept the
 supported image ZIP profile. Both `flatten.Build` and `flatten.BuildFromDir`
 therefore produce their trailers through `pkg/tailzip` indirectly and all image
 config reads share the same payload-boundary implementation.
+
+
+### Shared readers, writers and strict profiles
+
+`pkg/manifest/transfer.Reader` opens the selected logical source and retains source ownership and verification. `transfer.Write` accepts a sparse source plus `WriteOptions`; its `BeforeCommit` hook completes caller-owned source/output validation before the Store root is emitted. `manifest.RefLocations` supplies the shared validated location mapping used by manifest-ctl and sandboxer.
+
+`tailzip.ReadCanonical` and `EncodeCanonical` implement the fixed raw-header profile used by S/E; `ReadFooter` and `Names` provide bounded geometry and role-detection metadata. Application modules supply ordered entry names, size limits and their config/schema validation. `tailzip.Section` preserves borrowed run lifetimes and unchanged prefix ChunkRun capabilities; `Append` preserves the authoritative payload boundary and compatible digest commitments.
+
+The image reader/writer, both flatten builders, flatten-ctl packing, sandboxer S/E readers/builders and their image assembly/capture/restore callers share these helpers. Image ZIP bytes retain their existing writer profile; S/E keep their strict profile. New image tarstream envelopes declare the EROFS prefix as payload and the config ZIP as metadata tail. Existing carriers remain readable under their original identity declarations.
