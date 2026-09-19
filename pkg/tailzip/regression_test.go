@@ -106,3 +106,46 @@ func TestLocateRetainsUnderlyingReaderError(t *testing.T) {
 		t.Fatalf("underlying reader cause lost: %v", err)
 	}
 }
+
+func TestOrdinaryFullReadEOFIsNotSticky(t *testing.T) {
+	tail, err := Encode([]Entry{{Name: "config.json", Body: []byte("value")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for call := 1; call <= 20; call++ {
+		reader := &oneReadEOF{Reader: bytes.NewReader(tail), at: call}
+		zipReader, _, err := Open(reader, int64(len(tail)), Options{})
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				t.Fatalf("ordinary EOF on read %d: %v", call, err)
+			}
+			continue
+		}
+		body, err := zipReader.File[0].Open()
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				t.Fatal(err)
+			}
+			continue
+		}
+		got, err := io.ReadAll(body)
+		closeErr := body.Close()
+		if err != nil || closeErr != nil || string(got) != "value" {
+			t.Fatalf("read %d: body=%q err=%v close=%v", call, got, err, closeErr)
+		}
+	}
+}
+
+type oneReadEOF struct {
+	*bytes.Reader
+	at, calls int
+}
+
+func (r *oneReadEOF) ReadAt(b []byte, off int64) (int, error) {
+	n, err := r.Reader.ReadAt(b, off)
+	r.calls++
+	if n == len(b) && r.calls == r.at {
+		return n, io.EOF
+	}
+	return n, err
+}

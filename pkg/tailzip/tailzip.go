@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
@@ -51,8 +52,8 @@ func (t Tail) PayloadSize() int64 { return t.Offset }
 func Locate(r io.ReaderAt, size int64, opt Options) (found Tail, retErr error) {
 	observed := &checkedReaderAt{ReaderAt: r}
 	defer func() {
-		if observed.err != nil {
-			retErr = errors.Join(retErr, observed.err)
+		if err := observed.failure(); err != nil {
+			retErr = errors.Join(retErr, err)
 		}
 	}()
 	return locate(observed, size, opt)
@@ -164,8 +165,8 @@ func validateAt(r io.ReaderAt, t Tail, opt Options) error {
 func Open(r io.ReaderAt, size int64, opt Options) (reader *zip.Reader, found Tail, retErr error) {
 	observed := &checkedReaderAt{ReaderAt: r}
 	defer func() {
-		if observed.err != nil {
-			retErr = errors.Join(retErr, observed.err)
+		if err := observed.failure(); err != nil {
+			retErr = errors.Join(retErr, err)
 		}
 	}()
 	return open(observed, size, opt)
@@ -382,19 +383,27 @@ func IsNotFound(err error) bool { return errors.Is(err, ErrNotFound) }
 // Preserve source errors accompanying full buffers across ZIP metadata reads.
 type checkedReaderAt struct {
 	io.ReaderAt
+	mu  sync.Mutex
 	err error
 }
 
+func (r *checkedReaderAt) failure() error { r.mu.Lock(); defer r.mu.Unlock(); return r.err }
 func (r *checkedReaderAt) ReadAt(b []byte, off int64) (int, error) {
-	if r.err != nil {
-		return 0, r.err
+	if err := r.failure(); err != nil {
+		return 0, err
 	}
 	if r.ReaderAt == nil {
 		return 0, errors.New("tailzip: reader is required")
 	}
 	n, err := r.ReaderAt.ReadAt(b, off)
-	if err != nil && (err != io.EOF || n == len(b)) {
-		r.err = err
+	// Ordinary EOF with a complete buffer is handled by the ZIP reader.
+	// Only actual source failures remain sticky across metadata reads.
+	if err != nil && err != io.EOF {
+		r.mu.Lock()
+		if r.err == nil {
+			r.err = err
+		}
+		r.mu.Unlock()
 	}
 	return n, err
 }
