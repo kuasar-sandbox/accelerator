@@ -60,29 +60,35 @@ func (w *transferWriter) Put(ctx context.Context, a store.WriteAdmission, p stor
 		}
 		return true, nil
 	}
+	fresh := true
 	if w.local != nil {
-		if _, err := w.local.Put(ctx, a, p, key, data); err != nil {
+		var err error
+		fresh, err = w.local.Put(ctx, a, p, key, data)
+		if err != nil {
 			return false, err
 		}
 	}
 	if w.target != nil {
 		return w.target.Put(ctx, a, p, key, data)
 	}
-	return true, nil
+	return fresh, nil
 }
 func (w *transferWriter) PutChunkOrdered(ctx context.Context, a store.WriteAdmission, key store.ContentKey, data []byte, ordinal uint64) (bool, error) {
 	if a != w.admission {
 		return false, errors.New("write admission changed")
 	}
+	fresh := true
 	if w.local != nil {
-		if _, err := w.local.PutChunkOrdered(ctx, a, key, data, ordinal); err != nil {
+		var err error
+		fresh, err = w.local.PutChunkOrdered(ctx, a, key, data, ordinal)
+		if err != nil {
 			return false, err
 		}
 	}
 	if w.target != nil {
 		return w.target.Put(ctx, a, store.PartitionChunk, key, data)
 	}
-	return true, nil
+	return fresh, nil
 }
 func (w *transferWriter) commit(ctx context.Context) (bool, error) {
 	if w.target == nil {

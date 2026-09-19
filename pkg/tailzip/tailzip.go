@@ -198,8 +198,12 @@ func Read(r io.ReaderAt, size int64, opt Options) ([]byte, Tail, error) {
 		return nil, Tail{}, err
 	}
 	b := make([]byte, t.Size)
-	if _, err = io.ReadFull(io.NewSectionReader(r, t.Offset, t.Size), b); err != nil {
+	n, err := r.ReadAt(b, t.Offset)
+	if err != nil && err != io.EOF {
 		return nil, Tail{}, fmt.Errorf("tailzip: read archive: %w", err)
+	}
+	if n != len(b) {
+		return nil, Tail{}, io.ErrUnexpectedEOF
 	}
 	return b, t, nil
 }

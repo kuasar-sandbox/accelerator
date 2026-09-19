@@ -188,3 +188,21 @@ func TestManifestRoundtripPreservesTailCarrierIdentity(t *testing.T) {
 		t.Fatalf("reencryption changed expected carrier identity: %v", err)
 	}
 }
+
+func TestBundleOnlyDedupStatistics(t *testing.T) {
+	cfg, _, _ := transferConfig(t, false)
+	key, err := cfg.CustomerKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := bytes.Repeat([]byte{0x53}, 3*4096)
+	source, _ := sparse.NewSource(bytes.NewReader(body), uint64(len(body)), nil)
+	var encoded bytes.Buffer
+	result, err := transfer.Write(context.Background(), cfg, key, source, transfer.WriteOptions{Mode: "bundle", Output: &encoded})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Stats.StoredChunks != 1 || result.Stats.DedupChunks != 2 {
+		t.Fatalf("Bundle-only stored=%d dedup=%d", result.Stats.StoredChunks, result.Stats.DedupChunks)
+	}
+}

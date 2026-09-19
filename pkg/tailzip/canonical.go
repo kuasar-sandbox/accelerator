@@ -10,8 +10,6 @@ import (
 	"hash/crc32"
 	"io"
 	"math"
-
-	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 )
 
 // Footer describes relative ZIP geometry independently of entry semantics.
@@ -43,29 +41,31 @@ func parseEndRecord(end []byte, offset uint64) (Footer, error) {
 }
 
 // ReadFooter reads the fixed comment-free footer used by canonical artifacts.
-func ReadFooter(ctx context.Context, src sparse.Source) (Footer, error) {
-	if src == nil || src.Size() < 22 {
+// src must satisfy io.ReaderAt random-access semantics, independently of the
+// weaker monotone sparse.Source contract. size is the logical carrier size.
+func ReadFooter(ctx context.Context, src io.ReaderAt, size uint64) (Footer, error) {
+	if src == nil || size < 22 {
 		return Footer{}, io.ErrUnexpectedEOF
 	}
-	end, err := readLogical(ctx, src, src.Size()-22, 22)
+	end, err := readLogical(ctx, src, size, size-22, 22)
 	if err != nil {
 		return Footer{}, err
 	}
 	if binary.LittleEndian.Uint16(end[20:]) != 0 {
 		return Footer{}, errors.New("EOCD comment is not empty")
 	}
-	return parseEndRecord(end, src.Size()-22)
+	return parseEndRecord(end, size-22)
 }
-func readLogical(ctx context.Context, src sparse.Source, offset, size uint64) ([]byte, error) {
+func readLogical(ctx context.Context, src io.ReaderAt, total, offset, size uint64) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if offset > src.Size() || size > src.Size()-offset || size > uint64(defaultLimit) {
+	if src == nil || total > math.MaxInt64 || offset > total || size > total-offset || size > uint64(defaultLimit) {
 		return nil, errors.New("tailzip: read outside bounded logical tail")
 	}
 	b := make([]byte, size)
-	n, err := src.ReadAt(ctx, b, offset)
-	if err != nil {
+	n, err := src.ReadAt(b, int64(offset))
+	if err != nil && err != io.EOF {
 		return nil, err
 	}
 	if n != len(b) {
@@ -74,21 +74,22 @@ func readLogical(ctx context.Context, src sparse.Source, offset, size uint64) ([
 	return b, nil
 }
 
-// ReadCanonical validates one contiguous, comment-free STORED archive.
+// ReadCanonical validates one contiguous, comment-free STORED archive from
+// a genuine random-access reader. It reads the footer before the bounded tail.
 // names is the exact ordered entry set; limits are application-supplied bounds.
 // Bodies share only the bounded tail allocation and contain no payload data.
-func ReadCanonical(ctx context.Context, src sparse.Source, names []string, limits map[string]int) (uint64, map[string][]byte, error) {
-	footer, err := ReadFooter(ctx, src)
+func ReadCanonical(ctx context.Context, src io.ReaderAt, size uint64, names []string, limits map[string]int) (uint64, map[string][]byte, error) {
+	footer, err := ReadFooter(ctx, src, size)
 	if err != nil {
 		return 0, nil, err
 	}
 	if footer.Count != len(names) {
 		return 0, nil, fmt.Errorf("tailzip: %d entries, want %d", footer.Count, len(names))
 	}
-	if src.Size()-footer.Base > defaultLimit {
+	if size-footer.Base > defaultLimit {
 		return 0, nil, errors.New("tailzip: canonical tail exceeds limit")
 	}
-	raw, err := readLogical(ctx, src, footer.Base, src.Size()-footer.Base)
+	raw, err := readLogical(ctx, src, size, footer.Base, size-footer.Base)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -220,6 +221,9 @@ func ReadCanonical(ctx context.Context, src sparse.Source, names []string, limit
 
 // EncodeCanonical preserves the fixed CreateRaw layout used by S/E writers.
 func EncodeCanonical(entries []Entry) ([]byte, error) {
+	if len(entries) >= math.MaxUint16 {
+		return nil, errors.New("tailzip: ZIP64 entry counts are unsupported")
+	}
 	total := uint64(22)
 	seen := map[string]bool{}
 	for _, e := range entries {
@@ -250,17 +254,18 @@ func EncodeCanonical(entries []Entry) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-// Names reads bounded central-directory names without consuming entry bodies.
+// Names reads bounded central-directory names from a random-access reader
+// without consuming entry bodies.
 // found is false only when a fixed-footer suffix is absent. Callers classify
 // application roles from names before applying their full format validator.
-func Names(ctx context.Context, src sparse.Source, maxEntries int, maxDirectoryBytes uint64) (names []string, found bool, err error) {
+func Names(ctx context.Context, src io.ReaderAt, size uint64, maxEntries int, maxDirectoryBytes uint64) (names []string, found bool, err error) {
 	if src == nil {
 		return nil, false, errors.New("tailzip: source is required")
 	}
-	if src.Size() < 22 {
+	if size < 22 {
 		return nil, false, nil
 	}
-	end, err := readLogical(ctx, src, src.Size()-22, 22)
+	end, err := readLogical(ctx, src, size, size-22, 22)
 	if err != nil {
 		return nil, false, err
 	}
@@ -270,14 +275,14 @@ func Names(ctx context.Context, src sparse.Source, maxEntries int, maxDirectoryB
 	if binary.LittleEndian.Uint16(end[20:]) != 0 {
 		return nil, true, errors.New("tailzip: EOCD comment is not empty")
 	}
-	footer, err := parseEndRecord(end, src.Size()-22)
+	footer, err := parseEndRecord(end, size-22)
 	if err != nil {
 		return nil, true, err
 	}
 	if maxEntries < 0 || footer.Count > maxEntries || footer.CentralSize > maxDirectoryBytes {
 		return nil, true, errors.New("tailzip: central directory exceeds detection limits")
 	}
-	directory, err := readLogical(ctx, src, footer.CentralStart, footer.CentralSize)
+	directory, err := readLogical(ctx, src, size, footer.CentralStart, footer.CentralSize)
 	if err != nil {
 		return nil, true, err
 	}
