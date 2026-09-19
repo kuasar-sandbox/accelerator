@@ -74,9 +74,11 @@ func locate(r io.ReaderAt, size int64, opt Options) (Tail, error) {
 	}
 	buf := make([]byte, n)
 	if n > 0 {
-		if count, err := r.ReadAt(buf, size-n); err != nil {
+		count, err := r.ReadAt(buf, size-n)
+		if err != nil && err != io.EOF {
 			return Tail{}, fmt.Errorf("tailzip: read suffix: %w", err)
-		} else if count != len(buf) {
+		}
+		if count != len(buf) {
 			return Tail{}, io.ErrUnexpectedEOF
 		}
 	}
@@ -100,6 +102,12 @@ func locate(r io.ReaderAt, size int64, opt Options) (Tail, error) {
 		}
 		if limit > 0 && t.Size > limit {
 			return Tail{}, fmt.Errorf("tailzip: suffix size %d exceeds limit %d", t.Size, limit)
+		}
+		if opt.MaxEntries > 0 && footer.Count > opt.MaxEntries {
+			return Tail{}, fmt.Errorf("tailzip: %d entries exceed limit %d", footer.Count, opt.MaxEntries)
+		}
+		if err := checkDirectory(r, footer); err != nil {
+			return Tail{}, err
 		}
 		if err := validateAt(r, t, opt); err != nil {
 			return Tail{}, err
@@ -406,4 +414,46 @@ func (r *checkedReaderAt) ReadAt(b []byte, off int64) (int, error) {
 		r.mu.Unlock()
 	}
 	return n, err
+}
+
+// Check the declared count before archive/zip allocates its File objects and
+// require archive-relative local offsets. Absolute-prefix archives are rejected
+// instead of accidentally classifying their payload as part of the ZIP tail.
+func checkDirectory(r io.ReaderAt, footer Footer) error {
+	pos, end := footer.CentralStart, footer.CentralStart+footer.CentralSize
+	var header [46]byte
+	for i := 0; i < footer.Count; i++ {
+		if pos > end || end-pos < 46 {
+			return errors.New("tailzip: truncated central directory")
+		}
+		n, err := r.ReadAt(header[:], int64(pos))
+		if err != nil && err != io.EOF {
+			return err
+		}
+		if n != len(header) {
+			return io.ErrUnexpectedEOF
+		}
+		if binary.LittleEndian.Uint32(header[:4]) != 0x02014b50 {
+			return errors.New("tailzip: invalid central header")
+		}
+		offset := binary.LittleEndian.Uint32(header[42:46])
+		if i == 0 && offset != 0 {
+			return errors.New("tailzip: local ZIP offsets must be relative to the suffix")
+		}
+		if offset == math.MaxUint32 {
+			return errors.New("tailzip: ZIP64 local offset is unsupported")
+		}
+		variable := uint64(binary.LittleEndian.Uint16(header[28:30])) + uint64(binary.LittleEndian.Uint16(header[30:32])) + uint64(binary.LittleEndian.Uint16(header[32:34]))
+		if variable > end-pos-46 {
+			return errors.New("tailzip: central fields exceed directory")
+		}
+		pos += 46 + variable
+	}
+	if pos != end {
+		return errors.New("tailzip: EOCD entry count disagrees with directory")
+	}
+	if footer.Count == 0 && footer.CentralStart != footer.Base {
+		return errors.New("tailzip: empty suffix contains a prefix")
+	}
+	return nil
 }

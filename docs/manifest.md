@@ -527,3 +527,9 @@ Bundle tail-index opening cost at 4K/20K/100K chunks is reported by `BenchmarkBu
 - [system architecture](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox.md): the Manifest abstraction in the overall platform.
 
 Immutable read errors and client recovery are specified in [Read errors and recovery](accelerator-read-recovery.md).
+
+### Transfer identities and reconstructed boundaries
+
+Explicit tarstream `@digest`/`@hmac` identities and Bundle `@manifest` selectors remain binding when ordinary `manifest.verify_content` is disabled. Content conversion completes carrier verification before reporting success. Carrier selection uses its bytes or an explicit selector rather than the filename extension. When a carrier declares a tail, extraction and stripping require that boundary to match the validated ZIP suffix.
+
+For an unchanged complete Manifest/Bundle root, tarstream output recovers the boundary of a valid relative ZIP suffix. This preserves canonical image envelope identities across Store roundtrips; existing tarstream declarations and explicit windows retain their boundaries. Store statistics count new Manifest bytes only when the final Put creates the object. Tarstream-only loads report logical progress unless `--no-progress` is selected.

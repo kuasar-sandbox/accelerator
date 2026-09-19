@@ -685,3 +685,9 @@ metadata 读取及其与 chunk 数的关系。benchmark fixture 名称不覆盖�
 - [系统架构](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox_zh.md):Manifest 抽象在平台中的位置。
 
 不可变读取错误及 client 恢复见[读取错误与恢复](accelerator-read-recovery_zh.md).
+
+### 传输身份与边界重建
+
+显式 tarstream `@digest`/`@hmac` 身份和 Bundle `@manifest` selector 在关闭普通 `manifest.verify_content` 时仍然生效。内容转换完成载体校验后才报告成功。载体按字节格式或显式 selector 识别，与文件扩展名无关。载体声明 tail 时，提取和剥离要求该边界与合法 ZIP 后缀起点一致。
+
+对未经修改的完整 Manifest/Bundle 根，tarstream 输出恢复合法相对偏移 ZIP 后缀的边界，使规范镜像信封身份在 Store 往返中保持一致；既有 tarstream 声明和显式窗口维持各自边界。Store 统计仅在最终 Put 实际创建 Manifest 时计入新增字节。tarstream-only load 报告逻辑进度，`--no-progress` 可关闭动态进度。

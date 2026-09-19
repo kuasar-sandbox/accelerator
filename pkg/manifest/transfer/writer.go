@@ -84,17 +84,17 @@ func (w *transferWriter) PutChunkOrdered(ctx context.Context, a store.WriteAdmis
 	}
 	return true, nil
 }
-func (w *transferWriter) commit(ctx context.Context) error {
+func (w *transferWriter) commit(ctx context.Context) (bool, error) {
 	if w.target == nil {
-		return nil
+		return true, nil
 	}
 	if len(w.manifest) == 0 {
-		return errors.New("missing final Manifest")
+		return false, errors.New("missing final Manifest")
 	}
-	_, err := w.target.Put(ctx, w.admission, store.PartitionManifest, w.root, w.manifest)
+	fresh, err := w.target.Put(ctx, w.admission, store.PartitionManifest, w.root, w.manifest)
 	clear(w.manifest)
 	w.manifest = nil
-	return err
+	return fresh, err
 }
 
 func writeTransfer(ctx context.Context, cfg *manifest.Config, key [32]byte, src sparse.Source, mode string, out io.Writer, name string, storeOut bool, extra []byte, codec tarstream.Codec, required bool, finish func() error, progress func(uint64, uint64)) (result Result, retErr error) {
@@ -199,8 +199,15 @@ func writeTransfer(ctx context.Context, cfg *manifest.Config, key [32]byte, src 
 		if out == nil {
 			return result, errors.New("tarstream output writer is required")
 		}
-		if _, _, err := tarstream.WriteTo(ctx, out, name, src, writeOptions(codec, required)...); err != nil {
+		outputSource := src
+		if progress != nil {
+			outputSource = &progressSource{Source: src, report: progress}
+		}
+		if _, _, err := tarstream.WriteTo(ctx, out, name, outputSource, writeOptions(codec, required)...); err != nil {
 			return result, fmt.Errorf("write tarstream: %w", err)
+		}
+		if progress != nil {
+			progress(src.Size(), src.Size())
 		}
 	}
 	if finish != nil {
@@ -212,8 +219,12 @@ func writeTransfer(ctx context.Context, cfg *manifest.Config, key [32]byte, src 
 		return result, err
 	}
 	if writer != nil {
-		if err := writer.commit(ctx); err != nil {
+		fresh, err := writer.commit(ctx)
+		if err != nil {
 			return result, err
+		}
+		if !fresh {
+			result.Stats.StoredBytes -= result.Stats.ManifestStoredBytes
 		}
 	}
 	return result, nil
@@ -247,4 +258,61 @@ func Write(ctx context.Context, cfg *manifest.Config, key [32]byte, src sparse.S
 		return Result{}, errors.New("output writer is required")
 	}
 	return writeTransfer(ctx, cfg, key, src, opts.Mode, opts.Output, opts.Name, opts.Store, opts.ExtraSalt, opts.Codec, opts.RequireLocalEncryption, opts.BeforeCommit, opts.OnProgress)
+}
+
+// progressSource reports successful forward data consumption, not metadata
+// RunAt probes. The enclosing writer reports completion across holes/zeroes.
+type progressSource struct {
+	sparse.Source
+	report    func(uint64, uint64)
+	processed uint64
+}
+
+func (s *progressSource) progress(end uint64) {
+	if end > s.processed {
+		s.processed = end
+		s.report(end, s.Size())
+	}
+}
+func (s *progressSource) PayloadCommitment() (uint64, [32]byte, bool) {
+	if p, ok := s.Source.(tarstream.IdentityProvider); ok {
+		return p.PayloadCommitment()
+	}
+	return s.Size(), [32]byte{}, false
+}
+func (s *progressSource) TarStreamDigest(name string) ([32]byte, bool) {
+	if p, ok := s.Source.(tarstream.IdentityProvider); ok {
+		return p.TarStreamDigest(name)
+	}
+	return [32]byte{}, false
+}
+func (s *progressSource) RunAt(off, limit uint64) (sparse.Run, error) {
+	run, err := s.Source.RunAt(off, limit)
+	if err != nil {
+		return nil, err
+	}
+	if run == nil {
+		return nil, errors.New("nil progress source run")
+	}
+	return progressRun{Run: run, source: s}, nil
+}
+func (s *progressSource) ReadAt(ctx context.Context, p []byte, off uint64) (int, error) {
+	n, err := s.Source.ReadAt(ctx, p, off)
+	if n > 0 {
+		s.progress(off + uint64(n))
+	}
+	return n, err
+}
+
+type progressRun struct {
+	sparse.Run
+	source *progressSource
+}
+
+func (r progressRun) ReadAt(ctx context.Context, p []byte, inner uint64) (int, error) {
+	n, err := r.Run.ReadAt(ctx, p, inner)
+	if n > 0 {
+		r.source.progress(r.Offset() + inner + uint64(n))
+	}
+	return n, err
 }

@@ -244,6 +244,10 @@ func runTransfer(ctx context.Context, args []string, storeCommand bool, streams 
 			}
 
 			if err == nil {
+				boundary, _, _ := layer.PayloadCommitment()
+				if boundary < layer.Size() && uint64(bounds.Offset) != boundary {
+					return errors.New("ZIP tail disagrees with declared payload boundary")
+				}
 				if *appendPath != "" && !*strip {
 					return errors.New("append-tail on an existing tail requires --strip-tail")
 				}
@@ -294,6 +298,22 @@ func runTransfer(ctx context.Context, args []string, storeCommand bool, streams 
 		src, err = tailzip.Append(src, newTail, tailzip.Options{})
 		if err != nil {
 			return err
+		}
+	}
+	// A Manifest stores logical bytes/holes, not its former carrier boundary.
+	// Reconstruct the split of a valid relative suffix for an unchanged root.
+	// Existing tarstream declarations, explicit windows and layer transforms
+	// retain their own authoritative boundaries.
+	if mode == "tarstream" && sequential == nil && len(opened) == 1 && !*strip && len(newTail) == 0 && offset == 0 && size == opened[0].Size() {
+		if _, declared := opened[0].Source.(tarstream.IdentityProvider); !declared {
+			probe := &optionalTailReader{ctx: ctx, source: src}
+			tail, tailErr := tailzip.Locate(probe, int64(src.Size()), tailzip.Options{})
+			if probe.err != nil {
+				return probe.err
+			}
+			if tailErr == nil {
+				src = payloadBoundary{Source: src, boundary: uint64(tail.Offset)}
+			}
 		}
 	}
 	var outputWriter io.Writer
@@ -536,4 +556,35 @@ func (s *sourceStream) TarStreamDigest(name string) ([32]byte, bool) {
 		return p.TarStreamDigest(name)
 	}
 	return [32]byte{}, false
+}
+
+// payloadBoundary annotates geometry without retaining or changing any bytes.
+type payloadBoundary struct {
+	sparse.Source
+	boundary uint64
+}
+
+func (s payloadBoundary) PayloadCommitment() (uint64, [32]byte, bool) {
+	return s.boundary, [32]byte{}, false
+}
+func (s payloadBoundary) TarStreamDigest(string) ([32]byte, bool) { return [32]byte{}, false }
+
+type optionalTailReader struct {
+	ctx    context.Context
+	source sparse.Source
+	err    error
+}
+
+func (r *optionalTailReader) ReadAt(p []byte, off int64) (int, error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+	if off < 0 {
+		return 0, io.EOF
+	}
+	n, err := r.source.ReadAt(r.ctx, p, uint64(off))
+	if err != nil && err != io.EOF {
+		r.err = err
+	}
+	return n, err
 }

@@ -157,7 +157,7 @@ func (r *Reader) Open(ctx context.Context, raw string) (*Opened, error) {
 	if probeErr != nil && probeErr != io.EOF {
 		return fail(probeErr)
 	}
-	isBundle := ref.DigestScheme == "manifest" || filepath.Ext(path) == ".bundle" || n == 4 && bytes.Equal(magic[:], []byte{'P', 'K', 3, 4})
+	isBundle := ref.DigestScheme == "manifest" || n == 4 && bytes.Equal(magic[:], []byte{'P', 'K', 3, 4})
 	if isBundle {
 		if ref.DigestScheme != "" && ref.DigestScheme != "manifest" {
 			return fail(errors.New("Bundle requires a Manifest selector"))
@@ -184,7 +184,7 @@ func (r *Reader) Open(ctx context.Context, raw string) (*Opened, error) {
 		if err != nil {
 			return failBundle(err)
 		}
-		verify := r.cfg.Manifest.VerifyContent == nil || *r.cfg.Manifest.VerifyContent
+		verify := ref.DigestScheme == "manifest" || r.cfg.Manifest.VerifyContent == nil || *r.cfg.Manifest.VerifyContent
 		local := fetch.NewFetcherWithOptions(r.key, reader.Getter(), decryptor, fetch.Options{VerifyContent: verify})
 		// An explicitly selected root belongs to the current Bundle. Every Chunk
 		// is served from that selected source, never from a different Bundle.
@@ -219,7 +219,7 @@ func (r *Reader) Open(ctx context.Context, raw string) (*Opened, error) {
 		return errors.Join(err, file.Close())
 	}
 	return &Opened{Source: src, path: path, closeFn: closeSource, finish: func(ctx context.Context) (retErr error) {
-		if r.cfg.Manifest.VerifyContent != nil && !*r.cfg.Manifest.VerifyContent {
+		if ref.DigestScheme == "" && r.cfg.Manifest.VerifyContent != nil && !*r.cfg.Manifest.VerifyContent {
 			return ctx.Err()
 		}
 		verified, _, err := tarstream.SourceFrom(io.NewSectionReader(file, 0, info.Size()), "", options...)

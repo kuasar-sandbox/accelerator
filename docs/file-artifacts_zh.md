@@ -327,3 +327,5 @@ writer 保持历史确定性 entry 名称、STORED method、时间戳和字节�
 `tailzip.ReadCanonical` 与 `EncodeCanonical` 实现 S/E 使用的固定 raw-header profile；`ReadFooter` 和 `Names` 提供有界几何信息与角色探测元数据。应用模块传入有序条目名、大小上限，并负责配置/schema 校验。`tailzip.Section` 保持 borrowed run 生命周期及未偏移 prefix 的 ChunkRun 能力；`Append` 保留权威 payload 边界和可复用的摘要 commitment。
 
 Image reader/writer、两个 flatten builder、flatten-ctl 打包、sandboxer S/E reader/builder 及 image assembly/capture/restore 调用方共用这些 helper。Image ZIP 保持原有 writer profile，S/E 保持严格 profile。新 image tarstream envelope 将 EROFS prefix 声明为 payload、config ZIP 声明为 metadata tail；已有 carrier 继续按其原始身份声明读取。
+
+Suffix ZIP 在构造 ZIP reader 前检查 EOCD 条目数量与有界目录布局。local offset 相对后缀起点；带绝对前缀偏移的归档明确报错，避免将 payload 当作元数据。ReaderAt 返回完整缓冲并附带普通 EOF 时接受数据；短读和标记过的源故障仍然返回错误。
