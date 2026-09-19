@@ -209,9 +209,12 @@ preflight 只需发现 location/admission 时可使用 `OpenMetadata`/`ReadMetad
 并行，但实现通过有界 ordinal reorder 等待逻辑顺序并串行 append ZIP，不产生无界
 完成队列。
 
-配置层用 `Config.NewBundleIngester` 装配该 writer；此入口固定不混入
-`extra_salt`，保证 Chunk key 始终属于 recorded admission 的 canonical salt domain，
-从而可在 exact upload 时逐对象验证且无需重写。
+配置层用 `Config.NewBundleIngester` 装配不带 extra salt 的兼容路径；
+`Config.NewBundleIngesterWithExtraSalt` 接受与 Store ingest 相同的可选 extra-salt
+resolver。Bundle 记录基础 admission，实际 Chunk key 则由加密 Manifest key table
+认证。完整验证和 exact upload 使用该认证 key 解密，不再从基础 admission salt
+重复派生，因此读取方无需 extra salt。发布根之前仍验证物理 ContentKey、key-table
+AAD、解码尺寸、布局、依赖闭包和目标 admission。
 
 读侧仅在 `Fetcher.OpenManifest` 按以下顺序选择来源：
 
@@ -272,9 +275,10 @@ range，证明没有重排、gap、隐藏/重叠 entry；随后要求 index 是 
 4. 强制验证每个选定 Manifest physical ContentKey、解析并用 customer key 解封 key
    table，并证明该 Manifest 的完整 Chunk 闭包位于同一 source Bundle。
    在任何 Put 前拒绝跨 Manifest 的同一 ContentKey 对应不同 key 或 plaintext size。
-5. 并发 worker 逐个处理每个 source 中实际使用的唯一 Chunk:强制验证 physical ContentKey,
-   解密/解压为原明文,要求 `DeriveKey(sourceAdmission.Salt, plaintext)` 等于 key table 中的
-   key,然后 Put 该已验证 Chunk。这是逐 Chunk 验证后上传,不是全部明文验证完毕才开始写入。
+5. 并发 worker 逐个处理各来源实际使用的 unique Chunk：强制验证物理 ContentKey，
+   使用经过认证的 key-table key 解密/解压并验证解码长度，然后 Put 已验证的物理
+   Chunk。实际密钥已包含写入时的 extra-salt 派生结果。这是逐 Chunk 先验证后上传，
+   各 Chunk 按有界并发独立推进。
 6. 只有全部 Chunk worker 成功后才上传依赖 Manifest,最后发布调用方指定的 current root。
    后续 Chunk 验证或上传失败时,先前已验证的 Chunk 可能留在 Store,但根不会发布。
 

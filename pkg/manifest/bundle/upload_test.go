@@ -141,29 +141,19 @@ func TestExactUploadGenerationRemovalDoesNotPublishRoot(t *testing.T) {
 	}
 }
 
-func TestFullVerifyRejectsObjectsOutsideRecordedSaltDomain(t *testing.T) {
-	source := newTestFixture(t, "G2")
-	defer source.reader.Close()
-	g1Salt, err := store.SaltForGeneration("G1")
-	if err != nil {
-		t.Fatal(err)
+func TestFullVerifyAndExactUploadAcceptExtraSaltKeys(t *testing.T) {
+	fixture := newTestFixtureWithExtraSalt(t, "G1", []byte("tenant-a"))
+	defer fixture.reader.Close()
+	if err := fixture.reader.FullVerify(context.Background(), fixture.root, fixture.customer, fixture.decryptor, VerifyOptions{Workers: 2}); err != nil {
+		t.Fatalf("FullVerify extra-salt Bundle: %v", err)
 	}
-	entries := []rawEntry{{name: admissionName(store.WriteAdmission{Generation: "G1", Salt: g1Salt})}}
-	for _, key := range source.reader.ManifestKeys() {
-		entries = append(entries, rawEntry{name: manifestPrefix + keyString(key), data: objectBytes(t, source.reader, store.PartitionManifest, key)})
+	target := &recordingExactStore{accepted: fixture.admission, pool: 2}
+	if err := fixture.reader.Upload(context.Background(), fixture.root, fixture.customer, fixture.decryptor, target, VerifyOptions{Workers: 2}); err != nil {
+		t.Fatalf("Upload extra-salt Bundle: %v", err)
 	}
-	for _, key := range source.reader.ChunkKeys() {
-		entries = append(entries, rawEntry{name: chunkPrefix + keyString(key), data: objectBytes(t, source.reader, store.PartitionChunk, key)})
-	}
-	data := rawZIP(t, entries, "")
-	reader, err := NewReader(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reader.Close()
-	err = reader.FullVerify(context.Background(), source.root, source.customer, source.decryptor, VerifyOptions{Workers: 2})
-	if err == nil || !strings.Contains(err.Error(), "outside recorded admission salt domain") {
-		t.Fatalf("FullVerify error = %v", err)
+	_, _, puts := target.snapshot()
+	if len(puts) == 0 || puts[len(puts)-1].key != fixture.root {
+		t.Fatalf("exact upload did not publish root last: %#v", puts)
 	}
 }
 

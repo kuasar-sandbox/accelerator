@@ -165,7 +165,7 @@ func TestUploadExactManifestsStrictlyVerifiesEverySourceBeforeTargetContact(t *t
 	}
 }
 
-func TestUploadExactManifestsRejectsAdmissionAndSaltDomainMismatch(t *testing.T) {
+func TestUploadExactManifestsChecksAdmissionButAllowsExtraSaltKeys(t *testing.T) {
 	source := newTestFixture(t, "SOURCE")
 	root := newTestFixture(t, "ROOT")
 	defer source.reader.Close()
@@ -189,7 +189,7 @@ func TestUploadExactManifestsRejectsAdmissionAndSaltDomainMismatch(t *testing.T)
 		}
 	})
 
-	t.Run("object salt domain mismatch", func(t *testing.T) {
+	t.Run("authenticated keys need not derive from base admission salt", func(t *testing.T) {
 		wrongSalt, err := store.SaltForGeneration("WRONG")
 		if err != nil {
 			t.Fatal(err)
@@ -211,13 +211,17 @@ func TestUploadExactManifestsRejectsAdmissionAndSaltDomainMismatch(t *testing.T)
 			root.admission.Generation: root.admission,
 		}, pool: 1}
 		err = UploadExactManifests(context.Background(), ExactManifest{Key: root.root, Reader: root.reader}, []ExactManifest{{Key: source.root, Reader: wrongReader}}, root.customer, root.decryptor, target, VerifyOptions{Workers: 1})
-		if err == nil || !strings.Contains(err.Error(), "outside source admission salt domain") {
-			t.Fatalf("UploadExactManifests error = %v", err)
+		if err != nil {
+			t.Fatalf("UploadExactManifests: %v", err)
 		}
+		publishedRoot := false
 		for _, event := range target.snapshot() {
 			if event.kind == "put" && event.put.partition == store.PartitionManifest && event.put.key == root.root {
-				t.Fatal("root Manifest published after dependency salt-domain failure")
+				publishedRoot = true
 			}
+		}
+		if !publishedRoot {
+			t.Fatal("root Manifest was not published after successful authenticated upload")
 		}
 	})
 }
@@ -260,3 +264,43 @@ func TestUploadExactManifestsRejectsConflictingSourceAssignment(t *testing.T) {
 }
 
 var _ ExactStore = (*multiExactStore)(nil)
+
+func TestVerifyAndUploadExactManifestsWithActualExtraSalt(t *testing.T) {
+	dependency := newTestFixtureWithExtraSalt(t, "G1", []byte("dependency-domain"))
+	root := newTestFixtureWithExtraSalt(t, "G2", []byte("root-domain"))
+	defer dependency.reader.Close()
+	defer root.reader.Close()
+	selectedRoot := ExactManifest{Key: root.root, Reader: root.reader}
+	selectedDeps := []ExactManifest{{Key: dependency.root, Reader: dependency.reader}}
+	if err := VerifyExactManifests(context.Background(), selectedRoot, selectedDeps, root.customer, root.decryptor, VerifyOptions{}); err != nil {
+		t.Fatalf("VerifyExactManifests with actual extra salt: %v", err)
+	}
+	target := &multiExactStore{accepted: map[store.Generation]store.WriteAdmission{
+		dependency.admission.Generation: dependency.admission,
+		root.admission.Generation:       root.admission,
+	}, pool: 2}
+	if err := UploadExactManifests(context.Background(), selectedRoot, selectedDeps, root.customer, root.decryptor, target, VerifyOptions{Workers: 2}); err != nil {
+		t.Fatalf("UploadExactManifests with actual extra salt: %v", err)
+	}
+	events := target.snapshot()
+	if len(events) < 3 {
+		t.Fatalf("missing upload events: %v", events)
+	}
+	for _, event := range events {
+		if event.kind != "put" {
+			continue
+		}
+		reader := root.reader
+		if event.put.admission == dependency.admission {
+			reader = dependency.reader
+		}
+		expected := objectBytes(t, reader, event.put.partition, event.put.key)
+		if !bytes.Equal(expected, event.put.data) {
+			t.Fatal("exact upload rewrote encoded object")
+		}
+	}
+	last := events[len(events)-1]
+	if last.kind != "put" || last.put.partition != store.PartitionManifest || last.put.key != root.root {
+		t.Fatalf("current root not published last: %#v", last)
+	}
+}

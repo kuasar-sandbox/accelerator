@@ -272,12 +272,6 @@ func verifyExactChunks(ctx context.Context, chunks []exactChunk, refs map[exactC
 					continue
 				}
 				admission := chunk.reader.Admission()
-				if derived := manifestcrypto.DeriveKey(admission.Salt, plain); derived != reference.decryptKey {
-					blob.Release()
-					clear(plain)
-					fail(fmt.Errorf("manifest bundle: Chunk %s key is outside source admission salt domain", hex.EncodeToString(chunk.key[:])))
-					continue
-				}
 				if target != nil {
 					if _, err := target.Put(workCtx, admission, store.PartitionChunk, chunk.key, physical); err != nil {
 						blob.Release()

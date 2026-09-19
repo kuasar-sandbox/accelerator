@@ -228,11 +228,19 @@ func (c *Config) NewIngesterWithWriter(keyFn ingest.CustomerKeyFunc, extraSaltFn
 }
 
 // NewBundleIngester wires a caller-owned multi-Manifest writer with the
-// configured customer key and no extra salt. Bundle Chunk keys must remain in
-// the recorded WriteAdmission's canonical salt domain so exact upload can
-// validate and copy physical objects without rewriting them.
+// configured customer key and no extra salt. It preserves the original API for
+// callers that do not need a narrower derivation domain.
 func (c *Config) NewBundleIngester(writer ingest.StoreWriter) (ingest.Ingester, error) {
-	return c.NewIngesterWithWriter(c.IngestKeyFunc(), nil, writer)
+	return c.NewBundleIngesterWithExtraSalt(writer, nil)
+}
+
+// NewBundleIngesterWithExtraSalt wires a caller-owned Bundle writer to the
+// same ingest path and extra-salt derivation used by Store output. A Bundle
+// records the base WriteAdmission while the authenticated Manifest key table
+// records the actual per-Chunk keys, so readers and exact upload do not need
+// the extra salt again.
+func (c *Config) NewBundleIngesterWithExtraSalt(writer ingest.StoreWriter, extraSaltFn ingest.ExtraSaltFunc) (ingest.Ingester, error) {
+	return c.NewIngesterWithWriter(c.IngestKeyFunc(), extraSaltFn, writer)
 }
 
 // WriteAdmission resolves the one admission a local multi-object writer must
