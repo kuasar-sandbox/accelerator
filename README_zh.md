@@ -51,6 +51,8 @@
 
 ## 构建与测试
 
+构建使用环境提供的 Go，并继承 `GOROOT`、`GOTOOLCHAIN` 等工具链选择；发布自动化需要环境在 `PATH` 中提供支持 `api --slurp` 的 `gh`。项目不下载、替换或按固定二进制摘要认证这些环境工具。
+
 ```bash
 make manifest-ctl store-ctl     # 纯 Go 命令行服务
 make cache-ctl                  # 缓存服务及当前后端依赖
