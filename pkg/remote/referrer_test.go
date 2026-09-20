@@ -191,7 +191,16 @@ func TestReferrerRoundTrip(t *testing.T) {
 	}
 }
 
+func setReferrerTestNow(t *testing.T, now *time.Time) {
+	t.Helper()
+	old := referrerNow
+	referrerNow = func() time.Time { return *now }
+	t.Cleanup(func() { referrerNow = old })
+}
+
 func TestExpiredReferrerIsMiss(t *testing.T) {
+	now := time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC)
+	setReferrerTestNow(t, &now)
 	host := startRegistry(t)
 	img, err := random.Image(512, 1)
 	if err != nil {
@@ -221,13 +230,15 @@ func TestExpiredReferrerIsMiss(t *testing.T) {
 	if err := cfg.PutReferrer(ctx, res, manifestID, key); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(1100 * time.Millisecond)
+	now = now.Add(1100 * time.Millisecond)
 	if id, ok, err := cfg.FindReferrer(ctx, res, key); err != nil || ok || id != "" {
 		t.Fatalf("expired lookup id=%q ok=%v err=%v", id, ok, err)
 	}
 }
 
 func TestExpiredNewerReferrerFallsBackToNewestValidCandidate(t *testing.T) {
+	now := time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC)
+	setReferrerTestNow(t, &now)
 	host := startRegistry(t)
 	img, err := random.Image(512, 1)
 	if err != nil {
@@ -255,7 +266,7 @@ func TestExpiredNewerReferrerFallsBackToNewestValidCandidate(t *testing.T) {
 	if err := cfg.PutReferrer(ctx, res, stableID, key); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(1100 * time.Millisecond)
+	now = now.Add(1100 * time.Millisecond)
 	cfg.Referer.Validity = "3s"
 	if err := cfg.PutReferrer(ctx, res, expiringID, key); err != nil {
 		t.Fatal(err)
@@ -263,7 +274,7 @@ func TestExpiredNewerReferrerFallsBackToNewestValidCandidate(t *testing.T) {
 	if id, ok, err := cfg.FindReferrer(ctx, res, key); err != nil || !ok || id != expiringID {
 		t.Fatalf("newest live lookup id=%q ok=%v err=%v", id, ok, err)
 	}
-	time.Sleep(3100 * time.Millisecond)
+	now = now.Add(3100 * time.Millisecond)
 	if id, ok, err := cfg.FindReferrer(ctx, res, key); err != nil || !ok || id != stableID {
 		t.Fatalf("post-expiry lookup id=%q ok=%v err=%v", id, ok, err)
 	}

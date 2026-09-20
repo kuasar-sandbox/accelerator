@@ -39,6 +39,7 @@ const (
 var (
 	emptyLayerBlob      = []byte("{}")
 	emptyLayerMediaType = types.MediaType("application/vnd.oci.empty.v1+json")
+	referrerNow         = time.Now
 )
 
 var ErrReferrersUnsupported = errors.New("remote: registry does not support OCI referrers")
@@ -119,7 +120,7 @@ func (c *Config) findReferrerByOwner(ctx context.Context, subj *Resolved, ownerV
 	if err != nil {
 		return "", false, fmt.Errorf("remote: read referrers index: %w", err)
 	}
-	now := time.Now()
+	now := referrerNow()
 	var bestID, bestDigest string
 	var bestImported time.Time
 	for _, d := range im.Manifests {
@@ -320,7 +321,7 @@ func validManifestID(id string) bool {
 // validAtValue builds the valid_at annotation: "<import RFC3339>" plus, when
 // referer.validity is set, " <expiry RFC3339>".
 func (c *Config) validAtValue() (string, error) {
-	now := time.Now().UTC()
+	now := referrerNow().UTC()
 	v := now.Format(time.RFC3339Nano)
 	if c.Referer.Validity == "" {
 		return v, nil
