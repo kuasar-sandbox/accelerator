@@ -54,6 +54,8 @@ Do not interpret content encryption as a claim that every threat model leaks no 
 
 ## Build and test
 
+Builds use environment-provided Go and inherit its `GOROOT` and `GOTOOLCHAIN` selection. Release automation requires a working `gh` with `api --slurp` support on `PATH`; the project does not install, replace, or authenticate these environment tools against fixed binary digests.
+
 ```bash
 make manifest-ctl store-ctl     # pure-Go command-line services
 make cache-ctl                  # build the cache service and its current backend dependencies

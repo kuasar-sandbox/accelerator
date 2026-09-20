@@ -114,6 +114,7 @@ test-no-rocksdb:
 
 # Unit tests. cache/rocks tests need librocksdb (dynamic link is fine here).
 test: deps-rocksdb
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-tools.py
 	CGO_CFLAGS="$(CGO_CFLAGS)" \
 	CGO_LDFLAGS="-L$(ROCKS_PREFIX)/lib -lrocksdb -lstdc++ -lm -lpthread -ldl" \
 		$(GO) test ./...
@@ -160,6 +161,7 @@ release: build
 		bash scripts/release.sh package "$(VERSION)" "$(TARGET_ARCH)" build/release-bundle
 
 test-release:
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-tools.py
 	bash scripts/test-release.sh
 
 help:
