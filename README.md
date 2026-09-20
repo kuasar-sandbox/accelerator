@@ -65,7 +65,7 @@ make test                       # unit tests and backend tests
 make test-e2e                   # component owner suite; requires the assembled project BIN
 ```
 
-Go and native prerequisites vary by target. The current source tree documents and builds any native cache dependencies through repository scripts. Real object-storage tests must use explicit test credentials or a local S3-compatible service; ordinary unit and local-filesystem tests must not require production cloud credentials.
+Source builds require Go 1.26.1 or newer. Native prerequisites vary by target. The current source tree documents and builds any native cache dependencies through repository scripts. Real object-storage tests must use explicit test credentials or a local S3-compatible service; ordinary unit and local-filesystem tests must not require production cloud credentials.
 
 `cache-ctl` normally uses CGO and a locally built static `librocksdb.a` from
 `deps/build-rocksdb.sh`; `manifest-ctl`, `store-ctl` and the downstream import
