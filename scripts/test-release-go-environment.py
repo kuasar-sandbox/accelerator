@@ -77,6 +77,27 @@ class GoSourceEnvironment(unittest.TestCase):
         self.assertNotEqual(self.run_shell(
             "release_materials_go_payload_allowed unknown bin/tool").returncode, 0)
 
+    def test_archive_fixture_uses_its_own_selected_go_version(self):
+        assignment = next(line for line in (ROOT / "scripts/test-release.sh").read_text().splitlines()
+                          if line.startswith("go_toolchain="))
+        fixture = self.root / "fixture module"
+        fixture.mkdir()
+        (self.bin / "go").write_text('''#!/bin/sh
+if [ "$1" = version ]; then echo 'go version go1.26.1 linux/amd64'; exit 0; fi
+[ "$1" = -C ] && [ "$2" = "$EXPECTED_FIXTURE" ] || exit 61
+[ "$3:$4" = env:GOVERSION ] && [ "$GOWORK" = off ] || exit 62
+[ "$GOTOOLCHAIN" = auto ] && [ "$GOENV" = "$EXPECTED_GOENV" ] || exit 63
+echo go1.24.13
+''')
+        configuration = str(self.root / "environment-owned-config")
+        result = self.run_shell('fixture_root="$EXPECTED_FIXTURE"\n' + assignment
+                                + '\nprintf "%s\\n" "$go_toolchain"',
+                                {"EXPECTED_FIXTURE": str(fixture), "GOWORK": "/outer/go.work",
+                                 "GOTOOLCHAIN": "auto", "GOENV": configuration,
+                                 "EXPECTED_GOENV": configuration})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "go1.24.13")
+
     def test_validator_rejects_aliases_before_record_check(self):
         unit, official = ALLOWED[0].split(":", 1)
         stage = self.root / "stage"
