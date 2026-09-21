@@ -22,14 +22,14 @@ Bootstrap runs before requested accelerator source is checked out or executed.
 
 | Jobs | Shared profile |
 | --- | --- |
-| Release preflight, publish, Preview delete | `release-control`: minimal control tools and pinned Go needed by `release.sh` |
+| Release preflight, publish, Preview delete | `release-control`: minimal control tools and environment-provided Go needed by `release.sh` |
 | Reconcile Latest, artifact cleanup | `control`: Git, curl, jq, Python/YAML and archive tools |
 | Release build/test/package | `artifact-build` or `artifact-cross`: target-aware tools, native dependencies and control tools |
 | Public PR integration | Shared architecture lanes and separate required source checks; see [platform CI](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/ci.md) |
 
 The release build uses real RocksDB through the existing recipe; `NO_ROCKSDB=1` is not a release
-substitute. Go uses the shared verified 1.26.5 distribution and existing toolchain
-selection semantics. The pinned GitHub CLI installer is retained in control jobs.
+substitute. Go and native compilers come from the build environment, retaining
+the existing toolchain selection semantics. Control jobs retain the pinned GitHub CLI installer.
 
 Exact release source lives in `src/accelerator`. Build, tests, native caches,
 packaging and artifact upload use that subtree, so sibling trusted tooling does
@@ -78,4 +78,4 @@ candidate source/build/release behavior on a standard runner. Refresh pins after
 squash or rebase. Passing offline fixtures or preparing a private repository
 does not establish that its Public CI route is active or accepted.
 
-Normal Go RocksDB tests retain the upstream binding’s compression-library link flags; the accelerator profile explicitly supplies Snappy, LZ4, Zstandard and zlib development libraries. This does not enable compression in the existing native RocksDB recipe.
+Normal Go RocksDB tests retain the upstream binding’s compression-library link flags; the build profiles explicitly supply Snappy, LZ4, Zstandard and zlib development libraries. This does not enable compression in the existing native RocksDB recipe.

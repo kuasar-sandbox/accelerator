@@ -17,13 +17,13 @@ checkout 到 `trusted/platform`。Workflow 契约检查拒绝占位引用。Boot
 
 | Job | 共享 profile |
 | --- | --- |
-| 发布 preflight、publish、Preview delete | `release-control`:最小 control 工具与 `release.sh` 所需的固定 Go |
+| 发布 preflight、publish、Preview delete | `release-control`:最小 control 工具与 `release.sh` 所需的环境 Go |
 | Reconcile Latest、artifact cleanup | `control`:Git、curl、jq、Python/YAML 与归档工具 |
 | Release build/test/package | `artifact-build` 或 `artifact-cross`:目标架构工具、native 依赖与 control 工具 |
 | Public PR integration | 共享架构链路及独立必需源码检查,见[平台 CI](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/ci_zh.md) |
 
-发布构建按原有 recipe 构建真实 RocksDB,不能以 `NO_ROCKSDB=1` 替代发布载荷。Go 使用共享校验过的
-1.26.5 分发及既有工具链选择语义。Control job 保留固定版本的 GitHub CLI installer。
+发布构建按原有 recipe 构建真实 RocksDB,不能以 `NO_ROCKSDB=1` 替代发布载荷。Go 与 native
+编译器由构建环境提供,保留既有工具链选择语义。Control job 保留固定版本的 GitHub CLI installer。
 
 精确发布源码位于 `src/accelerator`。构建、测试、native cache、打包与 artifact 上传
 均使用该子目录,旁边的可信工具不会污染源码或 VCS stamping。Public cache 位于
@@ -63,4 +63,4 @@ binary/link-map fixture 与模拟 API 响应,不等于真实 RocksDB/云资格�
 Squash/rebase 后需更新 pin。Private 仓的准备或离线 fixture 通过,不代表 Public
 CI 路由已经激活或已经验收。
 
-普通 Go RocksDB 测试保留上游绑定的压缩库链接参数;accelerator profile 显式提供 Snappy、LZ4、Zstandard 与 zlib 开发库,并不启用原有 native RocksDB recipe 的压缩功能。
+普通 Go RocksDB 测试保留上游绑定的压缩库链接参数;build profile 显式提供 Snappy、LZ4、Zstandard 与 zlib 开发库,并不启用原有 native RocksDB recipe 的压缩功能。
