@@ -326,7 +326,9 @@ sha256sum -c "$TMP/rocksdb-before.sha256" >/dev/null \
   "$fixture_project_sha" release/v1.2.x
 
 archive="$TMP/bundle/assets/accelerator-v1.2.3-linux-x86_64.tar.gz"
-go_toolchain="$(go version | awk '{print $3}')"
+go_toolchain="$(go version -m "$TMP/bin/manifest-ctl" \
+  | awk 'NR == 1 {sub(/^.*: /, ""); sub(/-X:.*/, ""); print $1}')"
+[[ "$go_toolchain" =~ ^go[0-9] ]] || fail "cannot read fixture Go toolchain"
 for path in ./bin/manifest-ctl ./bin/store-ctl ./bin/cache-ctl \
   ./test/scripts/bench_cache.sh \
   ./share/licenses/accelerator/project/LICENSE \
