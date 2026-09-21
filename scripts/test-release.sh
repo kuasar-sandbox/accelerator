@@ -570,7 +570,7 @@ if RELEASE_BIN_DIR="$TMP/bin" "$fixture_root/scripts/release.sh" package 01.2.3 
 fi
 if RELEASE_BIN_DIR="$TMP/bin" "$fixture_root/scripts/release.sh" package v1.2.3 aarch64 \
   "$TMP/invalid-arch" >/dev/null 2>&1; then
-  fail "packager accepted an unvalidated release architecture"
+  fail "packager accepted x86_64 payloads as aarch64"
 fi
 
 for mutation in setuid setgid writable-directory writable-binary; do

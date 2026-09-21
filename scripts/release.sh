@@ -25,7 +25,8 @@ validate_version() {
 normalize_arch() {
   case "$1" in
     amd64|x86_64) printf 'x86_64\n' ;;
-    *) fail "unsupported release architecture: $1; current release target is x86_64" ;;
+    arm64|aarch64) printf 'aarch64\n' ;;
+    *) fail "unsupported release architecture: $1" ;;
   esac
 }
 
@@ -58,9 +59,28 @@ copy_root_executable() {
   install -m 0755 "$selected" "$STAGE/$destination"
 }
 
+# Inspect headers without executing target payloads on the build host.
+check_target_binary() {
+  local file="$1" machine
+  case "$2" in
+    x86_64) machine='Advanced Micro Devices X86-64' ;;
+    aarch64) machine='AArch64' ;;
+    *) fail "invalid target: $2" ;;
+  esac
+  LC_ALL=C readelf -h "$file" | awk -F: -v machine="$machine" '
+    { gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $2) }
+    $1 == "Class" { class++; if ($2 != "ELF64") bad=1 }
+    $1 == "Data" { data++; if ($2 != "2\047s complement, little endian") bad=1 }
+    $1 == "Machine" { arch++; if ($2 != machine) bad=1 }
+    END { exit bad || class != 1 || data != 1 || arch != 1 }
+  ' || fail "${3:-payload} has the wrong ELF target ($2): $file"
+}
+
 check_go_binary() {
   local file="$1" info expected
   expected="github.com/kuasar-sandbox/accelerator/cmd/$(basename "$1")"
+  local target_arch="$2" go_arch
+  case "$target_arch" in x86_64) go_arch=amd64 ;; aarch64) go_arch=arm64 ;; *) fail "invalid target: $target_arch" ;; esac
   info="$(go version -m "$file" 2>/dev/null)" \
     || fail "Go build info is missing from $file"
   awk -F '\t' -v expected="$expected" '
@@ -68,11 +88,12 @@ check_go_binary() {
     $2 == "mod" { modules++; if ($3 != "github.com/kuasar-sandbox/accelerator") bad=1 }
     END { exit bad || paths != 1 || modules != 1 }
   ' <<< "$info" || fail "Go release payload must have its expected main package: $file"
-  awk -F '\t' '
+  awk -F '\t' -v expected_arch="$go_arch" '
     $2 == "build" && $3 ~ /^GOOS=/ { os++; if ($3 != "GOOS=linux") bad=1 }
-    $2 == "build" && $3 ~ /^GOARCH=/ { arch++; if ($3 != "GOARCH=amd64") bad=1 }
+    $2 == "build" && $3 ~ /^GOARCH=/ { arch++; if ($3 != "GOARCH=" expected_arch) bad=1 }
     END { exit bad || os != 1 || arch != 1 }
-  ' <<< "$info" || fail "Go release payload must target linux/amd64: $file"
+  ' <<< "$info" || fail "Go release payload must target linux/$go_arch: $file"
+  check_target_binary "$file" "$target_arch"
 }
 
 validate_archive_paths() {
@@ -160,7 +181,7 @@ validate_bundle() {
   tar -xzf "$bundle/assets/$archive" -C "$extract"
   local file
   for file in manifest-ctl store-ctl cache-ctl; do
-    check_go_binary "$extract/bin/$file"
+    check_go_binary "$extract/bin/$file" "$arch"
   done
   local project_sha rocks_digest
   project_sha="$(go version -m "$extract/bin/manifest-ctl" | \
@@ -187,7 +208,7 @@ validate_bundle() {
   release_materials_require_go_key "$extract" "$NAME" 'bin/cache-ctl'
   for file in manifest-ctl store-ctl cache-ctl; do
     [ -x "$extract/bin/$file" ] || fail "$archive is missing executable bin/$file"
-    check_go_binary "$extract/bin/$file"
+    check_go_binary "$extract/bin/$file" "$arch"
   done
   for file in test/scripts/bench_cache.sh test/scripts/bench_cache_remote.sh \
     test/scripts/dedup_report.sh test/scripts/procmon.sh \
@@ -216,9 +237,9 @@ package_release() {
   copy_executable "$bin_dir/manifest-ctl" bin/manifest-ctl
   copy_executable "$bin_dir/store-ctl" bin/store-ctl
   copy_executable "$bin_dir/cache-ctl" bin/cache-ctl
-  check_go_binary "$STAGE/bin/manifest-ctl"
-  check_go_binary "$STAGE/bin/store-ctl"
-  check_go_binary "$STAGE/bin/cache-ctl"
+  check_go_binary "$STAGE/bin/manifest-ctl" "$arch"
+  check_go_binary "$STAGE/bin/store-ctl" "$arch"
+  check_go_binary "$STAGE/bin/cache-ctl" "$arch"
   require_rocksdb_payload "$STAGE/bin/cache-ctl"
   copy_root_executable test/scripts/bench_cache.sh test/scripts/bench_cache.sh
   copy_root_executable test/scripts/bench_cache_remote.sh test/scripts/bench_cache_remote.sh
