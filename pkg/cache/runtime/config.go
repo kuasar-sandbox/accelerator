@@ -55,14 +55,15 @@ type FreqConfig struct {
 // RocksConfig holds RocksDB parameters.
 //
 // BlobDB is always enabled on chunk, manifest and blob CFs with fixed
-// parameters (min_blob_size=4 KiB, blob_file_size=256 MiB) — there is
-// no YAML knob to disable or tune it. Large values bypass the LSM main
-// path automatically; small values (< 4 KiB) remain inline in the SST.
+// parameters (min_blob_size=4 KiB, blob_file_size=256 MiB, blob cache
+// shared with the block LRU, prepopulate on flush) — there is no YAML
+// knob to disable or tune it. Large values bypass the LSM main path
+// automatically; small values (< 4 KiB) remain inline in the SST.
 type RocksConfig struct {
 	Path              string  `yaml:"path"`
 	DiskBytes         string  `yaml:"disk_bytes"`          // e.g. "1TiB"
-	MemRatio          float64 `yaml:"mem_ratio"`           // BlockCache = disk_bytes * mem_ratio
-	DirectReads       *bool   `yaml:"direct_reads"`        // default true
+	MemRatio          float64 `yaml:"mem_ratio"`           // Block+blob LRU = disk_bytes * mem_ratio
+	DirectReads       *bool   `yaml:"direct_reads"`        // default true; also sets Direct IO for flush/compaction
 	BloomBits         int     `yaml:"bloom_bits"`          // default 15
 	BlockSize         string  `yaml:"block_size"`          // e.g. "64KiB"
 	WriteBufferBytes  string  `yaml:"write_buffer_bytes"`  // default "256MiB"

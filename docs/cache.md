@@ -329,17 +329,17 @@ Placing shard identity in the value makes a surviving peer's existing shard disc
 | Parameter/option | Default | Meaning |
 |---|---|---|
 | `disk_bytes` | 1 TiB. | Sizing input, **not an enforced disk quota**. |
-| `mem_ratio` | 0.01. | Shared BlockCache budget = disk_bytes × mem_ratio, minimum 64 MiB. |
+| `mem_ratio` | 0.01. | Shared **block+blob** LRU = disk_bytes × mem_ratio, min 64 MiB (SST index/filter/data **and** BlobDB payloads). |
 | `block_size` | 64 KiB. | SST data-block size. |
 | `bloom_bits` | 15. | Bits per key for Bloom filters; actual false-positive behavior is not a fixed documented percentage. |
 | Compression | None. | Fixed RocksDB option; encrypted chunk values are already high-entropy. |
-| `direct_reads` | true. | Enables UseDirectReads for supported reads. |
-| `write_buffer_bytes` | 256 MiB. | Configured write-buffer sizing input. |
+| `direct_reads` | true. | Enables UseDirectReads and UseDirectIOForFlushAndCompaction (reads and flush/compaction must match). |
+| `write_buffer_bytes` | 256 MiB. | **Per CF** (chunk, manifest, blob). DB-level settings are not inherited by `NewDefaultOptions()` CFs. Default 256 MiB, `max_write_buffer_number=4`. |
 | `max_background_jobs` | 8. | Used for maximum background compactions; the implementation separately allows two background flushes. |
 | Compaction | Leveled/default RocksDB behavior. | Data organization follows the underlying configured options. |
 | Pin L0 filters/indexes | true. | CacheIndexAndFilterBlocks plus PinL0FilterAndIndexBlocksInCache; this does not pin every level's metadata forever. |
 
-Index/filter blocks and data blocks share the configured BlockCache. Do not count them as independent guaranteed resident budgets or infer one-I/O reads for every key.
+Index/filter blocks, data blocks and BlobDB payloads share that **block+blob** LRU. Do not count them as independent guaranteed resident budgets or infer one-I/O reads for every key.
 
 #### Column-family isolation
 
@@ -358,12 +358,14 @@ All three CFs enable RocksDB BlobDB with fixed options, not YAML knobs:
 - `min_blob_size = 4 KiB`: smaller values remain inline in SST; values at/above the threshold can reside in separate blob files.
 - `blob_file_size = 256 MiB`: target blob-file sizing.
 - Blob garbage collection is enabled to reclaim stale/unreferenced blob data.
+- The same LRU used for `SetBlockCache` is also `SetBlobCache`.
+- `PrepopulateBlobCache = FlushOnly` so a flushed blob is not immediately re-read under Direct I/O.
 
-Large values leave a key/blob reference in the LSM; payloads are appended to blob files, reducing the amount of large-value data rewritten during ordinary key compaction. Actual amplification depends on key sizes, RocksDB format, workload, compaction and blob GC. Fetching a blob value can require additional I/O beyond locating its SST reference.
+Large values leave a key/blob reference in the LSM; payloads are appended to blob files, reducing the amount of large-value data rewritten during ordinary key compaction. Actual amplification depends on key sizes, RocksDB format, workload, compaction and blob GC. Fetching a blob value can require additional I/O beyond locating its SST reference: that is a blob-cache miss (cold or evicted), not the flushed restore path.
 
 #### DirectReads
 
-UseDirectReads defaults to true and bypasses the OS page cache for supported data reads.
+UseDirectReads defaults to true and bypasses the OS page cache for supported data reads. Mixed buffered flush and O_DIRECT GetCF of the same `.blob` file is the ≥8ms tail; that is why flush/compaction Direct I/O follows `direct_reads`.
 
 - **L1 beside Manifest consumers:** it reduces duplicated data caching between RocksDB BlockCache and the OS.
 - **Dedicated L2:** it can similarly reduce duplication when a large BlockCache is configured. BlockCache sizing is a deployment choice, not a daemon rule.
@@ -533,7 +535,7 @@ Tiered exposes only the object read chain. It rejects writes and shard operation
 
 ### 5.1 L1: an embedded tier inside a tiered process
 
-The configured BlockCache is one major native-memory allowance, not a complete process limit. Account separately for memtables/write buffers, native metadata, BlobDB/compaction activity, wire payload pools, active/previous CMS generations and transient buffers. Cached index/filter blocks share the configured BlockCache; do not count them again as independently pinned memory.
+The configured **block+blob** LRU (`disk_bytes × mem_ratio`, §4.4) is one major native-memory allowance, not a complete process limit. BlobDB payloads compete **inside** that LRU with SST index/filter/data blocks; they are not a second cache. Account separately for memtables/write buffers (256 MiB × CFs × buffers), native metadata, BlobDB/compaction activity, wire payload pools, active/previous CMS generations and transient buffers. Cached index/filter blocks share that same LRU; do not count them again as independently pinned memory.
 
 Derive the cache allowance from the actual sizing configuration and minimum size in the embedded-backend contract (§4.4). Go heap, in-flight request/fill concurrency and native/OS memory are workload-dependent. DirectReads can reduce supported data-read page caching but does not imply zero process-wide page-cache use. Measure the whole process/cgroup rather than treating one allowance as an enforced total.
 
