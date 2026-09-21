@@ -19,7 +19,7 @@ BIN=/path/to/assembled/bin/x86_64 bash test/e2e/e2e_manifest.sh
 
 The real suite requires:
 
-- Linux (the hosted validation target is Ubuntu 24.04), Bash 4+ with `/dev/tcp`, Python 3 stdlib, OpenSSL, GNU coreutils/findutils, GNU grep (including `-P`), awk, sed, tar, unzip, and util-linux `flock`; GNU Make for the Makefile entry points. These scripts use Linux sparse-file operations and GNU command options.
+- Linux, Bash 4+ with `/dev/tcp`, Python 3 stdlib, OpenSSL, GNU coreutils/findutils, GNU grep (including `-P`), awk, sed, tar, unzip, and util-linux `flock`; GNU Make for the Makefile entry points. These scripts use Linux sparse-file operations and GNU command options.
 - An assembled `BIN` containing executable `flatten-ctl`, `manifest-ctl`, `store-ctl` and `cache-ctl`. Use the normal RocksDB-enabled cache binary; `no_rocksdb` is not the suite default or a substitute for required coverage.
 - A real `mkfs.erofs` supporting deduplication and chunked layout (`-Ededupe --chunksize=4096`). Resolution is `MKFS_EROFS_PATH`, then beside the resolved `flatten-ctl` executable, then `PATH`. The manifest test checks it before starting its store.
 - Root or noninteractive `sudo -n` for flatten export to preserve layer UID/GID ownership. The rest of the suite can run unprivileged. The manifest test forwards only isolated HOME/Docker configuration, owned scratch space and the resolved EROFS tool into export; it does not use `sudo -E`.
@@ -51,4 +51,4 @@ Only overrides require Docker and access to its default local daemon. Each reque
 
 `e2e_obs.sh` is excluded unless `OBS_E2E=1` is explicitly set. It is a separate credentialed cloud test requiring an authorized OBS/S3-compatible endpoint, bucket and credentials (`OBS_BUCKET`, with endpoint/region/AK/SK overrides or its documented `~/.obsconfig` discovery), and permission to create/list/delete its isolated prefix. See [the OBS script](e2e_obs.sh) for the exact inputs. An excluded OBS case is **not cloud qualification**; ordinary/offline runs need no cloud credentials or cloud APIs.
 
-For central #128 / accelerator #134, private preparation verifies helpers and prepares a reviewable diff. It does not establish public free hosted-runner routing or hosted success. The separate publication/CI work must publish the reviewed diff on the real upstream parent and test actual upstream Git on the Ubuntu 24.04 hosted runner. Source archives and local authoring snapshot commits are not upstream/release identity. Eventual public free routing is a separate integration step; these scripts do not change workflows, visibility or billing.
+Shared runner routing, validation profiles and rollout status are maintained in the [platform CI contract](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/ci.md). This guide owns the accelerator suite requirements and case intent.

@@ -19,7 +19,7 @@ BIN=/path/to/assembled/bin/x86_64 bash test/e2e/e2e_manifest.sh
 
 真实套件的要求：
 
-- Linux（托管验证目标为 Ubuntu 24.04）、支持 `/dev/tcp` 的 Bash 4+、Python 3 标准库、OpenSSL、GNU coreutils/findutils、GNU grep（含 `-P`）、awk、sed、tar、unzip，以及 util-linux 的 `flock`；使用 Makefile 入口还需要 GNU Make。脚本使用 Linux 稀疏文件操作和 GNU 命令选项。
+- Linux、支持 `/dev/tcp` 的 Bash 4+、Python 3 标准库、OpenSSL、GNU coreutils/findutils、GNU grep（含 `-P`）、awk、sed、tar、unzip，以及 util-linux 的 `flock`；使用 Makefile 入口还需要 GNU Make。脚本使用 Linux 稀疏文件操作和 GNU 命令选项。
 - 组装后的 `BIN` 包含可执行的 `flatten-ctl`、`manifest-ctl`、`store-ctl`、`cache-ctl`。使用正常启用 RocksDB 的 cache 二进制；`no_rocksdb` 不是默认设置，也不能替代必需覆盖。
 - 支持去重和分块布局（`-Ededupe --chunksize=4096`）的真实 `mkfs.erofs`。查找顺序为 `MKFS_EROFS_PATH`、解析符号链接后的 `flatten-ctl` 所在目录、`PATH`。manifest 测试在启动 store 前检查该工具。
 - flatten export 需要 root 或非交互式 `sudo -n`，以保留镜像层的 UID/GID。套件其他操作可使用普通用户。manifest 测试仅向 export 传递隔离的 HOME/Docker 配置、自有临时目录和解析后的 EROFS 工具路径，不使用 `sudo -E`。
@@ -51,4 +51,4 @@ BIN=/path/to/assembled/bin/x86_64 IMAGE_A=already-cached:local \
 
 除非显式设置 `OBS_E2E=1`，否则 `e2e_obs.sh` 被排除。它是独立的、需要凭据的云测试，需要获授权的 OBS/S3 兼容 endpoint、bucket 和凭据（`OBS_BUCKET`，以及 endpoint/region/AK/SK 覆盖或脚本约定的 `~/.obsconfig` 自动发现），还需允许在独立 prefix 下创建、列举和删除对象。具体输入见 [OBS 脚本](e2e_obs.sh)。排除 OBS **不代表完成云端资格验证**；普通/离线运行不需要云凭据或云 API。
 
-对于 central #128 / accelerator #134，私有准备阶段用于验证辅助脚本并形成可审查 diff，不代表已经获得公开仓库的免费托管 runner 路由或托管测试成功。独立的发布/CI 工作须将审查后的 diff 应用到真实 upstream parent，再在 Ubuntu 24.04 托管 runner 上测试真实 upstream Git。源码归档和本地 authoring snapshot 提交不能作为 upstream/release 身份。最终公开免费路由属于另一项集成工作；这些脚本不修改 workflow、可见性或计费。
+共享 runner 路由、验证 profile 和上线状态统一见[平台 CI 契约](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/ci_zh.md)。本文负责说明 accelerator 套件的要求与用例意图。
