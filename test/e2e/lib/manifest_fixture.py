@@ -2,9 +2,11 @@
 """Write reproducible, data-only Docker archives without Docker or downloads."""
 
 import hashlib
+import argparse
 import io
 import json
 from pathlib import Path
+import platform
 import sys
 import tarfile
 
@@ -41,10 +43,12 @@ def layer(variant=None):
     return output.getvalue()
 
 
-def write_archive(path, variant, layers):
+def write_archive(path, variant, layers, architecture="amd64"):
+    if architecture not in ("amd64", "arm64"):
+        raise ValueError("unsupported fixture architecture")
     digests = [hashlib.sha256(data).hexdigest() for data in layers]
     config = json_bytes({
-        "architecture": "amd64",
+        "architecture": architecture,
         "os": "linux",
         "created": "1970-01-01T00:00:00Z",
         # A scratch/data image: no executable or container launch is needed.
@@ -76,13 +80,18 @@ def write_archive(path, variant, layers):
 
 
 def main():
-    if len(sys.argv) != 2:
-        sys.exit(f"usage: {sys.argv[0]} OUTPUT_DIRECTORY")
-    output = Path(sys.argv[1])
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--architecture", choices=("amd64", "arm64"),
+                        default={"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine()))
+    args = parser.parse_args()
+    if args.architecture is None:
+        parser.error("--architecture is required on this host")
+    output = args.output
     output.mkdir(parents=True, exist_ok=True)
     base = layer()
     for variant in ("a", "b"):
-        write_archive(output / f"image-{variant}.tar", variant, [base, layer(variant)])
+        write_archive(output / f"image-{variant}.tar", variant, [base, layer(variant)], args.architecture)
 
 
 if __name__ == "__main__":

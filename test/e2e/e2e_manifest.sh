@@ -129,7 +129,15 @@ flatten_archive() {
 echo ""
 echo "=== Prepare local image archives ==="
 if [ -z "$IMAGE_A" ] || [ -z "$IMAGE_B" ]; then
-    python3 "$SCRIPT_DIR/lib/manifest_fixture.py" "$TMPDIR"
+    if [ -n "${MANIFEST_FIXTURE_DIR:-}" ]; then
+        for variant in a b; do
+            [ -s "$MANIFEST_FIXTURE_DIR/image-$variant.tar" ] || die "prepared manifest fixture is missing: $variant"
+            cp "$MANIFEST_FIXTURE_DIR/image-$variant.tar" "$TMPDIR/image-$variant.tar"
+        done
+    else
+        [ "${KUASAR_ARTIFACT_E2E:-0}" != 1 ] || die "MANIFEST_FIXTURE_DIR is required for artifact E2E"
+        python3 "$SCRIPT_DIR/lib/manifest_fixture.py" "$TMPDIR"
+    fi
 fi
 [ -z "$IMAGE_A" ] || cached_archive IMAGE_A "$IMAGE_A" "$TMPDIR/image-a.tar"
 [ -z "$IMAGE_B" ] || cached_archive IMAGE_B "$IMAGE_B" "$TMPDIR/image-b.tar"

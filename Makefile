@@ -11,6 +11,7 @@
 SHELL := /bin/bash
 
 .PHONY: all build manifest-ctl store-ctl cache-ctl deps-rocksdb test test-no-rocksdb vet bench test-e2e perf-cache perf-cache-remote dedup-report release test-release clean help
+.PHONY: test-e2e-scripts
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -40,6 +41,16 @@ BINDIR         := bin/$(TARGET_ARCH)
 BUILD_DIR      := build/$(TARGET_ARCH)
 ROCKS_PREFIX   := $(abspath $(BUILD_DIR)/rocksdb)
 
+# Use the same target compiler for the RocksDB archive and the CGO link.
+# Keep these settings local to the product recipes; host tools remain native.
+ifeq ($(HOST_ARCH),$(TARGET_ARCH))
+  CROSS_PREFIX ?=
+else
+  CROSS_PREFIX ?= $(TARGET_ARCH)-linux-gnu-
+endif
+TARGET_CC := $(if $(CROSS_PREFIX),$(CROSS_PREFIX)gcc,$(if $(filter default,$(origin CC)),gcc,$(CC)))
+TARGET_CXX := $(if $(CROSS_PREFIX),$(CROSS_PREFIX)g++,$(if $(filter default,$(origin CXX)),g++,$(CXX)))
+
 # CGO flags for cache-ctl: static link librocksdb.a + libstdc++; glibc stays
 # dynamic. RocksDB is built without compression so the link line stays minimal.
 CGO_CFLAGS         := -I$(ROCKS_PREFIX)/include
@@ -61,10 +72,13 @@ CACHE_CTL_BUILD = GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=$(CACHE_CTL_CGO) \
 else
 CACHE_CTL_DEPS  := deps-rocksdb
 CACHE_CTL_CGO   := 1
-CACHE_CTL_TAGS  :=
+# Let our target-specific CGO_LDFLAGS own the complete RocksDB link. The
+# binding's default flags otherwise append host/shared compression and C++ libs.
+CACHE_CTL_TAGS  := grocksdb_no_link
 CACHE_CTL_BUILD = TMPDIR="$(abspath $(BUILD_DIR))" GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=$(CACHE_CTL_CGO) \
+    CC="$(TARGET_CC)" \
     CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS_STATIC)" \
-    $(GO) build $(GO_BUILD_FLAGS) -ldflags '$(GOLDFLAGS_STATIC)' -o $(BINDIR)/cache-ctl ./cmd/cache-ctl
+    $(GO) build $(GO_BUILD_FLAGS) -tags $(CACHE_CTL_TAGS) -ldflags '$(GOLDFLAGS_STATIC)' -o $(BINDIR)/cache-ctl ./cmd/cache-ctl
 endif
 
 # Native-only symlink: bin/<name> -> $(TARGET_ARCH)/<name>. $(1) = basename.
@@ -101,6 +115,8 @@ cache-ctl: $(CACHE_CTL_DEPS)
 deps-rocksdb: $(ROCKS_PREFIX)/lib/librocksdb.a
 $(ROCKS_PREFIX)/lib/librocksdb.a:
 	TARGET_ARCH="$(TARGET_ARCH)" \
+	CROSS_PREFIX="$(CROSS_PREFIX)" \
+	CC="$(TARGET_CC)" CXX="$(TARGET_CXX)" \
 	BUILD_DIR="$(abspath $(BUILD_DIR))" \
 	BINDIR="$(abspath $(BINDIR))" \
 	TARBALL_CACHE="$(abspath build/tarball)" \
@@ -152,6 +168,9 @@ perf-cache-remote:
 
 dedup-report:
 	BIN=$(E2E_BIN) bash test/scripts/dedup_report.sh
+
+test-e2e-scripts:
+	PYTHONDONTWRITEBYTECODE=1 python3 test/scripts/test_e2e_manifest.py
 
 VERSION ?= v0.1.0
 
