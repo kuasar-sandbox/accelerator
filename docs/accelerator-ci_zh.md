@@ -5,12 +5,10 @@
 仓库仍为 private 时,accelerator#134 / platform#128 仅为**已准备,未激活**。
 本变更不发布源码,不调整可见性、计费或 quota,也不建立 private CI 的 public relay。
 
-经授权公开并完成 rollout 后,`github.event.repository.private == false` 才选择
-`ubuntu-24.04`。Private 发布/维护 job 原样保留
-`[self-hosted, Linux, X64, kuasar-control]`,private 发布构建原样保留
-`[self-hosted, Linux, X64, kuasar-e2e]`。Private PR control 与 source E2E 保留
-原有池,包括 E2E 的 `kvm` 与 `cgroup-v2` 标签。共享 workflow 的其他 caller 与
-exact-assets 路由保持不变。
+#152 workflow 在分配任何 runner 前,要求实际 caller 仓库可见性为 `public`,
+且其完整名称与 `github.repository` 一致。所有 x86 发布、维护与集成 job 使用
+`ubuntu-latest`,ARM 原生集成使用 `ubuntu-24.04-arm`。非公开 caller 不调度新版
+hosted job。已部署的私有 workflow 保留至获授权的协调切换;私有调用被跳过不算验收。
 
 ## Bootstrap 与构建边界
 
@@ -21,17 +19,15 @@ checkout 到 `trusted/platform`。Workflow 契约检查拒绝占位引用。Boot
 | --- | --- |
 | 发布 preflight、publish、Preview delete | `release-control`:最小 control 工具与 `release.sh` 所需的固定 Go |
 | Reconcile Latest、artifact cleanup | `control`:Git、curl、jq、Python/YAML 与归档工具 |
-| Release build/test/package | `accelerator`:固定 Go、CMake、build-essential、pkg-config、binutils 与 control 工具 |
-| Public PR source E2E | 原有完整 `source`,包含 Redis、unzip 和 OpenSSL |
+| Release build/test/package | `artifact-build` 或 `artifact-cross`:目标架构工具、native 依赖与 control 工具 |
+| Public PR integration | 共享架构链路及独立必需源码检查,见[平台 CI](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/ci_zh.md) |
 
-Accelerator profile 不设置 KVM 或 Docker,不编译 Kernel/EROFS。它按原有 recipe
-构建真实 RocksDB,不能以 `NO_ROCKSDB=1` 替代发布载荷。Go 使用共享校验过的
+发布构建按原有 recipe 构建真实 RocksDB,不能以 `NO_ROCKSDB=1` 替代发布载荷。Go 使用共享校验过的
 1.26.5 分发及既有工具链选择语义。Control job 保留固定版本的 GitHub CLI installer。
 
 精确发布源码位于 `src/accelerator`。构建、测试、native cache、打包与 artifact 上传
 均使用该子目录,旁边的可信工具不会污染源码或 VCS stamping。Public cache 位于
 bootstrap 的 `$RUNNER_TEMP/kuasar-hosted.*`,不使用固定 `/var/cache` 状态。
-Private job 保留原有镜像与持久 tarball cache,不运行 apt 或 hosted bootstrap。
 Hosted 构建/打包使用字面值 `bash` shell,通过 `taskset` 应用 bootstrap 的 CPU/内存
 预算,也限制 RocksDB 使用 `nproc` 的并行度。
 
@@ -44,9 +40,9 @@ artifact cleanup 保留分离权限、精确 version/source/Preview 校验、一
 
 ## 覆盖与 rollout 证据
 
-PR wrapper 保留共享 `ci-entry.yml@main`。Public guest-runtime 与 accelerator
-复用同样的 source-set 组装、native 构建、binary assembly、owner E2E、UFFD gate
-和完整 working-set smoke。手工演练或离线测试不能替代必需的 Integration E2E。
+PR wrapper 保留共享 `ci-entry.yml@main`。#152 激活后,公开 caller 使用精确 baseline
+加候选产品、准备好的 owner workspace 和按架构选择的 E2E。源码检查、UFFD gate
+及适用的 x86 working-set smoke 仍为必需检查。手工演练或离线测试不能替代必需的 Integration E2E。
 本地 filesystem/cache 和 S3-compatible fixture 仅证明本地行为,不代表真实云覆盖。
 凭据化 OBS 仍需显式 `OBS_E2E=1` 运行;被排除的云测试不算通过。
 
@@ -57,7 +53,7 @@ python3 scripts/ci-test-workflows.py ../kuasar-sandbox  # 使用实际平台路�
 (umask 022; bash scripts/test-release.sh)
 ```
 
-Workflow 测试解析实际 YAML,验证 public/private 分支,执行 workspace/affinity shell,
+Workflow 测试解析实际 YAML,验证非公开调用的分配 guard,执行 workspace/affinity shell,
 并测试 ABI 接受与拒绝,无需 GitHub 或私有源码访问。原有发布测试使用合成
 binary/link-map fixture 与模拟 API 响应,不等于真实 RocksDB/云资格验证。
 平台 `ci/integration/test-ci-tools.sh` 仍为必需检查。

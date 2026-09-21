@@ -30,7 +30,7 @@ def check(platform):
         workflows[filename] = document
         assert document["permissions"] == {"contents": "read"}
         for name, job in document["jobs"].items():
-            assert job["runs-on"] == "ubuntu-24.04"
+            assert job["runs-on"] == "ubuntu-latest"
             for visibility in ("private", "internal", ""):
                 context = {"github": {"repository": "kuasar-sandbox/accelerator", "event": {"repository": {
                     "visibility": visibility, "full_name": "kuasar-sandbox/accelerator"}}}}
