@@ -51,6 +51,8 @@
 
 ## 构建与测试
 
+构建使用环境提供的 Go，并继承 `GOROOT`、`GOTOOLCHAIN` 等工具链选择；发布自动化需要环境在 `PATH` 中提供支持 `api --slurp` 的 `gh`。项目不下载、替换或按固定二进制摘要认证这些环境工具。
+
 ```bash
 make manifest-ctl store-ctl     # 纯 Go 命令行服务
 make cache-ctl                  # 缓存服务及当前后端依赖
@@ -62,7 +64,7 @@ make test                       # 单元与后端测试
 make test-e2e                   # 组件 owner suite;需要项目组装的 BIN
 ```
 
-Go 与原生前置依赖随构建目标而异。当前源码通过仓库脚本说明并构建所需原生缓存依赖。真实对象存储测试必须使用显式测试凭据或本地 S3-compatible 服务;普通单元测试与本地文件系统测试不应要求生产云凭据。
+源码构建需要 Go 1.26.1 或更新版本，原生前置依赖随构建目标而异。当前源码通过仓库脚本说明并构建所需原生缓存依赖。真实对象存储测试必须使用显式测试凭据或本地 S3-compatible 服务;普通单元测试与本地文件系统测试不应要求生产云凭据。
 
 `cache-ctl` 通常使用 CGO 以及 `deps/build-rocksdb.sh` 在本地构建的静态 `librocksdb.a`;`manifest-ctl`、`store-ctl` 与下游 import 面不需要 RocksDB。`make release VERSION=vX.Y.Z` 生成并检查本地发行 bundle;官方缓存载荷必须保留 RocksDB 支持。
 

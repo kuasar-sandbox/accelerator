@@ -11,9 +11,9 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
-// CopyManifestFromBundle copies one exact complete layer only when the source
-// and destination admissions match. Different salt domains must be decoded and
-// re-ingested by the caller.
+// CopyManifestFromBundle copies one exact complete layer when the recorded
+// source and destination write admissions match. The authenticated Manifest key
+// table preserves the actual Chunk keys, including any writer-side extra salt.
 func (w *Writer) CopyManifestFromBundle(ctx context.Context, key store.ContentKey, source *Reader) error {
 	if source == nil {
 		return fmt.Errorf("manifest bundle: source Bundle is required")
@@ -26,8 +26,8 @@ func (w *Writer) CopyManifestFromBundle(ctx context.Context, key store.ContentKe
 
 // CopyManifest copies exact physical bytes from a caller-owned Bundle-only or
 // Store Getter. It force-checks each physical ContentKey and complete Chunk
-// closure. Admission-domain provenance must be established by the caller (or
-// by CopyManifestFromBundle).
+// closure. Source/target write-admission compatibility is established by the
+// caller (or by CopyManifestFromBundle).
 func (w *Writer) CopyManifest(ctx context.Context, key store.ContentKey, source cache.Getter) error {
 	if source == nil {
 		return fmt.Errorf("manifest bundle: copy source Getter is required")

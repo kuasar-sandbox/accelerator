@@ -40,6 +40,10 @@ type testFixture struct {
 }
 
 func newTestFixture(t testing.TB, generation store.Generation) testFixture {
+	return newTestFixtureWithExtraSalt(t, generation, nil)
+}
+
+func newTestFixtureWithExtraSalt(t testing.TB, generation store.Generation, extraSalt []byte) testFixture {
 	t.Helper()
 	salt, err := store.SaltForGeneration(generation)
 	if err != nil {
@@ -63,7 +67,11 @@ func newTestFixture(t testing.TB, generation store.Generation) testFixture {
 	for index := range customer {
 		customer[index] = byte(index + 1)
 	}
-	ing := ingest.NewIngester(func() ([32]byte, error) { return customer, nil }, nil, w, chk, enc)
+	var extraSaltFn ingest.ExtraSaltFunc
+	if len(extraSalt) != 0 {
+		extraSaltFn = func() ([]byte, error) { return append([]byte(nil), extraSalt...), nil }
+	}
+	ing := ingest.NewIngester(func() ([32]byte, error) { return customer, nil }, extraSaltFn, w, chk, enc)
 	shared := bytes.Repeat([]byte{0x11}, 4096)
 	otherPlain := append(append([]byte(nil), shared...), bytes.Repeat([]byte{0x22}, 4096)...)
 	rootPlain := append(append([]byte(nil), shared...), bytes.Repeat([]byte{0x33}, 4096)...)

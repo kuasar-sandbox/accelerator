@@ -1003,6 +1003,16 @@ type sourceView struct {
 
 func (s *sourceView) Size() uint64 { return uint64(s.m.logical) }
 
+// PayloadCommitment exposes the declared payload boundary before sequential
+// consumption. Its digest becomes trustworthy only at the full-read boundary.
+func (s *sourceView) PayloadCommitment() (uint64, [32]byte, bool) {
+	if s.m.hasPayloadSize && s.m.payloadSize >= 0 {
+		return uint64(s.m.payloadSize), [32]byte{}, false
+	}
+	return s.Size(), [32]byte{}, false
+}
+func (s *sourceView) TarStreamDigest(string) ([32]byte, bool) { return [32]byte{}, false }
+
 // RunAt classifies offsets from the envelope's map: Data inside a
 // stored extent, Hole everywhere else. Zero is never produced — the
 // envelope has no such state.
