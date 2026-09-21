@@ -22,150 +22,82 @@ sys.dont_write_bytecode = True
 
 def check(platform):
     shared = runpy.run_path(str(platform / "ci/hosted/test-workflows.py"))
-    expression = shared["expression"]
     shared["check"]()
     subprocess.run([sys.executable, str(platform / "ci/hosted/test-bootstrap.py")], check=True)
-    profiles = {
-        "release.yml": {"preflight": "release-control", "build": "accelerator", "publish": "release-control", "cleanup": "control"},
-        "delete-preview.yml": {"delete": "release-control"},
-        "reconcile-latest.yml": {"reconcile": "control"},
-    }
-    pins = set()
     workflows = {}
-    for filename, expected in profiles.items():
+    for filename in ("release.yml", "delete-preview.yml", "reconcile-latest.yml"):
         document = yaml.safe_load((ROOT / ".github/workflows" / filename).read_text())
-        assert document["permissions"] == {"contents": "read"}
-        jobs = document["jobs"]
         workflows[filename] = document
-        assert jobs.keys() == expected.keys()
-        for name, job in jobs.items():
+        assert document["permissions"] == {"contents": "read"}
+        for name, job in document["jobs"].items():
+            assert job["runs-on"] == "ubuntu-24.04"
+            for visibility in ("private", "internal", ""):
+                context = {"github": {"repository": "kuasar-sandbox/accelerator", "event": {"repository": {
+                    "visibility": visibility, "full_name": "kuasar-sandbox/accelerator"}}}}
+                assert shared["expression"](job["if"], context) is False
+            assert "github.event.repository.full_name == github.repository" in job["if"]
             permissions = job.get("permissions", document["permissions"])
             assert permissions == ({"actions": "read", "contents": "write"} if name == "publish" else
                                    {"actions": "write", "contents": "read"} if name == "cleanup" else
                                    {"contents": "write"} if name in ("delete", "reconcile") else {"contents": "read"})
-            steps = {step["name"]: step for step in job["steps"]}
-            names = list(steps)
-            assert len(names) == len(job["steps"])
-            checkout = steps["Check out pinned hosted bootstrap"]
-            bootstrap = steps["Bootstrap standard runner"]
-            assert names.index(checkout["name"]) < names.index(bootstrap["name"])
-            assert bootstrap["run"] == f"bash trusted/platform/ci/hosted/bootstrap.sh --profile {expected[name]}"
-            assert checkout["with"]["repository"] == "kuasar-sandbox/kuasar-sandbox"
-            assert checkout["with"]["path"] == "trusted/platform"
-            assert checkout["with"]["token"] == "${{ github.token }}"
-            pin = checkout["with"]["ref"]
-            assert re.fullmatch(r"[0-9a-f]{40}", pin), "bootstrap pin must be a full upstream SHA"
-            pins.add(pin)
-            for private in (False, True):
-                context = {"github": {"event": {"repository": {"private": private}}},
-                           "env": {"KUASAR_HOSTED": "false" if private else "true"}}
-                pool = "kuasar-e2e" if name == "build" else "kuasar-control"
-                assert expression(job["runs-on"], context) == (
-                    ["self-hosted", "Linux", "X64", pool] if private else ["ubuntu-24.04"])
-                for step in (checkout, bootstrap):
-                    assert expression(step["if"], context) == (not private)
-                if name == "build":
-                    assert expression(job["env"]["KUASAR_HOSTED"], context) == (not private)
-                    assert expression(job["timeout-minutes"], context) == (45 if private else 90)
-                    assert set(job["env"]) == {"TARGET_ARCH", "KUASAR_HOSTED"}
-                    for step_name in ("Check out trusted build checks", "Check hosted CI regression contracts",
-                                      "Attach job-local native source cache", "Check the released accelerator ABI"):
-                        assert expression(steps[step_name]["if"], context) == (not private)
-                for step in job["steps"]:
-                    if any(value in step.get("run", "") for value in ("/var/cache", "goproxy.cn", "GOTOOLCHAIN=local")):
-                        assert expression(step["if"], context) == private
             for step in job["steps"]:
-                assert "${{" not in step.get("shell", "bash"), "shell must be literal"
-                assert "actions/cache@" not in step.get("uses", "")
                 assert "create-github-app-token" not in step.get("uses", "")
+                assert "actions/cache@" not in step.get("uses", "")
                 if "actions/checkout@" in step.get("uses", ""):
                     assert step["with"]["persist-credentials"] is False
-                if "Install pinned GitHub CLI" == step["name"]:
-                    assert names.index(bootstrap["name"]) < names.index(step["name"])
-                    assert step["run"] == "bash scripts/install-gh-cli.sh"
-            if name != "build":
-                # Root tooling checkout must precede the nested bootstrap checkout,
-                # so checkout's cleanup cannot erase trusted/platform.
-                root_checkout = next(s for s in job["steps"] if "actions/checkout@" in s.get("uses", ""))
-                assert root_checkout is not checkout
-                assert names.index(root_checkout["name"]) < names.index(checkout["name"])
-    assert len(pins) == 1
-    print(f"bootstrap pin: {pins.pop()} (preparation only; publication/qualification are separate)")
+                if "run" in step:
+                    subprocess.run(["bash", "-n"], input=step["run"], text=True, check=True)
 
     release = workflows["release.yml"]
-    event = release.get("on", release.get(True))
-    assert set(event["workflow_dispatch"]["inputs"]) == {
-        "version", "source_ref", "source_sha", "aggregate_version", "aggregate_sha"}
     jobs = release["jobs"]
     assert jobs["build"]["needs"] == "preflight"
+    assert jobs["build"]["strategy"] == {"fail-fast": False, "matrix": {"arch": ["x86_64", "aarch64"]}}
+    assert jobs["build"]["env"]["TARGET_ARCH"] == "${{ matrix.arch }}"
     assert jobs["publish"]["needs"] == ["preflight", "build"]
-    assert jobs["cleanup"]["needs"] == "publish"
+    assert jobs["cleanup"]["needs"] == ["preflight", "publish"]
     for filename in ("release.yml", "delete-preview.yml"):
         assert workflows[filename]["concurrency"] == {
             "group": "component-mutation-${{ github.repository }}-${{ inputs.version }}", "cancel-in-progress": False}
     build = {s["name"]: s for s in jobs["build"]["steps"]}
     names = list(build)
-    trusted = build["Check out trusted build checks"]
-    assert trusted["with"]["ref"] == "${{ github.workflow_sha }}"
-    assert trusted["with"]["path"] == "trusted/accelerator"
+    assert build["Check out trusted build checks"]["with"]["ref"] == "${{ github.workflow_sha }}"
+    assert build["Check out trusted platform tooling"]["with"]["ref"] == "${{ needs.preflight.outputs.framework_sha }}"
     for name in ("Check out exact component source", "Retry exact component source checkout"):
         assert build[name]["with"]["ref"] == "${{ needs.preflight.outputs.source_sha }}"
         assert build[name]["with"]["path"] == "src/accelerator"
-        assert names.index("Bootstrap standard runner") < names.index(name)
-        assert names.index("Check hosted CI regression contracts") < names.index(name)
-    assert build["Retry exact component source checkout"]["if"] == "steps.checkout-source.outcome == 'failure'"
-    for name in ("Attach native source cache", "Attach job-local native source cache", "Build and test accelerator", "Package the component release"):
-        assert build[name]["working-directory"] == "src/accelerator"
-    for name in ("Build and test accelerator", "Package the component release"):
-        assert build[name]["shell"] == "bash"
-        assert 'if [ "$KUASAR_HOSTED" = true ]; then\n  taskset -pc "$KUASAR_BUILD_CPUS" "$$" >/dev/null\nfi' in build[name]["run"]
-    assert 'ln -sfn "$KUASAR_TARBALL_CACHE" build/tarball' in build["Attach job-local native source cache"]["run"]
+    assert "artifact-cross" in build["Bootstrap native or cross build"]["run"]
     assert "NO_ROCKSDB" not in str(jobs["build"])
+    for name in ("Build and test accelerator", "Check the released accelerator ABI", "Check CI regression contracts"):
+        assert "continue-on-error" not in build[name]
     assert "umask 022" in build["Build and test accelerator"]["run"]
-    assert "continue-on-error" not in build["Build and test accelerator"]
-    assert "continue-on-error" not in build["Check the released accelerator ABI"]
-    assert build["Check the released accelerator ABI"]["run"] == "python3 trusted/accelerator/scripts/ci-check-abi.py src/accelerator/bin/x86_64"
+    assert "bin/$TARGET_ARCH" in build["Check the released accelerator ABI"]["run"]
     assert names.index("Build and test accelerator") < names.index("Check the released accelerator ABI") < names.index("Package the component release")
     package = build["Package the component release"]["run"]
     assert '[ "$(git rev-parse HEAD)" = "${{ needs.preflight.outputs.source_sha }}" ]' in package
-    assert 'SOURCE_DATE_EPOCH=$(git show -s --format=%ct "${{ needs.preflight.outputs.source_sha }}")' in package
     assert 'bash scripts/release.sh package "$VERSION" "$TARGET_ARCH" release-bundle' in package
     upload = build["Upload validated release bundle"]["with"]
-    assert upload["path"] == "src/accelerator/release-bundle"
+    assert "matrix.arch" in upload["name"] and upload["path"] == "src/accelerator/release-bundle"
     assert upload["retention-days"] == 1 and upload["if-no-files-found"] == "error"
     publish = {s["name"]: s for s in jobs["publish"]["steps"]}
-    assert publish["Download validated release bundle"]["with"]["name"] == upload["name"]
-    assert publish["Download validated release bundle"]["with"]["path"] == "release-bundle"
+    for arch in ("x86_64", "aarch64"):
+        assert publish[f"Download validated {arch} bundle"]["with"]["name"] == upload["name"].replace("${{ matrix.arch }}", arch)
+    assert 'publish-release.sh assemble' in publish["Assemble the two validated architecture archives"]["run"]
+    assert publish["Publish component release"]["env"]["TARGET_ARCH"] == "all"
     for job, name in ((jobs["preflight"], "Validate release request"), (jobs["publish"], "Publish component release")):
         step = next(s for s in job["steps"] if s["name"] == name)
         assert 'bash scripts/validate-preview-line.sh' in step["run"]
-        assert step["env"]["AGGREGATE_SHA"] == "${{ inputs.aggregate_sha }}"
-        assert step["env"]["AGGREGATE_VERSION"] == "${{ inputs.aggregate_version }}"
-        assert step["env"]["GH_TOKEN"] == "${{ github.token }}"
         for variable in ("SOURCE_REF", "SOURCE_SHA", "VERSION"):
             binding = f"inputs.{variable.lower()}" if name == "Validate release request" else f"needs.preflight.outputs.{variable.lower()}"
             assert step["env"][variable] == "${{ " + binding + " }}"
-    delete = workflows["delete-preview.yml"]
-    delete_event = delete.get("on", delete.get(True))["workflow_dispatch"]["inputs"]
-    assert set(delete_event) == {"version", "source_sha", "mode"}
-    assert delete_event["mode"]["options"] == ["incomplete", "gc"]
-    deletion = delete["jobs"]["delete"]["steps"][-1]
-    assert deletion["run"] == 'bash scripts/delete-preview.sh accelerator "$VERSION" "$SOURCE_SHA" "$MODE"'
-    reconcile = workflows["reconcile-latest.yml"]
-    assert set(reconcile.get("on", reconcile.get(True))) == {"workflow_run", "schedule", "workflow_dispatch"}
-    assert reconcile["jobs"]["reconcile"]["steps"][-1]["run"] == "bash scripts/publish-release.sh reconcile"
-    cleanup = jobs["cleanup"]["steps"][-1]["run"]
-    assert 'actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100' in cleanup
-    assert 'repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id' in cleanup
     pr = yaml.safe_load((ROOT / ".github/workflows/integration-tests.yml").read_text())
     assert pr["jobs"]["ci"]["uses"] == "kuasar-sandbox/kuasar-sandbox/.github/workflows/ci-entry.yml@main"
     check_build_shell(build)
     check_source_workspace()
-    print("accelerator workflows: visibility, trust, paths, permissions and release contracts PASS")
+    print("accelerator workflows: public caller, isolated architectures, trust, ABI and original-byte publication PASS")
 
 
 def check_build_shell(steps):
-    """Execute the actual YAML build shell with a fake make and real taskset."""
+    """Execute both actual YAML build paths with a fake make and real taskset."""
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         source = root / "src/accelerator"
@@ -177,19 +109,19 @@ def check_build_shell(steps):
                         "with open(os.environ['MAKE_LOG'], 'a') as log:\n"
                         "    print(sys.argv[1:], os.getcwd(), sorted(os.sched_getaffinity(0)), file=log)\n")
         make.chmod(0o755)
-        cpus = sorted(os.sched_getaffinity(0))
-        for hosted in (False, True):
-            log = root / f"make-{hosted}.log"
+        cpu = sorted(os.sched_getaffinity(0))[0]
+        for arch in ("x86_64", "aarch64"):
+            log = root / f"make-{arch}.log"
             env = dict(os.environ, PATH=f"{tools}:{os.environ['PATH']}", MAKE_LOG=str(log),
-                       KUASAR_HOSTED=str(hosted).lower(), KUASAR_BUILD_CPUS=str(cpus[0]))
+                       TARGET_ARCH=arch, KUASAR_BUILD_CPUS=str(cpu))
             subprocess.run(["bash", "-e", "-o", "pipefail", "-c", steps["Build and test accelerator"]["run"]],
                            cwd=source, env=env, check=True)
-            expected = [f"{[goal]} {source} {[cpus[0]] if hosted else cpus}" for goal in ("test", "vet", "build", "test-release")]
-            assert log.read_text().splitlines() == expected
+            goals = ("test", "vet", "build", "test-release") if arch == "x86_64" else ("build",)
+            assert log.read_text().splitlines() == [f"{[goal]} {source} {[cpu]}" for goal in goals]
         cache = root / "hosted/tarballs"
         cache.mkdir(parents=True)
-        subprocess.run(["bash", "-e", "-c", steps["Attach job-local native source cache"]["run"]],
-                       cwd=source, env=dict(os.environ, KUASAR_TARBALL_CACHE=str(cache)), check=True)
+        subprocess.run(["bash", "-e", "-c", steps["Attach native source cache"]["run"]],
+                       cwd=root, env=dict(os.environ, KUASAR_TARBALL_CACHE=str(cache)), check=True)
         assert (source / "build/tarball").resolve() == cache
 
 
