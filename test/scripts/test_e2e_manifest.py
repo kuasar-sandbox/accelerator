@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import platform
 import shutil
 import signal
 import subprocess
@@ -190,11 +191,12 @@ sys.exit("unexpected Docker operation (pull/tag/rm are forbidden)")
         repeat = self.case / "repeat"
         subprocess.run([sys.executable, str(self.tree / "lib/manifest_fixture.py"), str(repeat)], check=True)
         images = []
+        architecture = {"x86_64": "amd64", "aarch64": "arm64"}[platform.machine()]
         for variant in ("a", "b"):
             path = self.fixtures / f"image-{variant}.tar"
             self.assertEqual(path.read_bytes(), (repeat / path.name).read_bytes())
             config, layers, files = inspect_archive(path)
-            self.assertEqual((config["architecture"], config["os"]), ("amd64", "linux"))
+            self.assertEqual((config["architecture"], config["os"]), (architecture, "linux"))
             self.assertEqual(config["config"]["User"], "1000:1000")
             self.assertEqual(config["config"]["WorkingDir"], "/fixture")
             self.assertEqual(config["config"]["Env"], ["MANIFEST_E2E=1"])

@@ -38,7 +38,7 @@ BIN=/path/to/assembled/bin/x86_64 bash test/e2e/e2e_manifest.sh
 
 Manifest 用例保持为：(1) flatten、尾部配置 ZIP、架构及真实 EROFS magic；(2) store/load 字节一致；(3) 重复存储时新增 chunk 为零；(4) 远端 manifest info；(5) verify；(6) 可重复的 get-manifest；(7) get-manifest/info 流式管道；(8) 跨镜像共享 chunk 的 diff；(9) fixed 与 CDC 的 diff；(10) 管道 stdin store/load；(11) 零块往返、至少 100 个 zero chunk、info 数量一致且 manifest 不超过 12 KiB；(12) 稀疏 hole 元数据及恢复后的字节一致。现有编号断言和 `Results: N passed, N failed` 输出格式仍是测试契约。
 
-默认情况下，`lib/manifest_fixture.py` 仅用 Python 标准库生成两个可重复的 Docker 格式归档。每个归档包含两层：共享基础层提供 4 MiB 确定性的高熵内容，第二层用不同的 1 MiB 文件替换基础版本。时间戳、tar 元数据、配置摘要及 layer diff ID 固定且一致。数据镜像含 Linux/amd64 架构、运行时用户/环境/工作目录设置，以及 UID/GID 1000 的文件所有权。它们用于数据测试，不提供容器启动命令；即使测试主机为 arm64，镜像架构也只作为元数据处理。共享内容足以跨越多个 CDC 和 fixed 分块边界，不依赖大量零字节获得简单去重。归档直接输入 `flatten-ctl export`，默认流程不需要 Docker 或访问 registry。
+默认情况下，`lib/manifest_fixture.py` 仅用 Python 标准库生成两个可重复的 Docker 格式归档。每个归档包含两层：共享基础层提供 4 MiB 确定性的高熵内容，第二层用不同的 1 MiB 文件替换基础版本。时间戳、tar 元数据、配置摘要及 layer diff ID 固定且一致。fixture 生成器默认使用主机架构（`amd64` 或 `arm64`），也可通过 `--architecture` 显式选择其中之一。数据镜像含 Linux 元数据、运行时用户/环境/工作目录设置，以及 UID/GID 1000 的文件所有权。它们用于数据测试，不提供容器启动命令；镜像架构只作为元数据处理。共享内容足以跨越多个 CDC 和 fixed 分块边界，不依赖大量零字节获得简单去重。归档直接输入 `flatten-ctl export`，默认流程不需要 Docker 或访问 registry。
 
 显式设置 `IMAGE_A` 和/或 `IMAGE_B`，可用已在本地缓存的 Docker 镜像替换相应归档：
 

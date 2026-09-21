@@ -129,7 +129,7 @@ test-no-rocksdb:
 	CGO_ENABLED=0 $(GO) test -tags no_rocksdb ./pkg/cache/rocks
 
 # Unit tests. cache/rocks tests need librocksdb (dynamic link is fine here).
-test: deps-rocksdb
+test: deps-rocksdb test-e2e-scripts
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-tools.py
 	CGO_CFLAGS="$(CGO_CFLAGS)" \
 	CGO_LDFLAGS="-L$(ROCKS_PREFIX)/lib -lrocksdb -lstdc++ -lm -lpthread -ldl" \
@@ -170,6 +170,7 @@ dedup-report:
 	BIN=$(E2E_BIN) bash test/scripts/dedup_report.sh
 
 test-e2e-scripts:
+	bash test/e2e/port_lease_test.sh
 	PYTHONDONTWRITEBYTECODE=1 python3 test/scripts/test_e2e_manifest.py
 
 VERSION ?= v0.1.0
