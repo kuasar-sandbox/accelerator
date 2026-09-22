@@ -645,7 +645,7 @@ retained buffer 为 2 MiB,异常大 buffer 用后丢弃。slot 和 weighted byte
 
 
 
-### 4.1 来源选择与惰性恢复
+### 4.9 来源选择与惰性恢复
 
 Manifest/Bundle 读取继续遵守既有 metadata 和有序引用规则选中的来源。一次本地读取失败不会仅因失败就转向另一 Bundle 或 Store。有序 refs 不可用而使查找结果不确定时，后续 remote miss 不能升级为全局缺失证明；原始原因链保持可检查。
 
@@ -690,7 +690,7 @@ metadata 读取及其与 chunk 数的关系。benchmark fixture 名称不覆盖�
 - [sandboxer](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox_zh.md):磁盘 base 与快照的 Manifest key 引用。
 - [系统架构](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox_zh.md):Manifest 抽象在平台中的位置。
 
-Manifest 来源选择与惰性恢复见[§4.1](#41-来源选择与惰性恢复).
+Manifest 来源选择与惰性恢复见[§4.9](#49-来源选择与惰性恢复).
 
 ### 传输身份与边界重建
 
