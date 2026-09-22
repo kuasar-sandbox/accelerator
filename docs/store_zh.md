@@ -232,6 +232,12 @@ for i := len(generations) - 1; i >= 0; i-- {
 }
 ```
 
+### 3.1 单次读取与写入边界
+
+Store `Get` 只执行一次业务读取。失败 stream 会被取消/释放，后续调用从头开始完整对象读取；已确认缺失与 transport/access failure 保持不同语义。现有 endpoint 与 operation timeout 约束该次尝试，后续重试/退避由调用者 context 负责。
+
+读取合同从不授权重放 `Put`、Fill、ingestion、发布或快照捕获；响应丢失不能证明写入未生效。直接 CLI 读取把单次尝试错误交给命令所有者。只有 Store 掌握已确认缺失、完整性/格式失败等语义边界时才设置 `pkg/readerr` marker；不透明访问错误、网络 EOF/半流和后端内部取消保留原始原因。
+
 ## 4. FS direct-final-write
 
 对象路径为：
@@ -382,4 +388,4 @@ race detector 需要启用 CGO 并具备可用 C 工具链。上面的普通测�
 - [cache_zh.md](cache_zh.md) — tiered cache、origin 和 wire protocol
 - 仓库根目录 `README.md` / `Makefile` — 构建和完整测试入口
 
-不可变读取错误及 client 恢复见[读取错误与恢复](accelerator-read-recovery_zh.md).
+Store 单次读取与非重放边界见[§3.1](#31-单次读取与写入边界).

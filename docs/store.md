@@ -198,6 +198,12 @@ for i := len(generations) - 1; i >= 0; i-- {
 }
 ```
 
+### 3.1 Read attempt and write boundary
+
+Store `Get` performs one business read attempt. Failed streams are canceled/released, and a later call starts a complete new object read; confirmed absence remains different from transport/access failure. The existing endpoint and operation timeout bound that attempt, while caller context owns any later retry/backoff.
+
+This read contract never authorizes replay of `Put`, Fill, ingestion, publication or snapshot capture. A lost response does not prove that a write was not applied. Direct CLI reads return their single-attempt error to the command owner. `pkg/readerr` markers are applied only where Store knows a semantic boundary such as confirmed absence or integrity/format failure; opaque access, network EOF/partial stream and backend-local cancellation keep their original causes.
+
 ## 4. FS direct-final-write
 
 The object path is:
@@ -333,4 +339,4 @@ The race-detector command requires CGO and a working C toolchain. Disabling CGO 
 - [cache.md](cache.md): tiered cache, origins and wire protocol.
 - Repository-root `README.md` / `Makefile`: build and full-test entry points.
 
-Immutable read errors and client recovery are specified in [Read errors and recovery](accelerator-read-recovery.md).
+Store read-attempt and non-replay boundaries are specified in [§3.1](#31-read-attempt-and-write-boundary).

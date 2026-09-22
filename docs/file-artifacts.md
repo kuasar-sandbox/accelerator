@@ -200,7 +200,7 @@ Each object uses its source Bundle's recorded admission. Upload neither redirect
 
 FullVerify also rejects chunks unreferenced by any local Manifest. After parsing snapshot-specific metadata, the caller can supply `ExpectedManifests` as the exact locally reachable Manifest set, rejecting unrelated Manifests without making accelerator interpret `snapshot.cfg`.
 
-Read error classification, initialization ownership and recovery are specified in [Read errors and recovery](accelerator-read-recovery.md).
+Read error classification, random-access failure and recovery are specified in [§4](#4-read-errors-random-access-and-recovery).
 
 ## 3. Shared suffix-ZIP handling
 
@@ -239,3 +239,13 @@ The image reader/writer, both flatten builders, flatten-ctl packing, sandboxer S
 Suffix ZIP processing checks the EOCD entry count and bounded directory geometry before constructing the ZIP reader. Local offsets are relative to the suffix; absolute-prefix archives are rejected rather than treating payload as metadata. Full ReaderAt buffers accompanied by ordinary EOF are accepted. Short reads and marked source failures remain errors.
 
 Canonical footer/name/body readers explicitly accept io.ReaderAt and a logical size. Their footer-first access requires genuine random access; monotone sparse sources use the sequential transfer path. Canonical encoding rejects ZIP64 entry counts before output. Complete bounded suffix reads retain backend failures even when the returned buffer is full.
+
+## 4. Read errors, random access and recovery
+
+Accelerator immutable readers perform one attempt and leave business retry/backoff to their consumer. `pkg/readerr.Mark(err, retryable)` preserves `Error()`/`Unwrap()` and adds only `Retryable() bool`; marking nil returns nil. Unknown errors are not confirmed permanent failures. Permanent semantic causes remain visible through wrappers and joined errors, and a marker at a semantic boundary is authoritative for its wrapped branch. Normal end-of-object EOF and confirmed absence retain their existing interfaces; required immutable lookup converts confirmed absence into a permanent cause. Validated format/range/integrity/authentication failures are marked where that meaning is known, while network EOF, partial frame/stream, backend-local cancellation and opaque access/decode errors retain their causes unless actual validation proves corruption.
+
+A fixed-size `ReaderAt` request is one attempt. Short-nil results and real truncation of declared fields are structural failures, not permission to append a second response. Ordinary complete EOF remains valid where the source contract allows it; bare `io.ErrUnexpectedEOF` remains structural even with a full buffer. Explicit source failures are preserved before EOF compatibility handling, and the random-access metadata adapter must not let `io.ReadFull` hide a full buffer accompanied by a source failure. Sequential sources retain one-pass semantics rather than acquiring replay. `sparse.Dense` advances by bytes actually consumed while filling a request even when the read fails; rereading an earlier offset is rejected instead of returning following bytes for the failed range.
+
+Parallel range reads join every worker before returning, including cancellation paths. The original failure is retained, derived sibling cancellation cannot replace it, and another worker's permanent cause remains in the aggregate. No worker may keep writing the caller's buffer after return. Existing Hole/Zero/Data streaming semantics stay unchanged.
+
+Direct CLI immutable reads report their single-attempt error to the command owner. No retry setting, fallback source, health mask, service restart or compatibility mode is introduced by this contract. Tests cover partial frame/stream cleanup, initialization recovery, source isolation, joined permanent errors and worker lifetime; end-to-end retry policy remains consumer-owned.
