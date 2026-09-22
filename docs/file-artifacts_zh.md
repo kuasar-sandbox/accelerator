@@ -2,7 +2,7 @@
 
 # 文件工件与载体
 
-本篇定义通用不可变文件加密、tarstream 与多 Manifest Bundle 契约。[manifest_zh.md](manifest_zh.md) 定义逻辑 Manifest/Chunk 对象与密钥，[store_zh.md](store_zh.md) 定义持久化和准入。本篇不定义 Sandbox E/S 内容或 OCI/EROFS 镜像语义；对应消费者按自身 [Sandbox 工件](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox-artifacts_zh.md) 和 [镜像](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten_zh.md) 契约使用这些载体。
+本篇定义通用不可变文件加密、tarstream 与多 Manifest Bundle 契约。[manifest_zh.md](manifest_zh.md) 定义逻辑 Manifest/Chunk 对象与密钥，[store_zh.md](store_zh.md) 定义持久化和准入。本篇不定义 Sandbox E/S 内容或 OCI/EROFS 镜像语义；对应消费者按自身 [Sandbox 工件](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox_zh.md#artifact-model) 和 [镜像](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten_zh.md) 契约使用这些载体。
 
 ## 1. 不可变本地 tarstream 与加密
 

@@ -2,7 +2,7 @@
 
 # File artifacts and carriers
 
-This specification owns the generic immutable-file encryption, tarstream and multi-Manifest Bundle contracts. Logical Manifest/Chunk objects and keys remain in [manifest.md](manifest.md); persistence/admission belongs to [store.md](store.md). It does not define Sandbox E/S contents or OCI/EROFS image semantics. Those consumers apply these carriers according to their own [sandbox artifact](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox-artifacts.md) and [image](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten.md) contracts.
+This specification owns the generic immutable-file encryption, tarstream and multi-Manifest Bundle contracts. Logical Manifest/Chunk objects and keys remain in [manifest.md](manifest.md); persistence/admission belongs to [store.md](store.md). It does not define Sandbox E/S contents or OCI/EROFS image semantics. Those consumers apply these carriers according to their own [sandbox artifact](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox.md#artifact-model) and [image](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten.md) contracts.
 
 ## 1. Immutable local tarstreams and encryption
 
