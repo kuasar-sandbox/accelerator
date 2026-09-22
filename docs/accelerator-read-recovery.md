@@ -50,5 +50,5 @@ The idle Acquire path uses the existing connection channel without the publicati
 - [Store](store.md)
 - [Manifest](manifest.md)
 - [File artifacts](file-artifacts.md)
-- [Sandboxer synchronous recovery](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandboxer-read-recovery.md)
+- [Sandboxer synchronous recovery](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox.md#read-recovery)
 - [Proposal and acceptance checklist](https://github.com/kuasar-sandbox/sandboxer/issues/225)

@@ -50,5 +50,5 @@ Bundle Open 保留原有元数据和来源选择规则. Chunk 索引准备串行
 - [Store](store_zh.md)
 - [Manifest](manifest_zh.md)
 - [文件制品](file-artifacts_zh.md)
-- [Sandboxer 同步读取恢复](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandboxer-read-recovery_zh.md)
+- [Sandboxer 同步读取恢复](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox_zh.md#read-recovery)
 - [提案与验收清单](https://github.com/kuasar-sandbox/sandboxer/issues/225)
