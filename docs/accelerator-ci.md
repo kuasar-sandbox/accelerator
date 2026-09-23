@@ -1,6 +1,6 @@
-# Accelerator CI requirements and checks
-
 [English](accelerator-ci.md) | [简体中文](accelerator-ci_zh.md)
+
+# Accelerator CI requirements and checks
 
 The [platform CI contract](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/ci.md)
 owns shared runner routing, profiles, workflow entry points and rollout status.

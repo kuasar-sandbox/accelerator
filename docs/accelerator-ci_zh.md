@@ -1,6 +1,6 @@
-# Accelerator CI 要求与检查
-
 [English](accelerator-ci.md) | [简体中文](accelerator-ci_zh.md)
+
+# Accelerator CI 要求与检查
 
 共享 runner 路由、profile、workflow 入口和上线状态由
 [平台 CI 契约](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/ci_zh.md)
