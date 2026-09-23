@@ -2,11 +2,9 @@
 set -euo pipefail
 
 source "${E2E_LIB:?E2E_LIB is required}/common.sh"
+ACCELERATOR_LIB="$E2E_LIB/accelerator"
 
 # E2E test for manifest-ctl and flatten-ctl using local Docker archives.
-# Usage:
-#   bash test/e2e/e2e_manifest.sh
-#   IMAGE_A=already-cached:a IMAGE_B=already-cached:b bash test/e2e/e2e_manifest.sh
 
 IMAGE_A="${IMAGE_A:-}"
 IMAGE_B="${IMAGE_B:-}"
@@ -25,7 +23,7 @@ for binary in store-ctl manifest-ctl flatten-ctl; do
 done
 BIN="$(cd "$BIN" && pwd)"
 for helper in manifest_fixture.py port_lease.sh; do
-    [ -r "$SCRIPT_DIR/lib/$helper" ] || die "required fixture/helper missing: $SCRIPT_DIR/lib/$helper (include test/e2e/lib in the assembled tree)"
+    [ -r "$ACCELERATOR_LIB/$helper" ] || die "required prepared accelerator helper missing: $ACCELERATOR_LIB/$helper"
 done
 if [ -z "${MKFS_EROFS_PATH:-}" ]; then
     FLATTEN_DIR=$(dirname "$(readlink -f "$BIN/flatten-ctl")")
@@ -82,8 +80,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 E2E_PORT_LEASE_FILE="$TMPDIR/ports"
-# shellcheck source-path=SCRIPTDIR
-source "$(dirname "$0")/../lib/accelerator/port_lease.sh"
+# shellcheck source=/dev/null
+source "$ACCELERATOR_LIB/port_lease.sh"
 KEY=$(openssl rand -hex 32)
 mkdir -p "$TMPDIR/home" "$TMPDIR/docker-config" "$TMPDIR/flatten"
 
@@ -136,7 +134,7 @@ if [ -z "$IMAGE_A" ] || [ -z "$IMAGE_B" ]; then
         done
     else
         [ "${KUASAR_ARTIFACT_E2E:-0}" != 1 ] || die "MANIFEST_FIXTURE_DIR is required for artifact E2E"
-        python3 "$(dirname "$0")/../lib/accelerator/manifest_fixture.py" "$TMPDIR"
+        python3 "$ACCELERATOR_LIB/manifest_fixture.py" "$TMPDIR"
     fi
 fi
 [ -z "$IMAGE_A" ] || cached_archive IMAGE_A "$IMAGE_A" "$TMPDIR/image-a.tar"
@@ -240,8 +238,8 @@ COMMON=(--manifest-config "$TMPDIR/accelerator.yaml")
 echo ""
 echo "=== Test 1: Flatten $IMAGE_A ==="
 # flatten-ctl export preserves image file ownership, which needs root/CAP_CHOWN.
-# sudo just this call so the rest of the manifest e2e stays unprivileged and a
-# plain `make test-e2e` works without wrapping the whole run in sudo.
+# Escalate just this business operation so the platform runner need not wrap the
+# entire case in sudo.
 flatten_archive "$TMPDIR/image-a.tar" "$TMPDIR/image-a.erofs"
 SIZE=$(stat --printf="%s" "$TMPDIR/image-a.erofs" 2>/dev/null || stat -f "%z" "$TMPDIR/image-a.erofs")
 if [ "$SIZE" -gt 0 ]; then
@@ -478,7 +476,7 @@ echo "  source: apparent=8MiB allocated=$HOLED_ALLOC bytes"
 
 # Package the sparse file: flatten-ctl tar stream captures the filesystem hole
 # (SEEK_HOLE) into the artifact envelope, so the store records it as authoritative
-# hole metadata from the envelope — no content scanning. Fixed chunking for
+# hole metadata from the envelope — no content scan. Fixed chunking for
 # predictable counts.
 "$BIN/flatten-ctl" tar stream -f "$HOLED.tar" "image:$HOLED"
 MKEY_HOLED=$("$BIN/manifest-ctl" store --manifest-config "$TMPDIR/accelerator-fixed-64k.yaml" --no-progress \
