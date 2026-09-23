@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 
@@ -197,6 +198,18 @@ type registrySource struct {
 	cache      *Cache
 	configJSON []byte
 	layers     []layerRef
+}
+
+// ReleaseLayers drops only the private cache owned by this build. ConfigJSON
+// is already held in memory; persistent/shared cache blobs remain reusable.
+func (s *registrySource) ReleaseLayers() error {
+	if !s.cache.ephemeral {
+		return nil
+	}
+	if err := os.RemoveAll(s.cache.dir); err != nil {
+		return fmt.Errorf("remote: release temporary layer cache: %w", err)
+	}
+	return nil
 }
 
 func (s *registrySource) ConfigJSON() ([]byte, error) { return s.configJSON, nil }
