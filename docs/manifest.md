@@ -500,6 +500,12 @@ Snappy scratch uses explicit size-class free lists, not a `sync.Pool` with no re
 Prefetch still performs only full physical-object cache Get and immediate Release. It neither verifies/decrypts nor populates the plaintext cache. Thus prefetch and on-demand ReadAt may each issue a Get, while repeated on-demand partial reads are coalesced and reused inside the Stream.
 
 
+### 4.9 Source selection and lazy recovery
+
+Manifest/Bundle reads keep the source selected by the existing metadata and ordered-reference rules. A failed local read never falls through to another Bundle or Store merely because it failed. When unavailable ordered refs leave lookup uncertain, a later remote miss cannot be promoted to proof of global absence; original causes remain inspectable.
+
+Chunk-index preparation serializes loading, builds and validates a complete map in attempt-local state, and publishes it only after success. Failure or cancellation is not cached, so a later Open can retry initialization at the same selected source. Reader Close continues to wait for existing source leases and prevents late publication. Successful preparation is reused; failed preparation retains no poisoned index state.
+
 ## 5. Performance characteristics
 
 The [project performance guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf.md) provides the measurement context for end-to-end `manifest://` loads with cold/warm L1. Record actual revisions, workload and cache state; document structure or benchmark names alone are not fresh measurements.
@@ -526,7 +532,7 @@ Bundle tail-index opening cost at 4K/20K/100K chunks is reported by `BenchmarkBu
 - [sandboxer](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox.md): disk bases and snapshots referenced with Manifest keys.
 - [system architecture](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox.md): the Manifest abstraction in the overall platform.
 
-Immutable read errors and client recovery are specified in [Read errors and recovery](accelerator-read-recovery.md).
+Manifest source selection and lazy recovery are specified in [§4.9](#49-source-selection-and-lazy-recovery).
 
 ### Transfer identities and reconstructed boundaries
 

@@ -529,6 +529,14 @@ Current local and shard modes connect the same selected backend to both object a
 
 Tiered exposes only the object read chain. It rejects writes and shard operations. The protocol should not be mistaken for an authorization boundary; endpoint access belongs to the deployment.
 
+### 4.11 Read attempts, pool recovery and error ownership
+
+Cache reads are single-attempt operations. `Get`/`GetShard` release or cancel failed payloads and streams; a later call starts a complete new object read at the same selected endpoint and never splices an old prefix. A confirmed miss remains distinct from inability to contact a peer, and legal server cancellation remains retryable. Existing endpoint, pool and per-operation timeout settings remain authoritative; socket/RPC deadlines bound one attempt, while the caller's operation context decides whether another attempt is allowed. No retry flag, fallback endpoint, health mask, service restart or compatibility mode is added.
+
+Connection capacity counts idle, borrowed and dialing connections under the same reservation limit for Acquire and refill. Pool dialing has a bounded connection timeout even when no read deadline is configured. Failed dials release their reservation and return the actual error. Bad connections release capacity and wake waiters even when no healthy connection is returned; canceling/taking waiters transfer a consumed notification when spare capacity remains. Close prevents new publication, wakes waiters and cancels dials, while borrowed connections remain caller-owned until Release. Release and Close serialize publication, and socket cancellation must finish before connection ownership returns to the pool. Same-endpoint recovery does not require per-read Ping or whole-pool invalidation. The idle Acquire path continues to use the connection channel without the publication mutex; failed attempts create no unbounded refill tasks, and only bounded maintenance workers perform health/refill work across an outage.
+
+`pkg/readerr` classification used by cache callers is preserved across wrappers: confirmed miss is not a transport failure, unknown errors are not automatically permanent, and permanent semantic causes remain visible through joined/wrapped errors. Consumers, not accelerator, own business retry/backoff.
+
 ## 5. Memory budgeting
 
 ### 5.1 L1: an embedded tier inside a tiered process
@@ -784,4 +792,4 @@ Record workload controls `VALUE_SIZE`, `PREFILL`, `COLD_PREFILL`, `MISS_RATIO`, 
 - [README](../README.md) / [Makefile](../Makefile): `make cache-ctl` builds the repository's CGO binary after deps-rocksdb, statically linking librocksdb.
 - [system architecture](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox.md): the cache model in the platform.
 
-Immutable read errors and client recovery are specified in [Read errors and recovery](accelerator-read-recovery.md).
+Cache read attempts and client recovery are specified in [§4.11](#411-read-attempts-pool-recovery-and-error-ownership).

@@ -629,6 +629,14 @@ placement,不假定精确 1/M。**reload 不重建 RS codec**,需为既有 data+
 tiered 仅提供 object read chain,拒绝 writes 和 shard operations。协议不应被误解为授权边界;
 端点访问控制属于部署。
 
+### 4.11 单次读取、连接池恢复与错误归属
+
+Cache 读取是单次尝试操作。`Get`/`GetShard` 会释放或取消失败的 payload/stream；后续调用在同一已选 endpoint 重新开始完整对象读取，不拼接旧前缀。已确认 miss 与无法联系 peer 保持不同含义，合法服务端取消仍可重试。现有 endpoint、pool 和单次操作 timeout 设置仍然权威；socket/RPC deadline 只约束一次尝试，是否允许下一次尝试由调用者的 operation context 决定。不增加 retry 参数、fallback endpoint、健康屏蔽、服务重启或兼容模式。
+
+连接额度统一计算空闲、借出和拨号中的连接，Acquire/refill 共用预留上限。即使没有配置读取 deadline，pool 拨号仍使用有界连接 timeout。拨号失败释放预留并返回真实错误；坏连接释放容量并唤醒等待者，即使没有健康连接归还。等待者取消或取得连接后，如仍有空余额度，会转交已消费的通知。Close 阻止新发布、唤醒等待者并取消拨号，借出连接仍由调用者持有至 Release；Release 与 Close 对发布互斥，socket 取消必须在连接归还池前结束。同 endpoint 恢复不需要每次读前 Ping 或整池失效。空闲 Acquire 路径继续使用连接 channel 而不取得发布 mutex；失败尝试不创建无界 refill 任务，停机期间健康/refill 仍只由有界维护 worker 执行。
+
+Cache 调用方使用的 `pkg/readerr` 分类在包装链中保持：已确认 miss 不是 transport failure，未知错误不会自动成为永久失败，joined/wrapped error 中的永久语义原因仍可见。业务重试/退避由消费者而非 accelerator 负责。
+
 ## 5. 内存预算
 
 ### 5.1 L1(tiered 进程内嵌 embedded tier)
@@ -928,4 +936,4 @@ origin 与 tiered 并扫并发。使用 [procmon.sh](../test/scripts/procmon.sh)
   后静态链接 librocksdb,是本仓 CGO 二进制。
 - [系统架构](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox_zh.md):平台缓存模型。
 
-不可变读取错误及 client 恢复见[读取错误与恢复](accelerator-read-recovery_zh.md).
+Cache 单次读取与 client 恢复见[§4.11](#411-单次读取连接池恢复与错误归属).

@@ -297,7 +297,7 @@ snapshot-specific metadata 后可通过 `ExpectedManifests` 提交精确的本�
 Manifest 集，从而拒绝无关 Manifest，而无需让 accelerator 解释
 `snapshot.cfg`。
 
-读取错误分类、初始化所有权和恢复见[读取错误与恢复](accelerator-read-recovery_zh.md).
+读取错误分类、随机访问失败与恢复见[§4](#4-读取错误随机访问与恢复).
 
 ## 3. 共享后缀 ZIP 处理
 
@@ -331,3 +331,13 @@ Image reader/writer、两个 flatten builder、flatten-ctl 打包、sandboxer S/
 Suffix ZIP 在构造 ZIP reader 前检查 EOCD 条目数量与有界目录布局。local offset 相对后缀起点；带绝对前缀偏移的归档明确报错，避免将 payload 当作元数据。ReaderAt 返回完整缓冲并附带普通 EOF 时接受数据；短读和标记过的源故障仍然返回错误。
 
 规范后缀的 footer、名称和正文读取接口显式接受 io.ReaderAt 与逻辑大小。先读 footer 的流程要求真正随机访问；单调 sparse source 使用顺序传输路径。规范编码在输出前拒绝 ZIP64 条目数量。读取完整有界后缀时，即使已返回完整缓冲，也保留后端故障。
+
+## 4. 读取错误、随机访问与恢复
+
+Accelerator 不可变 reader 执行单次尝试，把业务重试/退避留给消费者。`pkg/readerr.Mark(err, retryable)` 保留 `Error()`/`Unwrap()`，只增加 `Retryable() bool`；标记 nil 仍返回 nil。未知错误不代表已确认永久失败。永久语义原因在包装和 joined errors 中保持可见，语义边界上的 marker 对其包装分支具有权威性。正常对象结束 EOF 与已确认缺失保留原接口；必需不可变对象查找把已确认缺失转换为永久原因。已验证格式/范围/完整性/认证失败在掌握语义的位置标记；网络 EOF、半帧/半流、后端内部取消和不透明访问/decode 错误保留原始原因，除非实际验证已经证明损坏。
+
+固定大小 `ReaderAt` 请求只执行一次尝试。short-nil 和已声明字段的真实截断属于结构失败，不能据此拼接第二个响应。来源合同允许时完整普通 EOF 仍然合法；原始 `io.ErrUnexpectedEOF` 即使带完整 buffer 也仍是结构失败。显式源失败在 EOF 兼容处理前保留，随机访问 metadata adapter 不得让 `io.ReadFull` 吞掉完整 buffer 携带的源失败。顺序来源保留单遍语义，不增加 replay。`sparse.Dense` 即使读取失败，也按填充请求时实际消费的字节推进；重读此前 offset 会被拒绝，而不会把随后字节当作失败范围返回。
+
+并行 range read 在返回前 join 所有 worker，包括取消路径。原失败保留，派生同级取消不能替换它，其他 worker 的永久原因仍保留在聚合结果中；返回后 worker 不得继续修改调用者 buffer。既有 Hole/Zero/Data 流式语义保持不变。
+
+直接 CLI 不可变读取向命令所有者报告单次尝试错误。该合同不增加 retry 设置、fallback 来源、健康屏蔽、服务重启或兼容模式。测试覆盖半帧/半流清理、初始化恢复、来源隔离、joined permanent error 与 worker 生命周期；端到端重试策略仍由消费者负责。

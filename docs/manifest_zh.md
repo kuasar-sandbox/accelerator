@@ -645,6 +645,12 @@ retained buffer 为 2 MiB,异常大 buffer 用后丢弃。slot 和 weighted byte
 
 
 
+### 4.9 来源选择与惰性恢复
+
+Manifest/Bundle 读取继续遵守既有 metadata 和有序引用规则选中的来源。一次本地读取失败不会仅因失败就转向另一 Bundle 或 Store。有序 refs 不可用而使查找结果不确定时，后续 remote miss 不能升级为全局缺失证明；原始原因链保持可检查。
+
+Chunk 索引准备串行加载，在单次尝试的局部状态中构建并验证完整 map，只在成功后发布。失败或取消不会缓存，因此后续 Open 可以在同一已选来源重新初始化。Reader Close 继续等待现有 source lease 并阻止延迟发布。成功准备会复用，失败准备不会留下中毒索引状态。
+
 ## 5. 性能特征
 
 [项目性能文档](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf_zh.md)
@@ -684,7 +690,7 @@ metadata 读取及其与 chunk 数的关系。benchmark fixture 名称不覆盖�
 - [sandboxer](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox_zh.md):磁盘 base 与快照的 Manifest key 引用。
 - [系统架构](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox_zh.md):Manifest 抽象在平台中的位置。
 
-不可变读取错误及 client 恢复见[读取错误与恢复](accelerator-read-recovery_zh.md).
+Manifest 来源选择与惰性恢复见[§4.9](#49-来源选择与惰性恢复).
 
 ### 传输身份与边界重建
 
