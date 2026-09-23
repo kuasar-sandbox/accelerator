@@ -10,7 +10,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all build manifest-ctl store-ctl cache-ctl deps-rocksdb test test-no-rocksdb vet bench test-e2e perf-cache perf-cache-remote dedup-report release test-release clean help
+.PHONY: all build manifest-ctl store-ctl cache-ctl deps-rocksdb test test-no-rocksdb vet bench perf-cache perf-cache-remote dedup-report release test-release clean help
 .PHONY: test-e2e-scripts
 
 # ---------------------------------------------------------------------------
@@ -147,18 +147,14 @@ clean:
 # ---------------------------------------------------------------------------
 # Tests + benchmarks + perf
 # ---------------------------------------------------------------------------
-# E2E needs the assembled platform binary set because accelerator-owned cases
-# also exercise flatten-ctl. Integration E2E sets BIN explicitly; this default
-# is convenient for the normal sibling-repository checkout.
+# Perf tools use the assembled platform binary set because they also exercise
+# flatten-ctl. Integration E2E is owned by the prepared platform runner.
 E2E_BIN ?= $(abspath ../kuasar-sandbox/bin/$(TARGET_ARCH))
 
 bench: deps-rocksdb
 	CGO_CFLAGS="$(CGO_CFLAGS)" \
 	CGO_LDFLAGS="-L$(ROCKS_PREFIX)/lib -lrocksdb -lstdc++ -lm -lpthread -ldl" \
 		$(GO) test -bench=. -benchmem -run=^$$ ./...
-
-test-e2e:
-	BIN="$(E2E_BIN)" bash test/e2e/run_all.sh
 
 perf-cache:
 	BIN=$(E2E_BIN) bash test/scripts/bench_cache.sh
@@ -193,7 +189,6 @@ help:
 	@echo "  deps-rocksdb  build local librocksdb.a"
 	@echo "  test          unit tests (needs librocksdb for cache/rocks)"
 	@echo "  vet           vet the CGO-free client surface"
-	@echo "  test-e2e      run the accelerator-owned E2E suite with E2E_BIN"
 	@echo "  release       build a validated component release bundle"
 	@echo "  test-release  test component release packaging"
 	@echo "  clean         remove bin/ + build/"
