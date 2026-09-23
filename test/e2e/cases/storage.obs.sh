@@ -2,15 +2,11 @@
 # store-ctl(obs backend) ↔ real S3-compatible OBS round-trip.
 #
 # This case is opt-in by selection. Once selected, missing credentials,
-# bucket configuration, host prerequisites, or prepared products are failures.
+# bucket/endpoint configuration, host prerequisites, or prepared products are failures.
 # Required:
-#   OBS_BUCKET
-# and either:
-#   OBS_AK + OBS_SK
-# or:
-#   ~/.obsconfig
+#   OBS_BUCKET, OBS_ENDPOINT, OBS_AK, OBS_SK
 # Optional:
-#   OBS_ENDPOINT, OBS_REGION, OBS_PREFIX
+#   OBS_REGION, OBS_PREFIX
 
 set -euo pipefail
 
@@ -24,11 +20,9 @@ fail_case() {
 }
 
 [ -n "${OBS_BUCKET:-}" ] || fail_case "OBS_BUCKET is required"
-if [ -n "${OBS_AK:-}" ] || [ -n "${OBS_SK:-}" ]; then
-    [ -n "${OBS_AK:-}" ] && [ -n "${OBS_SK:-}" ] || fail_case "OBS_AK and OBS_SK must be provided together"
-else
-    [ -n "${HOME:-}" ] && [ -f "$HOME/.obsconfig" ] || fail_case "provide OBS_AK/OBS_SK or ~/.obsconfig"
-fi
+[ -n "${OBS_ENDPOINT:-}" ] || fail_case "OBS_ENDPOINT is required"
+[ -n "${OBS_AK:-}" ] || fail_case "OBS_AK is required"
+[ -n "${OBS_SK:-}" ] || fail_case "OBS_SK is required"
 
 for tool in python3 openssl dd sha256sum awk grep date rm mktemp; do
     require_command "$tool"
@@ -68,16 +62,16 @@ backend: obs
 obs:
   bucket: ${OBS_BUCKET}
   prefix: ${OBS_PREFIX}
+  endpoint: ${OBS_ENDPOINT}
+  access_key: \${OBS_AK}
+  secret_key: \${OBS_SK}
 EOF
-if [ -n "${OBS_ENDPOINT:-}" ]; then echo "  endpoint: ${OBS_ENDPOINT}" >> "$WORK/store-ctl.yaml"; fi
-if [ -n "${OBS_REGION:-}"   ]; then echo "  region: ${OBS_REGION}"     >> "$WORK/store-ctl.yaml"; fi
-if [ -n "${OBS_AK:-}"       ]; then echo "  access_key: \${OBS_AK}"    >> "$WORK/store-ctl.yaml"; fi
-if [ -n "${OBS_SK:-}"       ]; then echo "  secret_key: \${OBS_SK}"    >> "$WORK/store-ctl.yaml"; fi
+if [ -n "${OBS_REGION:-}" ]; then echo "  region: ${OBS_REGION}" >> "$WORK/store-ctl.yaml"; fi
 echo "  verify_content_key: true" >> "$WORK/store-ctl.yaml"
 echo "  op_timeout: 15s"          >> "$WORK/store-ctl.yaml"
 
 echo "==> store-ctl init --generation G1"
-OBS_AK="${OBS_AK:-}" OBS_SK="${OBS_SK:-}" \
+OBS_AK="$OBS_AK" OBS_SK="$OBS_SK" \
     "$BIN/store-ctl" init --config "$WORK/store-ctl.yaml" --generation G1
 
 cat > "$WORK/accelerator.yaml" <<EOF
@@ -95,7 +89,7 @@ crypto:
 EOF
 
 echo "==> store-ctl: backend=obs bucket=${OBS_BUCKET} prefix=${OBS_PREFIX}"
-OBS_AK="${OBS_AK:-}" OBS_SK="${OBS_SK:-}" \
+OBS_AK="$OBS_AK" OBS_SK="$OBS_SK" \
     "$BIN/store-ctl" serve --config "$WORK/store-ctl.yaml" \
     >"$WORK/store.log" 2>&1 &
 STORE_PID=$!
@@ -149,7 +143,7 @@ kill "$STORE_PID" 2>/dev/null || true
 wait "$STORE_PID" 2>/dev/null || true
 STORE_PID=""
 echo "==> cleanup: store-ctl purge --all --confirm"
-if OBS_AK="${OBS_AK:-}" OBS_SK="${OBS_SK:-}" \
+if OBS_AK="$OBS_AK" OBS_SK="$OBS_SK" \
         "$BIN/store-ctl" purge --config "$WORK/store-ctl.yaml" \
         --all --confirm 2>&1; then
     echo "    PASS: per-run prefix purged"
