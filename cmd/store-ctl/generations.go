@@ -46,7 +46,7 @@ type generationSourceHandle struct {
 func openGenerationSource(ctx context.Context, cfg *Config, configPath string) (*generationSourceHandle, error) {
 	g := cfg.Generations
 	switch {
-	case g.configSet:
+	case g.IsConfigSource():
 		source := &configGenerationSource{path: configPath}
 		return &generationSourceHandle{source: source, kind: generationSourceConfig}, nil
 	case g.File != nil:
@@ -57,7 +57,7 @@ func openGenerationSource(ctx context.Context, cfg *Config, configPath string) (
 			Endpoint:  g.S3.Endpoint,
 			Region:    g.S3.Region,
 			Bucket:    g.S3.Bucket,
-			PathStyle: g.S3.pathStyle(),
+			PathStyle: g.S3.PathStyleEnabled(),
 			AccessKey: g.S3.AccessKey,
 			SecretKey: g.S3.SecretKey,
 			TLS:       tlsDialConfig(g.S3.TLS),
@@ -79,7 +79,7 @@ func (s *configGenerationSource) Load(_ context.Context) ([]store.Generation, er
 	if err != nil {
 		return nil, err
 	}
-	if cfg.Generations == nil || !cfg.Generations.configSet {
+	if cfg.Generations == nil || !cfg.Generations.IsConfigSource() {
 		return nil, errors.New("generation config source changed type")
 	}
 	return validateGenerationStrings(cfg.Generations.Config)

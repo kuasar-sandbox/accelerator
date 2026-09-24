@@ -126,7 +126,7 @@ generations:
 	}
 	meta := cfg.Generations.S3
 	if meta == nil || meta.Endpoint != "https://meta.example" || meta.Bucket != "metadata" ||
-		meta.Key != "prod/generations" || meta.pathStyle() || meta.AccessKey != "meta-ak" || meta.SecretKey != "meta-sk" {
+		meta.Key != "prod/generations" || meta.PathStyleEnabled() || meta.AccessKey != "meta-ak" || meta.SecretKey != "meta-sk" {
 		t.Fatalf("generation S3 config = %+v", meta)
 	}
 	if cfg.GenerationRefreshInterval() != 9*time.Second {

@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"fmt"
@@ -134,6 +134,11 @@ type GenerationsConfig struct {
 	s3Set     bool
 }
 
+// IsConfigSource reports whether the inline config source was selected.
+func (c *GenerationsConfig) IsConfigSource() bool {
+	return c != nil && (c.configSet || c.Config != nil)
+}
+
 func (c *GenerationsConfig) UnmarshalYAML(node *yaml.Node) error {
 	type plain GenerationsConfig
 	var decoded plain
@@ -218,7 +223,7 @@ func (c *GenerationS3Config) expandEnv() {
 	}
 }
 
-func (c *GenerationS3Config) pathStyle() bool {
+func (c *GenerationS3Config) PathStyleEnabled() bool {
 	if c.PathStyle == nil {
 		return true
 	}
@@ -357,46 +362,58 @@ func LoadConfig(path string, requireListen bool) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("store-ctl: parse config %s: %w", path, err)
 	}
-	if requireListen && cfg.Listen == "" {
-		return nil, fmt.Errorf("store-ctl: listen is required")
-	}
-	if cfg.Backend == "" {
-		return nil, fmt.Errorf("store-ctl: backend is required (want fs|s3)")
-	}
-	if err := cfg.normalizeBackend(); err != nil {
-		return nil, err
-	}
-
-	switch cfg.Backend {
-	case "fs":
-		if cfg.FS.Root == "" {
-			return nil, fmt.Errorf("store-ctl: fs.root is required for backend=fs")
-		}
-	case "s3":
-		cfg.S3.expandEnv()
-		if cfg.S3.Region == "" {
-			cfg.S3.Region = defaultS3Region
-		}
-		if cfg.S3.Endpoint == "" {
-			return nil, fmt.Errorf("store-ctl: s3.endpoint is required for backend=s3")
-		}
-		if cfg.S3.Bucket == "" {
-			return nil, fmt.Errorf("store-ctl: s3.bucket is required for backend=s3")
-		}
-		if (cfg.S3.AccessKey == "") != (cfg.S3.SecretKey == "") {
-			return nil, fmt.Errorf("store-ctl: s3.access_key and s3.secret_key must be set together")
-		}
-		if err := cfg.S3.TLS.validate("s3.tls"); err != nil {
-			return nil, err
-		}
-	}
-	if err := cfg.normaliseGenerations(); err != nil {
+	if err := cfg.normalize(requireListen, true); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
 }
 
-func (c *Config) normaliseGenerations() error {
+// Normalize validates and applies defaults to a Config constructed directly in
+// Go. Unlike LoadConfig, it never reads a file or expands environment variables.
+func (c *Config) Normalize(requireListen bool) error {
+	return c.normalize(requireListen, false)
+}
+
+func (c *Config) normalize(requireListen, expandEnvironment bool) error {
+	if requireListen && c.Listen == "" {
+		return fmt.Errorf("store-ctl: listen is required")
+	}
+	if c.Backend == "" {
+		return fmt.Errorf("store-ctl: backend is required (want fs|s3)")
+	}
+	if err := c.normalizeBackend(); err != nil {
+		return err
+	}
+
+	switch c.Backend {
+	case "fs":
+		if c.FS.Root == "" {
+			return fmt.Errorf("store-ctl: fs.root is required for backend=fs")
+		}
+	case "s3":
+		if expandEnvironment {
+			c.S3.expandEnv()
+		}
+		if c.S3.Region == "" {
+			c.S3.Region = defaultS3Region
+		}
+		if c.S3.Endpoint == "" {
+			return fmt.Errorf("store-ctl: s3.endpoint is required for backend=s3")
+		}
+		if c.S3.Bucket == "" {
+			return fmt.Errorf("store-ctl: s3.bucket is required for backend=s3")
+		}
+		if (c.S3.AccessKey == "") != (c.S3.SecretKey == "") {
+			return fmt.Errorf("store-ctl: s3.access_key and s3.secret_key must be set together")
+		}
+		if err := c.S3.TLS.validate("s3.tls"); err != nil {
+			return err
+		}
+	}
+	return c.normaliseGenerations(expandEnvironment)
+}
+
+func (c *Config) normaliseGenerations(expandEnvironment bool) error {
 	if c.Generations == nil {
 		switch c.Backend {
 		case "fs":
@@ -450,13 +467,17 @@ func (c *Config) normaliseGenerations() error {
 		return nil
 	}
 	if g.File != nil {
-		g.File.Path = expandEnv(g.File.Path)
+		if expandEnvironment {
+			g.File.Path = expandEnv(g.File.Path)
+		}
 		if g.File.Path == "" {
 			return fmt.Errorf("store-ctl: generations.file.path is required")
 		}
 	}
 	if g.S3 != nil {
-		g.S3.expandEnv()
+		if expandEnvironment {
+			g.S3.expandEnv()
+		}
 		if g.S3.Region == "" {
 			g.S3.Region = defaultS3Region
 		}
