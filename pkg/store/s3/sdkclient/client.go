@@ -20,6 +20,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
@@ -57,6 +59,11 @@ type Config struct {
 	AccessKey string
 	SecretKey string
 
+	// Credentials is authoritative when set. AccessKey and SecretKey are
+	// intentionally ignored in that case so callers can override a legacy
+	// static configuration without first rewriting it.
+	Credentials CredentialsProvider
+
 	// TLS tunes certificate verification for the endpoint: an extra
 	// CA bundle to trust, or opting out of verification (testing
 	// only). Zero value → SDK defaults (system trust store, strict).
@@ -83,8 +90,85 @@ type TLSConfig struct {
 // via the s3.s3Client interface; no public methods other than the
 // interface contract.
 type Client struct {
-	api    *awss3.Client
-	bucket string
+	api       *awss3.Client
+	bucket    string
+	lifetime  *providerLifetime
+	transport interface{ CloseIdleConnections() }
+	closeOnce sync.Once
+}
+
+// Credentials is an SDK-independent credential value. Expires is meaningful
+// only when CanExpire is true.
+type Credentials struct {
+	AccessKeyID     string
+	SecretAccessKey string
+	SessionToken    string
+	Expires         time.Time
+	CanExpire       bool
+}
+
+// CredentialsProvider supplies credentials to the AWS SDK credential cache.
+// Implementations must honor cancellation of the context passed to Retrieve.
+type CredentialsProvider interface {
+	Retrieve(context.Context) (Credentials, error)
+}
+
+var errProviderClosed = errors.New("s3 sdkclient: credentials provider is closed")
+
+// providerLifetime prevents WaitGroup Add/Wait races by guarding admission and
+// closure with one mutex. The provider itself is borrowed and is never closed.
+type providerLifetime struct {
+	provider CredentialsProvider
+	ctx      context.Context
+	cancel   context.CancelFunc
+	mu       sync.Mutex
+	closed   bool
+	wg       sync.WaitGroup
+}
+
+func newProviderLifetime(provider CredentialsProvider) *providerLifetime {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &providerLifetime{provider: provider, ctx: ctx, cancel: cancel}
+}
+
+func (p *providerLifetime) Retrieve(ctx context.Context) (aws.Credentials, error) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return aws.Credentials{}, errProviderClosed
+	}
+	p.wg.Add(1)
+	p.mu.Unlock()
+	defer p.wg.Done()
+
+	callCtx, cancel := context.WithCancel(p.ctx)
+	stop := context.AfterFunc(ctx, cancel)
+	defer func() { stop(); cancel() }()
+	c, err := p.provider.Retrieve(callCtx)
+	if err != nil {
+		return aws.Credentials{}, err
+	}
+	if c.AccessKeyID == "" || c.SecretAccessKey == "" {
+		return aws.Credentials{}, errors.New("s3 sdkclient: credentials provider returned an empty access key or secret key")
+	}
+	if c.CanExpire && c.Expires.IsZero() {
+		return aws.Credentials{}, errors.New("s3 sdkclient: expiring credentials have no expiration time")
+	}
+	return aws.Credentials{
+		AccessKeyID: c.AccessKeyID, SecretAccessKey: c.SecretAccessKey,
+		SessionToken: c.SessionToken, Expires: c.Expires, CanExpire: c.CanExpire,
+		Source: "accelerator CredentialsProvider",
+	}, nil
+}
+
+func (p *providerLifetime) close() {
+	p.mu.Lock()
+	if !p.closed {
+		p.closed = true
+		p.cancel()
+	}
+	p.mu.Unlock()
+	p.wg.Wait()
 }
 
 // New validates the required location and static-credential pairing,
@@ -117,8 +201,17 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		loadOpts = append(loadOpts, awsconfig.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")))
 	}
+	var lifetime *providerLifetime
+	if cfg.Credentials != nil {
+		lifetime = newProviderLifetime(cfg.Credentials)
+		loadOpts = append(loadOpts, awsconfig.WithCredentialsProvider(
+			aws.NewCredentialsCache(lifetime)))
+	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
 	if err != nil {
+		if lifetime != nil {
+			lifetime.close()
+		}
 		return nil, fmt.Errorf("s3 sdkclient: load aws config: %w", err)
 	}
 	if tlsClient != nil {
@@ -131,7 +224,38 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		awsCfg.HTTPClient = tlsClient
 	}
 	api := newAPI(awsCfg, cfg.Endpoint, cfg.PathStyle)
-	return &Client{api: api, bucket: cfg.Bucket}, nil
+	// Non-legacy DefaultsMode may replace a BuildableClient while resolving
+	// service options. Materialize that resolved client and rebuild once so the
+	// exact transport used for object requests is owned and closeable, rather
+	// than retaining (or later closing) an earlier pointer. BuildableClient's
+	// Freeze wrapper does not expose CloseIdleConnections, hence the explicit
+	// standard client with the SDK-resolved transport and timeout.
+	if buildable, ok := api.Options().HTTPClient.(*awshttp.BuildableClient); ok {
+		awsCfg.HTTPClient = &http.Client{
+			Transport: buildable.GetTransport(),
+			Timeout:   buildable.GetTimeout(),
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+		api = newAPI(awsCfg, cfg.Endpoint, cfg.PathStyle)
+	}
+	actual, _ := api.Options().HTTPClient.(interface{ CloseIdleConnections() })
+	return &Client{api: api, bucket: cfg.Bucket, lifetime: lifetime, transport: actual}, nil
+}
+
+// Close cancels and waits for credential callbacks, then releases idle object
+// request connections. It is safe to call more than once.
+func (c *Client) Close() error {
+	c.closeOnce.Do(func() {
+		if c.lifetime != nil {
+			c.lifetime.close()
+		}
+		if c.transport != nil {
+			c.transport.CloseIdleConnections()
+		}
+	})
+	return nil
 }
 
 // tlsHTTPClient builds the HTTP client for an endpoint whose TLS
