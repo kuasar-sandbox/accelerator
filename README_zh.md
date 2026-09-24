@@ -60,9 +60,11 @@ make cache-ctl NO_ROCKSDB=1     # 不带 RocksDB (-tags no_rocksdb, CGO_ENABLED=
 make build                      # 全部组件二进制
 make build TARGET_ARCH=aarch64  # 交叉编译;接受 amd64/arm64 别名
 make vet                        # 检查面向下游的薄 Go 导出面
-make test                       # 单元与后端测试
-make test-e2e                   # 组件 owner suite;需要项目组装的 BIN
+make test                       # 单元、后端及 source/helper 回归
+make test-e2e-scripts           # 离线 E2E fixture/helper 回归，不是产品 E2E
 ```
+
+产品 E2E 由平台统一的 prepared-workspace runner 对预构建制品执行；组件不再提供独立 owner `run_all.sh` 或 `make test-e2e` 入口。`prepare -> <suite>.<case>.sh -> run` 契约及 accelerator 用例前置条件见 [`test/e2e/README_zh.md`](test/e2e/README_zh.md)。
 
 源码构建需要 Go 1.26.1 或更新版本，原生前置依赖随构建目标而异。当前源码通过仓库脚本说明并构建所需原生缓存依赖。真实对象存储测试必须使用显式测试凭据或本地 S3-compatible 服务;普通单元测试与本地文件系统测试不应要求生产云凭据。
 

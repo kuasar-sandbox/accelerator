@@ -328,8 +328,10 @@ CGO_ENABLED=1 go test -race ./pkg/store/... ./pkg/manifest/... ./cmd/store-ctl
 make store-ctl
 make manifest-ctl
 make vet
-make test-e2e
+make test-e2e-scripts
 ```
+
+The commands above are source/unit/helper validation. Product Store/cache E2E is executed from the prepared platform workspace through the common runner and the `storage.*.sh` cases; see [`../test/e2e/README.md`](../test/e2e/README.md). It consumes prebuilt products and does not compile product or helper source during E2E execution.
 
 The race-detector command requires CGO and a working C toolchain. Disabling CGO is valid for the ordinary test command above, not for `go test -race`.
 

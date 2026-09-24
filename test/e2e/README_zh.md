@@ -1,54 +1,85 @@
 [English](README.md) | [简体中文](README_zh.md)
 
-# Accelerator E2E 测试
+# Accelerator 产品 E2E 用例
 
-本目录是 accelerator 负责的端到端测试，需要组装后的平台二进制集合。它调用真实的 flatten、manifest、store 和 cache API，并生成真实 EROFS。组装测试时必须保留整个 `test/e2e` 目录（包括 `lib/`）；fixture 不依赖任何私有源码。
+Accelerator 产品 E2E 统一由平台提供的 prepared-workspace runner 执行。组件仓库只负责用例文件和 accelerator 专属 helper，不再提供独立的 `run_all.sh` 或另一套产品 E2E runner。
 
-在 accelerator 源码目录运行：
+执行模型保持简单：
 
-```sh
-make test-e2e-scripts                          # 离线脚本/fixture 回归，不编译工具链
-make test-e2e E2E_BIN=/path/to/assembled/bin/x86_64
-# 也可直接运行组装后的测试：
-BIN=/path/to/assembled/bin/x86_64 bash test/e2e/run_all.sh
-# 仅运行 flatten/manifest 测试：
-BIN=/path/to/assembled/bin/x86_64 bash test/e2e/e2e_manifest.sh
+```text
+预构建产品 -> prepare -> <suite>.<case>.sh -> run
 ```
 
-`E2E_BIN` 默认指向同级平台仓库的 `bin/$(TARGET_ARCH)`；直接运行 `run_all.sh` 必须设置 `BIN`。二进制应为适配测试主机架构的 Linux 本机版本。`make test-e2e-scripts` 需要 Python 3.9+、Bash 及下列常规工具，不需要组装后的二进制、Docker、Redis、sudo 权限、Go 或原生编译。它测试端口租约，并在明确替换 CLI 边界的情况下验证 fixture 和生命周期。这些边界测试不会完成 E2E 的编号断言，不能作为真实 E2E 通过的证据。`make test` 也包含这些回归，同时保留原有 RocksDB/单元测试的编译要求。
+用例 ID 就是文件名，suite 是文件名第一段。Accelerator 当前提供以下 `storage` 和 `image` 用例：
 
-真实套件的要求：
-
-- Linux、支持 `/dev/tcp` 的 Bash 4+、Python 3 标准库、OpenSSL、GNU coreutils/findutils、GNU grep（含 `-P`）、awk、sed、tar、unzip，以及 util-linux 的 `flock`；使用 Makefile 入口还需要 GNU Make。脚本使用 Linux 稀疏文件操作和 GNU 命令选项。
-- 组装后的 `BIN` 包含可执行的 `flatten-ctl`、`manifest-ctl`、`store-ctl`、`cache-ctl`。使用正常启用 RocksDB 的 cache 二进制；`no_rocksdb` 不是默认设置，也不能替代必需覆盖。
-- 支持去重和分块布局（`-Ededupe --chunksize=4096`）的真实 `mkfs.erofs`。查找顺序为 `MKFS_EROFS_PATH`、解析符号链接后的 `flatten-ctl` 所在目录、`PATH`。manifest 测试在启动 store 前检查该工具。
-- flatten export 需要 root 或非交互式 `sudo -n`，以保留镜像层的 UID/GID。套件其他操作可使用普通用户。manifest 测试仅向 export 传递隔离的 HOME/Docker 配置、自有临时目录和解析后的 EROFS 工具路径，不使用 `sudo -E`。
-- 必需的 Redis local/tiered/sharded 用例需要 `PATH` 中的 `redis-server`，或用 `REDIS_SERVER` 指定可执行文件。套件自行启动一次性的本地 Redis 进程，无需外部 Redis 服务。
-- 可写且支持真实稀疏文件/`SEEK_HOLE` 的临时文件系统，有空间存放镜像和 store 副本，并允许本地回环 TCP 端口及 Unix socket。现有 cache/端口/rolling 脚本使用 `/tmp`；manifest 脚本遵循 `TMPDIR` 创建独立目录。其 store 就绪检测最多等待五秒，超时打印 store 日志并失败；这是启动边界而非性能断言。清理时向自有 store 发送 TERM，最多等待三秒，再 KILL 并回收进程、删除工作目录。INT/TERM 分别保留退出码 130/143。
-
-`run_all.sh` 始终按以下顺序运行必需用例：
-
-| 脚本 | 必需验证意图 |
+| 用例 | 验证契约 |
 | --- | --- |
-| `port_lease_test.sh` | 128 次快速分配及 128 次并发分配的本地端口租约均不重复。 |
-| `e2e_cache.sh` | Store 往返；embedded 和 Redis 的 local/shard/tiered 缓存；EC 读取、节点故障、上游填充/回写、慢节点取消、重启/回填及不访问 origin 的热读取。 |
-| `e2e_store_cache_listen.sh` | Store 内嵌只读 cache 协议、generation 切换、旧 manifest 读取、blob 命名空间及拒绝写入。 |
-| `e2e_cluster_rolling.sh` | 通过 SIGHUP 滚动修改 EC 成员，利用存活节点重建，且不回退到 origin。 |
-| `e2e_manifest.sh` | 下列全部 12 个编号 flatten/manifest 用例。 |
+| `storage.cache.sh` | 文件系统/本地缓存与 Store 往返、cache 协议、tiered 只读写拒绝等缓存正确性。 |
+| `storage.tiered-cache.sh` | Redis/tiered/sharded/EC、上游填充与回写、故障恢复、重启回填及无 origin 热读取。 |
+| `storage.cache-membership.sh` | EC cache 成员滚动变化及利用存活节点完成重建。 |
+| `storage.store-cache.sh` | Store 内嵌只读 cache 协议、generation 切换、旧 manifest 读取、blob 命名空间及拒绝写入。 |
+| `image.manifest.sh` | 真实 flatten/EROFS，以及 Manifest store/load、去重、校验、稀疏/零块与镜像差异契约。 |
+| `storage.obs.sh` | 显式选择、需要凭据的 OBS/S3 兼容对象存储往返；不属于普通离线执行。 |
 
-Manifest 用例保持为：(1) flatten、尾部配置 ZIP、架构及真实 EROFS magic；(2) store/load 字节一致；(3) 重复存储时新增 chunk 为零；(4) 远端 manifest info；(5) verify；(6) 可重复的 get-manifest；(7) get-manifest/info 流式管道；(8) 跨镜像共享 chunk 的 diff；(9) fixed 与 CDC 的 diff；(10) 管道 stdin store/load；(11) 零块往返、至少 100 个 zero chunk、info 数量一致且 manifest 不超过 12 KiB；(12) 稀疏 hole 元数据及恢复后的字节一致。现有编号断言和 `Results: N passed, N failed` 输出格式仍是测试契约。
+用例文件有意保持普通 `100644` 模式。公共 runner 使用 `bash` 执行选中的用例，不把 executable bit 变成第二套用例契约。
 
-默认情况下，`lib/manifest_fixture.py` 仅用 Python 标准库生成两个可重复的 Docker 格式归档。每个归档包含两层：共享基础层提供 4 MiB 确定性的高熵内容，第二层用不同的 1 MiB 文件替换基础版本。时间戳、tar 元数据、配置摘要及 layer diff ID 固定且一致。fixture 生成器默认使用主机架构（`amd64` 或 `arm64`），也可通过 `--architecture` 显式选择其中之一。数据镜像含 Linux 元数据、运行时用户/环境/工作目录设置，以及 UID/GID 1000 的文件所有权。它们用于数据测试，不提供容器启动命令；镜像架构只作为元数据处理。共享内容足以跨越多个 CDC 和 fixed 分块边界，不依赖大量零字节获得简单去重。归档直接输入 `flatten-ctl export`，默认流程不需要 Docker 或访问 registry。
+## 运行产品 E2E
 
-显式设置 `IMAGE_A` 和/或 `IMAGE_B`，可用已在本地缓存的 Docker 镜像替换相应归档：
+使用 Kuasar 平台测试包发布的 runner 和 cases，或精确 integration CI 生成的 prepared workspace。执行产品 E2E 时不得重新构建 accelerator、编译测试 helper、查找相邻源码仓库或静默回退到源码。
+
+普通、无需云凭据的 accelerator 用例可按以下 aggregate-release 方式运行：
 
 ```sh
-BIN=/path/to/assembled/bin/x86_64 IMAGE_A=already-cached:local \
-    bash test/e2e/e2e_manifest.sh
+RUNNER=/path/to/platform/test/e2e/e2e
+RELEASE_DIR=/path/to/prebuilt/platform-release
+WORK=/tmp/kuasar-e2e
+
+"$RUNNER" prepare --release-dir "$RELEASE_DIR" --workdir "$WORK"
+"$RUNNER" run --workdir "$WORK" \
+  --include storage.cache.sh \
+  --include storage.tiered-cache.sh \
+  --include storage.cache-membership.sh \
+  --include storage.store-cache.sh \
+  --include image.manifest.sh
 ```
 
-仅此覆盖方式需要 Docker 及默认本地 daemon 的访问权限。脚本在启动 store 前 inspect/save 所有指定镜像；缓存缺失或 daemon 不可用会清晰失败。它不会 pull、打 tag 或删除镜像。未指定的另一个镜像继续使用生成的 fixture。Docker 使用全新且会清理的 HOME/`DOCKER_CONFIG`，忽略调用者凭据、context 和连接环境；调用者 tag 保持不变。
+上述普通命令有意不选择 `storage.obs.sh`。只有在明确具备所需 OBS/S3 兼容 endpoint 与凭据时才单独选择它，例如使用 `--include storage.obs.sh`。
 
-除非显式设置 `OBS_E2E=1`，否则 `e2e_obs.sh` 被排除。它是独立的、需要凭据的云测试，需要获授权的 OBS/S3 兼容 endpoint、bucket 和凭据（`OBS_BUCKET`，以及 endpoint/region/AK/SK 覆盖或脚本约定的 `~/.obsconfig` 自动发现），还需允许在独立 prefix 下创建、列举和删除对象。具体输入见 [OBS 脚本](e2e_obs.sh)。排除 OBS **不代表完成云端资格验证**；普通/离线运行不需要云凭据或云 API。
+平台 CI 使用同一个 runner。验证组件 candidate 时，CI 从已准入的 accelerator 精确提交中取得实际 case ID，并只运行这些 ID，避免把其他组件同名 `image.*` suite 用例误带进来。
 
-共享 runner 路由、验证 profile 和上线状态统一见[平台 CI 契约](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/ci_zh.md)。本文负责说明 accelerator 套件的要求与用例意图。
+已选用例缺少所需产品或执行条件时必须失败。架构、root 权限及主机服务属于执行条件，不是 suite，也不能以成功 skip 代替验证。
+
+## Source/helper 回归
+
+只验证 fixture 或测试 helper、本身不证明产品行为的检查留在产品 E2E 之外：
+
+```sh
+make test-e2e-scripts
+```
+
+该目标运行端口租约回归和离线 Manifest/cache 边界测试。它属于 source/helper gate，因此可以使用源码级 fixture 和明确的 stub；这不等价于 artifact E2E。`make test` 也会执行这些回归。
+
+## 运行条件
+
+真实用例按各自契约检查条件，而不是依赖一个全局 owner runner 环境。常见要求包括 Linux、Bash 4+、Python 3、GNU 常用工具、可写临时空间以及通过 `BIN` 提供的精确 prepared 二进制。
+
+Manifest/flatten 覆盖要求真实 `mkfs.erofs`，并支持产品实际使用的布局。需要保留镜像所有权的 flatten export 要求 root 或非交互式 `sudo -n`。用例不使用 `sudo -E`，只把自有临时目录/配置和解析后的 EROFS 工具路径传给提权操作。
+
+涉及 Redis 的 tiered/cache 用例要求 `PATH` 中存在 `redis-server`，或显式提供对应可执行文件。测试自行启动并清理临时实例，不依赖外部 Redis 服务。
+
+`storage.obs.sh` 必须显式选择，并在缺少以下任意云端输入时 fail closed：
+
+- `OBS_BUCKET`
+- `OBS_ENDPOINT`
+- `OBS_AK`
+- `OBS_SK`
+
+`OBS_REGION` 和 `OBS_PREFIX` 可选。该用例不会把 `~/.obsconfig` 当作凭据来源，因为 `store-ctl` 本身不读取该文件。用例使用每轮独立 prefix，并在结束时尝试清理该 prefix。普通 storage/image 测试不需要 OBS 凭据或云 API。
+
+## Manifest fixture 与离线行为
+
+`lib/manifest_fixture.py` 使用 Python 标准库生成可重复的 Docker 格式数据归档，用于 source/helper 回归及 prepared fixture 生成。镜像包含架构、Linux runtime 元数据、UID/GID、环境变量和工作目录，并提供足够的共享/差异内容来验证去重和分块行为。
+
+Artifact E2E 消费已经准备好的 manifest fixture 目录，不允许在执行阶段把动态生成 fixture 当成隐藏 fallback。开发场景显式提供 `IMAGE_A`/`IMAGE_B` 时，只使用本地 Docker daemon 已缓存的镜像，不会 pull、重新打 tag 或删除调用者镜像。
+
+共享 runner 路由、provenance 校验、架构 lane 和上线规则统一见[平台 CI 契约](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/ci_zh.md)。本文只负责 accelerator 用例意图和运行前置条件。

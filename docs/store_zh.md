@@ -270,7 +270,6 @@ Close 和父目录同步，然后再次确认 identity。如果路径已被另�
 该并发判定不依赖进程内全局锁，适用于多个 writer 竞争同一个 content key。
 
 ### 4.1 可见性与故障边界
-
 direct-final-write 不提供 crash-atomic publication，也不作等价承诺：
 
 - 最终路径在写入期间可见，大小可能暂时不完整。
@@ -376,8 +375,10 @@ CGO_ENABLED=1 go test -race ./pkg/store/... ./pkg/manifest/... ./cmd/store-ctl
 make store-ctl
 make manifest-ctl
 make vet
-make test-e2e
+make test-e2e-scripts
 ```
+
+以上命令属于 source/unit/helper 验证。Store/cache 的产品 E2E 通过平台 prepared workspace 中的统一 runner 执行 `storage.*.sh` 用例，见 [`../test/e2e/README_zh.md`](../test/e2e/README_zh.md)。产品 E2E 只消费预构建产品，不在执行阶段编译产品或 source helper。
 
 race detector 需要启用 CGO 并具备可用 C 工具链。上面的普通测试可以关闭 CGO，
 `go test -race` 则不能使用 `CGO_ENABLED=0`。

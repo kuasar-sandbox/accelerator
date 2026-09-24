@@ -63,9 +63,11 @@ make cache-ctl NO_ROCKSDB=1     # build cache-ctl without RocksDB (-tags no_rock
 make build                      # all component binaries
 make build TARGET_ARCH=aarch64  # cross-compile; amd64/arm64 aliases are accepted
 make vet                        # validate the thin downstream-facing Go surface
-make test                       # unit tests and backend tests
-make test-e2e                   # component owner suite; requires the assembled project BIN
+make test                       # unit tests and backend/source-helper regressions
+make test-e2e-scripts           # offline E2E fixture/helper regressions; not product E2E
 ```
+
+Product E2E is executed by the platform-owned prepared-workspace runner against prebuilt artifacts; the component no longer has a separate owner `run_all.sh` or `make test-e2e` entrypoint. See [`test/e2e/README.md`](test/e2e/README.md) for the `prepare -> <suite>.<case>.sh -> run` contract and accelerator case prerequisites.
 
 Source builds require Go 1.26.1 or newer. Native prerequisites vary by target. The current source tree documents and builds any native cache dependencies through repository scripts. Real object-storage tests must use explicit test credentials or a local S3-compatible service; ordinary unit and local-filesystem tests must not require production cloud credentials.
 
