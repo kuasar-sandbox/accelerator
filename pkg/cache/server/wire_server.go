@@ -24,6 +24,7 @@ type WireServer struct {
 
 	connsMu sync.Mutex
 	conns   map[net.Conn]struct{}
+	readers map[net.Conn]context.CancelFunc
 }
 
 // NewWireServer creates a wire-protocol server.
@@ -45,22 +46,69 @@ func NewWireServer(handler *CacheHandler, idleTimeout, rpcTimeout time.Duration)
 		rpcTimeout:  rpcTimeout,
 		tr:          optrace.FromEnv("cache-ctl"),
 		conns:       make(map[net.Conn]struct{}),
+		readers:     make(map[net.Conn]context.CancelFunc),
 	}
 }
 
 // Serve accepts connections on lis until GracefulStop is called.
 func (s *WireServer) Serve(lis net.Listener) error {
+	s.connsMu.Lock()
+	if s.closing.Load() {
+		s.connsMu.Unlock()
+		_ = lis.Close()
+		return nil
+	}
 	s.listener = lis
+	s.connsMu.Unlock()
+	defer func() {
+		s.connsMu.Lock()
+		if s.listener == lis {
+			s.listener = nil
+		}
+		s.connsMu.Unlock()
+	}()
+
+	var retryDelay time.Duration
 	for {
 		conn, err := lis.Accept()
 		if err != nil {
 			if s.closing.Load() {
 				return nil
 			}
-			continue
+			if temporary, ok := err.(interface{ Temporary() bool }); ok && temporary.Temporary() {
+				if retryDelay == 0 {
+					retryDelay = 5 * time.Millisecond
+				} else {
+					retryDelay *= 2
+				}
+				if retryDelay > time.Second {
+					retryDelay = time.Second
+				}
+				timer := time.NewTimer(retryDelay)
+				<-timer.C
+				continue
+			}
+			return err
 		}
-		go s.serveConn(conn)
+		retryDelay = 0
+		if !s.startConn(conn) {
+			_ = conn.Close()
+		}
 	}
+}
+
+// startConn reserves WaitGroup work before launching the connection goroutine.
+// Holding connsMu makes this admission atomic with GracefulStop's transition to
+// waiting, so no Add can occur after shutdown has started waiting.
+func (s *WireServer) startConn(c net.Conn) bool {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	if s.closing.Load() {
+		return false
+	}
+	s.wg.Add(1)
+	go s.serveConn(c)
+	return true
 }
 
 func (s *WireServer) trackConn(c net.Conn) bool {
@@ -91,12 +139,11 @@ func (s *WireServer) ConnCount() int {
 func (s *WireServer) Handler() *CacheHandler { return s.handler }
 
 func (s *WireServer) serveConn(c net.Conn) {
+	defer s.wg.Done()
 	if !s.trackConn(c) {
 		c.Close()
 		return
 	}
-	s.wg.Add(1)
-	defer s.wg.Done()
 	defer func() {
 		s.untrackConn(c)
 		c.Close()
@@ -114,7 +161,16 @@ func (s *WireServer) serveConn(c net.Conn) {
 	// Reader goroutine: owns bufio.Reader exclusively. Reads frames
 	// into reqs channel. Idle timeout implemented via SetReadDeadline.
 	reqs := make(chan *wire.Request, 2)
+	readerCtx, cancelReader := context.WithCancel(context.Background())
+	s.connsMu.Lock()
+	s.readers[c] = cancelReader
+	if s.closing.Load() {
+		cancelReader()
+	}
+	s.connsMu.Unlock()
+	readerDone := make(chan struct{})
 	go func() {
+		defer close(readerDone)
 		defer close(reqs)
 		for {
 			if s.idleTimeout > 0 {
@@ -124,11 +180,30 @@ func (s *WireServer) serveConn(c net.Conn) {
 			if err != nil {
 				return
 			}
-			reqs <- req
+			select {
+			case reqs <- req:
+			case <-readerCtx.Done():
+				req.Release()
+				return
+			}
 		}
 	}()
 
 	var pendingReqs []*wire.Request
+	defer func() {
+		cancelReader()
+		_ = c.Close()
+		<-readerDone
+		s.connsMu.Lock()
+		delete(s.readers, c)
+		s.connsMu.Unlock()
+		for req := range reqs {
+			req.Release()
+		}
+		for _, req := range pendingReqs {
+			req.Release()
+		}
+	}()
 
 	for {
 		var req *wire.Request
@@ -228,15 +303,18 @@ func (s *WireServer) serveConn(c net.Conn) {
 // handlers can be cancelled and their responses lost; this is not a guarantee
 // that in-flight requests drain successfully.
 func (s *WireServer) GracefulStop() {
+	s.connsMu.Lock()
 	s.closing.Store(true)
 	if s.listener != nil {
-		s.listener.Close()
+		_ = s.listener.Close()
 	}
 	// Closing also interrupts active connection readers. serveConn cancels
 	// their handler, waits for cleanup, and can return without a response.
-	s.connsMu.Lock()
+	for _, cancel := range s.readers {
+		cancel()
+	}
 	for c := range s.conns {
-		c.Close()
+		_ = c.Close()
 	}
 	s.connsMu.Unlock()
 
@@ -249,4 +327,12 @@ func (s *WireServer) GracefulStop() {
 	case <-done:
 	case <-time.After(5 * time.Second):
 	}
+}
+
+// Wait blocks until every accepted connection goroutine has exited. Callers
+// that must keep handler dependencies alive beyond GracefulStop's legacy
+// five-second bound should call Wait after GracefulStop returns. Wait does not
+// force an uncancellable handler to finish.
+func (s *WireServer) Wait() {
+	s.wg.Wait()
 }

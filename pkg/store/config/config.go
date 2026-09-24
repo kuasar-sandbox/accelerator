@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"fmt"
@@ -134,6 +134,11 @@ type GenerationsConfig struct {
 	s3Set     bool
 }
 
+// IsConfigSource reports whether the inline config source was selected.
+func (c *GenerationsConfig) IsConfigSource() bool {
+	return c != nil && (c.configSet || c.Config != nil)
+}
+
 func (c *GenerationsConfig) UnmarshalYAML(node *yaml.Node) error {
 	type plain GenerationsConfig
 	var decoded plain
@@ -218,7 +223,7 @@ func (c *GenerationS3Config) expandEnv() {
 	}
 }
 
-func (c *GenerationS3Config) pathStyle() bool {
+func (c *GenerationS3Config) PathStyleEnabled() bool {
 	if c.PathStyle == nil {
 		return true
 	}
@@ -357,46 +362,126 @@ func LoadConfig(path string, requireListen bool) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("store-ctl: parse config %s: %w", path, err)
 	}
-	if requireListen && cfg.Listen == "" {
-		return nil, fmt.Errorf("store-ctl: listen is required")
-	}
-	if cfg.Backend == "" {
-		return nil, fmt.Errorf("store-ctl: backend is required (want fs|s3)")
-	}
-	if err := cfg.normalizeBackend(); err != nil {
-		return nil, err
-	}
-
-	switch cfg.Backend {
-	case "fs":
-		if cfg.FS.Root == "" {
-			return nil, fmt.Errorf("store-ctl: fs.root is required for backend=fs")
-		}
-	case "s3":
-		cfg.S3.expandEnv()
-		if cfg.S3.Region == "" {
-			cfg.S3.Region = defaultS3Region
-		}
-		if cfg.S3.Endpoint == "" {
-			return nil, fmt.Errorf("store-ctl: s3.endpoint is required for backend=s3")
-		}
-		if cfg.S3.Bucket == "" {
-			return nil, fmt.Errorf("store-ctl: s3.bucket is required for backend=s3")
-		}
-		if (cfg.S3.AccessKey == "") != (cfg.S3.SecretKey == "") {
-			return nil, fmt.Errorf("store-ctl: s3.access_key and s3.secret_key must be set together")
-		}
-		if err := cfg.S3.TLS.validate("s3.tls"); err != nil {
-			return nil, err
-		}
-	}
-	if err := cfg.normaliseGenerations(); err != nil {
+	if err := cfg.normalize(requireListen, true); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
 }
 
-func (c *Config) normaliseGenerations() error {
+// Normalize validates and applies defaults to a Config constructed directly in
+// Go. Unlike LoadConfig, it never reads a file or expands environment variables.
+func (c *Config) Normalize(requireListen bool) error {
+	return c.normalize(requireListen, false)
+}
+
+// Clone returns an independent copy, including configuration-presence state.
+func (c Config) Clone() Config {
+	cloneBool := func(value *bool) *bool {
+		if value == nil {
+			return nil
+		}
+		copy := *value
+		return &copy
+	}
+	cloneTLS := func(value *S3TLSConfig) *S3TLSConfig {
+		if value == nil {
+			return nil
+		}
+		copy := *value
+		return &copy
+	}
+	cloneS3 := func(value *S3Config) *S3Config {
+		if value == nil {
+			return nil
+		}
+		copy := *value
+		copy.PathStyle = cloneBool(value.PathStyle)
+		copy.VerifyContentKey = cloneBool(value.VerifyContentKey)
+		copy.TLS = cloneTLS(value.TLS)
+		return &copy
+	}
+
+	copy := c
+	if c.FS != nil {
+		fs := *c.FS
+		fs.VerifyContentKey = cloneBool(c.FS.VerifyContentKey)
+		copy.FS = &fs
+	}
+	copy.S3 = cloneS3(c.S3)
+	copy.OBS = cloneS3(c.OBS)
+	if c.Generations != nil {
+		generations := *c.Generations
+		generations.Config = append([]string(nil), c.Generations.Config...)
+		if c.Generations.File != nil {
+			file := *c.Generations.File
+			generations.File = &file
+		}
+		if c.Generations.S3 != nil {
+			s3 := *c.Generations.S3
+			s3.PathStyle = cloneBool(c.Generations.S3.PathStyle)
+			s3.TLS = cloneTLS(c.Generations.S3.TLS)
+			generations.S3 = &s3
+		}
+		copy.Generations = &generations
+	}
+	return copy
+}
+
+// NormalizeEffective applies direct-Go defaults while validating only the
+// credential and generation inputs selected by the caller. It never performs
+// file I/O or environment expansion. The booleans suppress only static-pair
+// validation; all active location, TLS, and duration validation is retained.
+func (c *Config) NormalizeEffective(requireListen, generations, objectStatic, generationStatic bool) error {
+	return c.normalizeSelected(requireListen, false, generations, objectStatic, generationStatic)
+}
+
+func (c *Config) normalize(requireListen, expandEnvironment bool) error {
+	return c.normalizeSelected(requireListen, expandEnvironment, true, true, true)
+}
+
+func (c *Config) normalizeSelected(requireListen, expandEnvironment, generations, objectStatic, generationStatic bool) error {
+	if requireListen && c.Listen == "" {
+		return fmt.Errorf("store-ctl: listen is required")
+	}
+	if c.Backend == "" {
+		return fmt.Errorf("store-ctl: backend is required (want fs|s3)")
+	}
+	if err := c.normalizeBackend(); err != nil {
+		return err
+	}
+
+	switch c.Backend {
+	case "fs":
+		if c.FS.Root == "" {
+			return fmt.Errorf("store-ctl: fs.root is required for backend=fs")
+		}
+	case "s3":
+		if expandEnvironment {
+			c.S3.expandEnv()
+		}
+		if c.S3.Region == "" {
+			c.S3.Region = defaultS3Region
+		}
+		if c.S3.Endpoint == "" {
+			return fmt.Errorf("store-ctl: s3.endpoint is required for backend=s3")
+		}
+		if c.S3.Bucket == "" {
+			return fmt.Errorf("store-ctl: s3.bucket is required for backend=s3")
+		}
+		if objectStatic && (c.S3.AccessKey == "") != (c.S3.SecretKey == "") {
+			return fmt.Errorf("store-ctl: s3.access_key and s3.secret_key must be set together")
+		}
+		if err := c.S3.TLS.validate("s3.tls"); err != nil {
+			return err
+		}
+	}
+	if generations {
+		return c.normaliseGenerations(expandEnvironment, generationStatic)
+	}
+	return nil
+}
+
+func (c *Config) normaliseGenerations(expandEnvironment, validateStatic bool) error {
 	if c.Generations == nil {
 		switch c.Backend {
 		case "fs":
@@ -405,16 +490,26 @@ func (c *Config) normaliseGenerations() error {
 				fileSet: true,
 			}
 		case "s3":
+			var pathStyle *bool
+			if c.S3.PathStyle != nil {
+				value := *c.S3.PathStyle
+				pathStyle = &value
+			}
+			var tls *S3TLSConfig
+			if c.S3.TLS != nil {
+				value := *c.S3.TLS
+				tls = &value
+			}
 			c.Generations = &GenerationsConfig{
 				S3: &GenerationS3Config{
 					Endpoint:  c.S3.Endpoint,
 					Region:    c.S3.Region,
 					Bucket:    c.S3.Bucket,
 					Key:       path.Join(strings.Trim(c.S3.Prefix, "/"), "__meta/generations"),
-					PathStyle: c.S3.PathStyle,
+					PathStyle: pathStyle,
 					AccessKey: c.S3.AccessKey,
 					SecretKey: c.S3.SecretKey,
-					TLS:       c.S3.TLS,
+					TLS:       tls,
 				},
 				s3Set: true,
 			}
@@ -450,20 +545,24 @@ func (c *Config) normaliseGenerations() error {
 		return nil
 	}
 	if g.File != nil {
-		g.File.Path = expandEnv(g.File.Path)
+		if expandEnvironment {
+			g.File.Path = expandEnv(g.File.Path)
+		}
 		if g.File.Path == "" {
 			return fmt.Errorf("store-ctl: generations.file.path is required")
 		}
 	}
 	if g.S3 != nil {
-		g.S3.expandEnv()
+		if expandEnvironment {
+			g.S3.expandEnv()
+		}
 		if g.S3.Region == "" {
 			g.S3.Region = defaultS3Region
 		}
 		if g.S3.Endpoint == "" || g.S3.Bucket == "" || g.S3.Key == "" {
 			return fmt.Errorf("store-ctl: generations.s3 endpoint, bucket, and key are required")
 		}
-		if (g.S3.AccessKey == "") != (g.S3.SecretKey == "") {
+		if validateStatic && (g.S3.AccessKey == "") != (g.S3.SecretKey == "") {
 			return fmt.Errorf("store-ctl: generations.s3 access_key and secret_key must be set together")
 		}
 		if err := g.S3.TLS.validate("generations.s3.tls"); err != nil {
