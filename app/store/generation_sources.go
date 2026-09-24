@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,9 @@ import (
 	"strings"
 
 	pkgstore "github.com/kuasar-sandbox/accelerator/pkg/store"
+	storeconfig "github.com/kuasar-sandbox/accelerator/pkg/store/config"
+	stores3 "github.com/kuasar-sandbox/accelerator/pkg/store/s3"
+	"github.com/kuasar-sandbox/accelerator/pkg/store/s3/sdkclient"
 )
 
 const maxGenerationListBytes = 256 << 10
@@ -18,7 +22,7 @@ var errGenerationSourceUninitialised = errors.New("generation source is uninitia
 // builtInGenerationSource constructs the read-only inline and file sources
 // selected by an already-prepared effective configuration. Construction never
 // opens the configured file; each file Load observes its current contents.
-func builtInGenerationSource(cfg Config) (*GenerationSource, func(), error) {
+func builtInGenerationSource(ctx context.Context, cfg Config, credentials CredentialsProvider) (*GenerationSource, func() error, error) {
 	g := cfg.Generations
 	if g == nil {
 		return nil, nil, errors.New("store: no generation source configured")
@@ -30,7 +34,7 @@ func builtInGenerationSource(cfg Config) (*GenerationSource, func(), error) {
 		}
 		return &GenerationSource{Load: func(context.Context) ([]pkgstore.Generation, error) {
 			return append([]pkgstore.Generation(nil), generations...), nil
-		}}, func() {}, nil
+		}}, func() error { return nil }, nil
 	}
 	if g.File != nil {
 		path := g.File.Path
@@ -47,9 +51,57 @@ func builtInGenerationSource(cfg Config) (*GenerationSource, func(), error) {
 				defer file.Close()
 				return readGenerationList(file)
 			},
-		}, func() {}, nil
+		}, func() error { return nil }, nil
 	}
-	return nil, nil, errors.New("store: built-in generation source is not inline or file")
+	if g.S3 != nil {
+		configured := *g.S3
+		if g.S3.PathStyle != nil {
+			pathStyle := *g.S3.PathStyle
+			configured.PathStyle = &pathStyle
+		}
+		if g.S3.TLS != nil {
+			tls := *g.S3.TLS
+			configured.TLS = &tls
+		}
+		client, err := sdkclient.New(ctx, sdkclient.Config{
+			Endpoint: configured.Endpoint, Region: configured.Region, Bucket: configured.Bucket,
+			PathStyle: configured.PathStyleEnabled(), AccessKey: configured.AccessKey,
+			SecretKey: configured.SecretKey, Credentials: credentials,
+			TLS: sdkclient.TLSConfig{CACert: tlsCACert(configured.TLS), InsecureSkipVerify: tlsInsecure(configured.TLS)},
+		})
+		if err != nil {
+			return nil, nil, fmt.Errorf("store: construct generation s3 client: %w", err)
+		}
+		key := configured.Key
+		return &GenerationSource{
+			RefreshInterval: cfg.GenerationRefreshInterval(),
+			Load: func(ctx context.Context) ([]pkgstore.Generation, error) {
+				body, meta, err := client.GetLimited(ctx, key, maxGenerationListBytes)
+				if errors.Is(err, stores3.ErrNotFound) {
+					return nil, fmt.Errorf("%w: missing s3://.../%s", errGenerationSourceUninitialised, key)
+				}
+				if err != nil {
+					return nil, fmt.Errorf("read generation object %s: %w", key, err)
+				}
+				if meta == nil || meta.ETag == "" {
+					return nil, fmt.Errorf("generation object %s returned no ETag", key)
+				}
+				return readGenerationList(bytes.NewReader(body))
+			},
+		}, client.Close, nil
+	}
+	return nil, nil, errors.New("store: built-in generation source is not inline, file, or s3")
+}
+
+func tlsCACert(cfg *storeconfig.S3TLSConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	return cfg.CACert
+}
+
+func tlsInsecure(cfg *storeconfig.S3TLSConfig) bool {
+	return cfg != nil && cfg.InsecureSkipVerify
 }
 
 func readGenerationList(reader io.Reader) ([]pkgstore.Generation, error) {
