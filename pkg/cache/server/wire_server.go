@@ -24,6 +24,7 @@ type WireServer struct {
 
 	connsMu sync.Mutex
 	conns   map[net.Conn]struct{}
+	readers map[net.Conn]context.CancelFunc
 }
 
 // NewWireServer creates a wire-protocol server.
@@ -45,20 +46,51 @@ func NewWireServer(handler *CacheHandler, idleTimeout, rpcTimeout time.Duration)
 		rpcTimeout:  rpcTimeout,
 		tr:          optrace.FromEnv("cache-ctl"),
 		conns:       make(map[net.Conn]struct{}),
+		readers:     make(map[net.Conn]context.CancelFunc),
 	}
 }
 
 // Serve accepts connections on lis until GracefulStop is called.
 func (s *WireServer) Serve(lis net.Listener) error {
+	s.connsMu.Lock()
+	if s.closing.Load() {
+		s.connsMu.Unlock()
+		_ = lis.Close()
+		return nil
+	}
 	s.listener = lis
+	s.connsMu.Unlock()
+	defer func() {
+		s.connsMu.Lock()
+		if s.listener == lis {
+			s.listener = nil
+		}
+		s.connsMu.Unlock()
+	}()
+
+	var retryDelay time.Duration
 	for {
 		conn, err := lis.Accept()
 		if err != nil {
 			if s.closing.Load() {
 				return nil
 			}
-			continue
+			if temporary, ok := err.(interface{ Temporary() bool }); ok && temporary.Temporary() {
+				if retryDelay == 0 {
+					retryDelay = 5 * time.Millisecond
+				} else {
+					retryDelay *= 2
+				}
+				if retryDelay > time.Second {
+					retryDelay = time.Second
+				}
+				timer := time.NewTimer(retryDelay)
+				<-timer.C
+				continue
+			}
+			return err
 		}
+		retryDelay = 0
 		if !s.startConn(conn) {
 			_ = conn.Close()
 		}
@@ -129,7 +161,16 @@ func (s *WireServer) serveConn(c net.Conn) {
 	// Reader goroutine: owns bufio.Reader exclusively. Reads frames
 	// into reqs channel. Idle timeout implemented via SetReadDeadline.
 	reqs := make(chan *wire.Request, 2)
+	readerCtx, cancelReader := context.WithCancel(context.Background())
+	s.connsMu.Lock()
+	s.readers[c] = cancelReader
+	if s.closing.Load() {
+		cancelReader()
+	}
+	s.connsMu.Unlock()
+	readerDone := make(chan struct{})
 	go func() {
+		defer close(readerDone)
 		defer close(reqs)
 		for {
 			if s.idleTimeout > 0 {
@@ -139,11 +180,30 @@ func (s *WireServer) serveConn(c net.Conn) {
 			if err != nil {
 				return
 			}
-			reqs <- req
+			select {
+			case reqs <- req:
+			case <-readerCtx.Done():
+				req.Release()
+				return
+			}
 		}
 	}()
 
 	var pendingReqs []*wire.Request
+	defer func() {
+		cancelReader()
+		_ = c.Close()
+		<-readerDone
+		s.connsMu.Lock()
+		delete(s.readers, c)
+		s.connsMu.Unlock()
+		for req := range reqs {
+			req.Release()
+		}
+		for _, req := range pendingReqs {
+			req.Release()
+		}
+	}()
 
 	for {
 		var req *wire.Request
@@ -243,15 +303,18 @@ func (s *WireServer) serveConn(c net.Conn) {
 // handlers can be cancelled and their responses lost; this is not a guarantee
 // that in-flight requests drain successfully.
 func (s *WireServer) GracefulStop() {
+	s.connsMu.Lock()
 	s.closing.Store(true)
 	if s.listener != nil {
-		s.listener.Close()
+		_ = s.listener.Close()
 	}
 	// Closing also interrupts active connection readers. serveConn cancels
 	// their handler, waits for cleanup, and can return without a response.
-	s.connsMu.Lock()
+	for _, cancel := range s.readers {
+		cancel()
+	}
 	for c := range s.conns {
-		c.Close()
+		_ = c.Close()
 	}
 	s.connsMu.Unlock()
 

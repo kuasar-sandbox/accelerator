@@ -51,6 +51,86 @@ type testAddr string
 func (a testAddr) Network() string { return string(a) }
 func (a testAddr) String() string  { return string(a) }
 
+type acceptResult struct {
+	conn net.Conn
+	err  error
+}
+
+type scriptedListener struct {
+	results chan acceptResult
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func (l *scriptedListener) Accept() (net.Conn, error) {
+	select {
+	case result := <-l.results:
+		return result.conn, result.err
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+func (l *scriptedListener) Close() error { l.once.Do(func() { close(l.closed) }); return nil }
+func (*scriptedListener) Addr() net.Addr { return testAddr("scripted") }
+
+type temporaryAcceptError struct{}
+
+func (temporaryAcceptError) Error() string   { return "temporary accept failure" }
+func (temporaryAcceptError) Timeout() bool   { return false }
+func (temporaryAcceptError) Temporary() bool { return true }
+
+func TestServeAfterImmediateStopClosesListener(t *testing.T) {
+	for range 100 {
+		listener := &scriptedListener{results: make(chan acceptResult), closed: make(chan struct{})}
+		s := NewWireServer(NewCacheHandler(nil, nil), 0, 0)
+		done := make(chan error, 1)
+		go func() { done <- s.Serve(listener) }()
+		s.GracefulStop()
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-listener.closed:
+		default:
+			t.Fatal("listener supplied after shutdown was not closed")
+		}
+	}
+}
+
+func TestServeReturnsPermanentAcceptError(t *testing.T) {
+	want := errors.New("permanent accept failure")
+	listener := &scriptedListener{results: make(chan acceptResult, 1), closed: make(chan struct{})}
+	listener.results <- acceptResult{err: want}
+	s := NewWireServer(NewCacheHandler(nil, nil), 0, 0)
+	if err := s.Serve(listener); !errors.Is(err, want) {
+		t.Fatalf("Serve error = %v, want %v", err, want)
+	}
+}
+
+func TestServeRetriesTemporaryAcceptError(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+	listener := &scriptedListener{results: make(chan acceptResult, 2), closed: make(chan struct{})}
+	listener.results <- acceptResult{err: temporaryAcceptError{}}
+	listener.results <- acceptResult{conn: serverConn}
+	s := NewWireServer(NewCacheHandler(nil, nil), 0, 0)
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(listener) }()
+	deadline := time.After(time.Second)
+	for s.ConnCount() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("connection was not accepted after temporary error")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	s.GracefulStop()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestGracefulStopTimeoutAndWaitForCompletion(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	listener := &singleConnListener{conn: serverConn, closed: make(chan struct{})}
@@ -114,4 +194,51 @@ func TestStartConnRejectsAdmissionAfterStop(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("rejected admission left Wait blocked")
 	}
+}
+
+func TestWriteFailureReleasesBlockedReader(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	listener := &singleConnListener{conn: serverConn, closed: make(chan struct{})}
+	s := NewWireServer(NewCacheHandler(roTier{cacheGetterFunc(func(context.Context, store.Partition, store.ContentKey) (cache.CacheResult, cache.Blob, error) {
+		return cache.CacheMiss, nil, nil
+	})}, nil), 0, 0)
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- s.Serve(listener) }()
+	client := wire.NewConn(clientConn)
+	writeDone := make(chan struct{})
+	go func() {
+		defer close(writeDone)
+		for range 8 {
+			if client.WriteRequest(&wire.Request{Opcode: wire.OpcodeObjectGet, Namespace: wire.NSChunk}) != nil {
+				return
+			}
+		}
+	}()
+	deadline := time.After(time.Second)
+	for s.ConnCount() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("connection was not tracked")
+		default:
+		}
+	}
+	_ = clientConn.Close() // fail the response write and unblock the full reader
+	s.GracefulStop()
+	waitDone := make(chan struct{})
+	go func() { s.Wait(); close(waitDone) }()
+	select {
+	case <-waitDone:
+	case <-time.After(time.Second):
+		t.Fatal("reader remained blocked after connection shutdown")
+	}
+	<-writeDone
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+type cacheGetterFunc func(context.Context, store.Partition, store.ContentKey) (cache.CacheResult, cache.Blob, error)
+
+func (f cacheGetterFunc) Get(ctx context.Context, p store.Partition, k store.ContentKey) (cache.CacheResult, cache.Blob, error) {
+	return f(ctx, p, k)
 }
