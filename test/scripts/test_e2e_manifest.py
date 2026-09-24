@@ -64,9 +64,15 @@ class ManifestScriptsTest(unittest.TestCase):
     def setUp(self):
         self.case = Path(tempfile.mkdtemp(dir=self.base))
         self.tree = self.case / "assembled/test/e2e"
-        (self.tree / "lib").mkdir(parents=True)
-        for name in ("e2e_manifest.sh", "lib/manifest_fixture.py", "lib/port_lease.sh"):
-            shutil.copyfile(E2E / name, self.tree / name)
+        (self.tree / "cases").mkdir(parents=True)
+        (self.tree / "lib/accelerator").mkdir(parents=True)
+        shutil.copyfile(E2E / "cases/image.manifest.sh", self.tree / "cases/image.manifest.sh")
+        for name in ("manifest_fixture.py", "port_lease.sh"):
+            shutil.copyfile(E2E / "lib" / name, self.tree / "lib/accelerator" / name)
+        # This source regression exercises the accelerator case boundaries, not
+        # the platform helper implementation. The real prepared workspace owns
+        # common.sh; keep only the sourceable contract here.
+        (self.tree / "lib/common.sh").write_text("# prepared platform common helper placeholder\n")
         self.bin = self.case / "bin"
         self.bin.mkdir()
         for tool in ("python3", "openssl", "unzip", "stat", "sha256sum", "awk", "grep", "sed", "dd",
@@ -82,6 +88,7 @@ class ManifestScriptsTest(unittest.TestCase):
         (caller / ".docker/config.json").write_text('{"credsStore":"must-not-be-used"}')
         self.env = {
             "PATH": str(self.bin), "BIN": str(self.bin), "TMPDIR": str(self.scratch),
+            "E2E_LIB": str(self.tree / "lib"),
             "HOME": str(caller), "DOCKER_CONFIG": str(caller / ".docker"),
             "DOCKER_AUTH_CONFIG": "caller-secret-sentinel", "REGISTRY_PASSWORD": "caller-secret-sentinel",
         }
@@ -158,7 +165,7 @@ sys.exit("unexpected Docker operation (pull/tag/rm are forbidden)")
         path.chmod(0o755)
 
     def run_script(self, send_signal=None):
-        with subprocess.Popen(["/bin/bash", str(self.tree / "e2e_manifest.sh")], env=self.env,
+        with subprocess.Popen(["/bin/bash", str(self.tree / "cases/image.manifest.sh")], env=self.env,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True) as proc:
             try:
                 if send_signal is not None:
@@ -189,7 +196,7 @@ sys.exit("unexpected Docker operation (pull/tag/rm are forbidden)")
 
     def test_archive_integrity_reproducibility_and_content(self):
         repeat = self.case / "repeat"
-        subprocess.run([sys.executable, str(self.tree / "lib/manifest_fixture.py"), str(repeat)], check=True)
+        subprocess.run([sys.executable, str(self.tree / "lib/accelerator/manifest_fixture.py"), str(repeat)], check=True)
         images = []
         architecture = {"x86_64": "amd64", "aarch64": "arm64"}[platform.machine()]
         for variant in ("a", "b"):
@@ -233,12 +240,12 @@ sys.exit("unexpected Docker operation (pull/tag/rm are forbidden)")
     def test_missing_fixture_or_port_helper_fails_before_store(self):
         for helper in ("manifest_fixture.py", "port_lease.sh"):
             with self.subTest(helper=helper):
-                path = self.tree / "lib" / helper
+                path = self.tree / "lib/accelerator" / helper
                 path.unlink()
                 try:
                     code, output = self.run_script()
                     self.assertEqual(code, 1, output)
-                    self.assertIn("required fixture/helper missing:", output)
+                    self.assertIn("required prepared accelerator helper missing:", output)
                     self.assertIn(helper, output)
                     self.assertFalse((self.case / "store.log").exists())
                 finally:
@@ -252,7 +259,7 @@ sys.exit("unexpected Docker operation (pull/tag/rm are forbidden)")
         self.assertFalse((self.case / "store.log").exists())
 
     def test_missing_generated_archive_fails_before_store(self):
-        (self.tree / "lib/manifest_fixture.py").write_text("# Deliberately produce no archives.\n")
+        (self.tree / "lib/accelerator/manifest_fixture.py").write_text("# Deliberately produce no archives.\n")
         code, output = self.run_script()
         self.assertEqual(code, 1, output)
         self.assertIn("required image archive missing or empty", output)
@@ -367,7 +374,7 @@ sys.exit("unexpected Docker operation (pull/tag/rm are forbidden)")
     def test_startup_boundary_normal_exit_cleanup(self):
         # Execute the real startup/EXIT trap, stopping before the numbered
         # assertions. No stub supplies a successful flatten or manifest result.
-        script = self.tree / "e2e_manifest.sh"
+        script = self.tree / "cases/image.manifest.sh"
         marker = '# ============================================================\necho ""\necho "=== Test 1: Flatten'
         startup, _ = script.read_text().split(marker, 1)
         script.write_text(startup + "\nexit 0\n")
