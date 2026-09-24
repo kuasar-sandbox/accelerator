@@ -59,8 +59,24 @@ func (s *WireServer) Serve(lis net.Listener) error {
 			}
 			continue
 		}
-		go s.serveConn(conn)
+		if !s.startConn(conn) {
+			_ = conn.Close()
+		}
 	}
+}
+
+// startConn reserves WaitGroup work before launching the connection goroutine.
+// Holding connsMu makes this admission atomic with GracefulStop's transition to
+// waiting, so no Add can occur after shutdown has started waiting.
+func (s *WireServer) startConn(c net.Conn) bool {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	if s.closing.Load() {
+		return false
+	}
+	s.wg.Add(1)
+	go s.serveConn(c)
+	return true
 }
 
 func (s *WireServer) trackConn(c net.Conn) bool {
@@ -91,12 +107,11 @@ func (s *WireServer) ConnCount() int {
 func (s *WireServer) Handler() *CacheHandler { return s.handler }
 
 func (s *WireServer) serveConn(c net.Conn) {
+	defer s.wg.Done()
 	if !s.trackConn(c) {
 		c.Close()
 		return
 	}
-	s.wg.Add(1)
-	defer s.wg.Done()
 	defer func() {
 		s.untrackConn(c)
 		c.Close()
@@ -249,4 +264,12 @@ func (s *WireServer) GracefulStop() {
 	case <-done:
 	case <-time.After(5 * time.Second):
 	}
+}
+
+// Wait blocks until every accepted connection goroutine has exited. Callers
+// that must keep handler dependencies alive beyond GracefulStop's legacy
+// five-second bound should call Wait after GracefulStop returns. Wait does not
+// force an uncancellable handler to finish.
+func (s *WireServer) Wait() {
+	s.wg.Wait()
 }
