@@ -53,7 +53,7 @@ func TestCredentialSelection(t *testing.T) {
 
 	t.Run("provider overrides legacy static fields", func(t *testing.T) {
 		client := newCredentialTestClient(t, server, Config{
-			AccessKey: "legacy-ak", SecretKey: "legacy-sk",
+			AccessKey: "stale-legacy-ak",
 			Credentials: credentialsProviderFunc(func(context.Context) (Credentials, error) {
 				return Credentials{AccessKeyID: "bound-ak", SecretAccessKey: "bound-sk", SessionToken: "bound-token"}, nil
 			}),
@@ -62,7 +62,7 @@ func TestCredentialSelection(t *testing.T) {
 			t.Fatal(err)
 		}
 		r := <-requests
-		if auth := r.Header.Get("Authorization"); !strings.Contains(auth, "Credential=bound-ak/") || strings.Contains(auth, "legacy-ak") {
+		if auth := r.Header.Get("Authorization"); !strings.Contains(auth, "Credential=bound-ak/") || strings.Contains(auth, "stale-legacy-ak") {
 			t.Fatalf("Authorization did not use bound credentials: %q", auth)
 		}
 		if token := r.Header.Get("X-Amz-Security-Token"); token != "bound-token" {
@@ -200,8 +200,8 @@ func TestCloseUsesResolvedDefaultsModeTransport(t *testing.T) {
 	server.Start()
 	defer server.Close()
 	client := newCredentialTestClient(t, server, Config{})
-	if _, ok := client.api.Options().HTTPClient.(*http.Client); !ok {
-		t.Fatalf("resolved HTTP client = %T, want owned *http.Client", client.api.Options().HTTPClient)
+	if _, ok := client.api.Options().HTTPClient.(*ownedHTTPClient); !ok {
+		t.Fatalf("resolved HTTP client = %T, want *ownedHTTPClient", client.api.Options().HTTPClient)
 	}
 	if _, err := client.Head(context.Background(), "key"); err != nil {
 		t.Fatal(err)
@@ -223,6 +223,69 @@ func TestCloseUsesResolvedDefaultsModeTransport(t *testing.T) {
 	if closed.Load() == 0 {
 		t.Fatal("Close did not close the actual idle object transport")
 	}
+}
+
+func TestOwnedHTTPClientPreservesSDKRedirectBehavior(t *testing.T) {
+	var redirectedToken string
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirectedToken = r.Header.Get("X-Amz-Security-Token")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+
+	redirect := func(status int, location string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if location != "" {
+				w.Header().Set("Location", location)
+			}
+			w.WriteHeader(status)
+		}))
+	}
+
+	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server := redirect(status, target.URL)
+			defer server.Close()
+			req, _ := http.NewRequest(http.MethodHead, server.URL, nil)
+			req.Header.Set("X-Amz-Security-Token", "secret")
+			resp, err := newOwnedHTTPClient(http.DefaultTransport.(*http.Transport).Clone(), 0).Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusNoContent || redirectedToken != "" {
+				t.Fatalf("status = %d, redirected token = %q", resp.StatusCode, redirectedToken)
+			}
+		})
+	}
+
+	for _, status := range []int{http.StatusMovedPermanently, http.StatusFound} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server := redirect(status, target.URL)
+			defer server.Close()
+			resp, err := newOwnedHTTPClient(http.DefaultTransport.(*http.Transport).Clone(), 0).Get(server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != status {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, status)
+			}
+		})
+	}
+
+	t.Run("suppresses missing Location error", func(t *testing.T) {
+		server := redirect(http.StatusMovedPermanently, "")
+		defer server.Close()
+		resp, err := newOwnedHTTPClient(http.DefaultTransport.(*http.Transport).Clone(), 0).Get(server.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusMovedPermanently {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+	})
 }
 
 func TestProviderLifetimeAdmissionDoesNotRaceClose(t *testing.T) {

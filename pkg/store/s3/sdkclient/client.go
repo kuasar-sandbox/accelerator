@@ -181,7 +181,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.Bucket == "" {
 		return nil, errors.New("s3 sdkclient: bucket is required")
 	}
-	if (cfg.AccessKey == "") != (cfg.SecretKey == "") {
+	if cfg.Credentials == nil && (cfg.AccessKey == "") != (cfg.SecretKey == "") {
 		return nil, errors.New("s3 sdkclient: access key and secret key must be set together")
 	}
 	if cfg.TLS.CACert != "" && cfg.TLS.InsecureSkipVerify {
@@ -229,19 +229,58 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	// exact transport used for object requests is owned and closeable, rather
 	// than retaining (or later closing) an earlier pointer. BuildableClient's
 	// Freeze wrapper does not expose CloseIdleConnections, hence the explicit
-	// standard client with the SDK-resolved transport and timeout.
+	// owned client around the SDK-resolved transport and timeout.
 	if buildable, ok := api.Options().HTTPClient.(*awshttp.BuildableClient); ok {
-		awsCfg.HTTPClient = &http.Client{
-			Transport: buildable.GetTransport(),
-			Timeout:   buildable.GetTimeout(),
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		}
+		awsCfg.HTTPClient = newOwnedHTTPClient(buildable.GetTransport(), buildable.GetTimeout())
 		api = newAPI(awsCfg, cfg.Endpoint, cfg.PathStyle)
 	}
 	actual, _ := api.Options().HTTPClient.(interface{ CloseIdleConnections() })
 	return &Client{api: api, bucket: cfg.Bucket, lifetime: lifetime, transport: actual}, nil
+}
+
+const badHTTPRedirectLocation = `https://amazonaws.com/badhttpredirectlocation`
+
+// ownedHTTPClient reproduces the redirect policy of the pinned SDK's
+// BuildableClient while exposing closure of the transport it actually uses.
+type ownedHTTPClient struct {
+	*http.Client
+	transport *http.Transport
+}
+
+func newOwnedHTTPClient(transport *http.Transport, timeout time.Duration) *ownedHTTPClient {
+	c := &ownedHTTPClient{transport: transport}
+	c.Client = &http.Client{
+		Transport:     redirectTransport{transport},
+		Timeout:       timeout,
+		CheckRedirect: limitedRedirect,
+	}
+	return c
+}
+
+func (c *ownedHTTPClient) CloseIdleConnections() { c.transport.CloseIdleConnections() }
+
+func limitedRedirect(req *http.Request, via []*http.Request) error {
+	if req.URL.String() == badHTTPRedirectLocation {
+		req.Response.Header.Del(badHTTPRedirectLocation)
+		return http.ErrUseLastResponse
+	}
+	if req.Response.StatusCode != http.StatusTemporaryRedirect && req.Response.StatusCode != http.StatusPermanentRedirect {
+		return http.ErrUseLastResponse
+	}
+	if len(via) > 0 && via[len(via)-1].URL.Host != req.URL.Host {
+		req.Header.Del("X-Amz-Security-Token")
+	}
+	return nil
+}
+
+type redirectTransport struct{ transport http.RoundTripper }
+
+func (t redirectTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.transport.RoundTrip(req)
+	if err == nil && (resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusFound) && resp.Header.Get("Location") == "" {
+		resp.Header.Set("Location", badHTTPRedirectLocation)
+	}
+	return resp, err
 }
 
 // Close cancels and waits for credential callbacks, then releases idle object
