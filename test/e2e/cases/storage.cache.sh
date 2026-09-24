@@ -7,16 +7,12 @@ require_binary manifest-ctl
 require_binary cache-ctl
 require_binary flatten-ctl
 
-# E2E test for cache-ctl + manifest-ctl integration.
-# Tests embedded and Redis-compatible local/shard/tiered modes.
-#
-# Usage:
-#   bash test/e2e/e2e_cache.sh
+# Prepared Store/cache object, shard and embedded-tier correctness.
+# Run with the platform runner: e2e run --include storage.cache.sh.
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TMPDIR=$(mktemp -d /tmp/acc-cache-e2e-XXXXXX)
 E2E_PORT_LEASE_FILE="$TMPDIR/ports"
-source "$SCRIPT_DIR/../lib/accelerator/port_lease.sh"
+source "$E2E_LIB/accelerator/port_lease.sh"
 KEY=$(openssl rand -hex 32)
 
 PASS=0
@@ -58,7 +54,7 @@ assert_eq() {
 wait_ready() {
     local endpoint=$1
     for i in $(seq 1 50); do
-        if "$BIN/cache-ctl" ping --endpoint "$endpoint" 2>/dev/null | grep -q SERVING; then
+        if "$BIN/cache-ctl" ping --endpoint "$endpoint" 2>/dev/null | grep -Fxq SERVING; then
             return 0
         fi
         sleep 0.1
@@ -204,7 +200,7 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
         break
     fi
     sleep 0.1
-done
+ done
 echo "  store-ctl listen=127.0.0.1:$STORE_PORT root=$STORE_ROOT"
 
 # Write config for manifest-ctl. The store endpoint points at the
@@ -437,11 +433,12 @@ assert_eq "$ORIG_HASH" "$WARM_HASH" "tiered embedded warm load without origin"
 # ============================================================
 echo ""
 echo "=== Test 7: tiered mode — object put returns error (writes not supported) ==="
-PUT_OUT=$("$BIN/cache-ctl" object put --endpoint "127.0.0.1:$TIERED_PORT" --namespace chunk --hash "$TEST_HASH" --value /dev/null 2>&1 || true)
-if echo "$PUT_OUT" | grep -qi "not supported\|error"; then
-    ok "object put on tiered mode returns error"
+if PUT_OUT=$("$BIN/cache-ctl" object put --endpoint "127.0.0.1:$TIERED_PORT" --namespace chunk --hash "$TEST_HASH" --value /dev/null 2>&1); then
+    fail "object put on tiered mode unexpectedly succeeded (got: $PUT_OUT)"
+elif grep -Fq "writes not supported" <<<"$PUT_OUT"; then
+    ok "object put on tiered mode rejects writes"
 else
-    fail "object put on tiered mode should return error (got: $PUT_OUT)"
+    fail "object put on tiered mode returned an unrelated error (got: $PUT_OUT)"
 fi
 kill "$TIERED_PID" 2>/dev/null || true
 wait "$TIERED_PID" 2>/dev/null || true

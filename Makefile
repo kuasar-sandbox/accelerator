@@ -168,6 +168,7 @@ dedup-report:
 test-e2e-scripts:
 	bash test/e2e/port_lease_test.sh
 	PYTHONDONTWRITEBYTECODE=1 python3 test/scripts/test_e2e_manifest.py
+	PYTHONDONTWRITEBYTECODE=1 python3 test/scripts/test_e2e_cache.py
 
 VERSION ?= v0.1.0
 

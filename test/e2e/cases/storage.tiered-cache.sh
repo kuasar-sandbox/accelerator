@@ -2,33 +2,25 @@
 set -euo pipefail
 
 source "${E2E_LIB:?E2E_LIB is required}/common.sh"
+require_command timeout
 require_binary store-ctl
 require_binary manifest-ctl
 require_binary cache-ctl
 require_binary flatten-ctl
+REDIS_SERVER="${REDIS_SERVER:-redis-server}"
+require_command "$REDIS_SERVER"
 
-# E2E test for cache-ctl + manifest-ctl integration.
-# Tests embedded and Redis-compatible local/shard/tiered modes.
-#
-# Usage:
-#   bash test/e2e/e2e_cache.sh
+# Prepared tiered/EC/Redis cache correctness.
+# Run with the platform runner: e2e run --include storage.tiered-cache.sh.
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TMPDIR=$(mktemp -d /tmp/acc-cache-e2e-XXXXXX)
 E2E_PORT_LEASE_FILE="$TMPDIR/ports"
-source "$SCRIPT_DIR/../lib/accelerator/port_lease.sh"
+source "$E2E_LIB/accelerator/port_lease.sh"
 KEY=$(openssl rand -hex 32)
 
 PASS=0
 FAIL=0
 PIDS=()
-REDIS_SERVER="${REDIS_SERVER:-$(command -v redis-server || true)}"
-
-if [ -z "$REDIS_SERVER" ]; then
-    echo "ERROR: redis-server is required for Redis-compatible cache E2E" >&2
-    exit 1
-fi
-
 cleanup() {
     # A SIGSTOP-based slow-peer test may abort before its matching SIGCONT.
     # Resume every child first so TERM + wait cannot strand cleanup.
@@ -65,7 +57,7 @@ assert_eq() {
 wait_ready() {
     local endpoint=$1
     for i in $(seq 1 50); do
-        if "$BIN/cache-ctl" ping --endpoint "$endpoint" 2>/dev/null | grep -q SERVING; then
+        if "$BIN/cache-ctl" ping --endpoint "$endpoint" 2>/dev/null | grep -Fxq SERVING; then
             return 0
         fi
         sleep 0.1
@@ -515,15 +507,16 @@ origin:
     timeout: 2s
   max_inflight: 16
 EOF
-# Run in foreground; do NOT push PID to PIDS (process is expected to
-# exit on its own).
-if ERR_OUT=$("$BIN/cache-ctl" serve --config "$TMPDIR/upstream-bad.yaml" 2>&1); then
+# Bound the negative test: accepting the invalid upstream must fail, not hang.
+# timeout owns and reaps the process; it is never treated as the expected error.
+if ERR_OUT=$(timeout --signal=TERM --kill-after=1s 5s "$BIN/cache-ctl" serve --config "$TMPDIR/upstream-bad.yaml" 2>&1); then
     fail "upstream bad endpoint should have rejected startup (exited 0; output: $ERR_OUT)"
 else
-    if echo "$ERR_OUT" | grep -qiE "dial reader|dial writer|upstream.*connection refused|connection refused"; then
+    ERR_STATUS=$?
+    if [ "$ERR_STATUS" -eq 1 ] && grep -qiE "dial reader|dial writer|upstream.*connection refused|connection refused" <<<"$ERR_OUT"; then
         ok "upstream bad endpoint rejected at startup"
     else
-        fail "upstream bad endpoint error should mention dial/connection refused (got: $ERR_OUT)"
+        fail "upstream bad endpoint did not reject startup as expected (exit=$ERR_STATUS; output: $ERR_OUT)"
     fi
 fi
 
