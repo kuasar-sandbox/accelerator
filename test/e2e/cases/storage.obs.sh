@@ -47,7 +47,9 @@ cleanup() {
     fi
     exit "$status"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 OBS_PREFIX="${OBS_PREFIX:-store-ctl-e2e/$(date +%s)-$$/}"
 free_port() {
