@@ -166,7 +166,7 @@ dedup-report:
 	BIN=$(E2E_BIN) bash test/scripts/dedup_report.sh
 
 test-e2e-scripts:
-	bash test/e2e/port_lease_test.sh
+	bash test/scripts/test_port_lease.sh
 	PYTHONDONTWRITEBYTECODE=1 python3 test/scripts/test_e2e_manifest.py
 	PYTHONDONTWRITEBYTECODE=1 python3 test/scripts/test_e2e_cache.py
 
@@ -192,5 +192,5 @@ help:
 	@echo "  vet           vet the CGO-free client surface"
 	@echo "  release       build a validated component release bundle"
 	@echo "  test-release  test component release packaging"
-	@echo "  clean         remove bin/ + build/"
+	@echo "  clean         remove bin build"
 	@echo "  TARGET_ARCH   x86_64 (default) | aarch64"
