@@ -27,7 +27,7 @@ Accelerator 产品 E2E 统一由平台提供的 prepared-workspace runner 执行
 
 使用 Kuasar 平台测试包发布的 runner 和 cases，或精确 integration CI 生成的 prepared workspace。执行产品 E2E 时不得重新构建 accelerator、编译测试 helper、查找相邻源码仓库或静默回退到源码。
 
-典型的 aggregate-release 使用方式：
+普通、无需云凭据的 accelerator 用例可按以下 aggregate-release 方式运行：
 
 ```sh
 RUNNER=/path/to/platform/test/e2e/e2e
@@ -35,8 +35,15 @@ RELEASE_DIR=/path/to/prebuilt/platform-release
 WORK=/tmp/kuasar-e2e
 
 "$RUNNER" prepare --release-dir "$RELEASE_DIR" --workdir "$WORK"
-"$RUNNER" run --workdir "$WORK" --suite storage --suite image
+"$RUNNER" run --workdir "$WORK" \
+  --include storage.cache.sh \
+  --include storage.tiered-cache.sh \
+  --include storage.cache-membership.sh \
+  --include storage.store-cache.sh \
+  --include image.manifest.sh
 ```
+
+上述普通命令有意不选择 `storage.obs.sh`。只有在明确具备所需 OBS/S3 兼容 endpoint 与凭据时才单独选择它，例如使用 `--include storage.obs.sh`。
 
 平台 CI 使用同一个 runner。验证组件 candidate 时，CI 从已准入的 accelerator 精确提交中取得实际 case ID，并只运行这些 ID，避免把其他组件同名 `image.*` suite 用例误带进来。
 
