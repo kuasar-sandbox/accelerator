@@ -1,8 +1,11 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -41,6 +44,18 @@ func TestGenerationInputInitialLoadAndCopyIsolation(t *testing.T) {
 	got[1] = "reader-mutated"
 	if again := g.current(); again[0] != "one" || again[1] != "two" {
 		t.Fatalf("active snapshot was mutated: %v", again)
+	}
+}
+
+func TestGenerationInputViewDoesNotAllocate(t *testing.T) {
+	g, err := newGenerationInput(context.Background(), source(func(context.Context) ([]pkgstore.Generation, error) {
+		return []pkgstore.Generation{"one"}, nil
+	}, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allocs := testing.AllocsPerRun(100, func() { _ = g.view() }); allocs != 0 {
+		t.Fatalf("view allocations = %v, want 0", allocs)
 	}
 }
 
@@ -83,6 +98,37 @@ func TestGenerationInputRefreshFailureRetainsSnapshot(t *testing.T) {
 	}
 }
 
+func TestGenerationInputRefreshFailureLogsToInstanceLogger(t *testing.T) {
+	var calls atomic.Int32
+	refreshed := make(chan struct{})
+	g, err := newGenerationInput(context.Background(), source(func(context.Context) ([]pkgstore.Generation, error) {
+		if calls.Add(1) == 1 {
+			return []pkgstore.Generation{"one"}, nil
+		}
+		close(refreshed)
+		return nil, errors.New("instance refresh failure")
+	}, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	reload := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { g.run(ctx, reload, logger); close(done) }()
+	reload <- struct{}{}
+	<-refreshed
+	cancel()
+	<-done
+	if got := g.current(); len(got) != 1 || got[0] != "one" {
+		t.Fatalf("snapshot after failed refresh = %v", got)
+	}
+	if !strings.Contains(logs.String(), "instance refresh failure") {
+		t.Fatalf("instance log = %q", logs.String())
+	}
+}
+
 func TestGenerationInputSerializesTimerAndReload(t *testing.T) {
 	var active, maximum, calls atomic.Int32
 	entered := make(chan struct{}, 8)
@@ -106,7 +152,7 @@ func TestGenerationInputSerializesTimerAndReload(t *testing.T) {
 	reload := make(chan struct{}, 2)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { g.run(ctx, reload); close(done) }()
+	go func() { g.run(ctx, reload, nil); close(done) }()
 	<-entered
 	reload <- struct{}{}
 	time.Sleep(10 * time.Millisecond)
@@ -135,7 +181,7 @@ func TestGenerationInputClosedReloadDoesNotSpin(t *testing.T) {
 	close(reload)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { g.run(ctx, reload); close(done) }()
+	go func() { g.run(ctx, reload, nil); close(done) }()
 	time.Sleep(20 * time.Millisecond)
 	cancel()
 	<-done
@@ -161,7 +207,7 @@ func TestGenerationInputCancellationWaitsAndPreventsAnotherLoad(t *testing.T) {
 	reload := make(chan struct{}, 2)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { g.run(ctx, reload); close(done) }()
+	go func() { g.run(ctx, reload, nil); close(done) }()
 	reload <- struct{}{}
 	<-started
 	reload <- struct{}{}

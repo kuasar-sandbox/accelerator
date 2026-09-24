@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pkgstore "github.com/kuasar-sandbox/accelerator/pkg/store"
@@ -88,8 +89,7 @@ type generationInput struct {
 	interval time.Duration
 
 	loadMu   sync.Mutex
-	mu       sync.RWMutex
-	snapshot []pkgstore.Generation
+	snapshot atomic.Value // immutable []pkgstore.Generation
 }
 
 func newGenerationInput(ctx context.Context, source *GenerationSource) (*generationInput, error) {
@@ -128,22 +128,24 @@ func (g *generationInput) refresh(ctx context.Context) error {
 	if err := pkgstore.ValidateGenerations(next); err != nil {
 		return err
 	}
-	g.mu.Lock()
-	g.snapshot = next
-	g.mu.Unlock()
+	g.snapshot.Store(next)
 	return nil
 }
 
 func (g *generationInput) current() []pkgstore.Generation {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	return append([]pkgstore.Generation(nil), g.snapshot...)
+	return append([]pkgstore.Generation(nil), g.view()...)
+}
+
+// view returns the immutable snapshot used by the Store server request path.
+// Callers must not mutate the returned slice.
+func (g *generationInput) view() []pkgstore.Generation {
+	return g.snapshot.Load().([]pkgstore.Generation)
 }
 
 // run refreshes until ctx is cancelled. It returns only after any synchronous
 // Load already in progress has returned; consequently its return is the
 // controller's quiescence boundary.
-func (g *generationInput) run(ctx context.Context, reload <-chan struct{}) {
+func (g *generationInput) run(ctx context.Context, reload <-chan struct{}, logger *slog.Logger) {
 	var ticker *time.Ticker
 	var ticks <-chan time.Time
 	if g.interval > 0 {
@@ -165,12 +167,18 @@ func (g *generationInput) run(ctx context.Context, reload <-chan struct{}) {
 				continue
 			}
 			if ctx.Err() == nil {
-				_ = g.refresh(ctx) // Retain the last valid snapshot on failure.
+				g.refreshAndLog(ctx, logger)
 			}
 		case <-ticks:
 			if ctx.Err() == nil {
-				_ = g.refresh(ctx) // Retain the last valid snapshot on failure.
+				g.refreshAndLog(ctx, logger)
 			}
 		}
+	}
+}
+
+func (g *generationInput) refreshAndLog(ctx context.Context, logger *slog.Logger) {
+	if err := g.refresh(ctx); err != nil && logger != nil {
+		logger.Error("generation refresh failed; keeping previous list", "error", err)
 	}
 }
