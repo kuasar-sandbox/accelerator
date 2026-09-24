@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -35,6 +36,48 @@ type Options struct {
 	Generations           *GenerationSource
 	ObjectCredentials     CredentialsProvider
 	GenerationCredentials CredentialsProvider
+}
+
+// prepareConfig makes and normalizes the configuration that Run will own. It
+// validates only selected inputs and performs no external I/O or callbacks.
+func prepareConfig(cfg Config, opts Options) (Config, error) {
+	effective := cfg.Clone()
+	overridden := opts.Generations != nil
+	if overridden {
+		if opts.Generations.Load == nil {
+			return Config{}, errors.New("store: generation source Load is required")
+		}
+		if opts.Generations.RefreshInterval < 0 {
+			return Config{}, errors.New("store: generation refresh interval must not be negative")
+		}
+	}
+	if err := effective.NormalizeEffective(true, !overridden, opts.ObjectCredentials == nil, opts.GenerationCredentials == nil); err != nil {
+		return Config{}, err
+	}
+	if opts.ObjectCredentials != nil {
+		if effective.Backend != "s3" {
+			return Config{}, errors.New("store: object credentials require s3 backend")
+		}
+		effective.S3.AccessKey = ""
+		effective.S3.SecretKey = ""
+	}
+	if overridden {
+		if opts.GenerationCredentials != nil {
+			return Config{}, errors.New("store: generation credentials are unused with explicit generations")
+		}
+	} else if opts.GenerationCredentials != nil {
+		if effective.Generations == nil || effective.Generations.S3 == nil {
+			return Config{}, errors.New("store: generation credentials require built-in s3 generations")
+		}
+		effective.Generations.S3.AccessKey = ""
+		effective.Generations.S3.SecretKey = ""
+	}
+	if effective.Backend == "s3" {
+		if _, err := effective.S3OpTimeout(); err != nil {
+			return Config{}, fmt.Errorf("store: invalid s3 op_timeout: %w", err)
+		}
+	}
+	return effective, nil
 }
 
 // generationInput owns refresh scheduling for one authoritative source. Calls
