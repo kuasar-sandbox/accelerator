@@ -27,7 +27,7 @@ The case files are intentionally regular `100644` files. The common runner invok
 
 Use the runner and cases shipped by the Kuasar platform test bundle or an exact integration prepared workspace. Do not build accelerator, compile a test helper, discover sibling source repositories, or fall back to source while executing product E2E.
 
-A typical aggregate-release workflow is:
+A typical aggregate-release workflow for the ordinary non-credentialed accelerator cases is:
 
 ```sh
 RUNNER=/path/to/platform/test/e2e/e2e
@@ -35,8 +35,15 @@ RELEASE_DIR=/path/to/prebuilt/platform-release
 WORK=/tmp/kuasar-e2e
 
 "$RUNNER" prepare --release-dir "$RELEASE_DIR" --workdir "$WORK"
-"$RUNNER" run --workdir "$WORK" --suite storage --suite image
+"$RUNNER" run --workdir "$WORK" \
+  --include storage.cache.sh \
+  --include storage.tiered-cache.sh \
+  --include storage.cache-membership.sh \
+  --include storage.store-cache.sh \
+  --include image.manifest.sh
 ```
+
+`storage.obs.sh` is deliberately omitted from that ordinary command. Run it only when the required OBS/S3-compatible credentials and endpoint are explicitly available, for example with `--include storage.obs.sh`.
 
 The platform CI uses the same runner. During component-candidate validation it selects the exact accelerator case IDs admitted from that candidate, so another component's `image.*` cases are not accidentally included.
 
