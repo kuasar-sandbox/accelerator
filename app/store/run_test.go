@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -129,4 +130,92 @@ func TestRunServingCancellationIsClean(t *testing.T) {
 		t.Fatal(err)
 	}
 	finishRunTest(t, cancel, done, addr)
+}
+
+func TestRunCancellationDuringLoadDoesNotOpenListener(t *testing.T) {
+	addr := runTestAddress(t)
+	occupied, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	entered, release := make(chan struct{}), make(chan struct{})
+	cfg := runTestConfig(t, addr)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, cfg, Options{Generations: &GenerationSource{Load: func(context.Context) ([]pkgstore.Generation, error) {
+			close(entered)
+			<-release
+			return []pkgstore.Generation{"one"}, nil
+		}}})
+	}()
+	<-entered
+	cancel()
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run after startup cancellation: %v", err)
+		}
+	case <-time.After(runTestTimeout):
+		t.Fatal("Run did not return after startup cancellation")
+	}
+}
+
+func TestRunSecondListenerFailureRollsBackPrimary(t *testing.T) {
+	primary := runTestAddress(t)
+	blocked, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocked.Close()
+	cfg := runTestConfig(t, primary)
+	cfg.CacheListen = blocked.Addr().String()
+	err = Run(context.Background(), cfg, Options{Generations: &GenerationSource{Load: func(context.Context) ([]pkgstore.Generation, error) {
+		return []pkgstore.Generation{"one"}, nil
+	}}})
+	if err == nil {
+		t.Fatal("Run succeeded with occupied cache listener")
+	}
+	l, err := net.Listen("tcp", primary)
+	if err != nil {
+		t.Fatalf("primary listener was not rolled back: %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunServingDeadlineIsErrorAndReleasesPort(t *testing.T) {
+	addr := runTestAddress(t)
+	cfg := runTestConfig(t, addr)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, cfg, Options{Generations: &GenerationSource{Load: func(context.Context) ([]pkgstore.Generation, error) {
+			return []pkgstore.Generation{"one"}, nil
+		}}})
+	}()
+	conn := waitForRunTestStore(t, addr)
+	requireRunTestRPC(t, conn, "one")
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Run error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(runTestTimeout):
+		t.Fatal("Run did not return after deadline")
+	}
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("listen address was not released: %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
