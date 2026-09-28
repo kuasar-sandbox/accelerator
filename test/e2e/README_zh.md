@@ -45,7 +45,7 @@ WORK=/tmp/kuasar-e2e
 
 上述普通命令有意不选择 `storage.obs.sh`。只有在明确具备所需 OBS/S3 兼容 endpoint 与凭据时才单独选择它，例如使用 `--include storage.obs.sh`。
 
-平台 CI 使用同一个 runner。验证组件 candidate 时，CI 从已准入的 accelerator 精确提交中取得实际 case ID，并只运行这些 ID，避免把其他组件同名 `image.*` suite 用例误带进来。
+平台 CI 使用同一个 runner，并从已准入的精确测试版本中解析用例文件名。Suite 选择遵循[平台 CI 契约](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/ci_zh.md)；同一个 suite 可以包含多个组件维护的用例。仅选择上面列出的 accelerator 用例时，使用示例中的显式 `--include` 文件名。
 
 已选用例缺少所需产品或执行条件时必须失败。架构、root 权限及主机服务属于执行条件，不是 suite，也不能以成功 skip 代替验证。
 
