@@ -1,6 +1,7 @@
 package remote
 
 import (
+	"archive/tar"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -12,6 +13,8 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	ggcrremote "github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/types"
@@ -128,7 +131,9 @@ func TestPullSourceMatches(t *testing.T) {
 }
 
 // TestDecompress — gzip / zstd / plain layer streams all yield the original
-// uncompressed tar bytes.
+// uncompressed tar bytes. Selection is by content sniffing, so a stream that
+// contradicts any mediaType labeling still round-trips: gzipped bytes are
+// decompressed, plain bytes pass through.
 func TestDecompress(t *testing.T) {
 	payload := []byte("the quick brown fox jumps over the lazy dog")
 
@@ -143,23 +148,27 @@ func TestDecompress(t *testing.T) {
 	zw.Close()
 
 	cases := []struct {
-		mt types.MediaType
-		in []byte
+		name string
+		in   []byte
+		want []byte
 	}{
-		{"application/vnd.oci.image.layer.v1.tar+gzip", gz.Bytes()},
-		{"application/vnd.docker.image.rootfs.diff.tar.gzip", gz.Bytes()},
-		{"application/vnd.oci.image.layer.v1.tar+zstd", zs.Bytes()},
-		{"application/vnd.oci.image.layer.v1.tar", payload},
+		{"gzip", gz.Bytes(), payload},
+		{"zstd", zs.Bytes(), payload},
+		{"plain (mislabeled as gzip in the manifest)", payload, payload},
+		{"empty", nil, nil},
 	}
 	for _, tc := range cases {
-		rc, err := decompress(bytes.NewReader(tc.in), tc.mt)
+		rc, err := decompress(bytes.NewReader(tc.in))
 		if err != nil {
-			t.Fatalf("%s: %v", tc.mt, err)
+			t.Fatalf("%s: %v", tc.name, err)
 		}
-		got, _ := io.ReadAll(rc)
+		got, err := io.ReadAll(rc)
 		rc.Close()
-		if !bytes.Equal(got, payload) {
-			t.Fatalf("%s: got %q, want %q", tc.mt, got, payload)
+		if err != nil {
+			t.Fatalf("%s: read: %v", tc.name, err)
+		}
+		if !bytes.Equal(got, tc.want) {
+			t.Fatalf("%s: got %q, want %q", tc.name, got, tc.want)
 		}
 	}
 }
@@ -176,5 +185,106 @@ func TestLooksLikeReference(t *testing.T) {
 		if LooksLikeReference(s) {
 			t.Errorf("LooksLikeReference(%q) = true, want false", s)
 		}
+	}
+}
+
+// mislabeledPlainLayer is a v1.Layer whose stored blob is a plain
+// (uncompressed) tar while its manifest mediaType claims gzip — the shape
+// pushed by tooling that mislabels layers. Every method reports the truth
+// about the bytes except MediaType().
+type mislabeledPlainLayer struct {
+	blob []byte
+	d    v1.Hash
+}
+
+func (l *mislabeledPlainLayer) Compressed() (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(l.blob)), nil
+}
+
+func (l *mislabeledPlainLayer) Uncompressed() (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(l.blob)), nil
+}
+
+func (l *mislabeledPlainLayer) Digest() (v1.Hash, error) { return l.d, nil }
+
+func (l *mislabeledPlainLayer) DiffID() (v1.Hash, error) { return l.d, nil }
+
+func (l *mislabeledPlainLayer) Size() (int64, error) { return int64(len(l.blob)), nil }
+
+func (l *mislabeledPlainLayer) MediaType() (types.MediaType, error) {
+	return types.DockerLayer, nil
+}
+
+// plainTarLayer builds a minimal valid plain tar containing one file.
+func plainTarLayer(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	hdr := &tar.Header{Name: "hello.txt", Mode: 0o644, Size: 5}
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// TestPullMislabeledPlainLayer — repro for a pushed image whose layer
+// descriptor says gzip but whose blob is a plain tar. Digest verification
+// passes (it hashes the stored bytes), so any failure surfaces at layer-open
+// time. docker (archive.DecompressStream) and ggcr's own
+// layer.Uncompressed() sniff the content magic bytes and accept such layers;
+// the flatten-ctl registry path must too.
+func TestPullMislabeledPlainLayer(t *testing.T) {
+	host := startRegistry(t)
+	blob := plainTarLayer(t)
+	d, _, err := v1.SHA256(bytes.NewReader(blob))
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := mutate.AppendLayers(empty.Image, &mislabeledPlainLayer{blob: blob, d: d})
+	if err != nil {
+		t.Fatalf("build mislabeled image: %v", err)
+	}
+
+	ref := host + "/test/mislabeled:v1"
+	pushImage(t, ref, img)
+
+	cfg := testConfig(t)
+	ctx := context.Background()
+	res, err := cfg.Resolve(ctx, ref)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	cache, err := OpenCache(cfg.CacheDir(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := cfg.Pull(ctx, res, cache)
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	openers, err := src.Layers()
+	if err != nil {
+		t.Fatalf("Layers: %v", err)
+	}
+	if len(openers) != 1 {
+		t.Fatalf("got %d layers, want 1", len(openers))
+	}
+	rc, err := openers[0]()
+	if err != nil {
+		t.Fatalf("open mislabeled layer: %v", err)
+	}
+	got, err := io.ReadAll(rc)
+	rc.Close()
+	if err != nil {
+		t.Fatalf("read mislabeled layer: %v", err)
+	}
+	if !bytes.Equal(got, blob) {
+		t.Fatal("mislabeled layer content mismatch")
 	}
 }

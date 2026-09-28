@@ -1,18 +1,18 @@
 package remote
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"sync"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	ggcrremote "github.com/google/go-containerregistry/pkg/v1/remote"
-	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/klauspost/compress/zstd"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/flatten"
@@ -89,7 +89,7 @@ func (c *Config) Resolve(ctx context.Context, ref string) (*Resolved, error) {
 // Pull ensures every blob of the resolved image (config + layers) is present
 // in cache — downloading missing ones concurrently (bounded by PullJobs),
 // each digest-verified and written atomically — then returns a flatten.Source
-// that streams the layers (decompressed per their media type) from cache.
+// that streams the layers (decompressed by content sniffing) from cache.
 // Downloads run in parallel; flatten then applies layers sequentially.
 func (c *Config) Pull(ctx context.Context, res *Resolved, cache *Cache) (flatten.Source, error) {
 	img, err := ggcrremote.Image(res.Digest, c.remoteOpts(ctx)...)
@@ -117,8 +117,8 @@ func (c *Config) Pull(ctx context.Context, res *Resolved, cache *Cache) (flatten
 		return nil, fmt.Errorf("remote: layers %s: %w", res.Digest, err)
 	}
 
-	// Pass 1: resolve every layer's digest + media type and note which ones
-	// are cache misses, so the download progress total is known up front.
+	// Pass 1: resolve every layer's digest and note which ones are cache
+	// misses, so the download progress total is known up front.
 	refs := make([]layerRef, len(layers))
 	var misses []int
 	for i, l := range layers {
@@ -126,11 +126,7 @@ func (c *Config) Pull(ctx context.Context, res *Resolved, cache *Cache) (flatten
 		if err != nil {
 			return nil, fmt.Errorf("remote: layer digest: %w", err)
 		}
-		mt, err := l.MediaType()
-		if err != nil {
-			return nil, fmt.Errorf("remote: layer media type: %w", err)
-		}
-		refs[i] = layerRef{digest: d, mt: mt}
+		refs[i] = layerRef{digest: d}
 		if !cache.Has(d) {
 			misses = append(misses, i)
 		}
@@ -189,10 +185,9 @@ func (c *Config) Pull(ctx context.Context, res *Resolved, cache *Cache) (flatten
 
 type layerRef struct {
 	digest v1.Hash
-	mt     types.MediaType
 }
 
-// registrySource is a flatten.Source backed by cached compressed layer blobs.
+// registrySource is a flatten.Source backed by cached layer blobs.
 type registrySource struct {
 	cache      *Cache
 	configJSON []byte
@@ -204,13 +199,12 @@ func (s *registrySource) ConfigJSON() ([]byte, error) { return s.configJSON, nil
 func (s *registrySource) Layers() ([]flatten.LayerOpener, error) {
 	openers := make([]flatten.LayerOpener, 0, len(s.layers))
 	for _, lr := range s.layers {
-		lr := lr
 		openers = append(openers, func() (io.ReadCloser, error) {
 			f, err := s.cache.Get(lr.digest)
 			if err != nil {
 				return nil, fmt.Errorf("remote: open cached layer %s: %w", lr.digest, err)
 			}
-			dr, err := decompress(f, lr.mt)
+			dr, err := decompress(f)
 			if err != nil {
 				f.Close()
 				return nil, err
@@ -221,26 +215,40 @@ func (s *registrySource) Layers() ([]flatten.LayerOpener, error) {
 	return openers, nil
 }
 
-// decompress wraps r with the decompressor implied by the layer media type,
-// yielding a plain (uncompressed) tar stream. gzip and zstd are handled
-// explicitly; anything else is assumed already-uncompressed tar.
-func decompress(r io.Reader, mt types.MediaType) (io.ReadCloser, error) {
-	s := string(mt)
+// zstdMagic is the four-byte zstd frame header, mirroring ggcr's internal
+// zstd.MagicHeader. The gzip magic (0x1f 0x8b) is inlined below.
+var zstdMagic = []byte{0x28, 0xb5, 0x2f, 0xfd}
+
+// decompress wraps r with the decompressor implied by the layer's actual
+// content, sniffing the stream's leading magic bytes rather than trusting
+// the manifest mediaType — a plain tar yields a plain tar stream. Mislabeled
+// layers (descriptor says gzip, blob is a plain tar) occur in the wild;
+// docker's archive.DecompressStream and ggcr's own layer.Uncompressed()
+// accept them by sniffing the same way, and flatten-ctl's docker-archive
+// path (flatten.openMaybeGzip) has always been sniff-based too.
+func decompress(r io.Reader) (io.ReadCloser, error) {
+	// Peek does not consume; the decompressor (or the passthrough) keeps
+	// reading from br so the peeked bytes are seen exactly once.
+	br := bufio.NewReader(r)
+	magic, err := br.Peek(4)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("remote: sniff layer: %w", err)
+	}
 	switch {
-	case strings.HasSuffix(s, "gzip"):
-		gz, err := gzip.NewReader(r)
+	case len(magic) >= 2 && magic[0] == 0x1f && magic[1] == 0x8b:
+		gz, err := gzip.NewReader(br)
 		if err != nil {
 			return nil, fmt.Errorf("remote: gzip layer: %w", err)
 		}
 		return gz, nil
-	case strings.HasSuffix(s, "zstd"):
-		zr, err := zstd.NewReader(r)
+	case len(magic) >= 4 && bytes.Equal(magic, zstdMagic):
+		zr, err := zstd.NewReader(br)
 		if err != nil {
 			return nil, fmt.Errorf("remote: zstd layer: %w", err)
 		}
 		return zr.IOReadCloser(), nil
 	default:
-		return io.NopCloser(r), nil
+		return io.NopCloser(br), nil
 	}
 }
 
