@@ -45,7 +45,7 @@ WORK=/tmp/kuasar-e2e
 
 `storage.obs.sh` is deliberately omitted from that ordinary command. Run it only when the required OBS/S3-compatible credentials and endpoint are explicitly available, for example with `--include storage.obs.sh`.
 
-The platform CI uses the same runner. During component-candidate validation it selects the exact accelerator case IDs admitted from that candidate, so another component's `image.*` cases are not accidentally included.
+The platform CI uses the same runner and resolves case filenames from exact admitted test revisions. Suite selection follows the [platform CI contract](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/ci.md); a suite can include cases maintained by more than one component. Use explicit `--include` filenames, as above, when selecting only the listed accelerator cases.
 
 A selected case fails when a required product or execution prerequisite is missing. Architecture, root privileges and host services are execution conditions, not suites and not successful skips.
 
