@@ -81,6 +81,16 @@ type Source interface {
 	ConfigJSON() ([]byte, error)
 }
 
+// LayerReleaser is an optional Source lifecycle implemented by sources that
+// own disposable layer data. Build calls ReleaseLayers once all layers have
+// been applied and their readers closed, before building EROFS. ConfigJSON
+// must remain readable afterwards. Released layer openers must not be reused.
+// Sources backed by shared or persistent data must leave that data intact.
+// Callers remain responsible for cleanup when applying a layer fails.
+type LayerReleaser interface {
+	ReleaseLayers() error
+}
+
 // Build flattens src into a deterministic EROFS image at outputPath with
 // the OCI runtime-config ZIP appended. It is the single sink shared by
 // every Source. Determinism comes from applying identical uncompressed
@@ -113,6 +123,12 @@ func Build(src Source, outputPath string, opts Options) error {
 		}
 		if err := applyLayerOpener(open, rootfsDir); err != nil {
 			return fmt.Errorf("flatten: apply layer %d: %w", i, err)
+		}
+	}
+
+	if releaser, ok := src.(LayerReleaser); ok {
+		if err := releaser.ReleaseLayers(); err != nil {
+			return fmt.Errorf("flatten: release layers: %w", err)
 		}
 	}
 

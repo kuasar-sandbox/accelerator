@@ -29,6 +29,8 @@ import (
 type Cache struct {
 	dir     string
 	maxSize int64 // bytes; 0 = unlimited
+	// ephemeral is set only by Config.OpenCache for a private per-run cache.
+	ephemeral bool
 }
 
 // OpenCache opens (or initialises) an OCI-layout cache rooted at dir. The

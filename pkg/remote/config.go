@@ -232,7 +232,9 @@ func (c *Config) SetPlatform(p string) error {
 
 // OpenCache opens the blob cache. With cache.dir set it is persistent and the
 // returned cleanup is a no-op; empty (the default) yields an ephemeral cache
-// under tmpdir that cleanup removes. Callers must defer cleanup().
+// under tmpdir that cleanup removes. A Source pulled from this private cache
+// releases it after Build applies all layers; its layer openers are single-use
+// across builds. Callers must still defer cleanup() for failure paths.
 func (c *Config) OpenCache() (*Cache, func(), error) {
 	dir := c.Cache.Dir
 	cleanup := func() {}
@@ -248,5 +250,6 @@ func (c *Config) OpenCache() (*Cache, func(), error) {
 		cleanup()
 		return nil, nil, err
 	}
+	cache.ephemeral = c.Cache.Dir == ""
 	return cache, cleanup, nil
 }
