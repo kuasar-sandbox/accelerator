@@ -207,6 +207,27 @@ func TestDecompressZstdLeadingSkippableFrame(t *testing.T) {
 	}
 }
 
+// TestDecompressShortInputPassthrough — streams shorter than the smallest
+// magic (4 bytes: zstd data frame or skippable frame) cannot match any
+// compression header, so 0- to 3-byte inputs must pass through as plain
+// rather than enter the zstd decoder path.
+func TestDecompressShortInputPassthrough(t *testing.T) {
+	for _, in := range [][]byte{nil, {'a'}, {'a', 'b'}, {'a', 'b', 'c'}} {
+		rc, err := decompress(bytes.NewReader(in))
+		if err != nil {
+			t.Fatalf("%d-byte input: %v", len(in), err)
+		}
+		got, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			t.Fatalf("%d-byte input: read: %v", len(in), err)
+		}
+		if !bytes.Equal(got, in) {
+			t.Fatalf("%d-byte input: got %q, want plain passthrough %q", len(in), got, in)
+		}
+	}
+}
+
 // TestLooksLikeReference — the export source detector accepts docker refs and
 // rejects obvious non-refs.
 func TestLooksLikeReference(t *testing.T) {

@@ -225,6 +225,12 @@ func (s *registrySource) Layers() ([]flatten.LayerOpener, error) {
 // path did. Hand-rolling the magic table here would duplicate it; ggcr's
 // sniffer is internal and does not know skippable frames either.
 func looksLikeZstd(peeked []byte) bool {
+	if len(peeked) < 4 {
+		// Too short to match any zstd or skippable-frame magic; Decode
+		// would return io.ErrUnexpectedEOF, which is not a "not zstd"
+		// verdict, so guard here to keep such streams on the plain path.
+		return false
+	}
 	var h zstd.Header
 	return !errors.Is(h.Decode(peeked), zstd.ErrMagicMismatch)
 }
