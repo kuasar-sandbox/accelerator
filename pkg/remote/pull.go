@@ -215,19 +215,18 @@ func (s *registrySource) Layers() ([]flatten.LayerOpener, error) {
 	return openers, nil
 }
 
-// zstdMagic is the four-byte zstd data-frame header, mirroring ggcr's
-// internal zstd.MagicHeader. The gzip magic (0x1f 0x8b) is inlined below.
-var zstdMagic = []byte{0x28, 0xb5, 0x2f, 0xfd}
-
-// isZstdSkippableFrame reports whether magic opens a zstd skippable frame
-// (RFC 8878 §3.1.2): little-endian 0x184D2A50..0x184D2A5F, i.e. first byte
-// 0x50..0x5f followed by 2a 4d 18. A stream may carry any number of these
-// ahead of its first data frame; the decoder skips them itself, so a blob
-// opening with one is still zstd, not a plain tar.
-func isZstdSkippableFrame(magic []byte) bool {
-	return len(magic) >= 4 &&
-		magic[0] >= 0x50 && magic[0] <= 0x5f &&
-		magic[1] == 0x2a && magic[2] == 0x4d && magic[3] == 0x18
+// looksLikeZstd reports whether the peeked bytes open a zstd stream,
+// delegating to the decoder's own frame-header parser (zstd.Header.Decode,
+// same module we decode with): it accepts the data-frame magic AND
+// skippable frames (RFC 8878 §3.1.2), which the decoder then skips on its
+// own. ErrMagicMismatch is the parser's sole "not zstd" verdict; anything
+// else — success, short-input io.ErrUnexpectedEOF, malformed-frame errors —
+// is left to the decoder, which fails the same way the mediaType-driven
+// path did. Hand-rolling the magic table here would duplicate it; ggcr's
+// sniffer is internal and does not know skippable frames either.
+func looksLikeZstd(peeked []byte) bool {
+	var h zstd.Header
+	return !errors.Is(h.Decode(peeked), zstd.ErrMagicMismatch)
 }
 
 // decompress wraps r with the decompressor implied by the layer's actual
@@ -256,7 +255,7 @@ func decompress(r io.Reader) (io.ReadCloser, error) {
 			return nil, fmt.Errorf("remote: gzip layer: %w", err)
 		}
 		return gz, nil
-	case len(magic) >= 4 && (bytes.Equal(magic, zstdMagic) || isZstdSkippableFrame(magic)):
+	case looksLikeZstd(magic):
 		zr, err := zstd.NewReader(br)
 		if err != nil {
 			return nil, fmt.Errorf("remote: zstd layer: %w", err)
