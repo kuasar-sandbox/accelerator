@@ -40,12 +40,19 @@ func nameOpts(insecure bool) []name.Option {
 	return nil
 }
 
+func (c *Config) pullJobs() int {
+	if c.PullJobs < 1 {
+		return defaultPullJobs
+	}
+	return c.PullJobs
+}
+
 func (c *Config) remoteOpts(ctx context.Context) []ggcrremote.Option {
 	opts := []ggcrremote.Option{
 		ggcrremote.WithContext(ctx),
 		ggcrremote.WithAuth(authenticator()),
 		ggcrremote.WithPlatform(c.platform),
-		ggcrremote.WithJobs(c.PullJobs),
+		ggcrremote.WithJobs(c.pullJobs()),
 	}
 	// A custom transport (TLS CA / skip-verify) must apply to every request,
 	// including the CDN blob redirects where MITM proxies swap the cert.
@@ -64,24 +71,24 @@ func (c *Config) Resolve(ctx context.Context, ref string) (*Resolved, error) {
 	if err != nil {
 		return nil, fmt.Errorf("remote: parse ref %q: %w", ref, err)
 	}
-	desc, err := ggcrremote.Get(r, c.remoteOpts(ctx)...)
-	if err != nil {
-		return nil, fmt.Errorf("remote: resolve %q: %w", ref, err)
-	}
-	img, err := desc.Image()
-	if err != nil {
-		return nil, fmt.Errorf("remote: select platform %s for %q: %w", c.platform, ref, err)
-	}
-	d, err := img.Digest()
-	if err != nil {
-		return nil, fmt.Errorf("remote: image digest %q: %w", ref, err)
-	}
-	return &Resolved{
-		Ref:    r,
-		Repo:   r.Context(),
-		Digest: r.Context().Digest(d.String()),
-		Hash:   d,
-	}, nil
+	var resolved *Resolved
+	err = c.retryPull(ctx, "resolve "+ref, metadataRetryDelay, func() error {
+		desc, err := ggcrremote.Get(r, c.remoteOpts(ctx)...)
+		if err != nil {
+			return err
+		}
+		img, err := desc.Image()
+		if err != nil {
+			return fmt.Errorf("select platform %s: %w", c.platform, err)
+		}
+		d, err := img.Digest()
+		if err != nil {
+			return err
+		}
+		resolved = &Resolved{Ref: r, Repo: r.Context(), Digest: r.Context().Digest(d.String()), Hash: d}
+		return nil
+	})
+	return resolved, err
 }
 
 // Pull ensures every blob of the resolved image (config + layers) is present
@@ -90,19 +97,44 @@ func (c *Config) Resolve(ctx context.Context, ref string) (*Resolved, error) {
 // that streams the layers (decompressed via ggcr's content sniffing) from
 // cache. Downloads run in parallel; flatten then applies layers sequentially.
 func (c *Config) Pull(ctx context.Context, res *Resolved, cache *Cache) (flatten.Source, error) {
-	img, err := ggcrremote.Image(res.Digest, c.remoteOpts(ctx)...)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var img v1.Image
+	var mfst *v1.Manifest
+	err := c.retryPull(ctx, "manifest "+res.Digest.String(), metadataRetryDelay, func() error {
+		var err error
+		img, err = ggcrremote.Image(res.Digest, c.remoteOpts(ctx)...)
+		if err != nil {
+			return err
+		}
+		mfst, err = img.Manifest()
+		return err
+	})
 	if err != nil {
-		return nil, fmt.Errorf("remote: pull %s: %w", res.Digest, err)
-	}
-	mfst, err := img.Manifest()
-	if err != nil {
-		return nil, fmt.Errorf("remote: manifest %s: %w", res.Digest, err)
+		return nil, err
 	}
 
-	// Config blob — also kept in memory, since it feeds the config projection.
-	cfgBytes, err := img.RawConfigFile()
+	// RawConfigFile in ggcr v0.20.6 can memoize partial bytes on a failed
+	// ReadAll. Reuse the already-fetched image on the first attempt, then use
+	// a fresh image after a failure so partial config bytes cannot be reused.
+	var cfgBytes []byte
+	configAttempt := 0
+	err = c.retryPull(ctx, "config "+mfst.Config.Digest.String(), metadataRetryDelay, func() error {
+		candidate := img
+		if configAttempt > 0 {
+			var err error
+			candidate, err = ggcrremote.Image(res.Digest, c.remoteOpts(ctx)...)
+			if err != nil {
+				return err
+			}
+		}
+		configAttempt++
+		var err error
+		cfgBytes, err = candidate.RawConfigFile()
+		return err
+	})
 	if err != nil {
-		return nil, fmt.Errorf("remote: config %s: %w", res.Digest, err)
+		return nil, err
 	}
 	if !cache.Has(mfst.Config.Digest) {
 		if _, err := cache.Put(mfst.Config.Digest, io.NopCloser(bytes.NewReader(cfgBytes))); err != nil {
@@ -133,7 +165,7 @@ func (c *Config) Pull(ctx context.Context, res *Resolved, cache *Cache) (flatten
 	// Pass 2: download the misses concurrently (bounded by PullJobs),
 	// reporting each completion through OnPullProgress.
 	toPull := len(misses)
-	sem := make(chan struct{}, c.PullJobs)
+	sem := make(chan struct{}, c.pullJobs())
 	var (
 		wg     sync.WaitGroup
 		mu     sync.Mutex
@@ -144,26 +176,39 @@ func (c *Config) Pull(ctx context.Context, res *Resolved, cache *Cache) (flatten
 		mu.Lock()
 		if errVal == nil {
 			errVal = err
+			cancel()
 		}
 		mu.Unlock()
 	}
+downloadLoop:
 	for _, i := range misses {
 		l := layers[i]
 		d := refs[i].digest
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break downloadLoop
+		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(l v1.Layer, d v1.Hash) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			rc, err := l.Compressed() // digest-verified reader from the registry
+			err := c.retryPull(ctx, "layer "+d.String(), layerRetryDelay, func() error {
+				// A failed transfer starts at byte zero on retry. Range resume
+				// would reduce the cost for large layers, but needs cache support.
+				rc, err := l.Compressed()
+				if err != nil {
+					return err
+				}
+				// Put closes the reader and removes partial temp files on error.
+				_, err = cache.Put(d, rc)
+				return err
+			})
 			if err != nil {
-				record(fmt.Errorf("remote: fetch %s: %w", d, err))
-				return
-			}
-			if _, err := cache.Put(d, rc); err != nil {
 				record(err)
 				return
 			}
+
 			mu.Lock()
 			done++
 			n := done
@@ -178,6 +223,9 @@ func (c *Config) Pull(ctx context.Context, res *Resolved, cache *Cache) (flatten
 		return nil, errVal
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return &registrySource{cache: cache, configJSON: cfgBytes, layers: refs}, nil
 }
 

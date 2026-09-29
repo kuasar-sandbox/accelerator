@@ -50,6 +50,30 @@ func testConfig(t *testing.T) *Config {
 	return c
 }
 
+func TestPullJobsDefaultForDirectConfig(t *testing.T) {
+	host := startRegistry(t)
+	img, err := random.Image(128, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := host + "/test/default-jobs:v1"
+	pushImage(t, ref, img)
+
+	c := testConfig(t)
+	c.PullJobs = 0 // A caller may construct or modify Config without normalize.
+	res, err := c.Resolve(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("Resolve with zero jobs: %v", err)
+	}
+	cache, err := OpenCache(c.CacheDir(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Pull(context.Background(), res, cache); err != nil {
+		t.Fatalf("Pull with zero jobs: %v", err)
+	}
+}
+
 // TestPullSourceMatches — Resolve pins the right digest, and Pull yields a
 // flatten.Source whose config and uncompressed layers match the pushed image,
 // with every blob landed in the cache.
