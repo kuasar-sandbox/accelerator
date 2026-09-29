@@ -1,19 +1,17 @@
 package remote
 
 import (
-	"bufio"
 	"bytes"
-	"compress/gzip"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"sync"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/partial"
 	ggcrremote "github.com/google/go-containerregistry/pkg/v1/remote"
-	"github.com/klauspost/compress/zstd"
+	"github.com/google/go-containerregistry/pkg/v1/types"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/flatten"
 )
@@ -89,8 +87,8 @@ func (c *Config) Resolve(ctx context.Context, ref string) (*Resolved, error) {
 // Pull ensures every blob of the resolved image (config + layers) is present
 // in cache — downloading missing ones concurrently (bounded by PullJobs),
 // each digest-verified and written atomically — then returns a flatten.Source
-// that streams the layers (decompressed by content sniffing) from cache.
-// Downloads run in parallel; flatten then applies layers sequentially.
+// that streams the layers (decompressed via ggcr's content sniffing) from
+// cache. Downloads run in parallel; flatten then applies layers sequentially.
 func (c *Config) Pull(ctx context.Context, res *Resolved, cache *Cache) (flatten.Source, error) {
 	img, err := ggcrremote.Image(res.Digest, c.remoteOpts(ctx)...)
 	if err != nil {
@@ -204,86 +202,52 @@ func (s *registrySource) Layers() ([]flatten.LayerOpener, error) {
 			if err != nil {
 				return nil, fmt.Errorf("remote: open cached layer %s: %w", lr.digest, err)
 			}
-			dr, err := decompress(f)
-			if err != nil {
-				f.Close()
-				return nil, err
-			}
-			return &multiCloser{Reader: dr, closers: []io.Closer{dr, f}}, nil
+			// decompress (ggcr's Uncompressed path) closes f when the
+			// returned stream is closed.
+			return decompress(f, lr.digest)
 		})
 	}
 	return openers, nil
 }
 
-// looksLikeZstd reports whether the peeked bytes open a zstd stream,
-// delegating to the decoder's own frame-header parser (zstd.Header.Decode,
-// same module we decode with): it accepts the data-frame magic AND
-// skippable frames (RFC 8878 §3.1.2), which the decoder then skips on its
-// own. ErrMagicMismatch is the parser's sole "not zstd" verdict; anything
-// else — success, short-input io.ErrUnexpectedEOF, malformed-frame errors —
-// is left to the decoder, which fails the same way the mediaType-driven
-// path did. Hand-rolling the magic table here would duplicate it; ggcr's
-// sniffer is internal and does not know skippable frames either.
-func looksLikeZstd(peeked []byte) bool {
-	if len(peeked) < 4 {
-		// Too short to match any zstd or skippable-frame magic; Decode
-		// would return io.ErrUnexpectedEOF, which is not a "not zstd"
-		// verdict, so guard here to keep such streams on the plain path.
-		return false
-	}
-	var h zstd.Header
-	return !errors.Is(h.Decode(peeked), zstd.ErrMagicMismatch)
+// cachedLayer adapts a cached layer blob to ggcr's minimal
+// partial.CompressedLayer interface, so the SDK's own sniff — the
+// PeekCompression machinery behind layer.Uncompressed() and crane export —
+// decides gzip / zstd / plain and performs the decompression. Detection
+// stays owned by ggcr: no magic table is maintained here, and upstream
+// sniff fixes are inherited on upgrade.
+type cachedLayer struct {
+	r io.ReadCloser
+	d v1.Hash
 }
 
-// decompress wraps r with the decompressor implied by the layer's actual
-// content, sniffing the stream's leading magic bytes rather than trusting
-// the manifest mediaType — a plain tar yields a plain tar stream. Mislabeled
-// layers (descriptor says gzip, blob is a plain tar) occur in the wild;
-// docker's archive.DecompressStream and ggcr's own layer.Uncompressed()
-// accept them by sniffing the same way, and flatten-ctl's docker-archive
-// path (flatten.openMaybeGzip) has always been sniff-based too.
-//
-// zstd streams are recognized by either their data-frame magic or a leading
-// skippable frame; the full stream (skippable bytes included) goes to the
-// decoder, which skips skippable frames itself.
-func decompress(r io.Reader) (io.ReadCloser, error) {
-	// Peek does not consume; the decompressor (or the passthrough) keeps
-	// reading from br so the peeked bytes are seen exactly once.
-	br := bufio.NewReader(r)
-	magic, err := br.Peek(4)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("remote: sniff layer: %w", err)
-	}
-	switch {
-	case len(magic) >= 2 && magic[0] == 0x1f && magic[1] == 0x8b:
-		gz, err := gzip.NewReader(br)
-		if err != nil {
-			return nil, fmt.Errorf("remote: gzip layer: %w", err)
-		}
-		return gz, nil
-	case looksLikeZstd(magic):
-		zr, err := zstd.NewReader(br)
-		if err != nil {
-			return nil, fmt.Errorf("remote: zstd layer: %w", err)
-		}
-		return zr.IOReadCloser(), nil
-	default:
-		return io.NopCloser(br), nil
-	}
-}
+func (l *cachedLayer) Compressed() (io.ReadCloser, error) { return l.r, nil }
 
-// multiCloser reads from Reader and closes its closers in order.
-type multiCloser struct {
-	io.Reader
-	closers []io.Closer
-}
+func (l *cachedLayer) Digest() (v1.Hash, error) { return l.d, nil }
 
-func (m *multiCloser) Close() error {
-	var first error
-	for _, c := range m.closers {
-		if err := c.Close(); err != nil && first == nil {
-			first = err
-		}
+// Size and MediaType satisfy partial.CompressedLayer; the Uncompressed()
+// path consults neither.
+func (l *cachedLayer) Size() (int64, error) { return 0, nil }
+
+func (l *cachedLayer) MediaType() (types.MediaType, error) { return types.OCILayer, nil }
+
+// decompress returns the layer's uncompressed tar stream, delegating both
+// detection (by content sniffing, not the manifest mediaType) and
+// decompression to ggcr — the same machinery behind layer.Uncompressed().
+// Mislabeled layers (descriptor says gzip, blob is a plain tar) are
+// accepted, matching docker's archive.DecompressStream and the
+// docker-archive source's openMaybeGzip. Short and empty streams that match
+// no magic pass through as plain. The returned reader closes r.
+func decompress(r io.ReadCloser, d v1.Hash) (io.ReadCloser, error) {
+	layer, err := partial.CompressedToLayer(&cachedLayer{r: r, d: d})
+	if err != nil {
+		r.Close()
+		return nil, err
 	}
-	return first
+	rc, err := layer.Uncompressed()
+	if err != nil {
+		r.Close()
+		return nil, fmt.Errorf("remote: layer %s: %w", d, err)
+	}
+	return rc, nil
 }
