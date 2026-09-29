@@ -173,6 +173,40 @@ func TestDecompress(t *testing.T) {
 	}
 }
 
+// TestDecompressZstdLeadingSkippableFrame — a zstd stream may open with
+// skippable frames (RFC 8878 §3.1.2, magic 0x184D2A50..0x184D2A5F
+// little-endian) ahead of its first data frame; the decoder skips them
+// itself. Regression: the sniff used to recognize only the data-frame
+// magic and routed such blobs to the plain branch, handing compressed
+// bytes to tar. Sweeps all 16 legal skippable magics with a
+// "skippable frame + zstd(tar)" input and asserts the original tar
+// comes back.
+func TestDecompressZstdLeadingSkippableFrame(t *testing.T) {
+	tarBytes := plainTarLayer(t)
+
+	var zs bytes.Buffer
+	zw, _ := zstd.NewWriter(&zs)
+	zw.Write(tarBytes)
+	zw.Close()
+
+	for magic := byte(0x50); magic <= 0x5f; magic++ {
+		// Skippable frame: 4-byte magic + 4-byte little-endian content size (0).
+		frame := []byte{magic, 0x2a, 0x4d, 0x18, 0x00, 0x00, 0x00, 0x00}
+		rc, err := decompress(io.MultiReader(bytes.NewReader(frame), bytes.NewReader(zs.Bytes())))
+		if err != nil {
+			t.Fatalf("skippable magic %#x: %v", magic, err)
+		}
+		got, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			t.Fatalf("skippable magic %#x: read: %v", magic, err)
+		}
+		if !bytes.Equal(got, tarBytes) {
+			t.Fatalf("skippable magic %#x: got %d bytes, want the original %d-byte tar", magic, len(got), len(tarBytes))
+		}
+	}
+}
+
 // TestLooksLikeReference — the export source detector accepts docker refs and
 // rejects obvious non-refs.
 func TestLooksLikeReference(t *testing.T) {

@@ -215,9 +215,20 @@ func (s *registrySource) Layers() ([]flatten.LayerOpener, error) {
 	return openers, nil
 }
 
-// zstdMagic is the four-byte zstd frame header, mirroring ggcr's internal
-// zstd.MagicHeader. The gzip magic (0x1f 0x8b) is inlined below.
+// zstdMagic is the four-byte zstd data-frame header, mirroring ggcr's
+// internal zstd.MagicHeader. The gzip magic (0x1f 0x8b) is inlined below.
 var zstdMagic = []byte{0x28, 0xb5, 0x2f, 0xfd}
+
+// isZstdSkippableFrame reports whether magic opens a zstd skippable frame
+// (RFC 8878 §3.1.2): little-endian 0x184D2A50..0x184D2A5F, i.e. first byte
+// 0x50..0x5f followed by 2a 4d 18. A stream may carry any number of these
+// ahead of its first data frame; the decoder skips them itself, so a blob
+// opening with one is still zstd, not a plain tar.
+func isZstdSkippableFrame(magic []byte) bool {
+	return len(magic) >= 4 &&
+		magic[0] >= 0x50 && magic[0] <= 0x5f &&
+		magic[1] == 0x2a && magic[2] == 0x4d && magic[3] == 0x18
+}
 
 // decompress wraps r with the decompressor implied by the layer's actual
 // content, sniffing the stream's leading magic bytes rather than trusting
@@ -226,6 +237,10 @@ var zstdMagic = []byte{0x28, 0xb5, 0x2f, 0xfd}
 // docker's archive.DecompressStream and ggcr's own layer.Uncompressed()
 // accept them by sniffing the same way, and flatten-ctl's docker-archive
 // path (flatten.openMaybeGzip) has always been sniff-based too.
+//
+// zstd streams are recognized by either their data-frame magic or a leading
+// skippable frame; the full stream (skippable bytes included) goes to the
+// decoder, which skips skippable frames itself.
 func decompress(r io.Reader) (io.ReadCloser, error) {
 	// Peek does not consume; the decompressor (or the passthrough) keeps
 	// reading from br so the peeked bytes are seen exactly once.
@@ -241,7 +256,7 @@ func decompress(r io.Reader) (io.ReadCloser, error) {
 			return nil, fmt.Errorf("remote: gzip layer: %w", err)
 		}
 		return gz, nil
-	case len(magic) >= 4 && bytes.Equal(magic, zstdMagic):
+	case len(magic) >= 4 && (bytes.Equal(magic, zstdMagic) || isZstdSkippableFrame(magic)):
 		zr, err := zstd.NewReader(br)
 		if err != nil {
 			return nil, fmt.Errorf("remote: zstd layer: %w", err)
