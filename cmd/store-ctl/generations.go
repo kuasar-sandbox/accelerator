@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
@@ -171,65 +170,6 @@ func renderGenerationList(generations []store.Generation) []byte {
 
 func cloneGenerations(generations []store.Generation) []store.Generation {
 	return append([]store.Generation(nil), generations...)
-}
-
-type generationManager struct {
-	handle  *generationSourceHandle
-	current atomic.Value // []store.Generation, immutable after Store
-}
-
-func newGenerationManager(ctx context.Context, handle *generationSourceHandle) (*generationManager, error) {
-	generations, err := handle.source.Load(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if err := store.ValidateGenerations(generations); err != nil {
-		return nil, err
-	}
-	manager := &generationManager{handle: handle}
-	manager.current.Store(cloneGenerations(generations))
-	return manager, nil
-}
-
-// Current returns the immutable current list. Callers must not modify it.
-func (m *generationManager) Current() []store.Generation {
-	return m.current.Load().([]store.Generation)
-}
-
-func (m *generationManager) Refresh(ctx context.Context) error {
-	generations, err := m.handle.source.Load(ctx)
-	if err != nil {
-		return err
-	}
-	if err := store.ValidateGenerations(generations); err != nil {
-		return err
-	}
-	m.current.Store(cloneGenerations(generations))
-	return nil
-}
-
-func (m *generationManager) Run(ctx context.Context, hup <-chan os.Signal, logError func(string, ...any)) {
-	var ticker *time.Ticker
-	var ticks <-chan time.Time
-	if m.handle.interval > 0 {
-		ticker = time.NewTicker(m.handle.interval)
-		ticks = ticker.C
-		defer ticker.Stop()
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticks:
-			if err := m.Refresh(ctx); err != nil {
-				logError("generation refresh failed; keeping previous list: %v", err)
-			}
-		case <-hup:
-			if err := m.Refresh(ctx); err != nil {
-				logError("generation SIGHUP refresh failed; keeping previous list: %v", err)
-			}
-		}
-	}
 }
 
 func (h *generationSourceHandle) readOnly() bool { return h.kind == generationSourceConfig }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"sync"
@@ -28,6 +29,21 @@ func cmdServe(args []string) {
 		fatal("%v", err)
 	}
 
+	term := make(chan os.Signal, 2)
+	hup := make(chan os.Signal, 1)
+	signal.Notify(term, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(hup, syscall.SIGHUP)
+	err = serveStore(*cfg, resolved, term, hup, os.Stderr, appstore.Run)
+	signal.Stop(hup)
+	signal.Stop(term)
+	if err != nil {
+		fatal("serve: %v", err)
+	}
+}
+
+type storeRunner func(context.Context, appstore.Config, appstore.Options) error
+
+func serveStore(cfg Config, resolved string, term, hup <-chan os.Signal, output io.Writer, run storeRunner) error {
 	reload := make(chan struct{}, 1)
 	opts := appstore.Options{Reload: reload}
 	if cfg.Generations.IsConfigSource() {
@@ -36,8 +52,6 @@ func cmdServe(args []string) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	signals := make(chan os.Signal, 2)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	done := make(chan struct{})
 	var signalWG sync.WaitGroup
 	signalWG.Add(1)
@@ -47,26 +61,21 @@ func cmdServe(args []string) {
 			select {
 			case <-done:
 				return
-			case sig := <-signals:
-				if sig == syscall.SIGHUP {
-					select {
-					case reload <- struct{}{}:
-					default:
-					}
-					continue
+			case <-hup:
+				select {
+				case reload <- struct{}{}:
+				default:
 				}
-				fmt.Fprintf(os.Stderr, "store-ctl: received %s, shutting down...\n", sig)
+			case sig := <-term:
+				fmt.Fprintf(output, "store-ctl: received %s, shutting down...\n", sig)
 				cancel()
 			}
 		}
 	}()
 
-	err = appstore.Run(ctx, *cfg, opts)
-	signal.Stop(signals)
+	err := run(ctx, cfg, opts)
 	close(done)
 	cancel()
 	signalWG.Wait()
-	if err != nil {
-		fatal("serve: %v", err)
-	}
+	return err
 }

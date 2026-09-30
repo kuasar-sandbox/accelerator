@@ -9,7 +9,6 @@ import (
 	"reflect"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -134,56 +133,17 @@ generations:
 	}
 }
 
-func TestConfigSourceSIGHUPReloadAndFailureRetention(t *testing.T) {
-	directory := t.TempDir()
-	configPath := filepath.Join(directory, "store.yaml")
-	root := filepath.Join(directory, "objects")
-	writeConfigGenerations(t, configPath, root, "    - G1\n")
-	cfg, err := LoadConfig(configPath, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	handle, err := openGenerationSource(context.Background(), cfg, configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manager, err := newGenerationManager(context.Background(), handle)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	writeConfigGenerations(t, configPath, root, "    - G1\n    - G1\n")
-	if err := manager.Refresh(context.Background()); err == nil {
-		t.Fatal("invalid refresh succeeded")
-	}
-	if got := manager.Current(); !reflect.DeepEqual(got, []store.Generation{"G1"}) {
-		t.Fatalf("failed refresh replaced current list: %v", got)
-	}
-
-	writeConfigGenerations(t, configPath, root, "    - G1\n    - G2\n")
-	ctx, cancel := context.WithCancel(context.Background())
-	hup := make(chan os.Signal, 1)
-	done := make(chan struct{})
-	go func() {
-		manager.Run(ctx, hup, func(string, ...any) {})
-		close(done)
-	}()
-	hup <- syscall.SIGHUP
-	deadline := time.After(2 * time.Second)
-	for !reflect.DeepEqual(manager.Current(), []store.Generation{"G1", "G2"}) {
-		select {
-		case <-deadline:
-			cancel()
-			<-done
-			t.Fatalf("SIGHUP did not refresh list: %v", manager.Current())
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
-	cancel()
-	<-done
+type fakeGenerationClient struct {
+	mu           sync.Mutex
+	body         []byte
+	etag         string
+	version      int
+	conflictOnce bool
+	conflictBody []byte
+	lastLimit    int64
 }
 
-func TestFileSourceMutationAndRetention(t *testing.T) {
+func TestFileSourceMutationPreservesOrder(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "meta", "generations")
 	source := &fileGenerationSource{path: path}
 	handle := &generationSourceHandle{source: source, kind: generationSourceFile, file: source}
@@ -195,65 +155,13 @@ func TestFileSourceMutationAndRetention(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	manager, err := newGenerationManager(context.Background(), handle)
+	got, err := source.Load(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := manager.Current(); !reflect.DeepEqual(got, []store.Generation{"G9", "G1"}) {
+	if !reflect.DeepEqual(got, []store.Generation{"G9", "G1"}) {
 		t.Fatalf("file order = %v", got)
 	}
-	writeText(t, path, "G9\nG9\n")
-	if err := manager.Refresh(context.Background()); err == nil {
-		t.Fatal("duplicate refresh succeeded")
-	}
-	if got := manager.Current(); !reflect.DeepEqual(got, []store.Generation{"G9", "G1"}) {
-		t.Fatalf("failed file refresh replaced list: %v", got)
-	}
-}
-
-func TestFileSourcePeriodicRefresh(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "generations")
-	writeText(t, path, "G1\n")
-	source := &fileGenerationSource{path: path}
-	handle := &generationSourceHandle{
-		source:   source,
-		kind:     generationSourceFile,
-		file:     source,
-		interval: 10 * time.Millisecond,
-	}
-	manager, err := newGenerationManager(context.Background(), handle)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		manager.Run(ctx, make(chan os.Signal), func(string, ...any) {})
-		close(done)
-	}()
-	writeText(t, path, "G1\nG2\n")
-	deadline := time.After(2 * time.Second)
-	for !reflect.DeepEqual(manager.Current(), []store.Generation{"G1", "G2"}) {
-		select {
-		case <-deadline:
-			cancel()
-			<-done
-			t.Fatalf("periodic refresh did not update list: %v", manager.Current())
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
-	cancel()
-	<-done
-}
-
-type fakeGenerationClient struct {
-	mu           sync.Mutex
-	body         []byte
-	etag         string
-	version      int
-	conflictOnce bool
-	conflictBody []byte
-	lastLimit    int64
 }
 
 func (f *fakeGenerationClient) GetLimited(_ context.Context, _ string, maxBytes int64) ([]byte, *stores3.ObjectMeta, error) {
@@ -336,60 +244,6 @@ func TestS3SourceCASReloadsBeforeRetry(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("CAS result = %v, want %v", got, want)
 	}
-}
-
-func TestS3SourcePeriodicRefreshPreservesOrderAndRetainsValidList(t *testing.T) {
-	client := &fakeGenerationClient{body: []byte("G9\nG1\nG5\n"), etag: "etag-1", version: 1}
-	source := &s3GenerationSource{client: client, key: "meta/generations"}
-	handle := &generationSourceHandle{
-		source:   source,
-		kind:     generationSourceS3,
-		s3:       source,
-		interval: 10 * time.Millisecond,
-	}
-	manager, err := newGenerationManager(context.Background(), handle)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantInitial := []store.Generation{"G9", "G1", "G5"}
-	if got := manager.Current(); !reflect.DeepEqual(got, wantInitial) {
-		t.Fatalf("S3 order = %v, want %v", got, wantInitial)
-	}
-
-	client.mu.Lock()
-	client.body = []byte("G9\nG9\n")
-	client.etag = "etag-2"
-	client.mu.Unlock()
-	if err := manager.Refresh(context.Background()); err == nil {
-		t.Fatal("invalid S3 refresh succeeded")
-	}
-	if got := manager.Current(); !reflect.DeepEqual(got, wantInitial) {
-		t.Fatalf("failed S3 refresh replaced valid list: %v", got)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		manager.Run(ctx, make(chan os.Signal), func(string, ...any) {})
-		close(done)
-	}()
-	client.mu.Lock()
-	client.body = []byte("G9\nG1\nG5\nG2\n")
-	client.etag = "etag-3"
-	client.mu.Unlock()
-	wantRefreshed := []store.Generation{"G9", "G1", "G5", "G2"}
-	deadline := time.After(2 * time.Second)
-	for !reflect.DeepEqual(manager.Current(), wantRefreshed) {
-		select {
-		case <-deadline:
-			cancel()
-			<-done
-			t.Fatalf("periodic S3 refresh did not update list: %v", manager.Current())
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
-	cancel()
-	<-done
 }
 
 func TestConfigSourceIsReadOnlyAndLastGenerationCannotBeRemoved(t *testing.T) {

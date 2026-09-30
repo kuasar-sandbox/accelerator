@@ -6,16 +6,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	pkgstore "github.com/kuasar-sandbox/accelerator/pkg/store"
 	storeconfig "github.com/kuasar-sandbox/accelerator/pkg/store/config"
 )
 
@@ -270,17 +273,25 @@ func TestBuiltInS3SourceLimitAndProviderError(t *testing.T) {
 
 func TestBuiltInS3CleanupClosesOwnedTransportOnly(t *testing.T) {
 	setGenerationCredentialEnvironment(t)
-	var idle, closed atomic.Int32
+	idle := make(chan struct{}, 1)
+	closed := make(chan struct{}, 1)
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("ETag", `"v"`)
 		_, _ = io.WriteString(w, "one\n")
 	}))
 	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
-		if state == http.StateIdle {
-			idle.Add(1)
+		var signal chan struct{}
+		switch state {
+		case http.StateIdle:
+			signal = idle
+		case http.StateClosed:
+			signal = closed
+		default:
+			return
 		}
-		if state == http.StateClosed {
-			closed.Add(1)
+		select {
+		case signal <- struct{}{}:
+		default:
 		}
 	}
 	server.Start()
@@ -290,23 +301,118 @@ func TestBuiltInS3CleanupClosesOwnedTransportOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = cleanup() })
 	if _, err := source.Load(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if idle.Load() == 0 {
+	// Client response completion does not synchronize the server ConnState hook.
+	select {
+	case <-idle:
+	case <-time.After(time.Second):
 		t.Fatal("connection did not become idle")
 	}
 	if err := cleanup(); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(time.Second)
-	for closed.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if closed.Load() == 0 {
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
 		t.Fatal("cleanup did not close owned transport")
 	}
 	if provider.closed.Load() {
 		t.Fatal("cleanup closed borrowed provider")
+	}
+}
+
+// periodicFailureWriter observes the actual controller failure publication.
+type periodicFailureWriter chan struct{}
+
+func (w periodicFailureWriter) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), "generation refresh failed") {
+		select {
+		case w <- struct{}{}:
+		default:
+		}
+	}
+	return len(p), nil
+}
+
+func TestBuiltInSourcesPeriodicRefreshPreservesOrderAndRetainsValidList(t *testing.T) {
+	for _, kind := range []string{"file", "s3"} {
+		t.Run(kind, func(t *testing.T) {
+			setGenerationCredentialEnvironment(t)
+			initial := "G9\nG1\nG5\n"
+			var cfg Config
+			var update func(string)
+			if kind == "file" {
+				path := filepath.Join(t.TempDir(), "generations")
+				update = func(body string) {
+					t.Helper()
+					if err := os.WriteFile(path+".next", []byte(body), 0600); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Rename(path+".next", path); err != nil {
+						t.Fatal(err)
+					}
+				}
+				cfg = Config{Generations: &storeconfig.GenerationsConfig{File: &storeconfig.GenerationFileConfig{Path: path}, RefreshInterval: "10ms"}}
+			} else {
+				var body atomic.Value
+				body.Store(initial)
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("ETag", `"test-version"`)
+					_, _ = io.WriteString(w, body.Load().(string))
+				}))
+				defer server.Close()
+				update = func(value string) { body.Store(value) }
+				cfg = generationS3Config(server.URL)
+				cfg.Generations.RefreshInterval = "10ms"
+			}
+			update(initial)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			source, closeSource, err := builtInGenerationSource(ctx, cfg, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeSource()
+			input, err := newGenerationInput(ctx, source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantInitial := []pkgstore.Generation{"G9", "G1", "G5"}
+			if got := input.current(); !reflect.DeepEqual(got, wantInitial) {
+				t.Fatalf("initial order=%v", got)
+			}
+			failures := make(periodicFailureWriter, 1)
+			stopped := make(chan struct{})
+			go func() { defer close(stopped); input.run(ctx, nil, slog.New(slog.NewTextHandler(failures, nil))) }()
+			defer func() {
+				cancel()
+				select {
+				case <-stopped:
+				case <-time.After(5 * time.Second):
+					t.Error("periodic source did not stop")
+				}
+			}()
+			update("G9\nG9\n")
+			select {
+			case <-failures:
+			case <-time.After(5 * time.Second):
+				t.Fatal("periodic invalid list was not observed")
+			}
+			if got := input.current(); !reflect.DeepEqual(got, wantInitial) {
+				t.Fatalf("invalid refresh replaced valid list: %v", got)
+			}
+			update("G9\nG1\nG5\nG2\n")
+			wantNext := []pkgstore.Generation{"G9", "G1", "G5", "G2"}
+			deadline := time.Now().Add(5 * time.Second)
+			for !reflect.DeepEqual(input.current(), wantNext) {
+				if time.Now().After(deadline) {
+					t.Fatalf("periodic refresh failed: %v", input.current())
+				}
+				time.Sleep(time.Millisecond)
+			}
+		})
 	}
 }
