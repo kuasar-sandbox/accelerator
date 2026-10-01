@@ -21,7 +21,10 @@ type OpenOptions struct {
 func BuildOptions(cfg runtime.RocksConfig) *OpenOptions {
 	bbto := grocksdb.NewDefaultBlockBasedTableOptions()
 
-	// BlockCache size = disk_bytes * mem_ratio
+	// Block+blob cache size = disk_bytes * mem_ratio. One LRU is shared:
+	// SST index/filter/data blocks and BlobDB payloads. Chunk values live
+	// in .blob files, not SST data blocks — a block-only cache never
+	// absorbs GetCF of a flushed chunk (restore SLO ≤5ms).
 	diskBytes, _ := util.ParseSize(cfg.DiskBytes)
 	if diskBytes == 0 {
 		diskBytes = 1 << 40 // 1 TiB default
@@ -30,11 +33,12 @@ func BuildOptions(cfg runtime.RocksConfig) *OpenOptions {
 	if memRatio <= 0 {
 		memRatio = 0.01
 	}
-	blockCacheBytes := uint64(float64(diskBytes) * memRatio)
-	if blockCacheBytes < 64<<20 {
-		blockCacheBytes = 64 << 20 // min 64 MiB
+	cacheBytes := uint64(float64(diskBytes) * memRatio)
+	if cacheBytes < 64<<20 {
+		cacheBytes = 64 << 20 // min 64 MiB
 	}
-	bbto.SetBlockCache(grocksdb.NewLRUCache(blockCacheBytes))
+	cache := grocksdb.NewLRUCache(cacheBytes)
+	bbto.SetBlockCache(cache)
 
 	// Block size
 	blockSize, _ := util.ParseSize(cfg.BlockSize)
@@ -63,9 +67,12 @@ func BuildOptions(cfg runtime.RocksConfig) *OpenOptions {
 	// No compression (encrypted ciphertext has high entropy)
 	dbOpts.SetCompression(grocksdb.NoCompression)
 
-	// Direct reads
+	// Direct I/O: reads and flush/compaction must match. Buffered flush
+	// + O_DIRECT GetCF on the same .blob file forces kernel writeback
+	// before the read and shows up as ≥8ms GetCF tails.
 	if runtime.BoolDefault(cfg.DirectReads, true) {
 		dbOpts.SetUseDirectReads(true)
+		dbOpts.SetUseDirectIOForFlushAndCompaction(true)
 	}
 
 	// Write buffer — default 256 MiB to reduce flush frequency under concurrent writes.
@@ -73,8 +80,7 @@ func BuildOptions(cfg runtime.RocksConfig) *OpenOptions {
 	if writeBufferBytes == 0 {
 		writeBufferBytes = 256 << 20 // 256 MiB default (was 64 MiB Go/RocksDB default)
 	}
-	dbOpts.SetWriteBufferSize(writeBufferBytes)
-	dbOpts.SetMaxWriteBufferNumber(4) // allow 4 concurrent memtables before stall
+	const maxWriteBuffers = 4
 
 	// Background jobs
 	maxJobs := cfg.MaxBackgroundJobs
@@ -83,6 +89,18 @@ func BuildOptions(cfg runtime.RocksConfig) *OpenOptions {
 	}
 	dbOpts.SetMaxBackgroundCompactions(maxJobs)
 	dbOpts.SetMaxBackgroundFlushes(2)
+
+	// CF options built from NewDefaultOptions() do not inherit DB-level
+	// write-buffer settings. write_buffer_size is per-CF; leaving chunk
+	// at RocksDB's 64 MiB flushed the memtable mid-restore (Write Buffer
+	// Full) and raced GetCF with a 60 MiB blob-file write.
+	applyCF := func(o *grocksdb.Options) {
+		o.SetBlockBasedTableFactory(bbto)
+		o.SetCompression(grocksdb.NoCompression)
+		o.SetWriteBufferSize(writeBufferBytes)
+		o.SetMaxWriteBufferNumber(maxWriteBuffers)
+	}
+	applyCF(dbOpts)
 
 	// BlobDB on chunk, manifest, and blob CFs.
 	//
@@ -103,21 +121,22 @@ func BuildOptions(cfg runtime.RocksConfig) *OpenOptions {
 		o.SetMinBlobSize(4 << 10)    // 4 KiB inline threshold
 		o.SetBlobFileSize(256 << 20) // 256 MiB per blob file
 		o.EnableBlobGC(true)         // background reclamation of stale blobs
+		o.SetBlobCache(cache)
+		// Flush already has the blob in memory. Prepopulate so a
+		// subsequent Direct-IO GetCF does not read it back from disk.
+		o.SetPrepopulateBlobCache(grocksdb.PrepopulateBlobFlushOnly)
 	}
 
 	chunkOpts := grocksdb.NewDefaultOptions()
-	chunkOpts.SetBlockBasedTableFactory(bbto)
-	chunkOpts.SetCompression(grocksdb.NoCompression)
+	applyCF(chunkOpts)
 	applyBlobDB(chunkOpts)
 
 	manifestOpts := grocksdb.NewDefaultOptions()
-	manifestOpts.SetBlockBasedTableFactory(bbto)
-	manifestOpts.SetCompression(grocksdb.NoCompression)
+	applyCF(manifestOpts)
 	applyBlobDB(manifestOpts)
 
 	blobOpts := grocksdb.NewDefaultOptions()
-	blobOpts.SetBlockBasedTableFactory(bbto)
-	blobOpts.SetCompression(grocksdb.NoCompression)
+	applyCF(blobOpts)
 	applyBlobDB(blobOpts)
 
 	return &OpenOptions{
