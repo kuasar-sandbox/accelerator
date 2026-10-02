@@ -1,6 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
+source "${E2E_LIB:?E2E_LIB is required}/common.sh"
+require_binary store-ctl
+require_binary manifest-ctl
+require_binary cache-ctl
+require_binary flatten-ctl
+
 # E2E test for rolling EC membership change via SIGHUP.
 #
 # Layout: 6 shard peers + 1 origin (store-ctl) + 1 tiered client.
@@ -18,16 +24,10 @@ set -euo pipefail
 # This is the "stability" guarantee: rolling 1-peer replacement must
 # not force cache invalidation — surviving peers keep serving their
 # existing shards.
-#
-# Usage:
-#   bash test/e2e/e2e_cluster_rolling.sh
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BIN="${BIN:-$PROJECT_ROOT/bin}"
 TMPDIR=$(mktemp -d /tmp/acc-cluster-e2e-XXXXXX)
 E2E_PORT_LEASE_FILE="$TMPDIR/ports"
-source "$SCRIPT_DIR/lib/port_lease.sh"
+source "$E2E_LIB/accelerator/port_lease.sh"
 KEY=$(openssl rand -hex 32)
 
 PASS=0
@@ -59,7 +59,7 @@ assert_eq() {
 wait_ready() {
     local endpoint=$1
     for i in $(seq 1 50); do
-        if "$BIN/cache-ctl" ping --endpoint "$endpoint" 2>/dev/null | grep -q SERVING; then
+        if "$BIN/cache-ctl" ping --endpoint "$endpoint" 2>/dev/null | grep -Fxq SERVING; then
             return 0
         fi
         sleep 0.1

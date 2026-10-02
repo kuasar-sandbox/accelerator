@@ -1,30 +1,26 @@
 #!/bin/bash
 set -euo pipefail
 
-# E2E test for cache-ctl + manifest-ctl integration.
-# Tests embedded and Redis-compatible local/shard/tiered modes.
-#
-# Usage:
-#   bash test/e2e/e2e_cache.sh
+source "${E2E_LIB:?E2E_LIB is required}/common.sh"
+require_command timeout
+require_binary store-ctl
+require_binary manifest-ctl
+require_binary cache-ctl
+require_binary flatten-ctl
+REDIS_SERVER="${REDIS_SERVER:-redis-server}"
+require_command "$REDIS_SERVER"
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BIN="${BIN:-$PROJECT_ROOT/bin}"
+# Prepared tiered/EC/Redis cache correctness.
+# Run with the platform runner: e2e run --include storage.tiered-cache.sh.
+
 TMPDIR=$(mktemp -d /tmp/acc-cache-e2e-XXXXXX)
 E2E_PORT_LEASE_FILE="$TMPDIR/ports"
-source "$SCRIPT_DIR/lib/port_lease.sh"
+source "$E2E_LIB/accelerator/port_lease.sh"
 KEY=$(openssl rand -hex 32)
 
 PASS=0
 FAIL=0
 PIDS=()
-REDIS_SERVER="${REDIS_SERVER:-$(command -v redis-server || true)}"
-
-if [ -z "$REDIS_SERVER" ]; then
-    echo "ERROR: redis-server is required for Redis-compatible cache E2E" >&2
-    exit 1
-fi
-
 cleanup() {
     # A SIGSTOP-based slow-peer test may abort before its matching SIGCONT.
     # Resume every child first so TERM + wait cannot strand cleanup.
@@ -61,7 +57,7 @@ assert_eq() {
 wait_ready() {
     local endpoint=$1
     for i in $(seq 1 50); do
-        if "$BIN/cache-ctl" ping --endpoint "$endpoint" 2>/dev/null | grep -q SERVING; then
+        if "$BIN/cache-ctl" ping --endpoint "$endpoint" 2>/dev/null | grep -Fxq SERVING; then
             return 0
         fi
         sleep 0.1
@@ -280,177 +276,6 @@ for chunk_key in "${MAIN_CHUNK_KEYS[@]}"; do
     MAIN_CACHE_OBJECTS+=("chunk:$chunk_key")
 done
 
-# ============================================================
-echo ""
-echo "=== Test 0: store-ctl standalone roundtrip ==="
-# Write + read a distinct manifest through manifest-ctl → store-ctl
-# to prove the standalone path is healthy before any cache-ctl
-# tests run. Uses a fresh 64 KiB payload so it doesn't collide with
-# the main artifact's chunks.
-dd if=/dev/urandom of="$TMPDIR/store0-payload.bin" bs=1024 count=64 2>/dev/null
-"$BIN/flatten-ctl" tar stream -f "$TMPDIR/store0.bin" \
-    "store0-payload.bin:$TMPDIR/store0-payload.bin"
-MKEY0=$("$BIN/manifest-ctl" store $COMMON --no-progress "$TMPDIR/store0.bin")
-"$BIN/manifest-ctl" get-manifest $COMMON --output "$TMPDIR/store0.manifest.rt" "$MKEY0" 2>&1
-"$BIN/manifest-ctl" load $COMMON --output "$TMPDIR/store0.rt" --no-progress "$MKEY0" 2>&1
-H_ORIG=$(payload_hash "$TMPDIR/store0.bin")
-H_RT=$(payload_hash "$TMPDIR/store0.rt")
-assert_eq "$H_ORIG" "$H_RT" "store-ctl standalone store + get-manifest + load roundtrip (one-step store)"
-
-# ============================================================
-echo ""
-echo "=== Test 1: local mode — object put/get roundtrip ==="
-LOCAL_PORT=$(e2e_free_port)
-LOCAL_HEALTH_PORT=$(e2e_free_port)
-cat > "$TMPDIR/local.yaml" <<EOF
-mode: local
-type: embedded
-listen: 127.0.0.1:$LOCAL_PORT
-health_listen: 127.0.0.1:$LOCAL_HEALTH_PORT
-rpc_timeout: 2s
-freq:
-  counters: 1M
-  reset_after: 100K
-rocks:
-  path: $TMPDIR/rocks-local
-  disk_bytes: 1GiB
-  mem_ratio: 0.05
-  direct_reads: false
-  bloom_bits: 10
-EOF
-
-"$BIN/cache-ctl" serve --config "$TMPDIR/local.yaml" &
-PIDS+=($!)
-wait_ready "127.0.0.1:$LOCAL_HEALTH_PORT"
-
-TEST_HASH="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-echo -n "test-value-local" | "$BIN/cache-ctl" object put --endpoint "127.0.0.1:$LOCAL_PORT" --namespace chunk --hash "$TEST_HASH" --value -
-GOT=$("$BIN/cache-ctl" object get --endpoint "127.0.0.1:$LOCAL_PORT" --namespace chunk --hash "$TEST_HASH")
-assert_eq "test-value-local" "$GOT" "local object put/get roundtrip"
-
-# ============================================================
-echo ""
-echo "=== Test 2: local mode — shard put/get also works (unified handler) ==="
-# shard put attaches [idx][total] prefix to the raw data before sending;
-# shard get parses the prefix off and echoes only the raw body to stdout,
-# so the assertion matches the input verbatim.
-echo -n "shard-on-local" | "$BIN/cache-ctl" shard put --endpoint "127.0.0.1:$LOCAL_PORT" --namespace chunk --hash "$TEST_HASH" --idx 0 --total 5 --value -
-GOT=$("$BIN/cache-ctl" shard get --endpoint "127.0.0.1:$LOCAL_PORT" --namespace chunk --hash "$TEST_HASH" 2>/dev/null)
-assert_eq "shard-on-local" "$GOT" "shard put/get on local mode (unified handler)"
-
-# ============================================================
-echo ""
-echo "=== Test 3: shard mode — shard put/get roundtrip ==="
-SHARD_PORT=$(e2e_free_port)
-SHARD_HEALTH_PORT=$(e2e_free_port)
-cat > "$TMPDIR/shard.yaml" <<EOF
-mode: shard
-type: embedded
-listen: 127.0.0.1:$SHARD_PORT
-health_listen: 127.0.0.1:$SHARD_HEALTH_PORT
-rpc_timeout: 2s
-freq:
-  counters: 1M
-  reset_after: 100K
-rocks:
-  path: $TMPDIR/rocks-shard
-  disk_bytes: 1GiB
-  mem_ratio: 0.05
-  direct_reads: false
-  bloom_bits: 10
-EOF
-
-"$BIN/cache-ctl" serve --config "$TMPDIR/shard.yaml" &
-PIDS+=($!)
-wait_ready "127.0.0.1:$SHARD_HEALTH_PORT"
-
-echo -n "shard-data-idx3" | "$BIN/cache-ctl" shard put --endpoint "127.0.0.1:$SHARD_PORT" --namespace chunk --hash "$TEST_HASH" --idx 3 --total 5 --value -
-GOT=$("$BIN/cache-ctl" shard get --endpoint "127.0.0.1:$SHARD_PORT" --namespace chunk --hash "$TEST_HASH" 2>/dev/null)
-assert_eq "shard-data-idx3" "$GOT" "shard put/get roundtrip"
-
-# ============================================================
-echo ""
-echo "=== Test 4: shard mode — object put/get also works (unified handler) ==="
-echo -n "obj-on-shard" | "$BIN/cache-ctl" object put --endpoint "127.0.0.1:$SHARD_PORT" --namespace chunk --hash "$TEST_HASH" --value -
-GOT=$("$BIN/cache-ctl" object get --endpoint "127.0.0.1:$SHARD_PORT" --namespace chunk --hash "$TEST_HASH")
-assert_eq "obj-on-shard" "$GOT" "object put/get on shard mode (unified handler)"
-
-# ============================================================
-echo ""
-echo "=== Test 5: tiered mode (embedded only) — manifest-ctl load through cache ==="
-start_store_reader embedded-origin
-TIERED_ORIGIN_PORT=$STORE_READER_PORT
-TIERED_ORIGIN_PID=$STORE_READER_PID
-TIERED_PORT=$(e2e_free_port)
-TIERED_HEALTH_PORT=$(e2e_free_port)
-cat > "$TMPDIR/tiered.yaml" <<EOF
-mode: tiered
-listen: 127.0.0.1:$TIERED_PORT
-health_listen: 127.0.0.1:$TIERED_HEALTH_PORT
-rpc_timeout: 5s
-freq:
-  counters: 1M
-  reset_after: 100K
-tiers:
-  - type: embedded
-    rocks:
-      path: $TMPDIR/rocks-tiered
-      disk_bytes: 1GiB
-      mem_ratio: 0.05
-      direct_reads: false
-      bloom_bits: 10
-origin:
-  type: store
-  store:
-    endpoint: 127.0.0.1:$TIERED_ORIGIN_PORT
-    pool: 2
-    timeout: 2s
-  max_inflight: 16
-EOF
-
-"$BIN/cache-ctl" serve --config "$TMPDIR/tiered.yaml" &
-TIERED_PID=$!
-PIDS+=($TIERED_PID)
-wait_ready "127.0.0.1:$TIERED_HEALTH_PORT"
-TIERED_MANIFEST_CONFIG=$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")
-
-# Load via cache (first read — cold, fills embedded from origin).
-"$BIN/manifest-ctl" load --manifest-config "$TIERED_MANIFEST_CONFIG" \
-    --output "$TMPDIR/test-cached.bin" --no-progress "$MKEY" 2>&1
-CACHED_HASH=$(payload_hash "$TMPDIR/test-cached.bin")
-assert_eq "$ORIG_HASH" "$CACHED_HASH" "tiered load roundtrip (cold)"
-kill "$TIERED_ORIGIN_PID" 2>/dev/null || true
-wait "$TIERED_ORIGIN_PID" 2>/dev/null || true
-if wait_manifest_load "$TIERED_MANIFEST_CONFIG" "$TMPDIR/test-embedded-probe.bin" \
-    "$MKEY" "$ORIG_HASH"; then
-    ok "tiered embedded cold fill became readable with origin stopped"
-else
-    fail "tiered embedded cold fill did not become readable with origin stopped"
-    exit 1
-fi
-
-# ============================================================
-echo ""
-echo "=== Test 6: tiered mode — warm read (second load hits embedded cache) ==="
-"$BIN/manifest-ctl" load --manifest-config "$TIERED_MANIFEST_CONFIG" \
-    --output "$TMPDIR/test-warm.bin" --no-progress "$MKEY" 2>&1
-WARM_HASH=$(payload_hash "$TMPDIR/test-warm.bin")
-assert_eq "$ORIG_HASH" "$WARM_HASH" "tiered embedded warm load without origin"
-
-# ============================================================
-echo ""
-echo "=== Test 7: tiered mode — object put returns error (writes not supported) ==="
-PUT_OUT=$("$BIN/cache-ctl" object put --endpoint "127.0.0.1:$TIERED_PORT" --namespace chunk --hash "$TEST_HASH" --value /dev/null 2>&1 || true)
-if echo "$PUT_OUT" | grep -qi "not supported\|error"; then
-    ok "object put on tiered mode returns error"
-else
-    fail "object put on tiered mode should return error (got: $PUT_OUT)"
-fi
-kill "$TIERED_PID" 2>/dev/null || true
-wait "$TIERED_PID" 2>/dev/null || true
-
-# ============================================================
-echo ""
 echo "=== Test 8: 5-node shard cluster + tiered EC mode ==="
 
 SHARD_PORTS=()
@@ -682,15 +507,16 @@ origin:
     timeout: 2s
   max_inflight: 16
 EOF
-# Run in foreground; do NOT push PID to PIDS (process is expected to
-# exit on its own).
-if ERR_OUT=$("$BIN/cache-ctl" serve --config "$TMPDIR/upstream-bad.yaml" 2>&1); then
+# Bound the negative test: accepting the invalid upstream must fail, not hang.
+# timeout owns and reaps the process; it is never treated as the expected error.
+if ERR_OUT=$(timeout --signal=TERM --kill-after=1s 5s "$BIN/cache-ctl" serve --config "$TMPDIR/upstream-bad.yaml" 2>&1); then
     fail "upstream bad endpoint should have rejected startup (exited 0; output: $ERR_OUT)"
 else
-    if echo "$ERR_OUT" | grep -qiE "dial reader|dial writer|upstream.*connection refused|connection refused"; then
+    ERR_STATUS=$?
+    if [ "$ERR_STATUS" -eq 1 ] && grep -qiE "dial reader|dial writer|upstream.*connection refused|connection refused" <<<"$ERR_OUT"; then
         ok "upstream bad endpoint rejected at startup"
     else
-        fail "upstream bad endpoint error should mention dial/connection refused (got: $ERR_OUT)"
+        fail "upstream bad endpoint did not reject startup as expected (exit=$ERR_STATUS; output: $ERR_OUT)"
     fi
 fi
 

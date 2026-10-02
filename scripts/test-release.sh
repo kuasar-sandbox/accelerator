@@ -222,10 +222,30 @@ if grep -R -Fq 'queue: max' "$ROOT/.github/workflows"; then
   fail "workflows use the unsupported concurrency queue key"
 fi
 
-for entrypoint in test/e2e/e2e_manifest.sh test/e2e/e2e_obs.sh \
-  test/e2e/run_all.sh; do
-  [ "$(git -C "$ROOT" ls-files -s -- "$entrypoint" | awk '{print $1}')" = 100755 ] \
-    || fail "$entrypoint is not executable in the Git index"
+expected_cases=(
+  test/e2e/cases/image.manifest.sh
+  test/e2e/cases/storage.cache-membership.sh
+  test/e2e/cases/storage.cache.sh
+  test/e2e/cases/storage.obs.sh
+  test/e2e/cases/storage.store-cache.sh
+  test/e2e/cases/storage.tiered-cache.sh
+)
+mapfile -t actual_cases < <(git -C "$ROOT" ls-files -- 'test/e2e/cases/*.sh' | sort)
+mapfile -t sorted_expected_cases < <(printf '%s\n' "${expected_cases[@]}" | sort)
+[ "${#actual_cases[@]}" -eq "${#sorted_expected_cases[@]}" ] \
+  || fail "unexpected number of accelerator product E2E cases"
+for i in "${!sorted_expected_cases[@]}"; do
+  [ "${actual_cases[$i]}" = "${sorted_expected_cases[$i]}" ] \
+    || fail "accelerator E2E case set differs from the six prepared cases"
+done
+for case_path in "${expected_cases[@]}"; do
+  [ "$(git -C "$ROOT" ls-files -s -- "$case_path" | awk '{print $1}')" = 100644 ] \
+    || fail "$case_path must be a non-executable platform case file (100644)"
+done
+for retired in test/e2e/e2e_manifest.sh test/e2e/e2e_obs.sh test/e2e/run_all.sh; do
+  if git -C "$ROOT" ls-files --error-unmatch -- "$retired" >/dev/null 2>&1; then
+    fail "$retired is retired and must not remain in the source tree"
+  fi
 done
 
 mkdir -p "$TMP/bin" "$TMP/src" "$TMP/rocksdb"

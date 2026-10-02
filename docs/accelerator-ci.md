@@ -22,14 +22,45 @@ RocksDB, libstdc++ and libgcc; required GLIBC versions may not exceed the declar
 2.38 baseline. ABI failures stop packaging. Native recipes, checksums, licenses,
 source inventories and link-map validation remain required.
 
-## Owner E2E and local evidence
+## Prepared product E2E and local evidence
 
-The [accelerator E2E guide](../test/e2e/README.md) lists the assembled-binary,
-EROFS, Redis, scratch-storage and privilege prerequisites and each required
-flatten, manifest, store and cache case. Keep its complete helper tree with the
-owner suite. Local filesystem/cache and S3-compatible fixtures demonstrate local
-behavior; they do not establish real cloud coverage. Credentialed OBS remains
-an explicit `OBS_E2E=1` run. An excluded cloud case is not a pass.
+The [accelerator E2E guide](../test/e2e/README.md) lists the prepared-product,
+EROFS, Redis, scratch-storage and privilege prerequisites and each accelerator
+`storage.*.sh` / `image.*.sh` product case. Product E2E is executed only through
+the platform-owned prepared-workspace runner; accelerator no longer owns a
+`run_all.sh` or an owner-suite entry point. Local filesystem/cache and
+S3-compatible fixtures demonstrate local behavior; they do not establish real
+cloud coverage.
+
+For ordinary non-credentialed validation, prepare a workspace from the exact
+prebuilt platform release and explicitly select the five non-OBS accelerator
+cases:
+
+```bash
+RUNNER=/path/to/platform/test/e2e/e2e
+RELEASE_DIR=/path/to/prebuilt/platform-release
+WORK=/tmp/kuasar-e2e
+
+"$RUNNER" prepare --release-dir "$RELEASE_DIR" --workdir "$WORK"
+"$RUNNER" run --workdir "$WORK" \
+  --include storage.cache.sh \
+  --include storage.tiered-cache.sh \
+  --include storage.cache-membership.sh \
+  --include storage.store-cache.sh \
+  --include image.manifest.sh
+```
+
+Credentialed OBS remains opt-in and is selected by case ID, not by an
+`OBS_E2E` marker. With `OBS_BUCKET`, `OBS_ENDPOINT`, `OBS_AK` and `OBS_SK`
+explicitly configured, run the same prepared workspace with:
+
+```bash
+"$RUNNER" run --workdir "$WORK" --include storage.obs.sh
+```
+
+A selected cloud case that cannot satisfy its endpoint or credential
+prerequisites fails; an excluded cloud case is not a pass. CI uses the same
+platform runner and exact admitted case IDs.
 
 Offline checks from the accelerator checkout:
 
@@ -43,4 +74,4 @@ The workflow checks parse the component's actual YAML and exercise its allocatio
 workspace and ABI contracts. Release tests use synthetic binaries/link maps and
 mocked API responses. Script tests exercise fixtures and lifecycle boundaries;
 they do not complete the numbered real E2E assertions. Passing these checks is
-not evidence of a real RocksDB build, actual owner E2E or cloud qualification.
+not evidence of a real RocksDB build, prepared product E2E or cloud qualification.

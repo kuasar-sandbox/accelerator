@@ -63,6 +63,8 @@ type Config struct {
 	// layers that needed fetching (cache hits are not counted). Set by the
 	// CLI to render pull progress; not serialised.
 	OnPullProgress func(done, total int) `yaml:"-"`
+	// OnPullRetry reports each outer retry, including resolve/config retries.
+	OnPullRetry func(PullRetryEvent) `yaml:"-"`
 
 	platform  v1.Platform       // parsed from Platform in normalize
 	maxSize   int64             // parsed from Cache.MaxSize (bytes; 0 = unlimited)

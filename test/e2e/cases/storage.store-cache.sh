@@ -1,6 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
+source "${E2E_LIB:?E2E_LIB is required}/common.sh"
+require_binary store-ctl
+require_binary manifest-ctl
+require_binary cache-ctl
+require_binary flatten-ctl
+
 # E2E test for store-ctl's embedded read-only cache wire server
 # (cache_listen). Proves store-ctl can serve the cache wire protocol —
 # chunk / manifest / blob — straight over its backend, read-only, so cache
@@ -8,17 +14,12 @@ set -euo pipefail
 #
 # Self-contained: store-ctl + manifest-ctl + cache-ctl, with flatten-ctl used
 # only to write strict tarstream fixtures. Does not exercise the tiered/EC
-# chain (see e2e_cache.sh for that).
-#
-# Usage:
-#   bash test/e2e/e2e_store_cache_listen.sh
+# chain.
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BIN="${BIN:-$PROJECT_ROOT/bin}"
 TMPDIR=$(mktemp -d /tmp/acc-store-cache-e2e-XXXXXX)
 E2E_PORT_LEASE_FILE="$TMPDIR/ports"
-source "$SCRIPT_DIR/lib/port_lease.sh"
+[ -r "$E2E_LIB/accelerator/port_lease.sh" ] || e2e_fail "missing prepared accelerator helper: port_lease.sh"
+source "$E2E_LIB/accelerator/port_lease.sh"
 KEY=$(openssl rand -hex 32)
 
 PASS=0
@@ -130,27 +131,34 @@ assert_eq "$H_GRPC" "$H_WIRE" "cache_listen manifest bytes match the store gRPC"
 # ============================================================
 echo ""
 echo "=== Test 2: blob namespace (0x03) is wired end-to-end ==="
-# No blob has been written, so an absent blob key is a clean MISS — this
-# proves wire namespace 0x03 routes to PartitionBlob rather than erroring
-# as an unknown namespace.
+# No blob has been written. cache-ctl defines a cache MISS as exit status 1
+# plus the exact MISS diagnostic. Any transport/backend/protocol error is a
+# different result and must fail this selected product case.
 ABSENT="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-BLOB_OUT=$("$BIN/cache-ctl" object get --endpoint "$STORE_CACHE_EP" --namespace blob --hash "$ABSENT" 2>&1 || true)
-if echo "$BLOB_OUT" | grep -qiE "unknown|unsupported|protocol"; then
-    fail "blob namespace should be accepted (got: $BLOB_OUT)"
+set +e
+BLOB_OUT=$("$BIN/cache-ctl" object get --endpoint "$STORE_CACHE_EP" --namespace blob --hash "$ABSENT" 2>&1)
+BLOB_STATUS=$?
+set -e
+if [ "$BLOB_STATUS" -eq 1 ] && [ "$BLOB_OUT" = "MISS" ]; then
+    ok "blob namespace accepted; absent key returned the expected MISS"
 else
-    ok "blob namespace accepted; absent key returns a clean miss ($BLOB_OUT)"
+    fail "blob namespace did not return an explicit MISS (status=$BLOB_STATUS output=$BLOB_OUT)"
 fi
 
 # ============================================================
 echo ""
 echo "=== Test 3: read-only — writes are rejected ==="
 # cache_listen is a read path; ObjectPut must be refused (writes go through
-# the store gRPC).
-PUT_OUT=$("$BIN/cache-ctl" object put --endpoint "$STORE_CACHE_EP" --namespace chunk --hash "$ABSENT" --value /dev/null 2>&1 || true)
-if echo "$PUT_OUT" | grep -qi "not supported\|error"; then
+# the store gRPC). Require both a failing status and the product's rejection
+# diagnostic so an unrelated command/transport failure cannot masquerade as PASS.
+set +e
+PUT_OUT=$("$BIN/cache-ctl" object put --endpoint "$STORE_CACHE_EP" --namespace chunk --hash "$ABSENT" --value /dev/null 2>&1)
+PUT_STATUS=$?
+set -e
+if [ "$PUT_STATUS" -ne 0 ] && echo "$PUT_OUT" | grep -qi "not supported"; then
     ok "object put rejected (writes not supported)"
 else
-    fail "object put should be rejected (got: $PUT_OUT)"
+    fail "object put did not produce the expected read-only rejection (status=$PUT_STATUS output=$PUT_OUT)"
 fi
 
 # ============================================================
