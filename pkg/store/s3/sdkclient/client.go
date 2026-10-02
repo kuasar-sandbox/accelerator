@@ -261,7 +261,7 @@ func (c *ownedHTTPClient) CloseIdleConnections() { c.transport.CloseIdleConnecti
 
 func limitedRedirect(req *http.Request, via []*http.Request) error {
 	if req.URL.String() == badHTTPRedirectLocation {
-		req.Response.Header.Del(badHTTPRedirectLocation)
+		req.Response.Header.Del("Location")
 		return http.ErrUseLastResponse
 	}
 	if req.Response.StatusCode != http.StatusTemporaryRedirect && req.Response.StatusCode != http.StatusPermanentRedirect {
