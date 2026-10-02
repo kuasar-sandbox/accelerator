@@ -1,4 +1,4 @@
-package main
+package cache
 
 import (
 	"errors"
@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuasar-sandbox/accelerator/pkg/cache"
+	pkgcache "github.com/kuasar-sandbox/accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/client"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/rocks"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/runtime"
@@ -114,7 +114,7 @@ func TestBuildTieredChain_EmbeddedOnly(t *testing.T) {
 	if comps.EmbeddedStore == nil {
 		t.Fatal("EmbeddedStore should be non-nil for embedded tier")
 	}
-	if _, ok := comps.Tiers[0].(cache.Semaphore); ok {
+	if _, ok := comps.Tiers[0].(pkgcache.Semaphore); ok {
 		t.Fatal("unlimited embedded tier should remain unwrapped")
 	}
 	// Sketch-construction invariant is covered by rocks package tests;
@@ -130,8 +130,8 @@ func TestBuildTieredChain_AppliesTierMaxInflight(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer comps.Close()
-	if _, ok := comps.Tiers[0].(cache.Semaphore); !ok {
-		t.Fatalf("limited tier type %T does not implement cache.Semaphore", comps.Tiers[0])
+	if _, ok := comps.Tiers[0].(pkgcache.Semaphore); !ok {
+		t.Fatalf("limited tier type %T does not implement pkgcache.Semaphore", comps.Tiers[0])
 	}
 	if comps.TierSpecs[0].EmbeddedStore == nil {
 		t.Fatal("limiting the tier discarded its concrete Info reference")

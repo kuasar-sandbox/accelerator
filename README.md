@@ -28,6 +28,7 @@ The downstream import surface is kept small and mostly pure Go, so consumers suc
 | `pkg/manifest` and subpackages | Content organization, chunking, encryption, ingest, fetch, and prefetch |
 | `pkg/store` and `pkg/store/client` | Content-store protocol and client |
 | `pkg/cache` and `pkg/cache/client` | Cache protocol, local/sharded/tiered composition, and clients |
+| `app/store` and `app/cache` | Complete reusable Store/Cache service lifecycles for official and custom executables |
 | `pkg/tarstream` | Sparse local transport artifact with identity and integrity metadata |
 | `pkg/flatten`, `pkg/image`, `pkg/remote`, `pkg/tar` | OCI/directory retrieval, image configuration, and EROFS flattening primitives |
 
@@ -91,7 +92,7 @@ The three services can be deployed independently of the full platform:
 - use `manifest-ctl` to ingest or fetch sparse artifacts;
 - run `store-ctl` with a filesystem root or an S3-compatible endpoint;
 - run `cache-ctl` in a local, sharded, or tiered topology;
-- use the exported packages in another Go service without importing heavy backends.
+- link `app/store.Run` or `app/cache.Run` into a custom service binary. The official CLIs are peer callers of these same lifecycle functions; custom binaries do not exec or depend on `store-ctl`/`cache-ctl`.
 
 Configuration examples must use local paths, documentation-reserved endpoints, and placeholder credentials. Production deployments should use protected endpoints, explicit resource budgets, durable authoritative storage, and observability appropriate to the selected cache topology.
 

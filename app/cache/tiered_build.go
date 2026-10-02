@@ -1,11 +1,11 @@
-package main
+package cache
 
 import (
 	"errors"
 	"fmt"
 	"time"
 
-	"github.com/kuasar-sandbox/accelerator/pkg/cache"
+	pkgcache "github.com/kuasar-sandbox/accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/client"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/ec"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/redisstore"
@@ -33,7 +33,7 @@ func parseDurationOrDefault(s string, def time.Duration) time.Duration {
 // managed to construct before the failure (partial-assembly safety).
 type tieredComponents struct {
 	// Tiers is the tier chain in YAML declaration order — never reordered.
-	Tiers []cache.Tier
+	Tiers []pkgcache.Tier
 
 	// TierSpecs is parallel to Tiers and carries tier type + concrete
 	// refs (rocks.Store / ec.Tier / upstream endpoint) for the Info
@@ -64,8 +64,8 @@ type tieredComponents struct {
 // blobPool is threaded into every wire-client-bearing tier (EC peers,
 // upstream) so 512KB-ish read payloads come from a shared pool instead
 // of fresh make() calls on every ReadResponse. Pass nil to fall back to
-// cache.DefaultPool (no pooling).
-func buildTieredChain(cfg *runtime.Config, blobPool cache.BlobPool) (*tieredComponents, error) {
+// pkgcache.DefaultPool (no pooling).
+func buildTieredChain(cfg *runtime.Config, blobPool pkgcache.BlobPool) (*tieredComponents, error) {
 	comps := &tieredComponents{}
 	var closers []func() error
 
@@ -79,8 +79,7 @@ func buildTieredChain(cfg *runtime.Config, blobPool cache.BlobPool) (*tieredComp
 		return errors.Join(errs...)
 	}
 	rollback := func(wrapped error) (*tieredComponents, error) {
-		_ = closeAll()
-		return nil, wrapped
+		return nil, errors.Join(wrapped, closeAll())
 	}
 
 	for i, t := range cfg.Tiers {
@@ -105,8 +104,8 @@ func buildTieredChain(cfg *runtime.Config, blobPool cache.BlobPool) (*tieredComp
 			}
 			closers = append(closers, store.Close)
 			comps.EmbeddedStore = store
-			// rocks.Interface implements cache.Tier directly — no wrapper.
-			comps.Tiers = append(comps.Tiers, cache.NewTierAdapter(store, t.MaxInflight))
+			// rocks.Interface implements pkgcache.Tier directly — no wrapper.
+			comps.Tiers = append(comps.Tiers, pkgcache.NewTierAdapter(store, t.MaxInflight))
 			comps.TierSpecs = append(comps.TierSpecs, TierSpec{
 				Type:          "embedded",
 				EmbeddedStore: store,
@@ -152,7 +151,7 @@ func buildTieredChain(cfg *runtime.Config, blobPool cache.BlobPool) (*tieredComp
 				return rollback(fmt.Errorf("tiered: tiers[%d] (ec): create tier: %w", i, err))
 			}
 			closers = append(closers, ecTier.Close)
-			comps.Tiers = append(comps.Tiers, cache.NewTierAdapter(ecTier, t.MaxInflight))
+			comps.Tiers = append(comps.Tiers, pkgcache.NewTierAdapter(ecTier, t.MaxInflight))
 			comps.TierSpecs = append(comps.TierSpecs, TierSpec{
 				Type: "ec",
 				EC:   ecTier,
@@ -177,7 +176,7 @@ func buildTieredChain(cfg *runtime.Config, blobPool cache.BlobPool) (*tieredComp
 				return rollback(fmt.Errorf("tiered: tiers[%d] (upstream): dial %s: %w", i, t.Endpoint, err))
 			}
 			closers = append(closers, c.Close)
-			comps.Tiers = append(comps.Tiers, cache.NewTierAdapter(c, t.MaxInflight))
+			comps.Tiers = append(comps.Tiers, pkgcache.NewTierAdapter(c, t.MaxInflight))
 			comps.TierSpecs = append(comps.TierSpecs, TierSpec{
 				Type:       "upstream",
 				UpstreamEP: t.Endpoint,

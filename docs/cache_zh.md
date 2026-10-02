@@ -924,6 +924,50 @@ origin 与 tiered 并扫并发。使用 [procmon.sh](../test/scripts/procmon.sh)
   “网卡必先满”“CPU 通常不影响”不是与硬件无关的事实。联合测量网络、磁盘、CPU、
   并发与时延;让实测热集驻留可能有益,但架构不自动带来固定数量级收益。
 
+
+## 8. 可复用的 Cache App 入口
+
+`app/cache.Run(ctx, cfg, opts)` 是 `cache-ctl serve` 与定制二进制共同使用的完整 Cache 服务实现。`app/cache.Config` 是 `pkg/cache/runtime.Config` 的别名；`Options` 仅包含 `Logger`、`Reload` 和 `LoadMembership`。App 不查找 `CACHE_CONFIG`、不注册进程信号，也不依赖官方 CLI。
+
+最小定制程序：
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "os"
+    "os/signal"
+    "syscall"
+
+    cacheapp "github.com/kuasar-sandbox/accelerator/app/cache"
+    cacheruntime "github.com/kuasar-sandbox/accelerator/pkg/cache/runtime"
+)
+
+func main() {
+    if len(os.Args) != 2 { log.Fatal("usage: custom-cache CONFIG") }
+    cfg, err := cacheruntime.LoadConfig(os.Args[1])
+    if err != nil { log.Fatal(err) }
+    ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+    defer stop()
+    if err := cacheapp.Run(ctx, *cfg, cacheapp.Options{}); err != nil { log.Fatal(err) }
+}
+```
+
+systemd 示例：
+
+```ini
+[Service]
+ExecStart=/opt/kuasar/bin/custom-cache /etc/kuasar/cache.yaml
+Restart=on-failure
+KillSignal=SIGTERM
+```
+
+EC membership 刷新时，调用方同时提供 `Reload` 与 `LoadMembership`。callback 只返回启动配置中已有 EC tier 的候选 peers。`Run` 先校验整批候选，再逐层 probe/apply；某层失败时保留该层旧 membership，不热替换拓扑或其他配置。关闭的 reload channel 会被禁用而不是持续轮询。
+
+App 拥有 listener、backend client、共享 BlobPool、Health/Info、统计、Redis health monitor 和可选的实例级 pprof HTTP server。退出时先停止 admission 并取消受管工作，等待 handler/fill/repair/EC detached cleanup 与 observer 真正结束，再关闭拥有的依赖。定制调用方拥有自己的信号与借入输入。
+
 ## 8. See Also
 
 - [store](store_zh.md):tiered origin 可用 store-ctl gRPC 或另一 cache wire endpoint。

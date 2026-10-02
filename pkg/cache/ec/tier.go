@@ -65,8 +65,11 @@ type impl struct {
 	// baseCtx parents the detached repair-backfill goroutine; baseCancel
 	// (called by Close) reaps it on shutdown so a fill blocked on a
 	// wedged peer can't leak when fillTimeout is 0 (= no deadline).
-	baseCtx     context.Context
-	baseCancel  context.CancelFunc
+	baseCtx    context.Context
+	baseCancel context.CancelFunc
+	// tailWG tracks detached fan-out cleanup started by Get after the
+	// foreground quorum returns. Close must join it before closing the pool.
+	tailWG      sync.WaitGroup
 	fillTimeout time.Duration
 
 	// shardScratchPool holds per-shard scratch buffers large enough
@@ -332,7 +335,9 @@ func (t *impl) Get(ctx context.Context, p store.Partition, key store.ContentKey)
 	// Cleanup: wait for all fan-outs, close channel, drain+release the
 	// tail the aggregator didn't consume. Starts only after the
 	// aggregator has finished reading — no concurrent consumers.
+	t.tailWG.Add(1)
 	go func() {
+		defer t.tailWG.Done()
 		wg.Wait()
 		close(results)
 		for r := range results {
@@ -849,11 +854,23 @@ func (t *impl) fillCtxFrom(parent context.Context) (context.Context, context.Can
 	return context.WithCancel(parent)
 }
 
-// Close cancels the detached repair backfill and closes the peer pool.
-func (t *impl) Close() error {
+// StopBackground cancels detached repair work without closing dependencies.
+func (t *impl) StopBackground() {
 	if t.baseCancel != nil {
 		t.baseCancel()
 	}
+}
+
+// WaitBackground joins detached Get-tail cleanup. Repair thunks themselves are
+// joined by TieredCache's runner before this method is called.
+func (t *impl) WaitBackground() {
+	t.tailWG.Wait()
+}
+
+// Close cancels and joins detached work before closing the peer pool.
+func (t *impl) Close() error {
+	t.StopBackground()
+	t.WaitBackground()
 	return t.pool.Close()
 }
 

@@ -29,6 +29,11 @@ type Interface interface {
 	// Epoch returns the current membership epoch (1 at startup, bumped
 	// by every successful ApplyMembership).
 	Epoch() int64
+
+	// StopBackground cancels detached repair work without closing peer clients.
+	StopBackground()
+	// WaitBackground joins detached Get-tail cleanup before dependencies close.
+	WaitBackground()
 }
 
 // Compile-time assertion that impl satisfies Interface.

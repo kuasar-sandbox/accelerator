@@ -28,6 +28,7 @@
 | `pkg/manifest` 及子包 | 内容组织、分块、加密、ingest、fetch 和 prefetch |
 | `pkg/store` 与 `pkg/store/client` | 内容存储协议和客户端 |
 | `pkg/cache` 与 `pkg/cache/client` | 缓存协议、本地/分片/分层组合与客户端 |
+| `app/store` 与 `app/cache` | 供官方及定制二进制复用的完整 Store/Cache 服务生命周期 |
 | `pkg/tarstream` | 携带身份及完整性元数据的本地稀疏传输工件 |
 | `pkg/flatten`、`pkg/image`、`pkg/remote`、`pkg/tar` | OCI/目录拉取、镜像配置与 EROFS 展平基础能力 |
 
@@ -81,7 +82,7 @@ make test-e2e-scripts           # 离线 E2E fixture/helper 回归，不是产�
 - 用 `manifest-ctl` ingest 或 fetch 稀疏工件;
 - 为 `store-ctl` 配置文件系统根目录或 S3-compatible endpoint;
 - 以本地、分片或分层拓扑运行 `cache-ctl`;
-- 在其他 Go 服务中使用导出包,不导入重后端。
+- 将 `app/store.Run` 或 `app/cache.Run` 静态链接进定制服务二进制。官方 CLI 与定制程序平级调用同一生命周期函数；定制程序不 exec、也不依赖安装 `store-ctl`/`cache-ctl`。
 
 配置示例使用本地路径、文档保留 endpoint 和占位凭据。生产部署应使用受保护的 endpoint、显式资源预算、持久的权威存储,以及适合所选缓存拓扑的可观测性。
 

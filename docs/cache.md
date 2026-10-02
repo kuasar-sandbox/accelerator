@@ -784,6 +784,50 @@ Record workload controls `VALUE_SIZE`, `PREFILL`, `COLD_PREFILL`, `MISS_RATIO`, 
 - **Aging/eviction:** embedded eviction is frequency based (§4.5), not a disk_bytes quota. A short run with total operations far below reset_after may not exercise count-driven decay; the time-driven reset can still fire, and once-touched keys can already be at or below the eviction threshold. Use a long window and skewed access, observing actual sketch/compaction behavior rather than assuming short runs cannot evict.
 - **Possible bottlenecks:** RAM-hot shard reads can saturate coordinator network/copy/CPU resources; disk-heavy working sets can saturate shard random I/O and amplify quorum tails. EC collects approximately one object's worth of data across data shards, with parity/hedging/protocol overhead, not automatically `value-size × data_shards` full-object bytes. Neither “the NIC always bottlenecks first” nor “CPU is usually irrelevant” is hardware-independent. Measure network, disk, CPU, concurrency and latency together. Keeping a measured hot set resident can improve performance, but no fixed order-of-magnitude gain follows from the architecture alone.
 
+
+## 8. Reusable Cache application entry point
+
+`app/cache.Run(ctx, cfg, opts)` is the complete Cache service used by both `cache-ctl serve` and custom executables. `app/cache.Config` aliases `pkg/cache/runtime.Config`; `Options` contains only `Logger`, `Reload` and `LoadMembership`. The App does not discover `CACHE_CONFIG`, register process signals, or depend on the official CLI.
+
+A minimal custom executable is:
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "os"
+    "os/signal"
+    "syscall"
+
+    cacheapp "github.com/kuasar-sandbox/accelerator/app/cache"
+    cacheruntime "github.com/kuasar-sandbox/accelerator/pkg/cache/runtime"
+)
+
+func main() {
+    if len(os.Args) != 2 { log.Fatal("usage: custom-cache CONFIG") }
+    cfg, err := cacheruntime.LoadConfig(os.Args[1])
+    if err != nil { log.Fatal(err) }
+    ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+    defer stop()
+    if err := cacheapp.Run(ctx, *cfg, cacheapp.Options{}); err != nil { log.Fatal(err) }
+}
+```
+
+Example systemd service:
+
+```ini
+[Service]
+ExecStart=/opt/kuasar/bin/custom-cache /etc/kuasar/cache.yaml
+Restart=on-failure
+KillSignal=SIGTERM
+```
+
+For EC membership refresh, the caller supplies both `Reload` and `LoadMembership`. The callback returns candidate peers only for EC tiers that already exist in the startup configuration. `Run` validates the whole candidate batch, probes and applies each tier independently, and retains that tier's previous membership on failure. It does not hot-replace the topology or other configuration. A closed reload channel is disabled rather than polled.
+
+The App owns listeners, backend clients, the shared BlobPool, Health/Info, statistics, Redis health monitoring and an optional instance-local pprof HTTP server. Shutdown first stops admission and cancels managed work, waits for handlers/fills/repairs/detached EC cleanup and observers, then closes owned dependencies. Custom callers own their signals and borrowed inputs.
+
 ## 8. See Also
 
 - [store](store.md): a tiered origin can use store-ctl gRPC or another cache wire endpoint. Embedded cache-ctl still has local filesystem I/O; authoritative origin persistence belongs to store-ctl. Its optional cache_listen exposes a **read-only** chunk/Manifest/blob wire interface with no L1, allowing direct wire reads without a separate cache daemon.
