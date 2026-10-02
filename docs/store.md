@@ -328,10 +328,53 @@ CGO_ENABLED=1 go test -race ./pkg/store/... ./pkg/manifest/... ./cmd/store-ctl
 make store-ctl
 make manifest-ctl
 make vet
-make test-e2e
 ```
 
 The race-detector command requires CGO and a working C toolchain. Disabling CGO is valid for the ordinary test command above, not for `go test -race`.
+
+
+## 9. Reusable Store application entry point
+
+`app/store.Run(ctx, cfg, opts)` owns the complete Store serving lifecycle. `store-ctl serve` is only one caller; a custom executable may link the same App directly and does not exec or require the official service binary. `Run` does not read `STORE_CONFIG`, register process signals, call `os.Exit`/`log.Fatal`, or mutate a process-global logger. The caller owns configuration loading, signals and exit policy.
+
+A minimal custom executable that deliberately reuses the repository's YAML adapter is:
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "os"
+    "os/signal"
+    "syscall"
+
+    storeapp "github.com/kuasar-sandbox/accelerator/app/store"
+    storeconfig "github.com/kuasar-sandbox/accelerator/pkg/store/config"
+)
+
+func main() {
+    if len(os.Args) != 2 { log.Fatal("usage: custom-store CONFIG") }
+    cfg, err := storeconfig.LoadConfig(os.Args[1], true)
+    if err != nil { log.Fatal(err) }
+    ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+    defer stop()
+    if err := storeapp.Run(ctx, *cfg, storeapp.Options{}); err != nil { log.Fatal(err) }
+}
+```
+
+A deployment can point systemd at that binary directly:
+
+```ini
+[Service]
+ExecStart=/opt/kuasar/bin/custom-store /etc/kuasar/store.yaml
+Restart=on-failure
+KillSignal=SIGTERM
+```
+
+Direct Go construction of `storeapp.Config` is equally supported. Dynamic generation or credential providers belong in the five `Options` fields documented by the Go API; they are process-local bindings and are not written back into YAML. A custom caller that wants reload must own its reload trigger and provider callback just as `store-ctl` owns SIGHUP adaptation.
+
+Validation of the reusable entry point should compile the custom module independently and exercise real Store protocol requests with the official service binary absent from `PATH`.
 
 ## 9. See also
 

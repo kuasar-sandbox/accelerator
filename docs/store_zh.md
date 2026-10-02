@@ -376,11 +376,54 @@ CGO_ENABLED=1 go test -race ./pkg/store/... ./pkg/manifest/... ./cmd/store-ctl
 make store-ctl
 make manifest-ctl
 make vet
-make test-e2e
 ```
 
 race detector 需要启用 CGO 并具备可用 C 工具链。上面的普通测试可以关闭 CGO，
 `go test -race` 则不能使用 `CGO_ENABLED=0`。
+
+
+## 9. 可复用的 Store App 入口
+
+`app/store.Run(ctx, cfg, opts)` 拥有完整 Store 服务生命周期。`store-ctl serve` 只是一个调用方；定制二进制可直接静态链接同一个 App，不 exec、也不要求安装官方服务二进制。`Run` 不读取 `STORE_CONFIG`、不注册进程信号、不调用 `os.Exit`/`log.Fatal`、不修改进程全局 logger；配置加载、信号和退出策略由调用方拥有。
+
+下面的最小定制程序有意复用仓库 YAML adapter：
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "os"
+    "os/signal"
+    "syscall"
+
+    storeapp "github.com/kuasar-sandbox/accelerator/app/store"
+    storeconfig "github.com/kuasar-sandbox/accelerator/pkg/store/config"
+)
+
+func main() {
+    if len(os.Args) != 2 { log.Fatal("usage: custom-store CONFIG") }
+    cfg, err := storeconfig.LoadConfig(os.Args[1], true)
+    if err != nil { log.Fatal(err) }
+    ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+    defer stop()
+    if err := storeapp.Run(ctx, *cfg, storeapp.Options{}); err != nil { log.Fatal(err) }
+}
+```
+
+systemd 可直接启动该二进制：
+
+```ini
+[Service]
+ExecStart=/opt/kuasar/bin/custom-store /etc/kuasar/store.yaml
+Restart=on-failure
+KillSignal=SIGTERM
+```
+
+也可直接用 Go 构造 `storeapp.Config`。动态 generation/credential provider 只通过 Go API 定义的五个 `Options` 字段绑定，不写回 YAML。需要 reload 的定制调用方自行拥有 reload 触发和 provider callback；官方 `store-ctl` 只是把 SIGHUP 适配为这些输入。
+
+可复用入口的验收应独立编译定制 module，并在服务 `PATH` 中没有官方二进制时执行真实 Store 协议请求。
 
 ## 9. See also
 

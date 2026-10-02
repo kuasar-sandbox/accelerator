@@ -28,6 +28,7 @@
 | `pkg/manifest` 及子包 | 内容组织、分块、加密、ingest、fetch 和 prefetch |
 | `pkg/store` 与 `pkg/store/client` | 内容存储协议和客户端 |
 | `pkg/cache` 与 `pkg/cache/client` | 缓存协议、本地/分片/分层组合与客户端 |
+| `app/store` 与 `app/cache` | 供官方及定制二进制复用的完整 Store/Cache 服务生命周期 |
 | `pkg/tarstream` | 携带身份及完整性元数据的本地稀疏传输工件 |
 | `pkg/flatten`、`pkg/image`、`pkg/remote`、`pkg/tar` | OCI/目录拉取、镜像配置与 EROFS 展平基础能力 |
 
@@ -61,7 +62,6 @@ make build                      # 全部组件二进制
 make build TARGET_ARCH=aarch64  # 交叉编译;接受 amd64/arm64 别名
 make vet                        # 检查面向下游的薄 Go 导出面
 make test                       # 单元与后端测试
-make test-e2e                   # 组件 owner suite;需要项目组装的 BIN
 ```
 
 源码构建需要 Go 1.26.1 或更新版本，原生前置依赖随构建目标而异。当前源码通过仓库脚本说明并构建所需原生缓存依赖。真实对象存储测试必须使用显式测试凭据或本地 S3-compatible 服务;普通单元测试与本地文件系统测试不应要求生产云凭据。
@@ -79,7 +79,7 @@ make test-e2e                   # 组件 owner suite;需要项目组装的 BIN
 - 用 `manifest-ctl` ingest 或 fetch 稀疏工件;
 - 为 `store-ctl` 配置文件系统根目录或 S3-compatible endpoint;
 - 以本地、分片或分层拓扑运行 `cache-ctl`;
-- 在其他 Go 服务中使用导出包,不导入重后端。
+- 将 `app/store.Run` 或 `app/cache.Run` 静态链接进定制服务二进制。官方 CLI 与定制程序平级调用同一生命周期函数；定制程序不 exec、也不依赖安装 `store-ctl`/`cache-ctl`。
 
 配置示例使用本地路径、文档保留 endpoint 和占位凭据。生产部署应使用受保护的 endpoint、显式资源预算、持久的权威存储,以及适合所选缓存拓扑的可观测性。
 
