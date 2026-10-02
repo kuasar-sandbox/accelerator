@@ -1,10 +1,10 @@
-package main
+package cache
 
 import (
 	"context"
 	"time"
 
-	"github.com/kuasar-sandbox/accelerator/pkg/cache"
+	pkgcache "github.com/kuasar-sandbox/accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/client"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/ec"
 	cachepb "github.com/kuasar-sandbox/accelerator/pkg/cache/pb"
@@ -36,7 +36,7 @@ type OriginSpec struct {
 	Endpoint  string // "upstream"
 }
 
-// InfoServer is the gRPC handler for cac.cache.v1.Info/Get. It holds
+// InfoServer is the gRPC handler for cac.pkgcache.v1.Info/Get. It holds
 // references to every counter-owning component and assembles a
 // DaemonStats snapshot on each request. Redis backend latency is sampled by
 // redisstore and copied into the snapshot here.
@@ -46,12 +46,12 @@ type InfoServer struct {
 	start time.Time
 	mode  string
 
-	handler       *server.CacheHandler // non-nil: always (wire counters source)
-	tiered        *cache.TieredCache   // non-nil when mode == "tiered"
-	tierSpecs     []TierSpec           // parallel to tiered.tiers
-	origin        *OriginSpec          // non-nil when mode == "tiered"
-	topLevelRocks rocks.Interface      // non-nil when mode != "tiered"
-	topLevelRedis *redisstore.Store    // non-nil for local/shard type=redis
+	handler       *server.CacheHandler  // non-nil: always (wire counters source)
+	tiered        *pkgcache.TieredCache // non-nil when mode == "tiered"
+	tierSpecs     []TierSpec            // parallel to tiered.tiers
+	origin        *OriginSpec           // non-nil when mode == "tiered"
+	topLevelRocks rocks.Interface       // non-nil when mode != "tiered"
+	topLevelRedis *redisstore.Store     // non-nil for local/shard type=redis
 }
 
 // NewInfoServer creates a fresh InfoServer with the wire handler
@@ -67,7 +67,7 @@ func NewInfoServer(mode string, handler *server.CacheHandler) *InfoServer {
 
 // SetTiered attaches the tiered cache and its parallel TierSpecs +
 // OriginSpec. Only valid when mode == "tiered".
-func (s *InfoServer) SetTiered(tc *cache.TieredCache, specs []TierSpec, origin *OriginSpec) {
+func (s *InfoServer) SetTiered(tc *pkgcache.TieredCache, specs []TierSpec, origin *OriginSpec) {
 	s.tiered = tc
 	s.tierSpecs = specs
 	s.origin = origin
@@ -86,7 +86,7 @@ func (s *InfoServer) SetTopLevelRedis(r *redisstore.Store) {
 	s.topLevelRedis = r
 }
 
-// Get implements cachepb.InfoServer. Assembles a cache.DaemonStats
+// Get implements cachepb.InfoServer. Assembles a pkgcache.DaemonStats
 // first (pure Go, no proto), then converts to proto at the boundary.
 func (s *InfoServer) Get(ctx context.Context, req *cachepb.InfoRequest) (*cachepb.InfoReply, error) {
 	ds := s.snapshot()
@@ -95,8 +95,8 @@ func (s *InfoServer) Get(ctx context.Context, req *cachepb.InfoRequest) (*cachep
 
 // snapshot builds the pure-Go DaemonStats. Split from Get so we can
 // test the assembly logic without touching proto types.
-func (s *InfoServer) snapshot() cache.DaemonStats {
-	ds := cache.DaemonStats{
+func (s *InfoServer) snapshot() pkgcache.DaemonStats {
+	ds := pkgcache.DaemonStats{
 		Mode:      s.mode,
 		UptimeSec: int64(time.Since(s.start).Seconds()),
 	}
@@ -105,9 +105,9 @@ func (s *InfoServer) snapshot() cache.DaemonStats {
 	}
 	if s.tiered != nil {
 		cnt := s.tiered.Counters()
-		tiers := make([]cache.TierStats, len(s.tierSpecs))
+		tiers := make([]pkgcache.TierStats, len(s.tierSpecs))
 		for i, spec := range s.tierSpecs {
-			t := cache.TierStats{
+			t := pkgcache.TierStats{
 				Type:          spec.Type,
 				Hits:          cnt.TierHits[i],
 				Misses:        cnt.TierMisses[i],
@@ -133,7 +133,7 @@ func (s *InfoServer) snapshot() cache.DaemonStats {
 			}
 			tiers[i] = t
 		}
-		origin := cache.OriginStats{
+		origin := pkgcache.OriginStats{
 			Hits:   cnt.OriginHits,
 			Misses: cnt.OriginMisses,
 			Errors: cnt.OriginErrors,
@@ -143,7 +143,7 @@ func (s *InfoServer) snapshot() cache.DaemonStats {
 			origin.StorePath = s.origin.StorePath
 			origin.Endpoint = s.origin.Endpoint
 		}
-		ds.Tiered = &cache.TieredStats{Tiers: tiers, Origin: origin}
+		ds.Tiered = &pkgcache.TieredStats{Tiers: tiers, Origin: origin}
 	}
 	if s.topLevelRocks != nil {
 		ds.BackendType = "embedded"
@@ -156,8 +156,8 @@ func (s *InfoServer) snapshot() cache.DaemonStats {
 	return ds
 }
 
-func redisStats(s redisstore.Stats) *cache.RedisStats {
-	return &cache.RedisStats{
+func redisStats(s redisstore.Stats) *pkgcache.RedisStats {
+	return &pkgcache.RedisStats{
 		Endpoint:         s.Endpoint,
 		Transport:        s.Transport,
 		GetPoolSize:      s.GetPoolSize,
@@ -190,10 +190,10 @@ func redisStats(s redisstore.Stats) *cache.RedisStats {
 // cache package's JSON-tagged type. The Compactions / BlobStats
 // fields on rocks.CFStats are dropped — they're verbose and not
 // exposed in the current Info API.
-func toRocksCFStats(in []rocks.CFStats) []cache.RocksCFStats {
-	out := make([]cache.RocksCFStats, len(in))
+func toRocksCFStats(in []rocks.CFStats) []pkgcache.RocksCFStats {
+	out := make([]pkgcache.RocksCFStats, len(in))
 	for i, s := range in {
-		out[i] = cache.RocksCFStats{
+		out[i] = pkgcache.RocksCFStats{
 			Name:      s.Name,
 			NumKeys:   s.NumKeys,
 			DiskUsage: s.DiskUsage,
@@ -203,9 +203,9 @@ func toRocksCFStats(in []rocks.CFStats) []cache.RocksCFStats {
 	return out
 }
 
-// toPb mechanically copies cache.DaemonStats into cachepb.InfoReply.
+// toPb mechanically copies pkgcache.DaemonStats into cachepb.InfoReply.
 // No reflection or generics — fields are scalar + simple nested slices.
-func toPb(ds cache.DaemonStats) *cachepb.InfoReply {
+func toPb(ds pkgcache.DaemonStats) *cachepb.InfoReply {
 	reply := &cachepb.InfoReply{
 		Mode:        ds.Mode,
 		BackendType: ds.BackendType,
@@ -251,7 +251,7 @@ func toPb(ds cache.DaemonStats) *cachepb.InfoReply {
 	return reply
 }
 
-func redisToPb(s *cache.RedisStats) *cachepb.RedisStats {
+func redisToPb(s *pkgcache.RedisStats) *cachepb.RedisStats {
 	if s == nil {
 		return nil
 	}
@@ -284,7 +284,7 @@ func redisToPb(s *cache.RedisStats) *cachepb.RedisStats {
 	}
 }
 
-func rocksToPb(in []cache.RocksCFStats) []*cachepb.RocksCFStats {
+func rocksToPb(in []pkgcache.RocksCFStats) []*cachepb.RocksCFStats {
 	out := make([]*cachepb.RocksCFStats, len(in))
 	for i, s := range in {
 		out[i] = &cachepb.RocksCFStats{
@@ -297,7 +297,7 @@ func rocksToPb(in []cache.RocksCFStats) []*cachepb.RocksCFStats {
 	return out
 }
 
-func peersToPb(in []cache.PeerStats) []*cachepb.PeerStats {
+func peersToPb(in []pkgcache.PeerStats) []*cachepb.PeerStats {
 	out := make([]*cachepb.PeerStats, len(in))
 	for i, p := range in {
 		out[i] = &cachepb.PeerStats{

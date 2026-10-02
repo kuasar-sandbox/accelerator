@@ -116,15 +116,46 @@ func (tc *TieredCache) fillCtx() (context.Context, context.CancelFunc) {
 	return context.WithCancel(tc.baseCtx)
 }
 
-// Close cancels and drains all in-flight async fill/repair goroutines.
-// Call it after the serving path has stopped admitting new requests.
-func (tc *TieredCache) Close() {
+// backgroundTier is implemented by tiers that own asynchronous work outside
+// TieredCache's fill runner. StopBackground must only signal cancellation;
+// WaitBackground joins that work without releasing the tier's dependencies.
+type backgroundTier interface {
+	StopBackground()
+	WaitBackground()
+}
+
+// Stop cancels asynchronous fills/repairs without waiting. Call it after
+// serving admission has been stopped and before joining handlers so every
+// managed activity receives cancellation before any shutdown wait begins.
+func (tc *TieredCache) Stop() {
 	if tc.baseCancel != nil {
 		tc.baseCancel()
 	}
+	for _, tier := range tc.tiers {
+		if bg, ok := unwrapTier(tier).(backgroundTier); ok {
+			bg.StopBackground()
+		}
+	}
+}
+
+// Wait joins all asynchronous fill/repair work, including background work
+// owned by a tier. No new operations may be admitted while Wait is running.
+func (tc *TieredCache) Wait() {
 	for i := range tc.fillInflight {
 		tc.fillInflight[i].Wait()
 	}
+	for _, tier := range tc.tiers {
+		if bg, ok := unwrapTier(tier).(backgroundTier); ok {
+			bg.WaitBackground()
+		}
+	}
+}
+
+// Close is the compatibility helper for callers that can stop and join in one
+// step. Application shutdown should prefer Stop followed by Wait.
+func (tc *TieredCache) Close() {
+	tc.Stop()
+	tc.Wait()
 }
 
 // TieredCache composes cache tiers and an origin into a layered lookup.

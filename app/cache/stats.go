@@ -1,4 +1,4 @@
-package main
+package cache
 
 import (
 	"fmt"
@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/kuasar-sandbox/accelerator/internal/util/obstat"
-	"github.com/kuasar-sandbox/accelerator/pkg/cache"
+	pkgcache "github.com/kuasar-sandbox/accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/redisstore"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/rocks"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/server"
@@ -17,10 +17,10 @@ import (
 // reporting the window inactive (silent) when no get/put completed and nothing
 // is in flight. tc (tiered counters, may be nil) adds the per-tier hit cascade;
 // rk and redisSources add slow-moving backend gauges when present.
-func cacheSampler(mode string, ws *server.WireServer, tc *cache.TieredCache, rk rocks.Interface, redisSources []redisGaugeSource) func(float64) (string, bool) {
+func cacheSampler(mode string, ws *server.WireServer, tc *pkgcache.TieredCache, rk rocks.Interface, redisSources []redisGaugeSource) func(float64) (string, bool) {
 	h := ws.Handler()
 	prev := h.WireStats()
-	var prevTier cache.TieredCounters
+	var prevTier pkgcache.TieredCounters
 	if tc != nil {
 		prevTier = tc.Counters()
 	}
@@ -100,7 +100,7 @@ func redisGauge(label string, s redisstore.Stats) string {
 
 // tierCascade renders where the window's hits landed across the cache tiers and
 // the origin, e.g. "hits L0 88% L1 6% origin 6%". Empty when no hits this window.
-func tierCascade(prev, cur cache.TieredCounters) string {
+func tierCascade(prev, cur pkgcache.TieredCounters) string {
 	dT := make([]uint64, len(cur.TierHits))
 	var total uint64
 	for i := range cur.TierHits {

@@ -1,0 +1,73 @@
+package cache
+
+import (
+	"testing"
+
+	pkgcache "github.com/kuasar-sandbox/accelerator/pkg/cache"
+)
+
+func TestRedisInfoProtoRoundTrip(t *testing.T) {
+	redis := &pkgcache.RedisStats{
+		Endpoint:         "redis.internal:6379",
+		Transport:        "tcp",
+		GetPoolSize:      32,
+		SetPoolSize:      8,
+		GetConnected:     31,
+		SetConnected:     7,
+		GetInflight:      5,
+		SetInflight:      3,
+		PoolWaiters:      2,
+		Draining:         1,
+		GetHits:          101,
+		GetMisses:        11,
+		Sets:             23,
+		Cancelled:        7,
+		LateBytesDrained: 4096,
+		Reconnects:       4,
+		ProtocolErrors:   2,
+		BackendErrors:    6,
+		GetP50Ns:         100_000,
+		GetP99Ns:         900_000,
+		GetP999Ns:        2_000_000,
+		SetP50Ns:         200_000,
+		SetP99Ns:         1_000_000,
+		SetP999Ns:        3_000_000,
+		PoolWaitP99Ns:    50_000,
+	}
+	want := pkgcache.DaemonStats{
+		Mode:        "tiered",
+		BackendType: "redis",
+		UptimeSec:   42,
+		Server:      pkgcache.ServerStats{Hits: 3, Misses: 4, Fills: 5},
+		Redis:       redis,
+		Tiered: &pkgcache.TieredStats{
+			Tiers: []pkgcache.TierStats{{
+				Type:          "redis",
+				Hits:          9,
+				Misses:        8,
+				Fills:         7,
+				Errors:        6,
+				FillsInflight: 2,
+				Redis:         redis,
+			}},
+			Origin: pkgcache.OriginStats{Type: "store", Hits: 5, Misses: 4, Errors: 3, Endpoint: "127.0.0.1:7100"},
+		},
+	}
+
+	reply := toPb(want)
+	if reply.Mode != want.Mode || reply.BackendType != want.BackendType || reply.UptimeSec != want.UptimeSec {
+		t.Fatalf("top-level conversion mismatch: got=%#v", reply)
+	}
+	if reply.Redis == nil || reply.Redis.Endpoint != redis.Endpoint || reply.Redis.GetHits != redis.GetHits || reply.Redis.SetP99Ns != redis.SetP99Ns {
+		t.Fatalf("top-level Redis conversion mismatch: got=%#v", reply.Redis)
+	}
+	if reply.Tiered == nil || len(reply.Tiered.Tiers) != 1 || reply.Tiered.Tiers[0].Redis == nil {
+		t.Fatalf("tiered conversion mismatch: %#v", reply.Tiered)
+	}
+	if reply.Tiered.Tiers[0].Redis.Endpoint != redis.Endpoint || reply.Tiered.Tiers[0].Hits != 9 || reply.Tiered.Tiers[0].FillsInflight != 2 {
+		t.Fatalf("tier Redis conversion mismatch: got=%#v", reply.Tiered.Tiers[0])
+	}
+	if reply.Tiered.Origin == nil || reply.Tiered.Origin.Type != want.Tiered.Origin.Type || reply.Tiered.Origin.Endpoint != want.Tiered.Origin.Endpoint {
+		t.Fatalf("origin conversion mismatch: got=%#v", reply.Tiered.Origin)
+	}
+}
