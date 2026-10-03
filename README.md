@@ -139,7 +139,8 @@ existing source/Preview markers. Trusted source selection, build/publish permiss
 separation and the refusal to replace published assets remain required.
 Producer-supplied notes may not contain the publisher's reserved source/Preview markers.
 
-The official package requires the three Linux/amd64 command binaries with
+The official package requires the three Linux command binaries for its selected
+native architecture (amd64 for x86_64, arm64 for aarch64), with
 their own Accelerator main-package identities; `cache-ctl` must include RocksDB.
 The five shipped operational helpers are copied from the selected source tree.
 Before extraction the validator rejects extra/duplicate payloads, links,

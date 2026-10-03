@@ -118,7 +118,8 @@ module 输入。
 权限分离及拒绝替换已发布资产的要求保持不变。
 生产者提供的说明不得夹带发布者专属的来源/Preview 标记。
 
-官方包要求三个 Linux/amd64 命令二进制分别具有自身的 Accelerator main-package
+官方包要求三个 Linux 命令二进制匹配所选原生架构（x86_64 对应 amd64，aarch64 对应
+arm64），并分别具有自身的 Accelerator main-package
 身份;`cache-ctl` 必须包含 RocksDB。五个交付运维脚本取自所选源码树。
 解包前拒绝额外/重复载荷、链接、错误属主或权限,以及其他组件的材料命名空间。
 
