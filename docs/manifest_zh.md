@@ -606,10 +606,12 @@ Release,不读取 Blob、不校验、不解密、不 pin。预取作用于当前
 完整可见视图,不再提供按 manifest key 选择叶子的接口。
 
 同一 Fetcher 的 manifest metadata、普通 ReadAt 和所有 Stream 共用一个底层
-Getter 与请求调度器。on-demand 请求从不等待已开始的 prefetch;存在任意
-on-demand 时不再准入新的 prefetch,且每个 Fetcher 最多一个 prefetch Get 在
-途。已开始的 prefetch 不抢占,可与后来到达的 on-demand 短暂重叠。不同
-Fetcher 相互独立,调度器不创建后台 goroutine,也不拥有底层 Getter 生命周期。
+Getter 与请求调度器。on-demand 请求从不等待 prefetch;存在任意 on-demand
+时不再准入新的 prefetch,每个 Fetcher 最多 `maxPrefetchGets`(当前 **8**)个
+prefetch Get 在途。该上限低于典型 sandboxer `cache.pool` 的 16,以便 UFFD
+fault 仍能取得连接。已开始的 prefetch 不抢占,可与后来到达的 on-demand
+短暂重叠。不同 Fetcher 相互独立,调度器不创建后台 goroutine,也不拥有底层
+Getter 生命周期。准入与遍历契约见[预取并发](prefetch_zh.md)。
 
 每个 manifest Stream 内部维护独立的解密 chunk cache,仅服务 on-demand 部分读。
 cache key 包含 `CiphertextHash`、chunk decrypt key 和 plaintext size,因此同一
