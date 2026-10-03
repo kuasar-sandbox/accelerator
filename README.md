@@ -2,6 +2,14 @@
 
 # accelerator
 
+For the first cross-component sandbox or Demo, follow the project
+[Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md)
+with the matching aggregate release and
+[workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README.md).
+This component can still be built/deployed independently; workbench is not a
+production runtime dependency. Published architectures are specific to the
+selected release; source support does not imply all historical assets exist.
+
 `accelerator` is the **data access, storage, encryption, and cache infrastructure** for images, snapshots, and sparse artifacts in [Kuasar Sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox).
 
 It provides reusable sparse-data and artifact abstractions, local and shared-file access, Manifest-backed content organization, filesystem and S3-compatible stores, layered caches, integrity and encryption, OCI retrieval, deterministic EROFS image flattening, on-demand fetch, and prefetch.
@@ -149,7 +157,7 @@ Distinct native inputs cannot overwrite a shared material name. RPM collection
 requires complete same-source sibling listings. These materials support release
 review, not legal certification, and do not change the RocksDB backend or durability.
 
-This repository publishes independent component versions named `vX.Y.Z`. The x86_64 component archive contains the three service binaries and the documented operational/performance helper scripts selected by the release contract. Component design documents and E2E sources are collected from the selected tag into the project platform archive.
+This repository publishes independent component versions named `vX.Y.Z`. Each published native-architecture component archive contains the three service binaries and the documented operational/performance helper scripts selected by the release contract. The aggregate platform archive carries selected user guides and canonical E2E runtime inputs from its explicit documentation/test selections. Internal design documents and source-only tests remain in the source repositories.
 
 The project repository publishes aggregate versions named `release-vX.Y.Z`, selecting exact versions of `accelerator` and the other release units, validating their assets, and running cross-component tests. Aggregate and component version numbers are independent.
 

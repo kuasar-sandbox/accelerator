@@ -2,6 +2,11 @@
 
 # accelerator
 
+首次运行跨组件沙箱或 Demo，推荐从项目[快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)
+使用匹配聚合版本的 [workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README_zh.md)。
+本组件仍可独立构建和部署，workbench 不是生产运行的强制依赖。预构建架构以所选
+发布版的实际资产为准；源码支持某架构不意味着所有历史版本都提供该架构制品。
+
 `accelerator` 是 [Kuasar Sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) 中面向镜像、快照和稀疏工件的数据访问、存储、加密与缓存基础组件。
 
 它提供可复用的稀疏数据和工件抽象、本地与共享文件访问、基于 Manifest 的内容组织、文件系统与 S3-compatible store、分层缓存、完整性校验和加密、OCI 拉取、确定性 EROFS 镜像展平、按需读取与预取。
@@ -126,7 +131,7 @@ RocksDB 静态库/源码树;显式提供时使用 `RELEASE_ROCKSDB_SOURCE_DIR`�
 RPM 收集要求完整枚举同源兄弟包。这些材料支持发行检视,不构成法律认证,
 也不改变 RocksDB 后端或持久化策略。
 
-本仓独立发布 `vX.Y.Z` 组件版本。x86_64 组件归档包含三个服务二进制及发行合同选定的运维/性能辅助脚本。组件设计文档和 E2E 源码从选定 Tag 收集到项目平台归档。
+本仓独立发布 `vX.Y.Z` 组件版本。已发布原生架构的组件归档包含三个服务二进制及发行合同选定的运维/性能辅助脚本。聚合 platform 包按显式文档/测试选择携带用户指南与规范 E2E 运行输入，内部设计文档和源码专用测试保留在源码仓。
 
 项目主仓独立发布 `release-vX.Y.Z` 聚合版本,选择 `accelerator` 和其他发行单元的精确版本,验证资产并执行跨组件测试。聚合与组件版本号相互独立。
 
