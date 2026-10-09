@@ -149,6 +149,7 @@ jobs:
         with:
           selection: workbench-selection/workbench.json
           sources: src
+          cache-coverage: release-accelerator-build
           outputs: accelerator/bin
           arch: ${{ matrix.arch }}
           cpus: '2'
@@ -168,6 +169,7 @@ jobs:
         with:
           selection: workbench-selection/workbench.json
           sources: src
+          cache-coverage: release-accelerator-package
           outputs: accelerator/release-bundle
           arch: ${{ matrix.arch }}
           cpus: '2'

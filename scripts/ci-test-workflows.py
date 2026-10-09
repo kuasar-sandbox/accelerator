@@ -86,6 +86,8 @@ def check(platform):
         assert "env" not in step
         assert "GH_TOKEN" not in step["with"]["run"]
     assert "restore-or-build rocksdb" in build["Build and test accelerator"]["with"]["run"]
+    assert build["Build and test accelerator"]["with"]["cache-coverage"] == "release-accelerator-build"
+    assert build["Package the component release"]["with"]["cache-coverage"] == "release-accelerator-package"
     assert build["Build and test accelerator"]["with"]["outputs"] == "accelerator/bin"
     assert build["Package the component release"]["with"]["outputs"] == "accelerator/release-bundle"
     assert "NO_ROCKSDB" not in str(jobs["build"])
