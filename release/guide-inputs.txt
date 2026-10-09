@@ -1,0 +1,17 @@
+# Owner-maintained user documentation inputs, relative to this repository.
+# The platform reads this file from the selected source revision.
+# Entries may be Markdown files, directories, or glob patterns; each must match.
+# Keep source/developer-only documentation outside the selected inputs.
+README.md
+README_zh.md
+docs/cache.md
+docs/cache_zh.md
+docs/cache-redis.md
+docs/store.md
+docs/store_zh.md
+docs/manifest.md
+docs/manifest_zh.md
+docs/file-artifacts.md
+docs/file-artifacts_zh.md
+test/e2e/README.md
+test/e2e/README_zh.md
