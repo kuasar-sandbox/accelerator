@@ -10,6 +10,10 @@
 
 发布构建按原有 recipe 构建真实 RocksDB，不能以 `NO_ROCKSDB=1` 替代发布载荷。
 Go 与 native 编译器由构建环境提供，保留既有工具链选择语义。
+CI 在一次运行开始时选择已通过验证的 Workbench, 为原生 x86_64 与 aarch64 Runner
+分别固定镜像身份. 普通构建、测试和打包使用 ordinary UID、只读根文件系统、移除
+capabilities, 以及任务私有源码和缓存目录. `KUASAR_BUILD_JOBS` 将同一任务 CPU
+预算传给 Go 和 RocksDB CMake 构建; 未配置预算的本地 native recipe 仍使用 `nproc`.
 普通 Go RocksDB 测试保留上游绑定的压缩库链接参数，需要 Snappy、LZ4、Zstandard
 与 zlib 开发库；这并不启用原有 native RocksDB recipe 的压缩功能。
 
@@ -17,6 +21,8 @@ Accelerator 的 [ABI 检查](../scripts/ci-check-abi.py) 要求 `manifest-ctl` �
 `store-ctl` 保持静态。`cache-ctl` 保留正常 CGO/glibc 和静态 RocksDB、libstdc++、
 libgcc，GLIBC 需求不得超过声明的 2.38 基线。ABI 失败阻止打包。
 Native recipe、摘要、许可、来源清单与 link-map 校验仍为必需检查。
+Publisher 在独立 Workbench 调用中从受信源码编译归档校验器, 该调用禁用缓存恢复和
+保存. 发布步骤直接执行校验器, 不再次编译.
 
 ## Prepared 产品 E2E 与本地证据
 
@@ -57,6 +63,7 @@ workspace 上运行：
 
 ```bash
 python3 scripts/ci-test-workflows.py ../kuasar-sandbox  # 使用实际平台路径
+python3 scripts/test-native-build-budget.py
 (umask 022; bash scripts/test-release.sh)
 make test-e2e-scripts
 ```

@@ -12,6 +12,11 @@ its checks.
 The release build uses real RocksDB through the existing recipe;
 `NO_ROCKSDB=1` is not a release substitute. Go and native compilers come from the
 build environment, retaining the existing toolchain selection semantics.
+CI uses the admitted Workbench image selected once for the run, pinned separately
+for native x86_64 and aarch64 runners. Ordinary builds, tests and packaging use an
+ordinary UID with a read-only root, dropped capabilities and private source/cache
+directories. `KUASAR_BUILD_JOBS` supplies the same task CPU budget to Go and the
+RocksDB CMake build; local native recipes without a budget still use `nproc`.
 Normal Go RocksDB tests retain the upstream binding's compression-library link
 flags and require Snappy, LZ4, Zstandard and zlib development libraries. This does
 not enable compression in the existing native RocksDB recipe.
@@ -20,7 +25,10 @@ The accelerator [ABI check](../scripts/ci-check-abi.py) requires `manifest-ctl`
 and `store-ctl` to remain static. `cache-ctl` retains normal CGO/glibc with static
 RocksDB, libstdc++ and libgcc; required GLIBC versions may not exceed the declared
 2.38 baseline. ABI failures stop packaging. Native recipes, checksums, licenses,
-source inventories and link-map validation remain required.
+source inventories and link-map validation remain required. The publisher uses a
+standalone archive validator compiled from its trusted source in a separate
+Workbench invocation with cache restore/save disabled; publishing executes the
+validator without compiling it again.
 
 ## Prepared product E2E and local evidence
 
@@ -66,6 +74,7 @@ Offline checks from the accelerator checkout:
 
 ```bash
 python3 scripts/ci-test-workflows.py ../kuasar-sandbox  # use the actual platform path
+python3 scripts/test-native-build-budget.py
 (umask 022; bash scripts/test-release.sh)
 make test-e2e-scripts
 ```
