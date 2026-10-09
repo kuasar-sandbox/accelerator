@@ -144,13 +144,15 @@ jobs:
       - name: Check CI regression contracts
         if: matrix.arch == 'x86_64'
         run: python3 trusted/accelerator/scripts/ci-test-workflows.py trusted/platform
-      - name: Build and test accelerator
+      - name: Build, test and package accelerator
         uses: ./trusted/platform/.github/actions/workbench
         with:
           selection: workbench-selection/workbench.json
           sources: src
           cache-coverage: release-accelerator-build
-          outputs: accelerator/bin
+          outputs: |
+            accelerator/bin
+            accelerator/release-bundle
           arch: ${{ matrix.arch }}
           cpus: '2'
           memory-gib: '8'
@@ -162,27 +164,14 @@ jobs:
             if [ "$TARGET_ARCH" = x86_64 ]; then make test; make vet; fi
             make build
             if [ "$TARGET_ARCH" = x86_64 ]; then make test-release; fi
-      - name: Check the released accelerator ABI
-        run: python3 trusted/accelerator/scripts/ci-check-abi.py "src/accelerator/bin/$TARGET_ARCH"
-      - name: Package the component release
-        uses: ./trusted/platform/.github/actions/workbench
-        with:
-          selection: workbench-selection/workbench.json
-          sources: src
-          cache-coverage: release-accelerator-package
-          outputs: accelerator/release-bundle
-          arch: ${{ matrix.arch }}
-          cpus: '2'
-          memory-gib: '8'
-          run: |
-            set -euo pipefail
-            cd accelerator
             VERSION='${{ needs.preflight.outputs.version }}'
             [ "$(git rev-parse HEAD)" = "${{ needs.preflight.outputs.source_sha }}" ]
             export SOURCE_DATE_EPOCH
             SOURCE_DATE_EPOCH=$(git show -s --format=%ct "${{ needs.preflight.outputs.source_sha }}")
             bash scripts/release.sh package "$VERSION" "$TARGET_ARCH" release-bundle
             bash scripts/release.sh validate "$VERSION" "$TARGET_ARCH" release-bundle
+      - name: Check the released accelerator ABI
+        run: python3 trusted/accelerator/scripts/ci-check-abi.py "src/accelerator/bin/$TARGET_ARCH"
       - name: Upload validated release bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:

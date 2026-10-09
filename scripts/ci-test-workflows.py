@@ -77,26 +77,23 @@ def check(platform):
     assert "Bootstrap native or cross build" not in build
     assert "Attach native source cache" not in build
     assert build["Download Workbench selection"]["with"]["name"] == selection
-    for name in ("Build and test accelerator", "Package the component release"):
-        step = build[name]
-        assert step["uses"] == "./trusted/platform/.github/actions/workbench"
-        assert step["with"]["selection"] == "workbench-selection/workbench.json"
-        assert step["with"]["sources"] == "src"
-        assert step["with"]["arch"] == "${{ matrix.arch }}"
-        assert "env" not in step
-        assert "GH_TOKEN" not in step["with"]["run"]
-    assert "restore-or-build rocksdb" in build["Build and test accelerator"]["with"]["run"]
-    assert build["Build and test accelerator"]["with"]["cache-coverage"] == "release-accelerator-build"
-    assert build["Package the component release"]["with"]["cache-coverage"] == "release-accelerator-package"
-    assert build["Build and test accelerator"]["with"]["outputs"] == "accelerator/bin"
-    assert build["Package the component release"]["with"]["outputs"] == "accelerator/release-bundle"
+    step = build["Build, test and package accelerator"]
+    assert sum(s.get("uses") == "./trusted/platform/.github/actions/workbench" for s in build.values()) == 1
+    assert step["uses"] == "./trusted/platform/.github/actions/workbench"
+    assert step["with"]["selection"] == "workbench-selection/workbench.json"
+    assert step["with"]["sources"] == "src"
+    assert step["with"]["arch"] == "${{ matrix.arch }}"
+    assert "env" not in step and "GH_TOKEN" not in step["with"]["run"]
+    assert "restore-or-build rocksdb" in step["with"]["run"]
+    assert step["with"]["cache-coverage"] == "release-accelerator-build"
+    assert step["with"]["outputs"].splitlines() == ["accelerator/bin", "accelerator/release-bundle"]
     assert "NO_ROCKSDB" not in str(jobs["build"])
-    for name in ("Build and test accelerator", "Check the released accelerator ABI", "Check CI regression contracts"):
+    for name in ("Build, test and package accelerator", "Check the released accelerator ABI", "Check CI regression contracts"):
         assert "continue-on-error" not in build[name]
-    assert "umask 022" in build["Build and test accelerator"]["with"]["run"]
+    assert "umask 022" in step["with"]["run"]
     assert "bin/$TARGET_ARCH" in build["Check the released accelerator ABI"]["run"]
-    assert names.index("Build and test accelerator") < names.index("Check the released accelerator ABI") < names.index("Package the component release")
-    package = build["Package the component release"]["with"]["run"]
+    assert names.index("Build, test and package accelerator") < names.index("Check the released accelerator ABI") < names.index("Upload validated release bundle")
+    package = step["with"]["run"]
     assert '[ "$(git rev-parse HEAD)" = "${{ needs.preflight.outputs.source_sha }}" ]' in package
     assert 'bash scripts/release.sh package "$VERSION" "$TARGET_ARCH" release-bundle' in package
     assert 'bash scripts/release.sh validate "$VERSION" "$TARGET_ARCH" release-bundle' in package
@@ -133,7 +130,7 @@ def check(platform):
 
 
 def check_build_shell(steps):
-    """Execute both actual Workbench commands; recipe or test failure stops the job."""
+    """Execute the real command with private cache material and failing stages."""
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         source = root / "src/accelerator"
@@ -146,30 +143,62 @@ def check_build_shell(steps):
                         "    print(sys.argv[1:], os.getcwd(), file=log)\n"
                         "sys.exit(72 if sys.argv[1] == os.environ.get('FAIL_GOAL') else 0)\n")
         make.chmod(0o755)
+        git = tools / "git"
+        git.write_text('#!/bin/sh\ncase "$*" in\n'
+                       '"rev-parse HEAD") printf "%s\\n" "$GIT_SHA" ;;\n'
+                       '"show -s --format=%ct "*) echo 12345 ;;\n*) exit 90 ;;\nesac\n')
+        git.chmod(0o755)
+        (source / "scripts").mkdir()
+        (source / "scripts/release.sh").write_text(
+            'set -eu\n[ "$SOURCE_DATE_EPOCH" = 12345 ]\n'
+            '[ "$(cat "$CACHE_LOG.state")" = "$TARGET_ARCH" ]\n'
+            'printf "%s\\n" "$1" >> "$RELEASE_LOG"\n'
+            'if [ "$1" = "${FAIL_RELEASE:-}" ]; then\n'
+            '  case "$1" in package) exit 74 ;; validate) exit 75 ;; esac\nfi\n')
         framework = root / "framework"
         recipe = framework / "ci/native-cache/native-cache.sh"
         recipe.parent.mkdir(parents=True)
         recipe.write_text('set -eu\n[ "$*" = "restore-or-build rocksdb" ]\n'
-                          'printf "%s\\n" "$TARGET_ARCH" > "$CACHE_LOG"\nexit "${CACHE_EXIT:-0}"\n')
-        command = steps["Build and test accelerator"]["with"]["run"].replace("/inputs/release", str(framework))
+                          'printf "%s\\n" "$TARGET_ARCH" > "$CACHE_LOG"\n'
+                          '[ "${CACHE_EXIT:-0}" = 0 ] || exit "$CACHE_EXIT"\n'
+                          'printf "%s\\n" "$TARGET_ARCH" > "$CACHE_LOG.state"\n')
+        command = steps["Build, test and package accelerator"]["with"]["run"].replace("/inputs/release", str(framework))
+        command = command.replace("${{ needs.preflight.outputs.version }}", "v0.1.6-preview.20261009")
+        command = command.replace("${{ needs.preflight.outputs.source_sha }}", "a" * 40)
         for arch in ("x86_64", "aarch64"):
             log = root / f"make-{arch}.log"
             cache_log = root / f"cache-{arch}.log"
+            release_log = root / f"release-{arch}.log"
             env = dict(os.environ, PATH=f"{tools}:{os.environ['PATH']}", MAKE_LOG=str(log),
-                       TARGET_ARCH=arch, CACHE_LOG=str(cache_log))
+                       TARGET_ARCH=arch, CACHE_LOG=str(cache_log), RELEASE_LOG=str(release_log), GIT_SHA="a" * 40)
             subprocess.run(["bash", "-e", "-o", "pipefail", "-c", command],
                            cwd=source.parent, env=env, check=True)
             goals = ("test", "vet", "build", "test-release") if arch == "x86_64" else ("build",)
             assert log.read_text().splitlines() == [f"{[goal]} {source}" for goal in goals]
             assert cache_log.read_text().strip() == arch
+            assert release_log.read_text().splitlines() == ["package", "validate"]
             log.unlink()
+            release_log.unlink()
             failed = subprocess.run(["bash", "-e", "-c", command], cwd=source.parent,
                                     env=dict(env, CACHE_EXIT="71"))
-            assert failed.returncode == 71 and not log.exists()
+            assert failed.returncode == 71 and not log.exists() and not release_log.exists()
             failed = subprocess.run(["bash", "-e", "-c", command], cwd=source.parent,
                                     env=dict(env, FAIL_GOAL=goals[0]))
             assert failed.returncode == 72
             assert log.read_text().splitlines() == [f"{[goals[0]]} {source}"]
+            assert not release_log.exists()
+            for stage, code, expected in (("package", 74, ["package"]),
+                                          ("validate", 75, ["package", "validate"])):
+                log.unlink()
+                failed = subprocess.run(["bash", "-e", "-c", command], cwd=source.parent,
+                                        env=dict(env, FAIL_RELEASE=stage))
+                assert failed.returncode == code
+                assert log.read_text().splitlines() == [f"{[goal]} {source}" for goal in goals]
+                assert release_log.read_text().splitlines() == expected
+                release_log.unlink()
+            failed = subprocess.run(["bash", "-e", "-c", command], cwd=source.parent,
+                                    env=dict(env, GIT_SHA="b" * 40))
+            assert failed.returncode == 1 and not release_log.exists()
 
 
 def check_source_workspace():
