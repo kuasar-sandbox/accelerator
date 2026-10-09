@@ -56,6 +56,7 @@ def check(platform):
     assert jobs["build"]["strategy"] == {"fail-fast": False, "matrix": {"include": [
         {"arch": "x86_64", "runner": "ubuntu-24.04"}, {"arch": "aarch64", "runner": "ubuntu-24.04-arm"}]}}
     preflight = {s["name"]: s for s in jobs["preflight"]["steps"]}
+    assert preflight["Select immutable native Workbench images"]["env"] == {"GH_TOKEN": "${{ github.token }}"}
     select = preflight["Select immutable native Workbench images"]["run"]
     assert '--framework-sha "${{ steps.framework.outputs.sha }}" --output workbench.json' in select
     assert str(release).count("workbench.py select") == 1
