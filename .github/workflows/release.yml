@@ -149,6 +149,7 @@ jobs:
         with:
           selection: workbench-selection/workbench.json
           sources: src
+          outputs: accelerator/bin
           arch: ${{ matrix.arch }}
           cpus: '2'
           memory-gib: '8'
@@ -167,6 +168,7 @@ jobs:
         with:
           selection: workbench-selection/workbench.json
           sources: src
+          outputs: accelerator/release-bundle
           arch: ${{ matrix.arch }}
           cpus: '2'
           memory-gib: '8'
@@ -237,6 +239,7 @@ jobs:
         with:
           selection: workbench-selection/workbench.json
           sources: publisher-tools
+          outputs: accelerator/release-archive-validator
           cache: 'false'
           arch: x86_64
           cpus: '2'

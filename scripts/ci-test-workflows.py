@@ -86,6 +86,8 @@ def check(platform):
         assert "env" not in step
         assert "GH_TOKEN" not in step["with"]["run"]
     assert "restore-or-build rocksdb" in build["Build and test accelerator"]["with"]["run"]
+    assert build["Build and test accelerator"]["with"]["outputs"] == "accelerator/bin"
+    assert build["Package the component release"]["with"]["outputs"] == "accelerator/release-bundle"
     assert "NO_ROCKSDB" not in str(jobs["build"])
     for name in ("Build and test accelerator", "Check the released accelerator ABI", "Check CI regression contracts"):
         assert "continue-on-error" not in build[name]
@@ -105,6 +107,7 @@ def check(platform):
     assert helper["uses"] == "./trusted/platform/.github/actions/workbench"
     assert helper["with"]["sources"] == "publisher-tools"
     assert helper["with"]["cache"] == "false"
+    assert helper["with"]["outputs"] == "accelerator/release-archive-validator"
     assert helper["with"]["arch"] == "x86_64" and "env" not in helper
     assert 'go build -p "$KUASAR_BUILD_JOBS" -trimpath -o release-archive-validator release-archive-validator.go' in helper["with"]["run"]
     assert "cp scripts/release-archive-validator.go publisher-tools/accelerator/" in publish["Prepare trusted archive validator source"]["run"]
