@@ -131,6 +131,7 @@ test-no-rocksdb:
 # Unit tests. cache/rocks tests need librocksdb (dynamic link is fine here).
 test: deps-rocksdb test-e2e-scripts
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-tools.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-native-build-budget.py
 	CGO_CFLAGS="$(CGO_CFLAGS)" \
 	CGO_LDFLAGS="-L$(ROCKS_PREFIX)/lib -lrocksdb -lstdc++ -lm -lpthread -ldl" \
 		$(GO) test ./...

@@ -17,6 +17,7 @@
 #                           when cross-compiling.
 #   CROSS_PREFIX            Optional GNU-triple prefix (e.g. "aarch64-linux-gnu-").
 #                           Empty for native builds.
+#   KUASAR_BUILD_JOBS       Optional positive task CPU budget; defaults to nproc.
 #
 # Idempotent: if the output librocksdb.a already exists it exits 0 without
 # rebuilding. Delete $BUILD_DIR/rocksdb/ to force.
@@ -33,6 +34,8 @@ source "$script_dir/common.sh"
 : "${BUILD_DIR:=$(pwd)/build}"
 : "${TARGET_ARCH:=$(uname -m)}"
 : "${CROSS_PREFIX:=}"
+build_jobs="${KUASAR_BUILD_JOBS-$(nproc)}"
+[[ "$build_jobs" =~ ^[1-9][0-9]*$ ]] || die "KUASAR_BUILD_JOBS must be a positive integer"
 
 prefix="$BUILD_DIR/rocksdb"
 out_lib="$prefix/lib/librocksdb.a"
@@ -104,7 +107,7 @@ cmake -S "$src_dir" -B "$cmake_build" \
     "${cmake_cross_args[@]}"
 
 log "building librocksdb.a (this takes several minutes)"
-cmake --build "$cmake_build" -j"$(nproc)" --target rocksdb
+cmake --build "$cmake_build" -j"$build_jobs" --target rocksdb
 
 mkdir -p "$prefix/lib" "$prefix/include"
 cp "$cmake_build/librocksdb.a" "$prefix/lib/"

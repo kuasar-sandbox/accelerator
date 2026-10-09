@@ -2,7 +2,7 @@
 """Offline portability contracts; no GitHub access, apt or real native build.
 
 Usage: python3 scripts/ci-test-workflows.py ../kuasar-sandbox
-Release bootstrap references must be immutable upstream commits.
+Release builds use native Workbench images selected once for the run.
 """
 import importlib.util
 import os
@@ -30,7 +30,8 @@ def check(platform):
         workflows[filename] = document
         assert document["permissions"] == {"contents": "read"}
         for name, job in document["jobs"].items():
-            assert job["runs-on"] == "ubuntu-latest"
+            assert job["runs-on"] == ("${{ matrix.runner }}" if filename == "release.yml" and name == "build"
+                                      else "ubuntu-latest")
             for visibility in ("private", "internal", ""):
                 context = {"github": {"repository": "kuasar-sandbox/accelerator", "event": {"repository": {
                     "visibility": visibility, "full_name": "kuasar-sandbox/accelerator"}}}}
@@ -45,13 +46,20 @@ def check(platform):
                 assert "actions/cache@" not in step.get("uses", "")
                 if "actions/checkout@" in step.get("uses", ""):
                     assert step["with"]["persist-credentials"] is False
-                if "run" in step:
-                    subprocess.run(["bash", "-n"], input=step["run"], text=True, check=True)
+                command = step.get("run", step.get("with", {}).get("run"))
+                if command:
+                    subprocess.run(["bash", "-n"], input=command, text=True, check=True)
 
     release = workflows["release.yml"]
     jobs = release["jobs"]
     assert jobs["build"]["needs"] == "preflight"
-    assert jobs["build"]["strategy"] == {"fail-fast": False, "matrix": {"arch": ["x86_64", "aarch64"]}}
+    assert jobs["build"]["strategy"] == {"fail-fast": False, "matrix": {"include": [
+        {"arch": "x86_64", "runner": "ubuntu-24.04"}, {"arch": "aarch64", "runner": "ubuntu-24.04-arm"}]}}
+    preflight = {s["name"]: s for s in jobs["preflight"]["steps"]}
+    select = preflight["Select immutable native Workbench images"]["run"]
+    assert '--framework-sha "${{ steps.framework.outputs.sha }}" --output workbench.json' in select
+    assert str(release).count("workbench.py select") == 1
+    selection = preflight["Upload Workbench selection"]["with"]["name"]
     assert jobs["build"]["env"]["TARGET_ARCH"] == "${{ matrix.arch }}"
     assert jobs["publish"]["needs"] == ["preflight", "build"]
     assert jobs["cleanup"]["needs"] == ["preflight", "publish"]
@@ -65,20 +73,42 @@ def check(platform):
     for name in ("Check out exact component source", "Retry exact component source checkout"):
         assert build[name]["with"]["ref"] == "${{ needs.preflight.outputs.source_sha }}"
         assert build[name]["with"]["path"] == "src/accelerator"
-    assert "artifact-cross" in build["Bootstrap native or cross build"]["run"]
+    assert "Bootstrap native or cross build" not in build
+    assert "Attach native source cache" not in build
+    assert build["Download Workbench selection"]["with"]["name"] == selection
+    for name in ("Build and test accelerator", "Package the component release"):
+        step = build[name]
+        assert step["uses"] == "./trusted/platform/.github/actions/workbench"
+        assert step["with"]["selection"] == "workbench-selection/workbench.json"
+        assert step["with"]["sources"] == "src"
+        assert step["with"]["arch"] == "${{ matrix.arch }}"
+        assert "env" not in step
+        assert "GH_TOKEN" not in step["with"]["run"]
+    assert "restore-or-build rocksdb" in build["Build and test accelerator"]["with"]["run"]
     assert "NO_ROCKSDB" not in str(jobs["build"])
     for name in ("Build and test accelerator", "Check the released accelerator ABI", "Check CI regression contracts"):
         assert "continue-on-error" not in build[name]
-    assert "umask 022" in build["Build and test accelerator"]["run"]
+    assert "umask 022" in build["Build and test accelerator"]["with"]["run"]
     assert "bin/$TARGET_ARCH" in build["Check the released accelerator ABI"]["run"]
     assert names.index("Build and test accelerator") < names.index("Check the released accelerator ABI") < names.index("Package the component release")
-    package = build["Package the component release"]["run"]
+    package = build["Package the component release"]["with"]["run"]
     assert '[ "$(git rev-parse HEAD)" = "${{ needs.preflight.outputs.source_sha }}" ]' in package
     assert 'bash scripts/release.sh package "$VERSION" "$TARGET_ARCH" release-bundle' in package
+    assert 'bash scripts/release.sh validate "$VERSION" "$TARGET_ARCH" release-bundle' in package
     upload = build["Upload validated release bundle"]["with"]
     assert "matrix.arch" in upload["name"] and upload["path"] == "src/accelerator/release-bundle"
     assert upload["retention-days"] == 1 and upload["if-no-files-found"] == "error"
     publish = {s["name"]: s for s in jobs["publish"]["steps"]}
+    assert publish["Download Workbench selection"]["with"]["name"] == selection
+    helper = publish["Compile trusted archive validator"]
+    assert helper["uses"] == "./trusted/platform/.github/actions/workbench"
+    assert helper["with"]["sources"] == "publisher-tools"
+    assert helper["with"]["cache"] == "false"
+    assert helper["with"]["arch"] == "x86_64" and "env" not in helper
+    assert 'go build -p "$KUASAR_BUILD_JOBS" -trimpath -o release-archive-validator release-archive-validator.go' in helper["with"]["run"]
+    assert "cp scripts/release-archive-validator.go publisher-tools/accelerator/" in publish["Prepare trusted archive validator source"]["run"]
+    for name in ("Assemble the two validated architecture archives", "Publish component release"):
+        assert publish[name]["env"]["RELEASE_ARCHIVE_VALIDATOR"] == "${{ github.workspace }}/publisher-tools/accelerator/release-archive-validator"
     for arch in ("x86_64", "aarch64"):
         assert publish[f"Download validated {arch} bundle"]["with"]["name"] == upload["name"].replace("${{ matrix.arch }}", arch)
     assert 'publish-release.sh assemble' in publish["Assemble the two validated architecture archives"]["run"]
@@ -97,7 +127,7 @@ def check(platform):
 
 
 def check_build_shell(steps):
-    """Execute both actual YAML build paths with a fake make and real taskset."""
+    """Execute both actual Workbench commands; recipe or test failure stops the job."""
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         source = root / "src/accelerator"
@@ -107,22 +137,33 @@ def check_build_shell(steps):
         make = tools / "make"
         make.write_text(f"#!{sys.executable}\nimport os, sys\n"
                         "with open(os.environ['MAKE_LOG'], 'a') as log:\n"
-                        "    print(sys.argv[1:], os.getcwd(), sorted(os.sched_getaffinity(0)), file=log)\n")
+                        "    print(sys.argv[1:], os.getcwd(), file=log)\n"
+                        "sys.exit(72 if sys.argv[1] == os.environ.get('FAIL_GOAL') else 0)\n")
         make.chmod(0o755)
-        cpu = sorted(os.sched_getaffinity(0))[0]
+        framework = root / "framework"
+        recipe = framework / "ci/native-cache/native-cache.sh"
+        recipe.parent.mkdir(parents=True)
+        recipe.write_text('set -eu\n[ "$*" = "restore-or-build rocksdb" ]\n'
+                          'printf "%s\\n" "$TARGET_ARCH" > "$CACHE_LOG"\nexit "${CACHE_EXIT:-0}"\n')
+        command = steps["Build and test accelerator"]["with"]["run"].replace("/inputs/release", str(framework))
         for arch in ("x86_64", "aarch64"):
             log = root / f"make-{arch}.log"
+            cache_log = root / f"cache-{arch}.log"
             env = dict(os.environ, PATH=f"{tools}:{os.environ['PATH']}", MAKE_LOG=str(log),
-                       TARGET_ARCH=arch, KUASAR_BUILD_CPUS=str(cpu))
-            subprocess.run(["bash", "-e", "-o", "pipefail", "-c", steps["Build and test accelerator"]["run"]],
-                           cwd=source, env=env, check=True)
+                       TARGET_ARCH=arch, CACHE_LOG=str(cache_log))
+            subprocess.run(["bash", "-e", "-o", "pipefail", "-c", command],
+                           cwd=source.parent, env=env, check=True)
             goals = ("test", "vet", "build", "test-release") if arch == "x86_64" else ("build",)
-            assert log.read_text().splitlines() == [f"{[goal]} {source} {[cpu]}" for goal in goals]
-        cache = root / "hosted/tarballs"
-        cache.mkdir(parents=True)
-        subprocess.run(["bash", "-e", "-c", steps["Attach native source cache"]["run"]],
-                       cwd=root, env=dict(os.environ, KUASAR_TARBALL_CACHE=str(cache)), check=True)
-        assert (source / "build/tarball").resolve() == cache
+            assert log.read_text().splitlines() == [f"{[goal]} {source}" for goal in goals]
+            assert cache_log.read_text().strip() == arch
+            log.unlink()
+            failed = subprocess.run(["bash", "-e", "-c", command], cwd=source.parent,
+                                    env=dict(env, CACHE_EXIT="71"))
+            assert failed.returncode == 71 and not log.exists()
+            failed = subprocess.run(["bash", "-e", "-c", command], cwd=source.parent,
+                                    env=dict(env, FAIL_GOAL=goals[0]))
+            assert failed.returncode == 72
+            assert log.read_text().splitlines() == [f"{[goals[0]]} {source}"]
 
 
 def check_source_workspace():
