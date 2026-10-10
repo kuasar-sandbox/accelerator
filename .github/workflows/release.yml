@@ -32,6 +32,7 @@ jobs:
   preflight:
     runs-on: ubuntu-latest
     outputs:
+      preview_manifest_digest: ${{ steps.request.outputs.preview_manifest_digest }}
       source_ref: ${{ steps.request.outputs.source_ref }}
       source_sha: ${{ steps.request.outputs.source_sha }}
       version: ${{ steps.request.outputs.version }}
@@ -73,6 +74,7 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
           AGGREGATE_VERSION: ${{ inputs.aggregate_version }}
           AGGREGATE_SHA: ${{ inputs.aggregate_sha }}
+          PREVIEW_EVIDENCE_OUTPUT: preview-evidence.json
           VERSION: ${{ inputs.version }}
           TARGET_ARCH: all
         run: |
@@ -93,11 +95,22 @@ jobs:
         run: |
           python3 trusted/platform/ci/hosted/workbench.py select \
             --framework-sha "${{ steps.framework.outputs.sha }}" --output workbench.json
+      - name: Freeze admitted source and selected dependency tags
+        env:
+          SOURCE_REF: ${{ steps.request.outputs.source_ref }}
+          SOURCE_SHA: ${{ steps.request.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          dependencies=()
+          python3 -B trusted/platform/release/producer-inputs.py freeze accelerator "$SOURCE_REF" "$SOURCE_SHA" producer-inputs.tar "${dependencies[@]}"
       - name: Upload Workbench selection
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: workbench-selection-${{ github.run_id }}
-          path: workbench.json
+          path: |
+            workbench.json
+            producer-inputs.tar
+            preview-evidence.json
           if-no-files-found: error
           retention-days: 1
     if: github.event.repository.visibility == 'public' && github.event.repository.full_name == github.repository
@@ -120,21 +133,10 @@ jobs:
         with:
           name: workbench-selection-${{ github.run_id }}
           path: workbench-selection
-      - name: Check out exact component source
-        id: checkout-source
-        continue-on-error: true
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ needs.preflight.outputs.source_sha }}
-          persist-credentials: false
-          path: src/accelerator
-      - name: Retry exact component source checkout
-        if: steps.checkout-source.outcome == 'failure'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ needs.preflight.outputs.source_sha }}
-          persist-credentials: false
-          path: src/accelerator
+      - name: Restore fixed producer inputs
+        env:
+          SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+        run: python3 -B trusted/platform/release/producer-inputs.py restore workbench-selection/producer-inputs.tar accelerator "$SOURCE_SHA" src
       - name: Check out trusted build checks
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -268,6 +270,8 @@ jobs:
           SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
           AGGREGATE_VERSION: ${{ inputs.aggregate_version }}
           AGGREGATE_SHA: ${{ inputs.aggregate_sha }}
+          PREVIEW_EVIDENCE_FILE: workbench-selection/preview-evidence.json
+          PREVIEW_EVIDENCE_DIGEST: ${{ needs.preflight.outputs.preview_manifest_digest }}
           TARGET_ARCH: all
         run: |
           set -euo pipefail

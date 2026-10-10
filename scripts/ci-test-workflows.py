@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Offline portability contracts; no GitHub access, apt or real native build.
+"""Portability contracts; no apt or real native build.
 
-Usage: python3 scripts/ci-test-workflows.py ../kuasar-sandbox
+Usage: python3 scripts/ci-test-workflows.py [platform-checkout]
+An omitted checkout provisions the platform test dependency from main once.
 Release builds use native Workbench images selected once for the run.
 """
+import contextlib
 import importlib.util
 import os
 from pathlib import Path
@@ -12,12 +14,92 @@ import runpy
 import subprocess
 import sys
 import tempfile
+import unittest
 from unittest.mock import patch
 
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
+
+
+
+@contextlib.contextmanager
+def platform_fixture(explicit=None):
+    """Use a declared checkout, or freeze the test framework's normal main ref.
+
+    Platform mechanism changes land before their component callers. This is a
+    workflow-test dependency, not a released component or test-source selector.
+    """
+    if explicit:
+        platform = Path(explicit).resolve()
+        if not (platform / "release/producer-inputs.py").is_file():
+            raise ValueError("platform test dependency lacks release/producer-inputs.py: " + str(platform))
+        yield platform
+        return
+    with tempfile.TemporaryDirectory(prefix="workflow-platform-") as directory:
+        platform = Path(directory)
+        environment = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")
+        def git(*args):
+            return subprocess.check_output(["git", "-C", str(platform), *args],
+                env=environment, text=True, timeout=120).strip()
+        repository = "https://github.com/kuasar-sandbox/kuasar-sandbox.git"
+        ref = "refs/heads/main"
+        observed = git("ls-remote", "--exit-code", "--refs", repository, ref).split()
+        if len(observed) != 2 or observed[1] != ref or not re.fullmatch(r"[0-9a-f]{40}", observed[0]):
+            raise ValueError("invalid platform test dependency identity")
+        git("init", "--quiet", "--template=")
+        git("config", "core.hooksPath", "/dev/null")
+        git("remote", "add", "origin", repository)
+        git("fetch", "--quiet", "--no-tags", "--depth=1", "origin", ref)
+        if git("rev-parse", "FETCH_HEAD") != observed[0]:
+            raise ValueError("platform test dependency moved during admission")
+        git("checkout", "--quiet", "--detach", "FETCH_HEAD")
+        if not (platform / "release/producer-inputs.py").is_file():
+            raise ValueError("platform main must provide release/producer-inputs.py before component workflow tests")
+        print("workflow test platform:", observed[0], git("rev-parse", "HEAD^{tree}"), flush=True)
+        yield platform
+
+
+
+def check_platform_fixture_failures():
+    """Provisioning must fail closed before any workflow contract is executed."""
+    case = unittest.TestCase()
+    with tempfile.TemporaryDirectory() as directory:
+        with patch.object(subprocess, "check_output", side_effect=AssertionError("unexpected network")):
+            with case.assertRaisesRegex(ValueError, "lacks release/producer-inputs.py"):
+                with platform_fixture(directory):
+                    case.fail("accepted a missing explicit dependency")
+    ref = "refs/heads/main"
+    for failure in ("bad-ref", "bad-sha", "moved", "fetch-failure", "timeout"):
+        def git(command, **kwargs):
+            case.assertEqual(kwargs["timeout"], 120)
+            case.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+            case.assertEqual(kwargs["env"]["GCM_INTERACTIVE"], "never")
+            args = command[3:]
+            if args[0] == "ls-remote":
+                return (("invalid" if failure == "bad-sha" else "a" * 40) + "\t" +
+                        ("refs/heads/other" if failure == "bad-ref" else ref) + "\n")
+            if args[0] == "fetch":
+                case.assertEqual(args, ["fetch", "--quiet", "--no-tags", "--depth=1", "origin", ref])
+                if failure == "timeout":
+                    raise subprocess.TimeoutExpired(command, 120)
+                if failure == "fetch-failure":
+                    raise subprocess.CalledProcessError(1, command)
+            if args[0] == "rev-parse":
+                return "b" * 40  # Ref changed after the first observation.
+            return ""
+        expected = (subprocess.TimeoutExpired if failure == "timeout" else
+                    subprocess.CalledProcessError if failure == "fetch-failure" else ValueError)
+        with patch.object(subprocess, "check_output", side_effect=git) as calls:
+            with case.assertRaises(expected):
+                with platform_fixture():
+                    case.fail("accepted " + failure)
+            commands = [call.args[0][3:] for call in calls.call_args_list]
+            case.assertEqual(sum(c[0] == "ls-remote" for c in commands), 1)
+            case.assertFalse(any(c[0] == "checkout" for c in commands))
+            case.assertLessEqual(sum(c[0] == "fetch" for c in commands), 1)
+    print("platform fixture: missing helper, invalid identity, movement and transport failures rejected")
 
 
 def check(platform):
@@ -71,9 +153,13 @@ def check(platform):
     names = list(build)
     assert build["Check out trusted build checks"]["with"]["ref"] == "${{ github.workflow_sha }}"
     assert build["Check out trusted platform tooling"]["with"]["ref"] == "${{ needs.preflight.outputs.framework_sha }}"
-    for name in ("Check out exact component source", "Retry exact component source checkout"):
-        assert build[name]["with"]["ref"] == "${{ needs.preflight.outputs.source_sha }}"
-        assert build[name]["with"]["path"] == "src/accelerator"
+    frozen = preflight['Freeze admitted source and selected dependency tags']
+    assert 'producer-inputs.py freeze accelerator "$SOURCE_REF" "$SOURCE_SHA"' in frozen['run']
+    assert preflight['Upload Workbench selection']['with']['path'].splitlines() == ['workbench.json', 'producer-inputs.tar', 'preview-evidence.json']
+    restored = build['Restore fixed producer inputs']
+    assert 'producer-inputs.py restore workbench-selection/producer-inputs.tar accelerator "$SOURCE_SHA" src' in restored['run']
+    assert restored['env']['SOURCE_SHA'] == '${{ needs.preflight.outputs.source_sha }}'
+    assert not any(row.get('with', {}).get('ref') == '${{ needs.preflight.outputs.source_sha }}' for row in build.values())
     assert "Bootstrap native or cross build" not in build
     assert "Attach native source cache" not in build
     assert build["Download Workbench selection"]["with"]["name"] == selection
@@ -260,5 +346,7 @@ def check_abi():
 
 
 if __name__ == "__main__":
-    check(Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT.parent / "kuasar-sandbox")
+    check_platform_fixture_failures()
+    with platform_fixture(sys.argv[1] if len(sys.argv) > 1 else os.environ.get("KUASAR_PLATFORM_ROOT")) as platform:
+        check(platform)
     check_abi()
