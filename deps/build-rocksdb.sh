@@ -18,6 +18,8 @@
 #   CROSS_PREFIX            Optional GNU-triple prefix (e.g. "aarch64-linux-gnu-").
 #                           Empty for native builds.
 #   KUASAR_BUILD_JOBS       Optional positive task CPU budget; defaults to nproc.
+#   SOURCE_DATE_EPOCH       Nonnegative Unix timestamp for RocksDB build metadata;
+#                           defaults to 0 rather than the current wall clock.
 #
 # Idempotent: if the output librocksdb.a already exists it exits 0 without
 # rebuilding. Delete $BUILD_DIR/rocksdb/ to force.
@@ -36,6 +38,9 @@ source "$script_dir/common.sh"
 : "${CROSS_PREFIX:=}"
 build_jobs="${KUASAR_BUILD_JOBS-$(nproc)}"
 [[ "$build_jobs" =~ ^[1-9][0-9]*$ ]] || die "KUASAR_BUILD_JOBS must be a positive integer"
+: "${SOURCE_DATE_EPOCH:=0}"
+[[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]] || die "SOURCE_DATE_EPOCH must be a nonnegative integer"
+export SOURCE_DATE_EPOCH
 
 prefix="$BUILD_DIR/rocksdb"
 out_lib="$prefix/lib/librocksdb.a"
