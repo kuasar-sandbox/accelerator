@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+# Archive fixtures target x86_64 even when this gate runs on an ARM host.
+# Validators run natively; payload fixtures are inspected, never executed.
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -283,9 +286,9 @@ cat > "$fixture_root/Makefile" <<'EOF'
 .PHONY: build
 build:
 	mkdir -p bin/x86_64 build/src/rocksdb build/x86_64/rocksdb/lib build/test-system
-	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/manifest-ctl ./cmd/manifest-ctl
-	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/store-ctl ./cmd/store-ctl
-	CGO_ENABLED=0 go build -trimpath -buildvcs=true -o bin/x86_64/cache-ctl ./cmd/cache-ctl
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -o bin/x86_64/manifest-ctl ./cmd/manifest-ctl
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -o bin/x86_64/store-ctl ./cmd/store-ctl
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -o bin/x86_64/cache-ctl ./cmd/cache-ctl
 	for notice in AUTHORS COPYING LICENSE.Apache LICENSE.leveldb; do printf 'fixture RocksDB %s\n' "$$notice" > "build/src/rocksdb/$$notice"; done
 	printf 'fresh synthetic RocksDB archive\n' > build/x86_64/rocksdb/lib/librocksdb.a
 	printf 'synthetic stdc++ archive\n' > build/test-system/libstdc++.a
@@ -295,10 +298,10 @@ build:
 	    "$(CURDIR)/build/test-system/libstdc++.a" "$(CURDIR)/build/test-system/libgcc.a" > "$$map"
 EOF
 fixture_project_sha="$(init_fixture_repo "$fixture_root" LICENSE LICENSES NOTICE .gitignore scripts go.mod cmd test/scripts Makefile)"
-(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/go-fixture" ./cmd/manifest-ctl)
+(cd "$fixture_root" && GOWORK=off GOOS=linux GOARCH=amd64 go build -buildvcs=true -o "$TMP/go-fixture" ./cmd/manifest-ctl)
 release_materials_require_go_revision "$TMP/go-fixture" "$fixture_project_sha"
 printf '// dirty fixture\n' >> "$fixture_root/cmd/manifest-ctl/main.go"
-(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -o "$TMP/dirty-go-fixture" ./cmd/manifest-ctl)
+(cd "$fixture_root" && GOWORK=off GOOS=linux GOARCH=amd64 go build -buildvcs=true -o "$TMP/dirty-go-fixture" ./cmd/manifest-ctl)
 if (release_materials_require_go_revision "$TMP/dirty-go-fixture" "$fixture_project_sha" >/dev/null 2>&1); then
   fail "release accepted a binary built from dirty source"
 fi
@@ -319,7 +322,7 @@ done
 mkdir -p "$TMP/no-rocksdb-bin"
 install -m 0755 "$TMP/bin/manifest-ctl" "$TMP/no-rocksdb-bin/manifest-ctl"
 install -m 0755 "$TMP/bin/store-ctl" "$TMP/no-rocksdb-bin/store-ctl"
-(cd "$fixture_root" && GOWORK=off go build -buildvcs=true -tags no_rocksdb \
+(cd "$fixture_root" && GOWORK=off GOOS=linux GOARCH=amd64 go build -buildvcs=true -tags no_rocksdb \
   -o "$TMP/no-rocksdb-bin/cache-ctl" ./cmd/cache-ctl)
 if SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/no-rocksdb-bin" \
   "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 \
