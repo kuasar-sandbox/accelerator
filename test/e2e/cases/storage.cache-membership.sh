@@ -77,10 +77,14 @@ payload_hash() {
 }
 
 load_hash_via_tiered() {
-    local key="$1" out="$2" label="$3" attempt hash
+    local key="$1" prefix="$2" label="$3" attempt hash out owned diagnostic
     local cfg
     cfg="$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")"
+    # load creates its output exclusively. Repeated repair probes and retries
+    # after a partial write must each own a fresh path, without deleting data.
+    owned=$(mktemp -d "${prefix}.load.XXXXXX") || return 1
     for attempt in $(seq 1 10); do
+        out="$owned/attempt-$attempt"
         if "$BIN/manifest-ctl" load --manifest-config "$cfg" \
             --output "$out" \
             --no-progress "$key" >"$out.stdout" 2>"$out.stderr"; then
@@ -92,9 +96,13 @@ load_hash_via_tiered() {
         sleep 0.3
     done
     echo "  FAIL: $label did not load/decode through tiered cache" >&2
-    [ -s "$out.stdout" ] && { echo "---- $out.stdout ----" >&2; cat "$out.stdout" >&2; }
-    [ -s "$out.stderr" ] && { echo "---- $out.stderr ----" >&2; cat "$out.stderr" >&2; }
-    [ -s "$out.tar.stderr" ] && { echo "---- $out.tar.stderr ----" >&2; cat "$out.tar.stderr" >&2; }
+    # Preserve every attempt's diagnostics in the case log before TMPDIR cleanup.
+    for diagnostic in "$owned"/*.stdout "$owned"/*.stderr; do
+        if [ -s "$diagnostic" ]; then
+            echo "---- $diagnostic ----" >&2
+            cat "$diagnostic" >&2
+        fi
+    done
     return 1
 }
 
