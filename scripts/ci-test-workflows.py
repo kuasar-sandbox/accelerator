@@ -71,9 +71,13 @@ def check(platform):
     names = list(build)
     assert build["Check out trusted build checks"]["with"]["ref"] == "${{ github.workflow_sha }}"
     assert build["Check out trusted platform tooling"]["with"]["ref"] == "${{ needs.preflight.outputs.framework_sha }}"
-    for name in ("Check out exact component source", "Retry exact component source checkout"):
-        assert build[name]["with"]["ref"] == "${{ needs.preflight.outputs.source_sha }}"
-        assert build[name]["with"]["path"] == "src/accelerator"
+    frozen = preflight['Freeze admitted source and selected dependency tags']
+    assert 'producer-inputs.py freeze accelerator "$SOURCE_REF" "$SOURCE_SHA"' in frozen['run']
+    assert preflight['Upload Workbench selection']['with']['path'].splitlines() == ['workbench.json', 'producer-inputs.tar', 'preview-evidence.json']
+    restored = build['Restore fixed producer inputs']
+    assert 'producer-inputs.py restore workbench-selection/producer-inputs.tar accelerator "$SOURCE_SHA" src' in restored['run']
+    assert restored['env']['SOURCE_SHA'] == '${{ needs.preflight.outputs.source_sha }}'
+    assert not any(row.get('with', {}).get('ref') == '${{ needs.preflight.outputs.source_sha }}' for row in build.values())
     assert "Bootstrap native or cross build" not in build
     assert "Attach native source cache" not in build
     assert build["Download Workbench selection"]["with"]["name"] == selection
