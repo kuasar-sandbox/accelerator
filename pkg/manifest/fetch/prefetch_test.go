@@ -332,20 +332,58 @@ func TestConcurrentPrefetchCallsAreIndependent(t *testing.T) {
 	secondStarted := make(chan struct{})
 	secondDone := asyncPrefetch(prefetcher, secondStarted)
 	<-secondStarted
-	close(firstCall.release)
-	if err := receivePrefetchError(t, firstDone); err != nil {
-		t.Fatalf("first Prefetch: %v", err)
-	}
-
 	secondCall := receivePrefetchGateCall(t, getter.entered)
 	if firstCall.blob == secondCall.blob {
 		t.Fatal("concurrent Prefetch calls shared one Blob handle")
+	}
+	close(firstCall.release)
+	if err := receivePrefetchError(t, firstDone); err != nil {
+		t.Fatalf("first Prefetch: %v", err)
 	}
 	close(secondCall.release)
 	if err := receivePrefetchError(t, secondDone); err != nil {
 		t.Fatalf("second Prefetch: %v", err)
 	}
 	assertPrefetchBlobsUntouchedAndReleased(t, []*prefetchObservedBlob{firstCall.blob, secondCall.blob})
+}
+
+func TestPrefetchWorkerErrorOutranksDerivedCancel(t *testing.T) {
+	const chunks = maxPrefetchGets + 1
+	const chunkSize uint32 = 4
+	sentinel := errors.New("prefetch cache miss")
+	entries := make([]codec.ChunkEntry, chunks)
+	for i := range entries {
+		entries[i] = codec.ChunkEntry{
+			Offset:         uint64(i) * uint64(chunkSize),
+			Size:           chunkSize,
+			CiphertextHash: prefetchTestKey(byte(i + 1)),
+		}
+	}
+	m := &codec.Manifest{
+		Version:   codec.Version1,
+		ImageSize: uint64(chunks) * uint64(chunkSize),
+		Entries:   entries,
+	}
+	getter := &fixedPrefetchGetter{result: cache.CacheMiss, err: sentinel}
+	err := newPrefetchManifest(m, getter).Prefetch(context.Background())
+	if err == nil {
+		t.Fatal("Prefetch unexpectedly succeeded")
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("Prefetch returned derived cancellation, want worker error: %v", err)
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Prefetch error = %v, want %v", err, sentinel)
+	}
+}
+
+func TestPrefetchCanceledContext(t *testing.T) {
+	stream := newPrefetchManifest(densePrefetchManifest(8, 0x51), newPrefetchRecordingGetter())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := stream.Prefetch(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Prefetch(canceled) = %v, want context.Canceled", err)
+	}
 }
 
 func TestFailedPrefetchDoesNotAffectLaterRead(t *testing.T) {
