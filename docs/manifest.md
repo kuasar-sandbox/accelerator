@@ -552,17 +552,26 @@ Use matching selected versions, not unrelated latest component downloads.
 The following disposable FS Store uses a private UDS and a generated test-only
 customer key. No L2, MicroVM, registry, public listener or external data is involved.
 [Store generation initialization](store.md#6-administrative-commands) and
-§3 above remain authoritative. Run in a new shell; cleanup stops only this child
-and removes only its temporary directory.
+§3 above remain authoritative. Run in a new shell. Exit cleanup always stops this
+child; only success removes its temporary directory. Failure retains the private
+directory and prints its path for diagnosis.
 
 ```bash
 set -euo pipefail
 umask 077
 LAB=$(mktemp -d)
 STORE_PID=
+SUCCESS=0
 cleanup() {
+  result=$?
+  trap - EXIT
   if [ -n "$STORE_PID" ]; then kill "$STORE_PID" 2>/dev/null || true; wait "$STORE_PID" 2>/dev/null || true; fi
-  rm -rf -- "$LAB"
+  if [ "$result" -eq 0 ] && [ "$SUCCESS" -eq 1 ]; then
+    rm -rf -- "$LAB"
+  else
+    printf 'Retained private diagnostics: %s (store.log)\n' "$LAB" >&2
+  fi
+  exit "$result"
 }
 trap cleanup EXIT
 cat > "$LAB/store.yaml" <<EOF
@@ -607,13 +616,16 @@ flatten-ctl tar extract -f "$LAB/output.tar" "image:$LAB/restored"
 cmp "$LAB/payload" "$LAB/restored"
 printf 'PASS: payload bytes match\n'
 unset MANIFEST_KEY
+SUCCESS=1
 ```
 
 Expect a complete Manifest key, zero failed chunks from verify, and the final
 PASS line. Compare extracted logical bytes: tar wrappers/names can differ after
 load. A normal file or a generic tar is not a substitute for the platform
-sparse/digest envelope. On failure inspect the private Store log before leaving
-the shell, check generation initialization, socket readiness and key availability;
+sparse/digest envelope. On failure inspect `store.log` in the retained directory
+reported on stderr; check generation initialization, socket readiness and key availability;
 do not retry an uncertain write as though it were a failed read. This validates
 only a local byte roundtrip, not sparse VM state, cache tiers, S3 or recovery.
-For retained data, preserve the key/config/ref instead of using this cleanup.
+After diagnosis, explicitly remove only the reported private test directory.
+For intentionally retained data, preserve the key/config/ref instead of using
+this test-only cleanup; the generated key exists only in this shell environment.

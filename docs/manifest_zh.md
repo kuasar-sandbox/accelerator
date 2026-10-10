@@ -708,16 +708,25 @@ aggregate 所选的 `store-ctl`、`manifest-ctl` 和 guest-runtime 的 `flatten-
 
 以下临时 FS Store 使用私有 UDS 和临时客户密钥，不需要 L2、MicroVM、registry、
 公共 listener 或外部数据。[Store generation 初始化](store_zh.md) 和上文 §3
-仍是权威契约。请在新 shell 执行；清理仅停止本次子进程并删除临时目录。
+仍是权威契约。请在新 shell 执行；退出时总会停止本次子进程，仅成功时删除
+临时目录。失败时保留私有目录并打印路径供诊断。
 
 ```bash
 set -euo pipefail
 umask 077
 LAB=$(mktemp -d)
 STORE_PID=
+SUCCESS=0
 cleanup() {
+  result=$?
+  trap - EXIT
   if [ -n "$STORE_PID" ]; then kill "$STORE_PID" 2>/dev/null || true; wait "$STORE_PID" 2>/dev/null || true; fi
-  rm -rf -- "$LAB"
+  if [ "$result" -eq 0 ] && [ "$SUCCESS" -eq 1 ]; then
+    rm -rf -- "$LAB"
+  else
+    printf 'Retained private diagnostics: %s (store.log)\n' "$LAB" >&2
+  fi
+  exit "$result"
 }
 trap cleanup EXIT
 cat > "$LAB/store.yaml" <<EOF
@@ -762,11 +771,13 @@ flatten-ctl tar extract -f "$LAB/output.tar" "image:$LAB/restored"
 cmp "$LAB/payload" "$LAB/restored"
 printf 'PASS: payload bytes match\n'
 unset MANIFEST_KEY
+SUCCESS=1
 ```
 
 预期获得完整 Manifest key、verify 零失败 chunk 和最终 PASS 行。比较解包后的
 逻辑字节，load 后 tar 包装/名称可能不同。普通文件或通用 tar 不能替代平台的
-稀疏/digest envelope。失败时退出 shell 前检查私有 Store 日志、generation
-初始化、socket 就绪与密钥；不要把结果未知的写操作当作读取失败重试。本流程
-只验证本地字节往返，不验证稀疏 VM 状态、cache 层级、S3 或恢复。若需保留数据，
-应保留密钥、配置和 ref，不使用此处临时清理。
+稀疏/digest envelope。失败后按 stderr 打印路径检查保留目录的 `store.log`、
+generation 初始化、socket 就绪与密钥；不要把结果未知的写操作当作读取失败重试。本流程
+只验证本地字节往返，不验证稀疏 VM 状态、cache 层级、S3 或恢复。诊断结束后，
+显式删除本次打印的私有测试目录。若需长期保留数据，应保留密钥、配置和 ref，
+不使用此处测试清理；生成的密钥仅存在于本 shell 环境。
