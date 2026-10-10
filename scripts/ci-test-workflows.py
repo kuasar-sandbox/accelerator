@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Offline portability contracts; no GitHub access, apt or real native build.
+"""Portability contracts; no apt or real native build.
 
-Usage: python3 scripts/ci-test-workflows.py ../kuasar-sandbox
+Usage: python3 scripts/ci-test-workflows.py [platform-checkout]
+An omitted checkout provisions the platform test dependency from main once.
 Release builds use native Workbench images selected once for the run.
 """
+import contextlib
 import importlib.util
 import os
 from pathlib import Path
@@ -18,6 +20,44 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
+
+
+
+@contextlib.contextmanager
+def platform_fixture(explicit=None):
+    """Use a declared checkout, or freeze the test framework's normal main ref.
+
+    Platform mechanism changes land before their component callers. This is a
+    workflow-test dependency, not a released component or test-source selector.
+    """
+    if explicit:
+        platform = Path(explicit).resolve()
+        if not (platform / "release/producer-inputs.py").is_file():
+            raise ValueError("platform test dependency lacks release/producer-inputs.py: " + str(platform))
+        yield platform
+        return
+    with tempfile.TemporaryDirectory(prefix="workflow-platform-") as directory:
+        platform = Path(directory)
+        environment = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")
+        def git(*args):
+            return subprocess.check_output(["git", "-C", str(platform), *args],
+                env=environment, text=True, timeout=120).strip()
+        repository = "https://github.com/kuasar-sandbox/kuasar-sandbox.git"
+        ref = "refs/heads/main"
+        observed = git("ls-remote", "--exit-code", "--refs", repository, ref).split()
+        if len(observed) != 2 or observed[1] != ref or not re.fullmatch(r"[0-9a-f]{40}", observed[0]):
+            raise ValueError("invalid platform test dependency identity")
+        git("init", "--quiet", "--template=")
+        git("config", "core.hooksPath", "/dev/null")
+        git("remote", "add", "origin", repository)
+        git("fetch", "--quiet", "--no-tags", "--depth=1", "origin", ref)
+        if git("rev-parse", "FETCH_HEAD") != observed[0]:
+            raise ValueError("platform test dependency moved during admission")
+        git("checkout", "--quiet", "--detach", "FETCH_HEAD")
+        if not (platform / "release/producer-inputs.py").is_file():
+            raise ValueError("platform main must provide release/producer-inputs.py before component workflow tests")
+        print("workflow test platform:", observed[0], git("rev-parse", "HEAD^{tree}"), flush=True)
+        yield platform
 
 
 def check(platform):
@@ -264,5 +304,6 @@ def check_abi():
 
 
 if __name__ == "__main__":
-    check(Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT.parent / "kuasar-sandbox")
+    with platform_fixture(sys.argv[1] if len(sys.argv) > 1 else os.environ.get("KUASAR_PLATFORM_ROOT")) as platform:
+        check(platform)
     check_abi()
