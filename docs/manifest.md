@@ -539,3 +539,81 @@ Manifest source selection and lazy recovery are specified in [§4.9](#49-source-
 Explicit tarstream `@digest`/`@hmac` identities and Bundle `@manifest` selectors remain binding when ordinary `manifest.verify_content` is disabled. Content conversion completes carrier verification before reporting success. Carrier selection uses its bytes or an explicit selector rather than the filename extension. When a carrier declares a tail, extraction and stripping require that boundary to match the validated ZIP suffix.
 
 For an unchanged complete Manifest/Bundle root, tarstream output recovers the boundary of a valid relative ZIP suffix. This preserves canonical image envelope identities across Store roundtrips; existing tarstream declarations and explicit windows retain their boundaries. Store statistics count new Manifest bytes only when the final Put creates the object. Tarstream-only loads report logical progress unless `--no-progress` is selected.
+
+## 7. Independent Store roundtrip
+
+Use this before adding a VM or cache. Prerequisites: Linux, Bash, Python 3,
+`store-ctl` and `manifest-ctl` from one selected aggregate, plus that aggregate's
+`flatten-ctl` from guest-runtime. Its [pure-Go tar stream/extract interface](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten.md#25-flatten-ctl-tar--tar-extraction-and-single-file-sparse-streams)
+needs neither mkfs.erofs nor KVM/root. Check these subcommands in the selected
+binary's help; older versions lacking this interface are outside this recipe.
+Use matching selected versions, not unrelated latest component downloads.
+
+The following disposable FS Store uses a private UDS and a generated test-only
+customer key. No L2, MicroVM, registry, public listener or external data is involved.
+[Store generation initialization](store.md#6-administrative-commands) and
+§3 above remain authoritative. Run in a new shell; cleanup stops only this child
+and removes only its temporary directory.
+
+```bash
+set -euo pipefail
+umask 077
+LAB=$(mktemp -d)
+STORE_PID=
+cleanup() {
+  if [ -n "$STORE_PID" ]; then kill "$STORE_PID" 2>/dev/null || true; wait "$STORE_PID" 2>/dev/null || true; fi
+  rm -rf -- "$LAB"
+}
+trap cleanup EXIT
+cat > "$LAB/store.yaml" <<EOF
+listen: unix://$LAB/store.sock
+backend: fs
+fs:
+  root: $LAB/objects
+  verify_content_key: true
+generations:
+  file:
+    path: $LAB/generations
+EOF
+store-ctl init --config "$LAB/store.yaml" --generation G1
+store-ctl serve --config "$LAB/store.yaml" >"$LAB/store.log" 2>&1 &
+STORE_PID=$!
+for i in $(seq 1 50); do
+  test -S "$LAB/store.sock" && break
+  kill -0 "$STORE_PID"
+  sleep 0.1
+done
+test -S "$LAB/store.sock"
+export MANIFEST_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+cat > "$LAB/manifest.yaml" <<EOF
+store:
+  endpoint: unix://$LAB/store.sock
+  timeout: 5s
+manifest:
+  verify_content: true
+chunker:
+  mode: cdc
+crypto:
+  chunk: aes
+  manifest: aes
+  local: off
+EOF
+printf 'Kuasar independent storage roundtrip\n' > "$LAB/payload"
+flatten-ctl tar stream -f "$LAB/input.tar" "image:$LAB/payload"
+KEY=$(manifest-ctl store --manifest-config "$LAB/manifest.yaml" --no-progress "$LAB/input.tar")
+manifest-ctl verify --manifest-config "$LAB/manifest.yaml" --no-progress "$KEY"
+manifest-ctl load --manifest-config "$LAB/manifest.yaml" --output "$LAB/output.tar" "$KEY"
+flatten-ctl tar extract -f "$LAB/output.tar" "image:$LAB/restored"
+cmp "$LAB/payload" "$LAB/restored"
+printf 'PASS: payload bytes match\n'
+unset MANIFEST_KEY
+```
+
+Expect a complete Manifest key, zero failed chunks from verify, and the final
+PASS line. Compare extracted logical bytes: tar wrappers/names can differ after
+load. A normal file or a generic tar is not a substitute for the platform
+sparse/digest envelope. On failure inspect the private Store log before leaving
+the shell, check generation initialization, socket readiness and key availability;
+do not retry an uncertain write as though it were a failed read. This validates
+only a local byte roundtrip, not sparse VM state, cache tiers, S3 or recovery.
+For retained data, preserve the key/config/ref instead of using this cleanup.

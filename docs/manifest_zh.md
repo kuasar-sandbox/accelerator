@@ -697,3 +697,76 @@ Manifest 来源选择与惰性恢复见[§4.9](#49-来源选择与惰性恢复).
 显式 tarstream `@digest`/`@hmac` 身份和 Bundle `@manifest` selector 在关闭普通 `manifest.verify_content` 时仍然生效。内容转换完成载体校验后才报告成功。载体按字节格式或显式 selector 识别，与文件扩展名无关。载体声明 tail 时，提取和剥离要求该边界与合法 ZIP 后缀起点一致。
 
 对未经修改的完整 Manifest/Bundle 根，tarstream 输出恢复合法相对偏移 ZIP 后缀的边界，使规范镜像信封身份在 Store 往返中保持一致；既有 tarstream 声明和显式窗口维持各自边界。Store 统计仅在最终 Put 实际创建 Manifest 时计入新增字节。tarstream-only load 报告逻辑进度，`--no-progress` 可关闭动态进度。
+
+## 7. 独立 Store 往返
+
+在加入 VM 或 cache 前先验证这一流程。前提为 Linux、Bash、Python 3，以及同一
+aggregate 所选的 `store-ctl`、`manifest-ctl` 和 guest-runtime 的 `flatten-ctl`。
+其[纯 Go tar stream/extract 接口](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten_zh.md)
+不需要 mkfs.erofs、KVM 或 root。先用所选二进制 help 确认子命令；缺少此接口的
+旧版不适用。使用配套版本，不要分别下载各组件的 latest。
+
+以下临时 FS Store 使用私有 UDS 和临时客户密钥，不需要 L2、MicroVM、registry、
+公共 listener 或外部数据。[Store generation 初始化](store_zh.md) 和上文 §3
+仍是权威契约。请在新 shell 执行；清理仅停止本次子进程并删除临时目录。
+
+```bash
+set -euo pipefail
+umask 077
+LAB=$(mktemp -d)
+STORE_PID=
+cleanup() {
+  if [ -n "$STORE_PID" ]; then kill "$STORE_PID" 2>/dev/null || true; wait "$STORE_PID" 2>/dev/null || true; fi
+  rm -rf -- "$LAB"
+}
+trap cleanup EXIT
+cat > "$LAB/store.yaml" <<EOF
+listen: unix://$LAB/store.sock
+backend: fs
+fs:
+  root: $LAB/objects
+  verify_content_key: true
+generations:
+  file:
+    path: $LAB/generations
+EOF
+store-ctl init --config "$LAB/store.yaml" --generation G1
+store-ctl serve --config "$LAB/store.yaml" >"$LAB/store.log" 2>&1 &
+STORE_PID=$!
+for i in $(seq 1 50); do
+  test -S "$LAB/store.sock" && break
+  kill -0 "$STORE_PID"
+  sleep 0.1
+done
+test -S "$LAB/store.sock"
+export MANIFEST_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+cat > "$LAB/manifest.yaml" <<EOF
+store:
+  endpoint: unix://$LAB/store.sock
+  timeout: 5s
+manifest:
+  verify_content: true
+chunker:
+  mode: cdc
+crypto:
+  chunk: aes
+  manifest: aes
+  local: off
+EOF
+printf 'Kuasar independent storage roundtrip\n' > "$LAB/payload"
+flatten-ctl tar stream -f "$LAB/input.tar" "image:$LAB/payload"
+KEY=$(manifest-ctl store --manifest-config "$LAB/manifest.yaml" --no-progress "$LAB/input.tar")
+manifest-ctl verify --manifest-config "$LAB/manifest.yaml" --no-progress "$KEY"
+manifest-ctl load --manifest-config "$LAB/manifest.yaml" --output "$LAB/output.tar" "$KEY"
+flatten-ctl tar extract -f "$LAB/output.tar" "image:$LAB/restored"
+cmp "$LAB/payload" "$LAB/restored"
+printf 'PASS: payload bytes match\n'
+unset MANIFEST_KEY
+```
+
+预期获得完整 Manifest key、verify 零失败 chunk 和最终 PASS 行。比较解包后的
+逻辑字节，load 后 tar 包装/名称可能不同。普通文件或通用 tar 不能替代平台的
+稀疏/digest envelope。失败时退出 shell 前检查私有 Store 日志、generation
+初始化、socket 就绪与密钥；不要把结果未知的写操作当作读取失败重试。本流程
+只验证本地字节往返，不验证稀疏 VM 状态、cache 层级、S3 或恢复。若需保留数据，
+应保留密钥、配置和 ref，不使用此处临时清理。
