@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Source regression tests for cache E2E assertions, not product E2E."""
+import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -83,6 +85,90 @@ class CacheAssertionTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("exit=124", result.stderr)
         self.assertLess(time.monotonic() - start, 8)
+
+
+class MembershipLoadTests(unittest.TestCase):
+    def exercise(self, mode, calls=1, existing_prefix=False):
+        source = (CASES / "storage.cache-membership.sh").read_text()
+        functions = "\n".join(name + "() {" + section(source, name + "() {", "\n}\n") + "\n}"
+                              for name in ("payload_hash", "load_hash_via_tiered"))
+        with tempfile.TemporaryDirectory(prefix="membership-load-") as directory:
+            root = Path(directory)
+            binary = root / "manifest-ctl"
+            # Model only the CLI's exclusive-create contract and failure modes.
+            # The actual shell helper and tar payload hashing run unchanged.
+            binary.write_text("""#!/usr/bin/env python3
+import io, json, os, pathlib, sys, tarfile
+out = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])
+record = pathlib.Path(os.environ['LOAD_CALLS'])
+first = not record.exists()
+with record.open('a') as log:
+    log.write(json.dumps(str(out)) + '\\n')
+try:
+    stream = out.open('xb')
+except FileExistsError:
+    print('output already exists', file=sys.stderr)
+    sys.exit(17)
+with stream:
+    mode = os.environ['LOAD_MODE']
+    if mode == 'fail' or (mode == 'partial-first' and first):
+        stream.write(b'partial')
+        print('partial load failed', file=sys.stderr)
+        sys.exit(23)
+    if mode == 'corrupt':
+        stream.write(b'not a tar archive')
+    else:
+        with tarfile.open(fileobj=stream, mode='w') as archive:
+            info = tarfile.TarInfo('image')
+            info.size = len(b'payload')
+            archive.addfile(info, io.BytesIO(b'payload'))
+""")
+            binary.chmod(0o755)
+            prefix = root / "output"
+            if existing_prefix:
+                prefix.write_bytes(b'previous unrelated data')
+            environment = dict(os.environ, BIN=directory, TIERED_PORT="1",
+                               LOAD_CALLS=str(root / "calls"), LOAD_MODE=mode,
+                               LOAD_PREFIX=str(prefix))
+            program = ('set -euo pipefail\nsleep() { :; }\n'
+                       'accel_cfg_for_cache() { echo fixture; }\n' + functions + '\n' +
+                       'load_hash_via_tiered key "$LOAD_PREFIX" fixture\n' * calls)
+            result = subprocess.run(['bash', '-c', program], env=environment,
+                                    capture_output=True, text=True, timeout=10)
+            outputs = [Path(json.loads(line)) for line in (root / 'calls').read_text().splitlines()]
+            self.assertEqual(len(outputs), len(set(outputs)), 'attempts reused an exclusive output path')
+            if existing_prefix:
+                self.assertEqual(prefix.read_bytes(), b'previous unrelated data')
+            self.assertTrue(all(path.exists() for path in outputs), 'attempt outputs were overwritten or removed')
+            return result, len(outputs)
+
+    def test_repeated_successful_probes_have_distinct_outputs(self):
+        result, count = self.exercise('success', calls=2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(count, 2)
+        self.assertEqual(result.stdout.splitlines(), [hashlib.sha256(b'payload').hexdigest()] * 2)
+
+    def test_existing_prefix_is_preserved(self):
+        result, count = self.exercise('success', existing_prefix=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(count, 1)
+
+    def test_partial_failure_does_not_poison_the_next_attempt(self):
+        result, count = self.exercise('partial-first')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(count, 2)
+        self.assertEqual(result.stdout.strip(), hashlib.sha256(b'payload').hexdigest())
+
+    def test_failed_or_corrupt_loads_cannot_pass(self):
+        for mode in ('fail', 'corrupt'):
+            with self.subTest(mode=mode):
+                result, count = self.exercise(mode)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(count, 10)
+                self.assertEqual(result.stdout, '')
+                self.assertIn('did not load/decode through tiered cache', result.stderr)
+                self.assertIn('attempt-1.', result.stderr)
+                self.assertIn('attempt-10.', result.stderr)
 
 
 if __name__ == "__main__":
