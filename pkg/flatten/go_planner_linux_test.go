@@ -312,8 +312,8 @@ func TestGoPlannerBatchHashContentAndDeterminism(t *testing.T) {
 	previous := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(previous)
 	var first []byte
-	for _, workers := range []int{1, 4} {
-		runtime.GOMAXPROCS(workers)
+	for _, parallelism := range []int{1, 2, 4} {
+		runtime.GOMAXPROCS(parallelism)
 		p, err := PrepareDir(context.Background(), root, Options{TmpDir: work}, DirOptions{})
 		if err != nil {
 			t.Fatal(err)
@@ -330,7 +330,7 @@ func TestGoPlannerBatchHashContentAndDeterminism(t *testing.T) {
 		}
 		actual, err := fs.ReadFile(img, "data")
 		if err != nil || !bytes.Equal(actual, payload) {
-			t.Fatalf("workers %d: content differs: %v", workers, err)
+			t.Fatalf("parallelism %d: content differs: %v", parallelism, err)
 		}
 		if first != nil && !bytes.Equal(first, raw.Bytes()) {
 			t.Fatal("worker count changed image identity")

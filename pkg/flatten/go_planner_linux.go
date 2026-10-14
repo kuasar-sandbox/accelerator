@@ -155,7 +155,8 @@ func buildGoPlan(ctx context.Context, selection *sourceSelection, layoutPath, na
 	}
 	g := &goPlanner{ctx: ctx, selection: selection, limits: limits, planBytes: planHeaderSize, memory: memory}
 	g.buffer = make([]byte, planReadBatch)
-	g.hashWorkers = min(4, runtime.GOMAXPROCS(0))
+	// Bound hashing CPU pressure as well as buffer memory.
+	g.hashWorkers = min(2, runtime.GOMAXPROCS(0))
 	g.blocks = planningTable[[32]byte, uint64]{hash: func(k [32]byte) uint64 { return binary.LittleEndian.Uint64(k[:8]) }, memory: &g.memory}
 	g.links = planningTable[inodeKey, erofs.NodeID]{hash: inodeHash, memory: &g.memory}
 	var err error
