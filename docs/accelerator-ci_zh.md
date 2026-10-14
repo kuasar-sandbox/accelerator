@@ -127,7 +127,7 @@ Builder 测试入口，以精确 source/artifact set 验证。接收工件字节
 
 ### 同条件展平测量
 
-纯 Go 生成器使用 `--variant NAME,CLI`，省略原生工具。`--allow-layout-differences` 只允许不同生成器的制品身份不同；既有内容、元数据、硬链接和运行配置核验不变，各生成器重复构建仍须字节一致。
+纯 Go 生成器使用 `--variant NAME,CLI`，省略原生工具。`--allow-layout-differences` 只允许不同生成器的制品身份不同；既有内容、元数据、硬链接和运行配置核验不变，各生成器重复构建仍须字节一致。`identity-comparison.json` 记录每个变体的轮数及重复身份核验结果。单轮资源测量仍可使用，但明确标为 `not_checked_single_trial`，不能作为确定性证据。比较重复输出至少需要两轮；性能验收仍保留三轮交替对照要求。
 
 `test/scripts/bench_flatten.py` 使用预先构建的原生生产工具、真实 stdout pipe 和当前
 artifact reader，默认交替顺序执行三轮。记录工具摘要、进程树采样 RSS、scratch

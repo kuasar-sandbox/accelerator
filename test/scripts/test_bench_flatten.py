@@ -32,12 +32,57 @@ class GeneratorComparison(unittest.TestCase):
             self.assertEqual(native['MKFS_EROFS_PATH'], '/selected/mkfs')
             self.assertEqual(os.environ['MKFS_EROFS_PATH'], '/stale/mkfs')
 
+    def test_main_records_single_trial_coverage_with_resource_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source, scratch, output = root/'source', root/'scratch', root/'output'
+            source.mkdir()
+            scratch.mkdir()
+            expected = root/'expected.json'
+            expected.write_text('null')
+            command = ['bench_flatten.py', '--variant', 'native,/bin/true',
+                       '--variant', 'go,/bin/true', '--input', str(source),
+                       '--consumer', '/bin/true', '--fsck', '/bin/true',
+                       '--expected', str(expected), '--expected-config', str(expected),
+                       '--scratch-parent', str(scratch), '--output-root', str(output),
+                       '--trials', '1', '--allow-layout-differences']
+            rows = [{'variant': name, 'artifact_sha256': name} for name in ('native', 'go')]
+            with mock.patch.object(sys, 'argv', command), mock.patch.object(bench_flatten, 'one', side_effect=rows), contextlib.redirect_stdout(io.StringIO()):
+                bench_flatten.main()
+            self.assertEqual(json.loads((output/'results.json').read_text()), rows)
+            comparison = json.loads((output/'identity-comparison.json').read_text())
+            self.assertEqual(set(comparison['variants']), {'native', 'go'})
+            self.assertTrue(all(v['repeated_identity_check'] == 'not_checked_single_trial'
+                                for v in comparison['variants'].values()))
+
+    def test_single_resource_trial_does_not_claim_determinism(self):
+        rows = [{'variant': name, 'artifact_sha256': digest}
+                for name, digest in [('native', 'a'), ('go', 'b')]]
+        comparison = bench_flatten.check_artifact_identities(rows, True)
+        self.assertFalse(comparison['cross_variant_identity_required'])
+        for variant in comparison['variants'].values():
+            self.assertEqual(variant, {'trials': 1, 'repeated_identity_check': 'not_checked_single_trial'})
+        rows.append(dict(rows[0]))
+        comparison = bench_flatten.check_artifact_identities(rows, True)
+        self.assertEqual(comparison['variants']['native']['repeated_identity_check'], 'passed')
+        self.assertEqual(comparison['variants']['go']['repeated_identity_check'], 'not_checked_single_trial')
+        # Same-artifact comparisons also must not claim repeated builds from
+        # a single run of each generator.
+        rows[1]['artifact_sha256'] = 'a'
+        comparison = bench_flatten.check_artifact_identities(rows)
+        self.assertTrue(comparison['cross_variant_identity_required'])
+        self.assertEqual(comparison['variants']['go']['repeated_identity_check'], 'not_checked_single_trial')
+        with self.assertRaisesRegex(RuntimeError, 'no artifact identities'):
+            bench_flatten.check_artifact_identities([], True)
+
     def test_semantic_comparison_never_relaxes_per_generator_determinism(self):
         rows = [{'variant':name, 'artifact_sha256':digest}
                 for name,digest in [('native','a'),('go','b'),('go','b'),('native','a')]]
         with self.assertRaisesRegex(RuntimeError, 'identities differ'):
             bench_flatten.check_artifact_identities(rows)
-        bench_flatten.check_artifact_identities(rows, True)
+        comparison = bench_flatten.check_artifact_identities(rows, True)
+        self.assertEqual(comparison['variants'], {name: {'trials': 2, 'repeated_identity_check': 'passed'}
+                                                 for name in ('native', 'go')})
         rows.append({'variant':'go', 'artifact_sha256':'c'})
         for allow in (False, True):
             with self.assertRaisesRegex(RuntimeError, 'not deterministic'):

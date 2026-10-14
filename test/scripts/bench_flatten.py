@@ -539,13 +539,25 @@ def producer_environment(scratch, mkfs):
 
 
 def check_artifact_identities(results, allow_layout_differences=False):
-    by_variant = {}
+    by_variant, counts = {}, {}
     for result in results:
-        by_variant.setdefault(result['variant'], set()).add(result['artifact_sha256'])
+        name = result['variant']
+        by_variant.setdefault(name, set()).add(result['artifact_sha256'])
+        counts[name] = counts.get(name, 0) + 1
+    if not counts:
+        raise RuntimeError('no artifact identities to compare')
     if any(len(identities) != 1 for identities in by_variant.values()):
         raise RuntimeError('repeated builds of one variant are not deterministic')
     if not allow_layout_differences and len({r['artifact_sha256'] for r in results}) != 1:
         raise RuntimeError('normal-corpus artifact identities differ')
+    # A standalone resource pass can intentionally use one trial. Preserve its
+    # measurements without representing that pass as a determinism check.
+    return {
+        'cross_variant_identity_required': not allow_layout_differences,
+        'variants': {name: {'trials': count, 'repeated_identity_check':
+                           'passed' if count >= 2 else 'not_checked_single_trial'}
+                     for name, count in counts.items()},
+    }
 
 
 def measure_one(args, variant, trial, result_root, verified):
@@ -761,7 +773,7 @@ def main():
     parser.add_argument('--progress-timing', action='store_true', help='timestamp existing CLI progress lines for stage attribution')
     parser.add_argument('--keep-artifacts', action='store_true')
     parser.add_argument('--timing-only', action='store_true', help='omit intrusive inode/FD/RSS sampling; run resource measurements separately')
-    parser.add_argument('--allow-layout-differences', action='store_true', help='compare filesystem/config semantics across variants, retaining per-variant byte determinism')
+    parser.add_argument('--allow-layout-differences', action='store_true', help='compare filesystem/config semantics across variants; check per-variant byte determinism when trials >= 2')
     args = parser.parse_args()
     variants = [value.split(',') for value in args.variant]
     if args.trials < 1 or not 0.01 <= args.interval <= 1:
@@ -801,7 +813,8 @@ def main():
             result = one(args, variant, trial, args.output_root, verified)
             results.append(result)
             print(json.dumps(result), flush=True)
-    check_artifact_identities(results, args.allow_layout_differences)
+    comparison = check_artifact_identities(results, args.allow_layout_differences)
+    (args.output_root / 'identity-comparison.json').write_text(json.dumps(comparison, indent=2)+'\n')
     (args.output_root / 'results.json').write_text(json.dumps(results,indent=2)+'\n')
 
 

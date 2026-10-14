@@ -148,7 +148,7 @@ tests or these mount fixtures do not replace real VM evidence.
 
 ### Matched flatten measurements
 
-For a linked Go generator, use `--variant NAME,CLI` without a native tool. `--allow-layout-differences` permits different artifact identities across generators only after the existing content, metadata, hard-link and runtime-config checks; repeated builds of each generator must still be byte-identical.
+For a linked Go generator, use `--variant NAME,CLI` without a native tool. `--allow-layout-differences` permits different artifact identities across generators only after the existing content, metadata, hard-link and runtime-config checks; repeated builds of each generator must still be byte-identical. `identity-comparison.json` records the trial count and repeated-identity check for each variant. A one-trial resource pass remains valid for resource measurements but explicitly reports `not_checked_single_trial`; it is not determinism evidence. Use at least two trials to compare repeated output, and retain the three alternating trials required for performance acceptance.
 
 `test/scripts/bench_flatten.py` uses prebuilt native producers, a real stdout
 pipe and the current artifact reader. It alternates variant order for three
