@@ -208,3 +208,5 @@ Do not report vulnerabilities or real storage credentials in public issues. Use 
 ## License
 
 Original project content is licensed under the [Apache License 2.0](LICENSE). Preserve the license, attribution, NOTICE, and source obligations of native libraries, vendored code, generated code, formats, and third-party tools included in source or release assets.
+
+<!-- Temporary RFC 245 docs-only Actions acceptance; this branch is not a merge candidate. -->
