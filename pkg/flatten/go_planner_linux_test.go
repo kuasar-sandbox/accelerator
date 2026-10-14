@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -294,4 +295,82 @@ func TestGoPlannerPaddedBlockSharing(t *testing.T) {
 			t.Fatalf("%s: %v", name, err)
 		}
 	}
+}
+
+func TestGoPlannerBatchHashContentAndDeterminism(t *testing.T) {
+	root, work := t.TempDir(), t.TempDir()
+	payload := bytes.Repeat(bytes.Repeat([]byte{0xa7}, planBlockSize), 2*planReadBatch/planBlockSize+1)
+	// Distinguish full blocks at both worker and batch boundaries, including a
+	// differing final byte. A prefix-only equality shortcut would corrupt these.
+	for _, block := range []int{0, 63, 64, 127, 128, 255, 256, 511, 512} {
+		payload[(block+1)*planBlockSize-1] = byte(block)
+	}
+	payload = append(payload, bytes.Repeat([]byte{0xa7}, 513)...)
+	if err := os.WriteFile(filepath.Join(root, "data"), payload, 0600); err != nil {
+		t.Fatal(err)
+	}
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	var first []byte
+	for _, workers := range []int{1, 4} {
+		runtime.GOMAXPROCS(workers)
+		p, err := PrepareDir(context.Background(), root, Options{TmpDir: work}, DirOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var raw bytes.Buffer
+		err = p.WriteRaw(context.Background(), &raw)
+		closeErr := p.Close()
+		if err != nil || closeErr != nil {
+			t.Fatal(err, closeErr)
+		}
+		img, err := erofs.Open(bytes.NewReader(raw.Bytes()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		actual, err := fs.ReadFile(img, "data")
+		if err != nil || !bytes.Equal(actual, payload) {
+			t.Fatalf("workers %d: content differs: %v", workers, err)
+		}
+		if first != nil && !bytes.Equal(first, raw.Bytes()) {
+			t.Fatal("worker count changed image identity")
+		}
+		first = append(first[:0], raw.Bytes()...)
+	}
+}
+
+type gatedHashContext struct {
+	context.Context
+	started chan struct{}
+	release <-chan struct{}
+}
+
+func (c *gatedHashContext) Err() error {
+	if c.Context.Err() == nil {
+		c.started <- struct{}{}
+		<-c.release
+	}
+	return c.Context.Err()
+}
+
+func TestGoPlannerCancelledBatchJoinsWorkers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	release := make(chan struct{})
+	gated := &gatedHashContext{Context: ctx, started: make(chan struct{}, 4), release: release}
+	g := &goPlanner{ctx: gated, buffer: make([]byte, planReadBatch), hashWorkers: 4}
+	done := make(chan error, 1)
+	go func() { done <- g.hashBatch(planReadBatch / planBlockSize) }()
+	for i := 0; i < 4; i++ {
+		<-gated.started
+	}
+	cancel()
+	close(release)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancel: %v", err)
+	}
+	// Cleanup can immediately reuse admitted storage after cancellation returns.
+	// The race suite also detects a worker escaping this lifetime boundary.
+	clear(g.buffer)
+	clear(g.sums[:])
 }

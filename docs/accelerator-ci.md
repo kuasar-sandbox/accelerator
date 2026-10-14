@@ -30,6 +30,13 @@ standalone archive validator compiled from its trusted source in a separate
 Workbench invocation with cache restore/save disabled; publishing executes the
 validator without compiling it again.
 
+
+Block hashing uses the admitted 1 MiB read buffer and a fixed digest array, with
+at most four workers bounded by `GOMAXPROCS`. All workers join before buffer reuse
+or cancellation cleanup. Deduplication and layout allocation remain sequential.
+An adjacent block can reuse a full SHA-256 only after comparing all 4096 bytes;
+worker count does not change block identities or output order.
+
 ## Prepared product E2E and local evidence
 
 The [accelerator E2E guide](../test/e2e/README.md) lists the prepared-product,

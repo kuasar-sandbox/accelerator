@@ -4,6 +4,7 @@ package flatten
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -15,6 +16,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
 	"unsafe"
 
 	erofs "github.com/kuasar-sandbox/go-erofs"
@@ -130,6 +133,8 @@ type goPlanner struct {
 	blocks                                       planningTable[[32]byte, uint64]
 	links                                        planningTable[inodeKey, erofs.NodeID]
 	buffer                                       []byte
+	sums                                         [planReadBatch / planBlockSize][sha256.Size]byte
+	hashWorkers                                  int
 	chunks, sources                              *bufio.Writer
 	chunkHash, sourceHash                        hash.Hash
 	records, sourceCount, sourceBytes, planBytes uint64
@@ -139,16 +144,18 @@ func buildGoPlan(ctx context.Context, selection *sourceSelection, layoutPath, na
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	g := &goPlanner{ctx: ctx, selection: selection, limits: limits, planBytes: planHeaderSize, memory: planningMemory{limit: limits.NativeMemoryBytes / 2}}
-	// Batch reads, two buffered plan streams, hashes, fixed parent stack and
+	memory := planningMemory{limit: limits.NativeMemoryBytes / 2}
+	// Batch reads and digests, two buffered plan streams, fixed parent stack and
 	// bounded metadata hashing workspace. Admit before allocating/opening.
-	if err := g.memory.reserve(2 * planReadBatch); err != nil {
+	if err := memory.reserve(2 * planReadBatch); err != nil {
 		return err
 	}
 	if limits.PlanBytes < planHeaderSize {
 		return fmt.Errorf("flatten: plan byte budget exceeded")
 	}
+	g := &goPlanner{ctx: ctx, selection: selection, limits: limits, planBytes: planHeaderSize, memory: memory}
 	g.buffer = make([]byte, planReadBatch)
+	g.hashWorkers = min(4, runtime.GOMAXPROCS(0))
 	g.blocks = planningTable[[32]byte, uint64]{hash: func(k [32]byte) uint64 { return binary.LittleEndian.Uint64(k[:8]) }, memory: &g.memory}
 	g.links = planningTable[inodeKey, erofs.NodeID]{hash: inodeHash, memory: &g.memory}
 	var err error
@@ -361,12 +368,15 @@ func (g *goPlanner) file(rel string, expected fileIdentity, id erofs.NodeID) (re
 		}
 		padded := (want + planBlockSize - 1) &^ (uint64(planBlockSize) - 1)
 		clear(g.buffer[want:padded])
+		if err = g.hashBatch(int(padded / planBlockSize)); err != nil {
+			return err
+		}
 		for pos := uint64(0); pos < want; pos += planBlockSize {
 			if err = g.ctx.Err(); err != nil {
 				return err
 			}
 			block := g.buffer[pos : pos+planBlockSize]
-			sum := sha256.Sum256(block)
+			sum := g.sums[pos/planBlockSize]
 			physical, ok := g.blocks.find(sum)
 			if !ok {
 				if g.records >= math.MaxUint32-1 {
@@ -416,6 +426,47 @@ func (g *goPlanner) file(rel string, expected fileIdentity, id erofs.NodeID) (re
 		return fmt.Errorf("flatten: source changed while planning: %s", rel)
 	}
 	return nil
+}
+
+// hashBatch uses the already-admitted read buffer and fixed digest array.
+// Hashing may run in parallel; allocation and deduplication still follow source
+// order. Every worker is joined before the buffer is reused or cleanup begins.
+func (g *goPlanner) hashBatch(blocks int) error {
+	workers := g.hashWorkers
+	if blocks < 64 {
+		workers = 1
+	}
+	if workers == 1 {
+		g.hashRange(0, blocks)
+		return g.ctx.Err()
+	}
+	var group sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		start, end := blocks*worker/workers, blocks*(worker+1)/workers
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			g.hashRange(start, end)
+		}()
+	}
+	group.Wait()
+	return g.ctx.Err()
+}
+
+func (g *goPlanner) hashRange(start, end int) {
+	for index := start; index < end; index++ {
+		if g.ctx.Err() != nil {
+			return
+		}
+		pos := index * planBlockSize
+		block := g.buffer[pos : pos+planBlockSize]
+		if index > start && bytes.Equal(block, g.buffer[pos-planBlockSize:pos]) {
+			// Compare all 4096 bytes before reusing the exact full SHA-256.
+			g.sums[index] = g.sums[index-1]
+		} else {
+			g.sums[index] = sha256.Sum256(block)
+		}
+	}
 }
 
 func (g *goPlanner) addSource(rel string, id fileIdentity) error {

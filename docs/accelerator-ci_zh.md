@@ -24,6 +24,12 @@ Native recipe、摘要、许可、来源清单与 link-map 校验仍为必需检
 Publisher 在独立 Workbench 调用中从受信源码编译归档校验器, 该调用禁用缓存恢复和
 保存. 发布步骤直接执行校验器, 不再次编译.
 
+
+块摘要计算使用已计入预算的 1 MiB 读取缓冲和固定摘要数组，最多四个 worker，
+并受 `GOMAXPROCS` 限制。复用缓冲或取消清理前必须等待全部 worker 结束；
+去重与布局分配仍按顺序执行。相邻块只有在全部 4096 字节比较相同后才复用
+完整 SHA-256，worker 数量不改变块身份与输出顺序。
+
 ## Prepared 产品 E2E 与本地证据
 
 [Accelerator E2E 指南](../test/e2e/README_zh.md) 列出预构建产品、EROFS、Redis、
