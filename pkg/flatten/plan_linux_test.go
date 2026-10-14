@@ -253,7 +253,6 @@ func TestPlanRejectsCorruptionAndBounds(t *testing.T) {
 
 func preparedFixture(t *testing.T, empty bool) *PreparedImage {
 	t.Helper()
-	requirePlan(t)
 	var entries []layerEntry
 	if !empty {
 		entries = []layerEntry{{name: "payload", body: strings.Repeat("verified data", 120000)}}

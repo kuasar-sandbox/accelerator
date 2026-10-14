@@ -108,7 +108,9 @@ Configuration examples must use local paths, documentation-reserved endpoints, a
 
 The selected owner source explicitly declares its compiled E2E helper inventory in `release/helper-inputs.json`. The current inventory is empty. Future helpers and their build recipe belong in this owner declaration; aggregate packaging discovers them without a platform filename list.
 
-Release tests need the matching native EROFS Plan capability. Preflight admits
+Production flatten planning uses the fixed external go-erofs module and has no
+mkfs.erofs runtime dependency. Release comparison tests retain the matching
+native EROFS Plan capability. Preflight admits
 the `guest-runtime` source branch on the same release line once and records its
 exact commit. The existing fixed-input transport carries that tree to both
 architecture jobs, which use the native EROFS recipe/cache and check its Plan
