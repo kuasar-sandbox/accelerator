@@ -21,6 +21,29 @@ from types import SimpleNamespace
 import bench_flatten
 
 
+class GeneratorComparison(unittest.TestCase):
+    def test_go_producer_drops_only_the_native_selection_override(self):
+        with mock.patch.dict(os.environ, {'MKFS_EROFS_PATH':'/stale/mkfs', 'KEEP':'yes'}):
+            go = bench_flatten.producer_environment('/owned/scratch', None)
+            native = bench_flatten.producer_environment('/owned/scratch', '/selected/mkfs')
+            self.assertNotIn('MKFS_EROFS_PATH', go)
+            self.assertEqual(go['KEEP'], 'yes')
+            self.assertEqual(go['TMPDIR'], '/owned/scratch')
+            self.assertEqual(native['MKFS_EROFS_PATH'], '/selected/mkfs')
+            self.assertEqual(os.environ['MKFS_EROFS_PATH'], '/stale/mkfs')
+
+    def test_semantic_comparison_never_relaxes_per_generator_determinism(self):
+        rows = [{'variant':name, 'artifact_sha256':digest}
+                for name,digest in [('native','a'),('go','b'),('go','b'),('native','a')]]
+        with self.assertRaisesRegex(RuntimeError, 'identities differ'):
+            bench_flatten.check_artifact_identities(rows)
+        bench_flatten.check_artifact_identities(rows, True)
+        rows.append({'variant':'go', 'artifact_sha256':'c'})
+        for allow in (False, True):
+            with self.assertRaisesRegex(RuntimeError, 'not deterministic'):
+                bench_flatten.check_artifact_identities(rows, allow)
+
+
 class BenchmarkLifecycle(unittest.TestCase):
 
 

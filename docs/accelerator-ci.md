@@ -141,6 +141,8 @@ tests or these mount fixtures do not replace real VM evidence.
 
 ### Matched flatten measurements
 
+For a linked Go generator, use `--variant NAME,CLI` without a native tool. `--allow-layout-differences` permits different artifact identities across generators only after the existing content, metadata, hard-link and runtime-config checks; repeated builds of each generator must still be byte-identical.
+
 `test/scripts/bench_flatten.py` uses prebuilt native producers, a real stdout
 pipe and the current artifact reader. It alternates variant order for three
 trials by default, records executable hashes, sampled process-tree RSS, allocated

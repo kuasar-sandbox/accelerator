@@ -121,6 +121,8 @@ Builder 测试入口，以精确 source/artifact set 验证。接收工件字节
 
 ### 同条件展平测量
 
+纯 Go 生成器使用 `--variant NAME,CLI`，省略原生工具。`--allow-layout-differences` 只允许不同生成器的制品身份不同；既有内容、元数据、硬链接和运行配置核验不变，各生成器重复构建仍须字节一致。
+
 `test/scripts/bench_flatten.py` 使用预先构建的原生生产工具、真实 stdout pipe 和当前
 artifact reader，默认交替顺序执行三轮。记录工具摘要、进程树采样 RSS、scratch
 实际分配块/inode、已删除但仍打开的文件，并等待自有生产会话中的全部进程组退出后清理 scratch。
