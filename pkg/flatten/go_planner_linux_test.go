@@ -375,7 +375,7 @@ func TestGoPlannerCancelledBatchJoinsWorkers(t *testing.T) {
 	clear(g.sums[:])
 }
 
-// The same fixed artifact digest runs on both native architecture CI lanes.
+// image.flatten E2E checks the same fixed digest on both native architectures.
 // Numeric owners and modes are fixed so host user/umask cannot alter the input.
 func TestGoPlannerCrossArchitectureGolden(t *testing.T) {
 	if os.Geteuid() != 0 {
