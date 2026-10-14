@@ -23,6 +23,17 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 )
 
+// Only native compatibility fixtures need the independent mkfs tool.
+func requireMkfs(t *testing.T) {
+	t.Helper()
+	if os.Getenv("MKFS_EROFS_PATH") != "" {
+		return
+	}
+	if _, err := exec.LookPath("mkfs.erofs"); err != nil {
+		t.Skip("mkfs.erofs not available")
+	}
+}
+
 func requirePlan(t *testing.T) string {
 	t.Helper()
 	requireMkfs(t)

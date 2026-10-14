@@ -87,11 +87,14 @@ a local release bundle; the official cache payload must retain RocksDB support.
 
 ### Private-network and offline builds
 
-This module has no cross-repository Go dependencies. Point `GOPROXY` at the
-deployment's mirror, with its checksum-database policy, or use a populated
-verified module cache when offline. Coordinated sibling development can use the
-[project workspace](https://github.com/kuasar-sandbox/kuasar-sandbox); it is not a
-prerequisite for this component's standalone build.
+The EROFS planner depends on the external `github.com/kuasar-sandbox/go-erofs`
+module. Mirror or pre-cache the exact version selected by `go.mod`, including
+its pseudo-version when applicable, and verify it against `go.sum` before
+building offline. Point `GOPROXY` at the deployment's mirror, with its
+checksum-database policy, or use a populated verified module cache. A checkout
+of go-erofs or a local replacement is not required. Coordinated sibling
+development can use the [project workspace](https://github.com/kuasar-sandbox/kuasar-sandbox);
+it is not a prerequisite for this component's standalone build.
 
 ## Running independently
 
