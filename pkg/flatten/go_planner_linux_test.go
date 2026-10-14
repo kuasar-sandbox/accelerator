@@ -374,3 +374,68 @@ func TestGoPlannerCancelledBatchJoinsWorkers(t *testing.T) {
 	clear(g.buffer)
 	clear(g.sums[:])
 }
+
+// The same fixed artifact digest runs on both native architecture CI lanes.
+// Numeric owners and modes are fixed so host user/umask cannot alter the input.
+func TestGoPlannerCrossArchitectureGolden(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("fixed numeric ownership requires the root integration suite")
+	}
+	root := t.TempDir()
+	payload := make([]byte, planReadBatch+73)
+	for i := range payload {
+		payload[i] = byte((i*17 + i/4096) % 251)
+	}
+	for name, body := range map[string][]byte{"data": payload, "duplicate": payload, "short": []byte("fixed tail\n"), "empty-file": nil} {
+		if err := os.WriteFile(filepath.Join(root, name), body, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Link(filepath.Join(root, "data"), filepath.Join(root, "hardlink")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("data", filepath.Join(root, "symlink")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "empty-directory"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mkfifo(filepath.Join(root, "fifo"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := filepath.Walk(root, func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if err := os.Lchown(path, 12345, 23456); err != nil {
+			return err
+		}
+		if info.Mode()&fs.ModeSymlink != 0 {
+			return nil
+		}
+		mode := fs.FileMode(0640)
+		if info.IsDir() {
+			mode = 0751
+		}
+		return os.Chmod(path, mode)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p, err := PrepareDir(context.Background(), root, Options{TmpDir: t.TempDir()}, DirOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := p.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	var artifact bytes.Buffer
+	if _, _, err := p.WriteArtifact(context.Background(), &artifact, "image"); err != nil {
+		t.Fatal(err)
+	}
+	const want = "53497f42d28f1697238d70a3bdd227b740875308831a108cad52bd5009927f16"
+	if got := fmt.Sprintf("%x", sha256.Sum256(artifact.Bytes())); got != want {
+		t.Fatalf("fixed Go EROFS artifact changed on %s: got %s, want %s", runtime.GOARCH, got, want)
+	}
+}
