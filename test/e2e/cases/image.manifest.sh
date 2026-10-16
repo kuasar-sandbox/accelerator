@@ -1,5 +1,5 @@
 #!/bin/bash
-# e2e-requires: ["docker"]
+# e2e-requires: []
 set -euo pipefail
 
 source "${E2E_LIB:?E2E_LIB is required}/common.sh"
