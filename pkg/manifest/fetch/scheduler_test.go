@@ -26,17 +26,19 @@ func TestRequestSchedulerStateRecovery(t *testing.T) {
 	s.endOnDemand()
 	assertClosed(t, changed)
 
-	acquired, _ = s.tryBeginPrefetch()
-	if !acquired {
-		t.Fatal("prefetch did not acquire after on-demand drained")
+	for i := 0; i < maxPrefetchGets; i++ {
+		acquired, _ = s.tryBeginPrefetch()
+		if !acquired {
+			t.Fatalf("prefetch slot %d/%d was not acquired after on-demand drained", i, maxPrefetchGets)
+		}
 	}
 	acquired, changed = s.tryBeginPrefetch()
 	if acquired {
-		t.Fatal("second prefetch acquired while the token was held")
+		t.Fatal("prefetch acquired beyond maxPrefetchGets")
 	}
 
-	// An on-demand request may overlap the already admitted prefetch. Ending
-	// the prefetch cannot wake another prefetch until on-demand also drains.
+	// An on-demand request may overlap already admitted prefetch. Ending one
+	// prefetch cannot wake another until on-demand also drains.
 	s.beginOnDemand()
 	s.endPrefetch()
 	assertOpen(t, changed)
@@ -47,12 +49,14 @@ func TestRequestSchedulerStateRecovery(t *testing.T) {
 	if !acquired {
 		t.Fatal("prefetch token was not restored")
 	}
-	s.endPrefetch()
+	for i := 0; i < maxPrefetchGets; i++ {
+		s.endPrefetch()
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.onDemand != 0 || s.prefetch || s.changed != nil {
-		t.Fatalf("scheduler did not return to idle state: onDemand=%d prefetch=%v changed=%v", s.onDemand, s.prefetch, s.changed != nil)
+	if s.onDemand != 0 || s.prefetch != 0 || s.changed != nil {
+		t.Fatalf("scheduler did not return to idle state: onDemand=%d prefetch=%d changed=%v", s.onDemand, s.prefetch, s.changed != nil)
 	}
 }
 
@@ -106,27 +110,34 @@ func TestOnDemandOverlapsAdmittedPrefetch(t *testing.T) {
 	assertSchedulerIdle(t, client.scheduler)
 }
 
-func TestOnlyOnePrefetchCallsInner(t *testing.T) {
+func TestPrefetchRespectsConcurrencyLimit(t *testing.T) {
 	inner := newGateGetter()
 	client := newScheduledCacheClient(inner)
-	prefetchA := client.PrefetchGetter()
-	prefetchB := client.PrefetchGetter()
+	prefetch := client.PrefetchGetter()
 
-	firstDone := callGetter(prefetchA, context.Background(), keyForTest(12))
-	firstCall := receiveCall(t, inner.entered)
+	inFlight := make([]<-chan getterResult, maxPrefetchGets)
+	calls := make([]*gateCall, maxPrefetchGets)
+	for i := range maxPrefetchGets {
+		inFlight[i] = callGetter(prefetch, context.Background(), keyForTest(byte(20+i)))
+		calls[i] = receiveCall(t, inner.entered)
+	}
 
-	secondDone := callGetter(prefetchB, context.Background(), keyForTest(13))
+	overflowDone := callGetter(prefetch, context.Background(), keyForTest(19))
 	waitForChangeChannel(t, client.scheduler)
 	assertNoCall(t, inner.entered)
 
-	close(firstCall.release)
-	receiveResult(t, firstDone)
-	secondCall := receiveCall(t, inner.entered)
-	if secondCall.key != keyForTest(13) {
-		t.Fatalf("second admitted prefetch key = %x, want %x", secondCall.key, keyForTest(13))
+	close(calls[0].release)
+	receiveResult(t, inFlight[0])
+	overflowCall := receiveCall(t, inner.entered)
+	if overflowCall.key != keyForTest(19) {
+		t.Fatalf("overflow admitted prefetch key = %x, want %x", overflowCall.key, keyForTest(19))
 	}
-	close(secondCall.release)
-	receiveResult(t, secondDone)
+	close(overflowCall.release)
+	receiveResult(t, overflowDone)
+	for i := 1; i < maxPrefetchGets; i++ {
+		close(calls[i].release)
+		receiveResult(t, inFlight[i])
+	}
 	assertSchedulerIdle(t, client.scheduler)
 }
 
@@ -339,8 +350,8 @@ func assertSchedulerIdle(t *testing.T, s *requestScheduler) {
 	t.Helper()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.onDemand != 0 || s.prefetch {
-		t.Fatalf("scheduler is not idle: onDemand=%d prefetch=%v", s.onDemand, s.prefetch)
+	if s.onDemand != 0 || s.prefetch != 0 {
+		t.Fatalf("scheduler is not idle: onDemand=%d prefetch=%d", s.onDemand, s.prefetch)
 	}
 }
 
