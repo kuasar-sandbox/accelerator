@@ -43,13 +43,10 @@ func applyVerifiedLayer(ctx context.Context, in LayerInput, root string, limits 
 // filesystems without xattr support. All filesystem application semantics stay
 // in umoci; no CLI, CAS, bundle or rootless ownership mapping is used.
 func unpackLayer(ctx context.Context, r io.Reader, root string, budget int64) error {
-	// archive/tar bounds each extended-header body to 1 MiB. Reserve space
-	// for parsing that body, its strings/maps and the extractor itself before
-	// asking for a header, rather than accounting only after allocation.
-	if budget < 8<<20 {
-		return errors.New("flatten: layer metadata budget must be at least 8 MiB")
+	metadata, err := newLayerMetadataBudget(budget)
+	if err != nil {
+		return err
 	}
-	budget -= 8 << 20
 	te := layer.NewTarExtractor(&layer.UnpackOptions{OnDiskFormat: layer.DirRootfs{}})
 	tr := tar.NewReader(r)
 	for {
@@ -71,20 +68,9 @@ func unpackLayer(ctx context.Context, r io.Reader, root string, budget int64) er
 				return err
 			}
 		}
-		// Charge every entry and ancestor, including duplicates. This is a
-		// conservative bound on umoci's upperPaths and temporary path storage,
-		// without building another full path set in the adapter.
-		charge := int64(2048 + len(hdr.Name) + len(hdr.Linkname))
-		for p := path.Clean(hdr.Name); p != "."; p = path.Dir(p) {
-			charge += int64(256 + 2*len(p))
+		if err := metadata.reserve(root, hdr); err != nil {
+			return err
 		}
-		for k, v := range hdr.PAXRecords {
-			charge += int64(256 + 2*len(k) + 2*len(v))
-		}
-		if charge > budget {
-			return errors.New("flatten: layer metadata budget exceeded")
-		}
-		budget -= charge
 		if err := te.UnpackEntry(root, hdr, tr); err != nil {
 			return fmt.Errorf("flatten: umoci unpack %q: %w", hdr.Name, err)
 		}
@@ -92,6 +78,82 @@ func unpackLayer(ctx context.Context, r io.Reader, root string, budget int64) er
 			return err
 		}
 	}
+}
+
+// layerMetadataBudget bounds retained path bookkeeping, rather than the total
+// allocation traffic over the lifetime of a layer. Header/PAX storage is live
+// for one entry only; shared ancestors and overwritten paths remain one map key.
+// Keep a matching set because TarExtractor's upperPaths is private. Charge both
+// sets, and resolve parent symlinks just as UnpackEntry does before extracting.
+type layerMetadataBudget struct {
+	limit, remaining int64
+	// Each value bounds the full entry path backing this key, not root+"/"+key.
+	// umoci's ancestor keys are substrings of entry paths and are reassigned by
+	// later descendants. String-map assignments can update that backing storage.
+	paths map[string]int
+}
+
+func newLayerMetadataBudget(limit int64) (*layerMetadataBudget, error) {
+	// archive/tar bounds each extended-header body to 1 MiB. Reserve parsing
+	// buffers and the extractor before asking for a header.
+	if limit < 8<<20 {
+		return nil, errors.New("flatten: layer metadata budget must be at least 8 MiB")
+	}
+	return &layerMetadataBudget{limit: limit, remaining: limit - (8 << 20), paths: make(map[string]int)}, nil
+}
+
+func (b *layerMetadataBudget) reserve(root string, hdr *tar.Header) error {
+	// This storage is released/reused between entries, not retained per file.
+	header := int64(2048 + len(hdr.Name) + len(hdr.Linkname))
+	for k, v := range hdr.PAXRecords {
+		header += int64(256 + 2*len(k) + 2*len(v))
+	}
+	check := func(charge int64) error {
+		if header > b.remaining || charge > b.remaining-header {
+			return fmt.Errorf("flatten: layer metadata budget exceeded (limit=%d, retained=%d, header=%d, next=%d)", b.limit, b.limit-b.remaining, header, charge)
+		}
+		return nil
+	}
+	if err := check(0); err != nil {
+		return err
+	}
+	name := path.Clean(hdr.Name)
+	// This adapter uses DirRootfs. umoci applies ordinary/opaque whiteouts
+	// and returns without adding their names or parents to upperPaths.
+	// Their current header still has to fit, but no path state is retained.
+	if strings.HasPrefix(path.Base(name), ".wh.") {
+		return nil
+	}
+	parent, err := securejoin.SecureJoin(root, path.Dir(name))
+	if err != nil {
+		return fmt.Errorf("flatten: resolve layer metadata path: %w", err)
+	}
+	absolute := filepath.Join(parent, path.Base(name))
+	resolved, err := filepath.Rel(root, absolute)
+	if err != nil {
+		return fmt.Errorf("flatten: relative layer metadata path: %w", err)
+	}
+	// absolute stays the full entry path while p walks its ancestors. A longer
+	// sibling can therefore increase the backing bound of an existing ancestor.
+	for p := resolved; p != "."; p = filepath.Dir(p) {
+		longest, exists := b.paths[p]
+		if exists && longest >= len(absolute) {
+			continue
+		}
+		// 256 bytes covers both map entries, including growth slack. Count
+		// two full absolute strings even when umoci shares one between
+		// ancestors; filepath.Rel may retain the root prefix backing storage.
+		charge := int64(256 + 2*len(absolute))
+		if exists {
+			charge = int64(2 * (len(absolute) - longest))
+		}
+		if err := check(charge); err != nil {
+			return err
+		}
+		b.remaining -= charge
+		b.paths[strings.Clone(p)] = len(absolute)
+	}
+	return nil
 }
 
 func layerPath(name string) error {

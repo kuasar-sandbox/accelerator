@@ -396,3 +396,177 @@ func TestPlannedSourceReplacedByFIFOIsRejectedWithoutBlocking(t *testing.T) {
 		t.Fatal("planned source open blocked on a replaced FIFO")
 	}
 }
+
+func TestSelectionBudgetTracksLiveTraversalMemory(t *testing.T) {
+	const budget = 16 << 10
+	t.Run("sibling-directories-reuse-budget", func(t *testing.T) {
+		root := t.TempDir()
+		for i := range 10 {
+			dir := filepath.Join(root, fmt.Sprintf("dir-%02d", i))
+			if err := os.Mkdir(dir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			for j := range 50 {
+				if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("file-%02d", j)), nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		selection, err := selectSource(context.Background(), root, nil, budget)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := selection.validate(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("wide-directory-remains-bounded", func(t *testing.T) {
+		root := t.TempDir()
+		for i := range 200 {
+			if err := os.WriteFile(filepath.Join(root, fmt.Sprintf("file-%03d", i)), nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		_, err := selectSource(context.Background(), root, nil, budget)
+		if err == nil || !strings.Contains(err.Error(), "directory index budget exceeded") {
+			t.Fatalf("wide directory escaped budget: %v", err)
+		}
+	})
+}
+
+func TestSelectionBudgetBoundsLiveAncestorFrames(t *testing.T) {
+	root := t.TempDir()
+	dir := root
+	for range 50 {
+		dir = filepath.Join(dir, "child")
+		if err := os.Mkdir(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := selectSource(context.Background(), root, nil, 8<<10)
+	if err == nil || !strings.Contains(err.Error(), "source selection budget exceeded") {
+		t.Fatalf("live ancestor frames escaped budget: %v", err)
+	}
+}
+
+func TestSelectionBudgetBoundsPersistentOutputAliases(t *testing.T) {
+	root := t.TempDir()
+	output, err := os.Create(filepath.Join(root, "output"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer output.Close()
+	for i := range 100 {
+		if err := os.Link(output.Name(), filepath.Join(root, fmt.Sprintf("alias-%03d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err = selectSourceWithOwned(context.Background(), root, nil, nil, []*os.File{output}, 24<<10)
+	if err == nil || !strings.Contains(err.Error(), "source selection budget exceeded") {
+		t.Fatalf("persistent output aliases escaped budget: %v", err)
+	}
+	selection, err := selectSourceWithOwned(context.Background(), root, nil, nil, []*os.File{output}, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selection.excludes) != 101 {
+		t.Fatalf("output aliases were not all excluded: %d", len(selection.excludes))
+	}
+	if err := selection.validate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectionBudgetChargesWideAncestorsTogether(t *testing.T) {
+	root := t.TempDir()
+	dir := root
+	for range 3 {
+		for i := range 50 {
+			if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("file-%03d", i)), nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		dir = filepath.Join(dir, "child")
+		if err := os.Mkdir(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := selectSource(context.Background(), root, nil, 16<<10)
+	if err == nil || !strings.Contains(err.Error(), "directory index budget exceeded") {
+		t.Fatalf("simultaneous ancestor indexes escaped budget: %v", err)
+	}
+}
+
+func TestSelectionBudgetChargesConfiguredExclusions(t *testing.T) {
+	root := t.TempDir()
+	var excluded []string
+	for i := range 200 {
+		excluded = append(excluded, fmt.Sprintf("excluded-%03d", i))
+	}
+	_, err := selectSource(context.Background(), root, excluded, 16<<10)
+	if err == nil || !strings.Contains(err.Error(), "source selection budget exceeded") {
+		t.Fatalf("configured exclusions escaped budget: %v", err)
+	}
+	selection, err := selectSource(context.Background(), root, excluded, 64<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := selection.validate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectionBudgetCompactsDuplicateExclusions(t *testing.T) {
+	t.Run("dedupe-releases-input-array", func(t *testing.T) {
+		in := make([]string, 4096)
+		for i := range in {
+			in[i] = fmt.Sprintf("skip-%d", i%2)
+		}
+		out := dedupeSorted(in)
+		if len(out) != 2 || out[0] != "skip-0" || out[1] != "skip-1" {
+			t.Fatalf("unexpected unique exclusions: %v", out)
+		}
+		// A three-index reslice can reduce cap without releasing the array.
+		if &out[0] == &in[0] {
+			t.Fatal("deduplicated exclusions still retain the input backing array")
+		}
+	})
+	t.Run("prepare-dir-with-duplicate-skip", func(t *testing.T) {
+		root := t.TempDir()
+		for _, name := range []string{"keep", "skip-a", "skip-b"} {
+			if err := os.WriteFile(filepath.Join(root, name), []byte(name), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		opts := Options{TmpDir: t.TempDir(), PlanLimits: PlanLimits{IndexMemoryBytes: 16 << 20}}
+		unique, err := PrepareDir(context.Background(), root, opts, DirOptions{Skip: []string{"skip-a", "skip-b"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer unique.Close()
+		// The raw slice alone exceeds selection's 4 MiB budget, but its two
+		// unique exclusions fit. The caller's raw array is not our retained state.
+		skips := make([]string, 1<<20)
+		for i := range skips {
+			if i%2 == 0 {
+				skips[i] = "./skip-b"
+			} else {
+				skips[i] = "/skip-a"
+			}
+		}
+		prepared, err := PrepareDir(context.Background(), root, opts, DirOptions{Skip: skips})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer prepared.Close()
+		if len(prepared.selection.excludes) != 2 || cap(prepared.selection.excludes) > 2*len(prepared.selection.excludes) {
+			t.Fatalf("duplicate Skip retained input-sized capacity: len=%d cap=%d", len(prepared.selection.excludes), cap(prepared.selection.excludes))
+		}
+		if prepared.selection.stamp != unique.selection.stamp {
+			t.Fatal("duplicate Skip changed the selected source tree")
+		}
+		if skips[0] != "./skip-b" || skips[1] != "/skip-a" {
+			t.Fatal("preparation modified the caller's Skip slice")
+		}
+	})
+}

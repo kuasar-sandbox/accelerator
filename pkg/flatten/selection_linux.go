@@ -74,11 +74,28 @@ func (s *sourceSelection) walk(ctx context.Context, rel string, h hash.Hash, rem
 	if rel != "." && s.excluded(rel) {
 		return nil
 	}
+	if rel == "." {
+		// Exclusions persist across the whole walk (and later validation).
+		fixed := uint64(len(s.owned)) * 128
+		for _, excluded := range s.excludes {
+			fixed += uint64(128 + 2*len(excluded))
+		}
+		if fixed > *remaining {
+			return fmt.Errorf("flatten: source selection budget exceeded")
+		}
+		*remaining -= fixed
+		defer func() { *remaining += fixed }()
+	}
 	charge := uint64(512 + 4*len(rel))
 	if len(rel) > 4096 || charge > *remaining {
 		return fmt.Errorf("flatten: source selection budget exceeded")
 	}
 	*remaining -= charge
+	// Relative paths and stat/hash workspace stay live across recursion. Keep
+	// name and d dead before recursing: their absolute-name backing includes
+	// s.root and is intentionally not charged once per ancestor. Siblings reuse
+	// this frame's budget when we leave the object.
+	defer func() { *remaining += charge }()
 	name := filepath.Join(s.root, rel)
 	var st unix.Stat_t
 	if err := unix.Lstat(name, &st); err != nil {
@@ -100,6 +117,12 @@ func (s *sourceSelection) walk(ctx context.Context, rel string, h hash.Hash, rem
 				match = uint64(parent.Dev) == owned.parentDev && parent.Ino == owned.parentIno
 			}
 			if match {
+				// A discovered output alias becomes a persistent exclusion.
+				cost := uint64(128 + 2*len(rel))
+				if cost > *remaining {
+					return fmt.Errorf("flatten: source selection budget exceeded")
+				}
+				*remaining -= cost
 				s.excludes = dedupeSorted(append(s.excludes, rel))
 				return nil
 			}
@@ -141,6 +164,10 @@ func (s *sourceSelection) walk(ctx context.Context, rel string, h hash.Hash, rem
 		return err
 	}
 	var entries []string
+	var entriesCharge uint64
+	// The sorted names stay live while visiting children, then the next
+	// sibling directory can reuse their budget.
+	defer func() { *remaining += entriesCharge }()
 	for {
 		batch, e := d.ReadDir(256)
 		for _, entry := range batch {
@@ -155,6 +182,7 @@ func (s *sourceSelection) walk(ctx context.Context, rel string, h hash.Hash, rem
 				return fmt.Errorf("flatten: directory index budget exceeded")
 			}
 			*remaining -= cost
+			entriesCharge += cost
 			entries = append(entries, entry.Name())
 		}
 		if e == io.EOF {

@@ -112,6 +112,16 @@ capacity-growth overlap. `PlanBytes` still defaults to 512 MiB and accounts for
 all materialized metadata, source records and chunk records. `IndexMemoryBytes`
 still defaults to 128 MiB and retains the selection, reader and writer shares.
 Released references are reclaimed by Go; these limits do not bound total RSS.
+
+Layer application keeps the 128 MiB `LayerLimits.MetadataBytes` default, with
+an 8 MiB parser/extractor reserve. Current header/PAX storage is transient;
+canonical unique paths and conservative string/map storage remain charged for
+one layer. Ordinary and opaque whiteout markers add no retained path state.
+Selection's quarter of `IndexMemoryBytes` bounds live traversal frames and
+ancestor directory indexes; sibling subtrees reuse released capacity, while
+configured exclusions and discovered output aliases remain charged. Duplicate
+exclusions are compacted so their original slice capacity is not retained. Regression
+cases exercise both reuse and genuine retained-state exhaustion.
 All payload records remain in first-seen source order and are streamed to the
 existing KERPLAN v1 files. No full payload blob or raw intermediate is created.
 Conversion lookup and writeback use `umoci-go-erofs-no-xattr-v1`; older conversion

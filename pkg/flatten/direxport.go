@@ -78,6 +78,13 @@ func dedupeSorted(in []string) []string {
 		out = append(out, s)
 		prev = s
 	}
+	if len(out) != len(in) {
+		// Selection charges unique exclusions. Release the input-sized backing
+		// array rather than retaining duplicate slots behind a short slice.
+		compact := make([]string, len(out))
+		copy(compact, out)
+		return compact
+	}
 	return out
 }
 
