@@ -156,7 +156,7 @@ func TestLayerValidationFailures(t *testing.T) {
 	}
 }
 
-func TestLayerStrictMediaAndTrailer(t *testing.T) {
+func TestLayerTrailerVerification(t *testing.T) {
 	plain := make([]byte, 2048)
 	for _, codec := range []string{"gzip", "zstd"} {
 		t.Run(codec, func(t *testing.T) {
@@ -170,14 +170,6 @@ func TestLayerStrictMediaAndTrailer(t *testing.T) {
 			if err == nil {
 				t.Fatal("accepted corrupt trailer")
 			}
-			body = &observedBody{Reader: bytes.NewReader(plain)}
-			s, err = openLayer(context.Background(), streamInput(plain, plain, media, body), LayerLimits{})
-			if err == nil {
-				err = s.finish()
-			}
-			if err == nil {
-				t.Fatal("sniffed plain bytes instead of enforcing media type")
-			}
 		})
 	}
 	opened := false
@@ -187,6 +179,86 @@ func TestLayerStrictMediaAndTrailer(t *testing.T) {
 	}}
 	if _, err := openLayer(context.Background(), in, LayerLimits{}); err == nil || opened {
 		t.Fatalf("unknown type: err=%v opened=%v", err, opened)
+	}
+}
+
+// Descriptors whose mediaType mislabels the blob (says gzip, blob is a plain
+// tar — and permutations) are accepted by content sniffing, restoring the
+// semantics fixed for the registry path in #156 (issue #154): docker and ggcr
+// both sniff, and digest verification passes because it hashes stored bytes.
+func TestLayerSniffOverridesDescriptorMediaType(t *testing.T) {
+	plain := make([]byte, 4096)
+	for i := range plain {
+		plain[i] = byte(i)
+	}
+	gzBlob, _ := encodedLayer(t, "gzip", plain)
+	zsBlob, _ := encodedLayer(t, "zstd", plain)
+	// A zstd stream opening with an RFC 8878 §3.1.2 skippable frame (magic
+	// 0x184D2A50, empty payload) before the first data frame, and the same
+	// with the range's upper magic 0x184D2A5F carrying a one-byte payload.
+	skippable := append([]byte{0x50, 0x2a, 0x4d, 0x18, 0, 0, 0, 0}, zsBlob...)
+	skippable5f := append([]byte{0x5f, 0x2a, 0x4d, 0x18, 1, 0, 0, 0, 0xAA}, zsBlob...)
+
+	gzipMT := "application/vnd.oci.image.layer.v1.tar+gzip"
+	zstdMT := "application/vnd.oci.image.layer.v1.tar+zstd"
+	plainMT := "application/vnd.oci.image.layer.v1.tar"
+	for _, tc := range []struct {
+		name   string
+		label  string
+		blob   []byte
+		diffID string
+	}{
+		{"gzip-label-plain-blob", gzipMT, plain, layerHash(plain)},
+		{"zstd-label-plain-blob", zstdMT, plain, layerHash(plain)},
+		{"plain-label-gzip-blob", plainMT, gzBlob, layerHash(plain)},
+		{"plain-label-zstd-blob", plainMT, zsBlob, layerHash(plain)},
+		{"gzip-label-zstd-blob", gzipMT, zsBlob, layerHash(plain)},
+		{"zstd-label-gzip-blob", zstdMT, gzBlob, layerHash(plain)},
+		{"zstd-skippable-frame-prefix", zstdMT, skippable, layerHash(plain)},
+		{"zstd-skippable-magic-5f", zstdMT, skippable5f, layerHash(plain)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := &observedBody{Reader: bytes.NewReader(tc.blob)}
+			in := LayerInput{MediaType: tc.label, Size: int64(len(tc.blob)),
+				Digest: layerHash(tc.blob), DiffID: tc.diffID,
+				Open: func(context.Context) (io.ReadCloser, error) { return body, nil }}
+			s, err := openLayer(context.Background(), in, LayerLimits{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := io.ReadAll(s)
+			err = errors.Join(err, s.finish())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, plain) {
+				t.Fatalf("decoded %d bytes, want the plain stream", len(got))
+			}
+			if body.closed.Load() != 1 {
+				t.Fatalf("Close count %d", body.closed.Load())
+			}
+		})
+	}
+
+	// Streams too short to hold any magic stay on the plain path (#156 kept
+	// 0–3 byte bodies out of the zstd decoder's ErrUnexpectedEOF).
+	for _, n := range []int{0, 1, 2, 3} {
+		t.Run(fmt.Sprintf("short-%d", n), func(t *testing.T) {
+			blob := []byte("abcdefgh")[:n]
+			for _, label := range []string{plainMT, gzipMT, zstdMT} {
+				body := &observedBody{Reader: bytes.NewReader(blob)}
+				in := LayerInput{MediaType: label, Size: int64(n),
+					Digest: layerHash(blob), DiffID: layerHash(blob),
+					Open: func(context.Context) (io.ReadCloser, error) { return body, nil }}
+				s, err := openLayer(context.Background(), in, LayerLimits{})
+				if err != nil {
+					t.Fatalf("%s: %v", label, err)
+				}
+				if err := s.finish(); err != nil {
+					t.Fatalf("%s: %v", label, err)
+				}
+			}
+		})
 	}
 }
 

@@ -100,7 +100,6 @@ type checkedReader struct {
 	ctx      context.Context
 	r        io.Reader
 	h        hash.Hash
-	skipHash bool // plain layers reuse the compressed stream hash
 	n, limit int64
 	label    string
 	err      error
@@ -125,9 +124,7 @@ func (r *checkedReader) Read(p []byte) (int, error) {
 	}
 	n, err := r.r.Read(p)
 	if n > 0 {
-		if !r.skipHash {
-			r.h.Write(p[:n])
-		}
+		r.h.Write(p[:n])
 		if int64(n) > left {
 			r.err = fmt.Errorf("flatten: %s byte limit exceeded", r.label)
 			return n, r.err
@@ -195,30 +192,126 @@ func openLayer(ctx context.Context, in LayerInput, limits LayerLimits) (_ *layer
 		}
 	}()
 	s.compressed = &checkedReader{ctx: ctx, r: body, h: sha256.New(), limit: in.Size, label: "compressed layer"}
-	var decoder io.Reader = s.compressed
-	switch in.MediaType {
-	case "application/vnd.oci.image.layer.v1.tar+gzip", "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip",
-		"application/vnd.docker.image.rootfs.diff.tar.gzip", "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip":
-		gz, e := gzip.NewReader(s.compressed)
-		if e != nil {
-			return nil, fmt.Errorf("flatten: gzip header: %w", e)
-		}
-		decoder, s.decoderClose = gz, gz.Close
-	case "application/vnd.oci.image.layer.v1.tar+zstd", "application/vnd.oci.image.layer.nondistributable.v1.tar+zstd":
-		z, e := zstd.NewReader(s.compressed, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(uint64(limits.DecoderBytes)))
-		if e != nil {
-			return nil, fmt.Errorf("flatten: zstd header: %w", e)
-		}
-		decoder, s.decoderClose = z, func() error { z.Close(); return nil }
-	}
-	s.decoded = &checkedReader{ctx: ctx, r: decoder, h: sha256.New(), limit: limits.DecodedBytes, label: "decoded layer"}
-	if decoder == s.compressed {
-		// With an explicit plain-tar media type both identities cover exactly
-		// the same bytes. Retain independent limits, counts and identity checks
-		// while computing their SHA-256 once. Encoded layers keep two hashes.
-		s.decoded.h, s.decoded.skipHash = s.compressed.h, true
-	}
+	// The decoder is selected by sniffing the stream's leading magic bytes, not
+	// by the manifest mediaType — the semantics fixed for the registry path in
+	// #156 (issue #154): descriptors whose label says gzip while the blob is a
+	// plain tar exist in the wild, digest verification passes (it hashes stored
+	// bytes), and docker (archive.DecompressStream) plus ggcr (PeekCompression
+	// behind layer.Uncompressed) both accept them by sniffing. The sniff runs
+	// lazily on the first Read, so a body that blocks until Close keeps that
+	// contract and openLayer itself never touches the network or body.
+	sd := &sniffedDecoder{src: s.compressed, maxMemory: uint64(limits.DecoderBytes)}
+	s.decoded = &checkedReader{ctx: ctx, r: sd, h: sha256.New(), limit: limits.DecodedBytes, label: "decoded layer"}
+	s.decoderClose = sd.Close
 	return s, nil
+}
+
+const (
+	compressionGzip = "gzip"
+	compressionZstd = "zstd"
+)
+
+// sniffedDecoder defers decoder selection to the first Read and holds the
+// constructed decoder for Close. Errors from the sniff or header construction
+// surface from Read (and therefore finish), not from openLayer.
+type sniffedDecoder struct {
+	src       io.Reader
+	maxMemory uint64
+
+	once     sync.Once
+	r        io.Reader
+	closeDec func() error
+	err      error
+}
+
+func (d *sniffedDecoder) init() {
+	d.once.Do(func() {
+		kind, replay, sniffErr := sniffCompression(d.src)
+		if sniffErr != nil && !errors.Is(sniffErr, io.EOF) && !errors.Is(sniffErr, io.ErrUnexpectedEOF) {
+			d.err = sniffErr
+			return
+		}
+		switch kind {
+		case compressionGzip:
+			gz, e := gzip.NewReader(replay)
+			if e != nil {
+				d.err = fmt.Errorf("flatten: gzip header: %w", e)
+				return
+			}
+			d.r, d.closeDec = gz, gz.Close
+		case compressionZstd:
+			z, e := zstd.NewReader(replay, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(d.maxMemory))
+			if e != nil {
+				d.err = fmt.Errorf("flatten: zstd header: %w", e)
+				return
+			}
+			d.r, d.closeDec = z, func() error { z.Close(); return nil }
+		default:
+			// Sniffed plain: the decoded and compressed identities cover the
+			// same bytes; both hashes are computed independently.
+			d.r = replay
+		}
+	})
+}
+
+func (d *sniffedDecoder) Read(p []byte) (int, error) {
+	d.init()
+	if d.err != nil {
+		return 0, d.err
+	}
+	return d.r.Read(p)
+}
+
+// Close releases the decoder when one was built; a stream never read has none.
+func (d *sniffedDecoder) Close() error {
+	if d.closeDec == nil {
+		return nil
+	}
+	c := d.closeDec
+	d.closeDec = nil
+	return c()
+}
+
+// replayReader hands back bytes consumed by the sniff before the tail stream.
+type replayReader struct {
+	prefix []byte
+	r      io.Reader
+}
+
+func (rr *replayReader) Read(p []byte) (int, error) {
+	if len(rr.prefix) > 0 {
+		n := copy(p, rr.prefix)
+		rr.prefix = rr.prefix[n:]
+		return n, nil
+	}
+	return rr.r.Read(p)
+}
+
+// sniffCompression reads up to 32 leading bytes and classifies the stream:
+// gzip by the 0x1f 0x8b magic (the one constant docker, ggcr and containerd
+// all hardcode — no library exports it), and zstd by the decoder's own header
+// parser zstd.Header.Decode, the single source of truth for what counts as a
+// zstd stream — it recognizes data-frame magic and the skippable-frame magics
+// of RFC 8878 §3.1.1–3.1.2 alike, so no magic table is maintained here. A
+// frame header is at most 18 bytes (magic + FHD + content size + window +
+// dictionary id); 32 covers it with margin. Anything else — including empty
+// and 1–3 byte streams, whose Decode verdict is ErrUnexpectedEOF rather than
+// a mismatch — is plain. The returned reader replays the consumed prefix
+// before streaming the remainder unchanged.
+func sniffCompression(r io.Reader) (kind string, replay io.Reader, err error) {
+	var buf [32]byte
+	n, err := io.ReadFull(r, buf[:])
+	head := buf[:n]
+	switch {
+	case n >= 2 && head[0] == 0x1f && head[1] == 0x8b:
+		kind = compressionGzip
+	default:
+		var h zstd.Header
+		if h.Decode(head) == nil {
+			kind = compressionZstd
+		}
+	}
+	return kind, &replayReader{prefix: head, r: r}, err
 }
 
 func (s *layerStream) Read(p []byte) (int, error) { return s.decoded.Read(p) }
