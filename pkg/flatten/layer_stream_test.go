@@ -262,6 +262,135 @@ func TestLayerSniffOverridesDescriptorMediaType(t *testing.T) {
 	}
 }
 
+// errBody yields data, then fails with err on every subsequent Read.
+type errBody struct {
+	data []byte
+	err  error
+	off  int
+}
+
+func (b *errBody) Read(p []byte) (int, error) {
+	if b.off < len(b.data) {
+		n := copy(p, b.data[b.off:])
+		b.off += n
+		return n, nil
+	}
+	return 0, b.err
+}
+
+// Real body errors must surface from Read/finish: io.ReadFull only
+// synthesizes ErrUnexpectedEOF from a literal io.EOF, so the EOF family the
+// sniff ignores cannot swallow transport failures — and a clean short EOF is
+// still caught downstream by the decoder trailer / size / DiffID checks.
+func TestLayerSniffSurfacesBodyErrors(t *testing.T) {
+	sentinel := errors.New("body failed mid-sniff")
+	for _, tc := range []struct {
+		name string
+		data []byte
+	}{
+		{"partial-bytes-then-error", []byte("not-a-magic-prefix")},
+		{"error-at-zero-bytes", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := &observedBody{Reader: &errBody{data: tc.data, err: sentinel}}
+			in := LayerInput{MediaType: "application/vnd.oci.image.layer.v1.tar",
+				Size: int64(len(tc.data)) + 64, Digest: layerHash(tc.data), DiffID: layerHash(tc.data),
+				Open: func(context.Context) (io.ReadCloser, error) { return body, nil }}
+			s, err := openLayer(context.Background(), in, LayerLimits{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.finish(); !errors.Is(err, sentinel) {
+				t.Fatalf("finish: %v, want wrapped %v", err, sentinel)
+			}
+			if body.closed.Load() != 1 {
+				t.Fatalf("Close count %d", body.closed.Load())
+			}
+		})
+	}
+
+	// A stream ending cleanly right after the gzip header — size and digest
+	// fully consistent with the stored bytes — must still be rejected: the
+	// sniff ignores the short EOF, and the trailer check catches the cut.
+	t.Run("clean-eof-truncated-gzip", func(t *testing.T) {
+		var b bytes.Buffer
+		w := gzip.NewWriter(&b)
+		if _, err := w.Write([]byte("payload")); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		truncated := b.Bytes()[:10] // header only, no member data, no trailer
+		body := &observedBody{Reader: bytes.NewReader(truncated)}
+		in := streamInput(truncated, []byte("payload"), "application/vnd.oci.image.layer.v1.tar+gzip", body)
+		s, err := openLayer(context.Background(), in, LayerLimits{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.finish(); err == nil {
+			t.Fatal("accepted a gzip stream truncated after its header")
+		}
+		if body.closed.Load() != 1 {
+			t.Fatalf("Close count %d", body.closed.Load())
+		}
+	})
+}
+
+// chunkedBody yields at most chunk bytes per Read, exercising the sniff's
+// ReadFull aggregation and the prefix replay across fragment boundaries.
+type chunkedBody struct {
+	data  []byte
+	off   int
+	chunk int
+}
+
+func (b *chunkedBody) Read(p []byte) (int, error) {
+	if b.off >= len(b.data) {
+		return 0, io.EOF
+	}
+	n := b.chunk
+	if n > len(p) {
+		n = len(p)
+	}
+	if n > len(b.data)-b.off {
+		n = len(b.data) - b.off
+	}
+	copy(p, b.data[b.off:b.off+n])
+	b.off += n
+	return n, nil
+}
+
+func TestLayerSniffFragmentedReads(t *testing.T) {
+	plain := make([]byte, 96)
+	for i := range plain {
+		plain[i] = byte(i * 7)
+	}
+	for _, codec := range []string{"plain", "gzip", "zstd"} {
+		blob, media := encodedLayer(t, codec, plain)
+		for _, chunk := range []int{1, 2, 3} {
+			t.Run(fmt.Sprintf("%s/chunk-%d", codec, chunk), func(t *testing.T) {
+				body := &observedBody{Reader: &chunkedBody{data: blob, chunk: chunk}}
+				s, err := openLayer(context.Background(), streamInput(blob, plain, media, body), LayerLimits{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := io.ReadAll(s)
+				err = errors.Join(err, s.finish())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(got, plain) {
+					t.Fatalf("decoded %d bytes, want %d", len(got), len(plain))
+				}
+				if body.closed.Load() != 1 {
+					t.Fatalf("Close count %d", body.closed.Load())
+				}
+			})
+		}
+	}
+}
+
 type blockedLayerBody struct {
 	entered, closed chan struct{}
 	once            sync.Once
