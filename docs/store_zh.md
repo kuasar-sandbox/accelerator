@@ -221,9 +221,9 @@ FS `Exists` 只接受普通文件。已知 size 时必须完全相等；未知 s
 原样传播，已知 size 时比较 Content-Length。
 
 gRPC Get 和内嵌 `cache_listen` 共用同一个反向查找入口。相同
-`(partition, content key, generation-list snapshot)` 的并发读取会在单个 Server
+`(partition, content key, generation-list snapshot, write epoch)` 的并发读取会在单个 Server
 内合并：backend 只查询一次，caller 共享 immutable 结果字节。generation list
-变化会形成不同 snapshot，因而不会共用 flight。若 leader 的请求 context 被取消，
+变化会形成不同 snapshot，且完成的 `Put`（新提交或 dedup 命中）会推进该 key 的 write epoch，因此写入完成后的读取不会加入写前 flight。若 leader 的请求 context 被取消，
 仍持有有效 context 的 waiter 会用自己的 context 重试，而不是继承该取消。
 合并仅限单进程，不会让不同 store-ctl daemon 共享读取。每个请求只读取一次
 generation slice：

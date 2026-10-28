@@ -198,7 +198,7 @@ for i := len(generations) - 1; i >= 0; i-- {
 }
 ```
 
-Concurrent reads for the same `(partition, content key, generation-list snapshot)` are coalesced inside one Server: the backend lookup runs once and callers share the immutable result bytes. A changed generation list forms a distinct snapshot and therefore a distinct flight. If the leader's request context is canceled, waiters with live contexts retry with their own context instead of inheriting that cancellation. Coalescing is process-local and does not make separate store-ctl daemons share reads.
+Concurrent reads for the same `(partition, content key, generation-list snapshot, write epoch)` are coalesced inside one Server: the backend lookup runs once and callers share the immutable result bytes. A changed generation list forms a distinct snapshot and therefore a distinct flight, and a completed `Put` (commit or dedup hit) advances the per-key write epoch so reads started after a write cannot join a pre-write flight. If the leader's request context is canceled, waiters with live contexts retry with their own context instead of inheriting that cancellation. Coalescing is process-local and does not make separate store-ctl daemons share reads.
 
 ### 3.1 Read attempt and write boundary
 
