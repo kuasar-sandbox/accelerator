@@ -8,10 +8,16 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
 
+type objectTargetKey struct {
+	partition store.Partition
+	key       store.ContentKey
+}
+
 type objectFlightKey struct {
 	partition   store.Partition
 	key         store.ContentKey
 	generations string
+	writeEpoch  uint64
 }
 
 type objectFlight struct {
@@ -24,8 +30,9 @@ type objectFlight struct {
 }
 
 type objectFlights struct {
-	mu    sync.Mutex
-	calls map[objectFlightKey]*objectFlight
+	mu          sync.Mutex
+	calls       map[objectFlightKey]*objectFlight
+	writeEpochs map[objectTargetKey]uint64
 }
 
 func generationsKey(gens []store.Generation) string {
@@ -35,6 +42,21 @@ func generationsKey(gens []store.Generation) string {
 		b.WriteByte(0)
 	}
 	return b.String()
+}
+
+func (g *objectFlights) writeEpoch(partition store.Partition, key store.ContentKey) uint64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.writeEpochs[objectTargetKey{partition: partition, key: key}]
+}
+
+func (g *objectFlights) advanceWriteEpoch(partition store.Partition, key store.ContentKey) {
+	g.mu.Lock()
+	if g.writeEpochs == nil {
+		g.writeEpochs = make(map[objectTargetKey]uint64)
+	}
+	g.writeEpochs[objectTargetKey{partition: partition, key: key}]++
+	g.mu.Unlock()
 }
 
 func (g *objectFlights) do(ctx context.Context, key objectFlightKey, fn func(context.Context) (bool, []byte, error)) (bool, []byte, error) {
@@ -55,10 +77,12 @@ func (g *objectFlights) do(ctx context.Context, key objectFlightKey, fn func(con
 			call.waiterN--
 			found, data, err := call.found, call.data, call.err
 			leaderCanceled := call.leaderCanceled
-			g.mu.Unlock()
 			if err != nil && leaderCanceled && ctx.Err() == nil {
+				key.writeEpoch = g.writeEpochs[objectTargetKey{partition: key.partition, key: key.key}]
+				g.mu.Unlock()
 				continue
 			}
+			g.mu.Unlock()
 			return found, data, err
 		}
 		call := &objectFlight{done: make(chan struct{})}

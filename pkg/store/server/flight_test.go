@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
+	"github.com/kuasar-sandbox/accelerator/pkg/store/pb"
 )
 
 type gatedObjectBackend struct {
@@ -302,3 +304,104 @@ func TestGetObjectDoesNotShareAcrossGenerationSnapshots(t *testing.T) {
 		t.Fatalf("backend calls = %v, want [G1 G2]", gotCalls)
 	}
 }
+
+type gatedMissBeforePutBackend struct {
+	inner       Backend
+	missStarted chan struct{}
+	missRelease chan struct{}
+	missOnce    sync.Once
+	getCalls    atomic.Int32
+}
+
+func (b *gatedMissBeforePutBackend) Get(ctx context.Context, generation store.Generation, partition store.Partition, key store.ContentKey) (bool, []byte, error) {
+	callIdx := b.getCalls.Add(1)
+	found, data, err := b.inner.Get(ctx, generation, partition, key)
+	if callIdx == 1 && !found && err == nil {
+		b.missOnce.Do(func() { close(b.missStarted) })
+		select {
+		case <-b.missRelease:
+		case <-ctx.Done():
+			return false, nil, ctx.Err()
+		}
+	}
+	return found, data, err
+}
+
+func (b *gatedMissBeforePutBackend) Exists(ctx context.Context, generation store.Generation, partition store.Partition, key store.ContentKey, expectedSize *int64) (bool, error) {
+	return b.inner.Exists(ctx, generation, partition, key, expectedSize)
+}
+
+func (b *gatedMissBeforePutBackend) OpenPut(generation store.Generation, partition store.Partition, key store.ContentKey, expectedSize *int64) (store.PutHandle, error) {
+	return b.inner.OpenPut(generation, partition, key, expectedSize)
+}
+
+func TestGetObjectAfterPutDoesNotJoinPreWriteMissFlight(t *testing.T) {
+	payload := []byte("written-while-prewrite-get-inflight")
+	key := store.ContentKey(sha256.Sum256(payload))
+	backend := &gatedMissBeforePutBackend{
+		inner:       newFSStore(t, "G1"),
+		missStarted: make(chan struct{}),
+		missRelease: make(chan struct{}),
+	}
+	cli, srv := startBufconnServer(t, Options{
+		Backend:     backend,
+		Generations: func() []store.Generation { return []store.Generation{"G1"} },
+		VerifyKey:   true,
+	})
+
+	type getResult struct {
+		found bool
+		data  []byte
+		err   error
+	}
+	preWriteDone := make(chan getResult, 1)
+	go func() {
+		found, data, err := srv.GetObject(context.Background(), store.PartitionChunk, key)
+		preWriteDone <- getResult{found: found, data: data, err: err}
+	}()
+
+	select {
+	case <-backend.missStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pre-write GetObject did not observe initial miss")
+	}
+
+	putResp, err := streamPut(t, cli, pb.Partition_PARTITION_CHUNK, key, payload)
+	if err != nil || !putResp.GetIsNew() {
+		t.Fatalf("streamPut = %v, %v", putResp, err)
+	}
+
+	postWriteDone := make(chan getResult, 1)
+	go func() {
+		found, data, err := srv.GetObject(context.Background(), store.PartitionChunk, key)
+		postWriteDone <- getResult{found: found, data: data, err: err}
+	}()
+
+	select {
+	case res := <-postWriteDone:
+		if res.err != nil || !res.found || !bytes.Equal(res.data, payload) {
+			t.Fatalf("post-Put GetObject = %v, %q, %v; want hit with payload", res.found, res.data, res.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("post-Put GetObject joined the blocked pre-write miss flight")
+	}
+
+	close(backend.missRelease)
+	select {
+	case res := <-preWriteDone:
+		if res.err != nil || res.found {
+			t.Fatalf("pre-Put GetObject = %v, %q, %v; want miss", res.found, res.data, res.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pre-Put GetObject did not finish")
+	}
+
+	dedupResp, err := streamPut(t, cli, pb.Partition_PARTITION_CHUNK, key, payload)
+	if err != nil || dedupResp.GetIsNew() {
+		t.Fatalf("dedup streamPut = %v, %v; want isNew=false", dedupResp, err)
+	}
+	if got := srv.flights.writeEpoch(store.PartitionChunk, key); got != 2 {
+		t.Fatalf("writeEpoch after commit + dedup = %d, want 2", got)
+	}
+}
+

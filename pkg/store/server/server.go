@@ -101,7 +101,12 @@ func (s *Server) AdmitWrite(_ context.Context, req *pb.AdmitWriteRequest) (*pb.A
 // reads with the same generation snapshot are coalesced.
 func (s *Server) GetObject(ctx context.Context, partition store.Partition, key store.ContentKey) (bool, []byte, error) {
 	gens := s.generations()
-	fk := objectFlightKey{partition: partition, key: key, generations: generationsKey(gens)}
+	fk := objectFlightKey{
+		partition:   partition,
+		key:         key,
+		generations: generationsKey(gens),
+		writeEpoch:  s.flights.writeEpoch(partition, key),
+	}
 	return s.flights.do(ctx, fk, func(ctx context.Context) (bool, []byte, error) {
 		return getAcrossGenerations(ctx, s.backend, gens, partition, key)
 	})
@@ -234,6 +239,7 @@ func (s *Server) Put(stream pb.Store_PutServer) error {
 	}
 	if exists {
 		s.stats.putDedup.Add(1)
+		s.flights.advanceWriteEpoch(partition, key)
 		return stream.SendAndClose(&pb.PutResponse{IsNew: false})
 	}
 
@@ -321,6 +327,7 @@ func (s *Server) Put(stream pb.Store_PutServer) error {
 	} else {
 		s.stats.putDedup.Add(1)
 	}
+	s.flights.advanceWriteEpoch(partition, key)
 	return stream.SendAndClose(&pb.PutResponse{IsNew: isNew})
 }
 
