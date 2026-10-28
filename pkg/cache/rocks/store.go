@@ -36,6 +36,12 @@ type impl struct {
 	cfh       map[string]int
 	sketch    *freq.Sketch
 	readOnly  bool
+	path      string
+
+	maintenanceStop chan struct{}
+	maintenanceWG   sync.WaitGroup
+	pressureMu      sync.Mutex
+	pressureNext    time.Time
 }
 
 var _ Interface = (*impl)(nil)
@@ -64,7 +70,7 @@ func openImpl(cfg runtime.RocksConfig, freqCfg runtime.FreqConfig) (*impl, error
 		_ = db.Close()
 		return nil, fmt.Errorf("rocks: restore sketch: %w", getErr)
 	}
-	inst := &impl{db: db, cfh: cfIndexes()}
+	inst := &impl{db: db, cfh: cfIndexes(), path: cfg.Path}
 	sketch := buildSketch(freqCfg, func(data []byte) {
 		// No lifecycle lock: Close joins this goroutine before closing db.
 		if err := db.Put(native.Default, []byte(freq.ReservedSketchKey), data); err != nil {
@@ -81,6 +87,7 @@ func openImpl(cfg runtime.RocksConfig, freqCfg runtime.FreqConfig) (*impl, error
 	}
 	if !freqCfg.DisableEviction {
 		filter.Arm()
+		inst.startDiskMaintenance(resolveDiskPressureConfig(cfg))
 	}
 	return inst, nil
 }
@@ -182,6 +189,7 @@ func (s *impl) Close() error {
 		s.mu.Lock()
 		s.closed = true
 		s.mu.Unlock()
+		s.stopDiskMaintenance()
 		if s.sketch != nil {
 			_ = s.sketch.Close()
 		}

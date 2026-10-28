@@ -27,13 +27,15 @@ const (
 	Blob
 )
 
-// Config contains resolved settings, with precisely the historical CF scope.
+// Config contains resolved settings for the fixed cache column families.
 type Config struct {
 	// TrackBlobIO enables the engine counter only for validation. Production leaves statistics disabled.
-	TrackBlobIO                              bool
-	CacheBytes, BlockBytes, WriteBufferBytes uint64
-	BloomBits, BackgroundCompactions         int
-	DirectReads                              bool
+	TrackBlobIO                                            bool
+	CacheBytes, BlockBytes, WriteBufferBytes               uint64
+	BlobFileSize, MaxBytesForLevelBase, TargetFileSizeBase uint64
+	BloomBits, BackgroundCompactions                       int
+	BlobGCForceThreshold                                   float64
+	DirectReads                                            bool
 }
 
 type DB struct {
@@ -51,13 +53,17 @@ func Open(path string, cfg Config, readOnly bool, evict func([]byte) bool) (*DB,
 	cpath := C.CString(path)
 	defer C.free(unsafe.Pointer(cpath))
 	c := C.cache_rocks_config{
-		track_blob_io:          flag(cfg.TrackBlobIO),
-		cache_bytes:            C.uint64_t(cfg.CacheBytes),
-		block_bytes:            C.uint64_t(cfg.BlockBytes),
-		write_buffer_bytes:     C.uint64_t(cfg.WriteBufferBytes),
-		bloom_bits:             C.double(cfg.BloomBits),
-		background_compactions: C.int(cfg.BackgroundCompactions),
-		direct_reads:           flag(cfg.DirectReads),
+		track_blob_io:            flag(cfg.TrackBlobIO),
+		cache_bytes:              C.uint64_t(cfg.CacheBytes),
+		block_bytes:              C.uint64_t(cfg.BlockBytes),
+		write_buffer_bytes:       C.uint64_t(cfg.WriteBufferBytes),
+		blob_file_size:           C.uint64_t(cfg.BlobFileSize),
+		max_bytes_for_level_base: C.uint64_t(cfg.MaxBytesForLevelBase),
+		target_file_size_base:    C.uint64_t(cfg.TargetFileSizeBase),
+		bloom_bits:               C.double(cfg.BloomBits),
+		blob_gc_force_threshold:  C.double(cfg.BlobGCForceThreshold),
+		background_compactions:   C.int(cfg.BackgroundCompactions),
+		direct_reads:             flag(cfg.DirectReads),
 	}
 	if err := takeError(C.cache_rocks_open(cpath, c, C.uintptr_t(db.callback), flag(readOnly), &db.ptr)); err != nil {
 		if db.callback != 0 {

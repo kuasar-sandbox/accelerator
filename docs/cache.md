@@ -111,10 +111,13 @@ freq:
 
 rocks:
   path: /var/cache/accel-l1
-  disk_bytes: 1TiB            # Sizing input for BlockCache; not an enforced disk quota
+  disk_bytes: 1TiB            # BlockCache sizing and soft disk-pressure target
   mem_ratio: 0.01             # 1 TiB × 1% = 10.24 GiB
   direct_reads: true
   bloom_bits: 15
+  disk_high_watermark: 0.85   # Decay sketch + compact at 85% of disk_bytes
+  disk_low_watermark: 0.70    # Re-arm pressure handling at 70%
+  disk_maintenance_interval: 30s
 ```
 
 ### 3.3 Shard mode
@@ -328,15 +331,18 @@ Placing shard identity in the value makes a surviving peer's existing shard disc
 
 | Parameter/option | Default | Meaning |
 |---|---|---|
-| `disk_bytes` | 1 TiB. | Sizing input, **not an enforced disk quota**. |
+| `disk_bytes` | 1 TiB. | BlockCache sizing input and soft disk-pressure target; **not a hard filesystem quota**. |
 | `mem_ratio` | 0.01. | Shared BlockCache budget = disk_bytes × mem_ratio, minimum 64 MiB. |
 | `block_size` | 64 KiB. | SST data-block size. |
 | `bloom_bits` | 15. | Bits per key for Bloom filters; actual false-positive behavior is not a fixed documented percentage. |
 | Compression | None. | Fixed RocksDB option; encrypted chunk values are already high-entropy. |
 | `direct_reads` | true. | Enables UseDirectReads for supported reads. |
-| `write_buffer_bytes` | 256 MiB. | Configured write-buffer sizing input. |
+| `write_buffer_bytes` | 256 MiB. | Per-CF write-buffer size and DB-wide memtable budget; `max_write_buffer_number=4`. |
 | `max_background_jobs` | 8. | Used for maximum background compactions; the implementation separately allows two background flushes. |
-| Compaction | Leveled/default RocksDB behavior. | Data organization follows the underlying configured options. |
+| `disk_high_watermark` | 0.85. | Fraction of `disk_bytes` that triggers sketch decay and compaction. |
+| `disk_low_watermark` | 0.70. | Fraction of `disk_bytes` that re-arms pressure handling. |
+| `disk_maintenance_interval` | 30s. | Usage polling period; `"0"` or `"off"` disables maintenance. |
+| Compaction | Leveled; data CFs use a 32 MiB L1 base and 8 MiB target file size. | Keeps blob-reference compaction from waiting for hundreds of GiB of payload. |
 | Pin L0 filters/indexes | true. | CacheIndexAndFilterBlocks plus PinL0FilterAndIndexBlocksInCache; this does not pin every level's metadata forever. |
 
 Index/filter blocks and data blocks share the configured BlockCache. Do not count them as independent guaranteed resident budgets or infer one-I/O reads for every key.
@@ -353,11 +359,11 @@ Separate CFs isolate write-buffer, filter and compaction state, though they shar
 
 #### BlobDB and write amplification
 
-All three CFs enable RocksDB BlobDB with fixed options, not YAML knobs:
+All three CFs enable RocksDB BlobDB:
 
 - `min_blob_size = 4 KiB`: smaller values remain inline in SST; values at/above the threshold can reside in separate blob files.
-- `blob_file_size = 256 MiB`: target blob-file sizing.
-- Blob garbage collection is enabled to reclaim stale/unreferenced blob data.
+- `blob_file_size = clamp(disk_bytes / 16, 1 MiB, 256 MiB)`: target blob-file sizing tracks the configured cache size.
+- Blob garbage collection is enabled with a 0.5 force threshold so mostly-garbage old files are reclaimed sooner.
 
 Large values leave a key/blob reference in the LSM; payloads are appended to blob files, reducing the amount of large-value data rewritten during ordinary key compaction. Actual amplification depends on key sizes, RocksDB format, workload, compaction and blob GC. Fetching a blob value can require additional I/O beyond locating its SST reference.
 
@@ -374,7 +380,9 @@ It does not mean the process has zero page-cache use, completely self-contained 
 
 Embedded RocksDB maintains a Go Count-Min Sketch. Get/Put touches the key; background compaction invokes the CGO-backed CompactionFilter, which asks ShouldEvict. An estimate **at or below** the threshold (default 1) removes the key.
 
-This is not capacity enforcement. disk_bytes does not make compaction evict enough to avoid a full disk. Monitor disk use, write failures and compaction behavior independently.
+Eviction is compaction-driven, so the store also monitors physical usage. Every `disk_maintenance_interval`, it sums regular files under `rocks.path` (SST, blob, WAL, MANIFEST and logs). At or above `disk_high_watermark` it decays the sketch and compacts the chunk, manifest and blob CFs. While usage remains high, repeat compactions are rate-limited; falling to `disk_low_watermark` clears that cooldown. Disabled eviction also disables this maintenance.
+
+This is a soft pressure target, not a hard quota or filesystem-reservation guarantee. Hot data can remain above the watermark because the filter deliberately preserves it. Monitor disk use, write failures and compaction behavior independently.
 
 ```text
 On Get/Put:
@@ -384,7 +392,14 @@ On reset_after touches or reset_interval:
     old active becomes previous; create a fresh active generation
     Estimate(key) = active estimate + previous estimate / 2
 
-During background compaction on chunk, manifest and blob CFs:
+Every disk_maintenance_interval:
+    usage = sum of regular files under rocks.path
+    if usage >= disk_high_watermark:
+        sketch.Reset()
+        compact chunk, manifest and blob CFs
+    if usage <= disk_low_watermark: clear pressure state
+
+During any compaction on chunk, manifest and blob CFs:
     if armed and sketch.ShouldEvict(key):
         remove the key
 ```
@@ -813,7 +828,7 @@ Record workload controls `VALUE_SIZE`, `PREFILL`, `COLD_PREFILL`, `MISS_RATIO`, 
 - **Access distribution:** uniform reads spread over the working set and expose the disk path. Zipf models hot-content skew, but excessive skew can fit the effective hot set in RAM and conceal disk behavior. Use uniform access or a much larger working set when measuring disk.
 - **EC hit rate is not RAM hit rate:** an EC hit means the shard cluster supplied enough data. RocksDB BlockCache misses and disk reads occur below that counter. Inspect shard-host disk IOPS, such as procmon `rd_iops`, to establish that the workload actually reached disk.
 - **L3 modeling:** `--cold-prefill N` writes only to origin, while `--miss-ratio f` selects those cold keys for roughly fraction f of reads. Repeated cold keys warm through fill-aside, lowering the measured origin-read ratio. Size the cold pool larger than the expected cold reads during the window.
-- **Aging/eviction:** embedded eviction is frequency based (§4.5), not a disk_bytes quota. A short run with total operations far below reset_after may not exercise count-driven decay; the time-driven reset can still fire, and once-touched keys can already be at or below the eviction threshold. Use a long window and skewed access, observing actual sketch/compaction behavior rather than assuming short runs cannot evict.
+- **Aging/eviction:** embedded eviction combines frequency with disk-pressure maintenance (§4.5); `disk_bytes` remains a soft target, not a hard quota. A short run with total operations far below reset_after may not exercise count-driven decay; the time-driven reset can still fire, and once-touched keys can already be at or below the eviction threshold. Use a long window and skewed access, observing actual sketch/compaction behavior rather than assuming short runs cannot evict.
 - **Possible bottlenecks:** RAM-hot shard reads can saturate coordinator network/copy/CPU resources; disk-heavy working sets can saturate shard random I/O and amplify quorum tails. EC collects approximately one object's worth of data across data shards, with parity/hedging/protocol overhead, not automatically `value-size × data_shards` full-object bytes. Neither “the NIC always bottlenecks first” nor “CPU is usually irrelevant” is hardware-independent. Measure network, disk, CPU, concurrency and latency together. Keeping a measured hot set resident can improve performance, but no fixed order-of-magnitude gain follows from the architecture alone.
 
 

@@ -54,10 +54,10 @@ type FreqConfig struct {
 
 // RocksConfig holds RocksDB parameters.
 //
-// BlobDB is always enabled on chunk, manifest and blob CFs with fixed
-// parameters (min_blob_size=4 KiB, blob_file_size=256 MiB) — there is
-// no YAML knob to disable or tune it. Large values bypass the LSM main
-// path automatically; small values (< 4 KiB) remain inline in the SST.
+// BlobDB is always enabled on chunk, manifest and blob CFs. Its inline
+// threshold and garbage-collection policy are fixed; blob-file sizing follows
+// disk_bytes. Large values bypass the LSM main path automatically; small
+// values (< 4 KiB) remain inline in the SST.
 type RocksConfig struct {
 	Path              string  `yaml:"path"`
 	DiskBytes         string  `yaml:"disk_bytes"`          // e.g. "1TiB"
@@ -65,8 +65,17 @@ type RocksConfig struct {
 	DirectReads       *bool   `yaml:"direct_reads"`        // default true
 	BloomBits         int     `yaml:"bloom_bits"`          // default 15
 	BlockSize         string  `yaml:"block_size"`          // e.g. "64KiB"
-	WriteBufferBytes  string  `yaml:"write_buffer_bytes"`  // default "256MiB"
+	WriteBufferBytes  string  `yaml:"write_buffer_bytes"`  // default "256MiB", per CF
 	MaxBackgroundJobs int     `yaml:"max_background_jobs"` // default 8
+	// DiskHighWatermark is the fraction of disk_bytes that triggers sketch
+	// decay and compaction. 0 selects 0.85.
+	DiskHighWatermark float64 `yaml:"disk_high_watermark"`
+	// DiskLowWatermark re-arms pressure handling after usage falls to this
+	// fraction of disk_bytes. 0 selects 0.70 (or 80% of the high watermark).
+	DiskLowWatermark float64 `yaml:"disk_low_watermark"`
+	// DiskMaintenanceInterval controls usage polling. Empty selects 30s;
+	// "0" or "off" disables disk-pressure maintenance.
+	DiskMaintenanceInterval string `yaml:"disk_maintenance_interval"`
 }
 
 // RedisConfig configures a Redis-compatible backend reached over UDS or TCP.

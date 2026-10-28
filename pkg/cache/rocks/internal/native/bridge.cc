@@ -81,18 +81,32 @@ extern "C" char* cache_rocks_open(const char* path, cache_rocks_config cfg,
   opts.compression = rocksdb::kNoCompression;
   opts.use_direct_reads = cfg.direct_reads;
   opts.write_buffer_size = cfg.write_buffer_bytes;
+  opts.db_write_buffer_size = cfg.write_buffer_bytes;
   opts.max_write_buffer_number = 4;
   opts.max_background_compactions = cfg.background_compactions;
   opts.max_background_flushes = 2;
 
-  // Preserve the existing per-CF scope: only default uses opts' write buffers.
+  const uint64_t blob_file_size =
+      cfg.blob_file_size ? cfg.blob_file_size : (256ULL << 20);
+  const uint64_t max_bytes_for_level_base =
+      cfg.max_bytes_for_level_base ? cfg.max_bytes_for_level_base : (256ULL << 20);
+  const uint64_t target_file_size_base =
+      cfg.target_file_size_base ? cfg.target_file_size_base : (64ULL << 20);
+  const double blob_gc_force_threshold =
+      cfg.blob_gc_force_threshold > 0 ? cfg.blob_gc_force_threshold : 1.0;
+
   rocksdb::ColumnFamilyOptions data;
   data.table_factory = opts.table_factory;
   data.compression = rocksdb::kNoCompression;
+  data.write_buffer_size = cfg.write_buffer_bytes;
+  data.max_write_buffer_number = 4;
+  data.max_bytes_for_level_base = max_bytes_for_level_base;
+  data.target_file_size_base = target_file_size_base;
   data.enable_blob_files = true;
   data.min_blob_size = 4 << 10;
-  data.blob_file_size = 256 << 20;
+  data.blob_file_size = blob_file_size;
   data.enable_blob_garbage_collection = true;
+  data.blob_garbage_collection_force_threshold = blob_gc_force_threshold;
   data.compaction_filter = owner->filter.get();
   std::vector<rocksdb::ColumnFamilyDescriptor> cfs{
       {"default", opts}, {"chunk", data}, {"manifest", data}, {"blob", data}};

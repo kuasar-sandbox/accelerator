@@ -24,9 +24,10 @@ RocksDB 9.7.4 的 C API 提供 pinned 读取，但不提供 `FilterBlobByKey`，
 | Go callback | 一个 `runtime/cgo.Handle`，在打开失败或 DB 析构完成后删除；C++ 只保留整数。callback panic 会保留 key 并记录日志。 |
 | 错误和属性字符串 | 同一次 bridge 调用中复制到 Go 后释放。 |
 
-存储的生命周期锁先排空完整请求，再开始释放。Close 随后等待 Sketch 后台任务退出、
-持久化最终 Sketch，并关闭 native owner。并发 Close 等待同一个结果；关闭后请求
-返回存储已关闭错误，缺失 key 仍是普通缓存未命中。
+存储的生命周期锁先排空完整请求，再开始释放。Close 随后停止磁盘压力维护、等待
+Sketch 后台任务退出、持久化最终 Sketch，并关闭 native owner。并发 Close 等待同一个
+结果；关闭后请求返回存储已关闭错误，缺失 key 仍是普通缓存未命中。维护会统计 DB
+路径下普通文件的总字节数，并在同一生命周期门下调用 wrapper 的同步 `Compact`。
 
 ## 保持的配置和数据
 
@@ -36,14 +37,15 @@ RocksDB 9.7.4 的 C API 提供 pinned 读取，但不提供 `FilterBlobByKey`，
 - `__freq_sketch__` 仍位于 default CF，保持版本 2 编码、计数器、阈值、衰减和
   持久化规则。default CF 不参与频率过滤。
 - `disk_bytes` 默认 1 TiB，通过 `mem_ratio`（默认 0.01，cache 最小 64 MiB）
-  决定 block cache 大小，不是磁盘容量配额。
+  决定 block cache 大小，同时设置软磁盘压力 high/low 目标，不是硬磁盘容量配额。
 - Block 默认 64 KiB，Bloom bits 默认 15；L0 index/filter pinning 和 index/filter
   cache 保持启用。序列化的 Bloom 描述现在包含参数，而不是原 C 包装层的通用名称。
 - Direct reads 仍默认开启，flush/compaction 的 Direct I/O 行为不变。
-- `write_buffer_bytes` 默认 256 MiB，四个写缓冲仍只作用于 default CF；数据 CF
-  保留引擎默认值。后台 compaction 默认 8，后台 flush 为 2。
-- 数据 CF 保留 BlobDB、4 KiB inline 阈值、256 MiB Blob 文件和 GC；压缩仍关闭，
-  WAL 和 sync 默认设置不变。
+- `write_buffer_bytes` 默认 256 MiB，作用于每个 CF，`max_write_buffer_number=4`；
+  同一数值作为 DB 级 memtable 总预算。后台 compaction 默认 8，后台 flush 为 2。
+- 数据 CF 使用 BlobDB、4 KiB inline 阈值、随磁盘调整的 blob 文件大小
+  （`disk_bytes/16`，限制在 1 MiB..256 MiB）、GC force threshold 0.5、32 MiB
+  L1 base 和 8 MiB target file size。压缩仍关闭，WAL 和 sync 默认设置不变。
 - 只读打开仍为容忍 WAL 文件的 `OpenForReadOnly`，可能向内存回放 WAL，不是
   secondary instance，也不创建 Sketch。
 - Inline 过滤与 `FilterBlobByKey` 查询同一个 Sketch，只决定保留或删除。

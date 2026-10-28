@@ -8,14 +8,16 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/runtime"
 )
 
-// buildConfig resolves only the settings used by this store. Native construction
-// preserves their historical scope, including default-only write buffer sizes.
+const (
+	blobCFMaxBytesForLevelBase = 32 << 20
+	blobCFTargetFileSizeBase   = 8 << 20
+	blobGCForceThreshold       = 0.5
+)
+
+// buildConfig resolves only the settings used by this store.
 func buildConfig(cfg runtime.RocksConfig) native.Config {
-	// BlockCache size = disk_bytes * mem_ratio
-	diskBytes, _ := util.ParseSize(cfg.DiskBytes)
-	if diskBytes == 0 {
-		diskBytes = 1 << 40 // 1 TiB default
-	}
+	diskBytes := parseDiskBytes(cfg)
+	// BlockCache size = disk_bytes * mem_ratio.
 	memRatio := cfg.MemRatio
 	if memRatio <= 0 {
 		memRatio = 0.01
@@ -54,5 +56,24 @@ func buildConfig(cfg runtime.RocksConfig) native.Config {
 		BloomBits:             bloomBits,
 		BackgroundCompactions: maxJobs,
 		DirectReads:           runtime.BoolDefault(cfg.DirectReads, true),
+		BlobFileSize:          blobFileSize(diskBytes),
+		BlobGCForceThreshold:  blobGCForceThreshold,
+		MaxBytesForLevelBase:  blobCFMaxBytesForLevelBase,
+		TargetFileSizeBase:    blobCFTargetFileSizeBase,
 	}
+}
+
+func blobFileSize(diskBytes uint64) uint64 {
+	const (
+		minBlobFileSize = 1 << 20
+		maxBlobFileSize = 256 << 20
+	)
+	size := diskBytes / 16
+	if size < minBlobFileSize {
+		return minBlobFileSize
+	}
+	if size > maxBlobFileSize {
+		return maxBlobFileSize
+	}
+	return size
 }

@@ -26,8 +26,13 @@ int main(int argc, char** argv) {
   cfg.cache_bytes = 64 << 20;
   cfg.block_bytes = 64 << 10;
   cfg.write_buffer_bytes = 256 << 20;
+  cfg.blob_file_size = 64 << 20;
+  cfg.max_bytes_for_level_base = 32 << 20;
+  cfg.target_file_size_base = 8 << 20;
   cfg.bloom_bits = 15;
+  cfg.blob_gc_force_threshold = 0.5;
   cfg.background_compactions = 8;
+  cfg.direct_reads = 1;
   cfg.track_blob_io = true;
   const std::string path = root + "/db";
   for (int round = 0; round < 8; ++round) {

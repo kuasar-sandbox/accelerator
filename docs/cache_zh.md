@@ -132,10 +132,13 @@ freq:
 
 rocks:
   path: /var/cache/accel-l1
-  disk_bytes: 1TiB             # BlockCache 大小计算输入,不是强制磁盘配额
+  disk_bytes: 1TiB             # BlockCache 计算输入与软磁盘压力目标
   mem_ratio: 0.01              # 1 TiB × 1% = 10.24 GiB
   direct_reads: true
   bloom_bits: 15
+  disk_high_watermark: 0.85    # 达到 disk_bytes 的 85% 时衰减 Sketch 并 compaction
+  disk_low_watermark: 0.70     # 降到 70% 后重新武装压力处理
+  disk_maintenance_interval: 30s
 ```
 
 ### 3.3 shard 模式
@@ -386,15 +389,18 @@ Wire 帧头只携带 32 字节 `Hash`——Object 与 Shard 都不需要告诉�
 
 | 参数/选项 | 默认 | 含义 |
 |---|---|---|
-| `disk_bytes` | 1 TiB | 大小计算输入,**不是强制磁盘配额** |
+| `disk_bytes` | 1 TiB | BlockCache 计算输入与软磁盘压力目标,**不是硬文件系统配额** |
 | `mem_ratio` | 0.01 | 共享 BlockCache=disk_bytes×mem_ratio,最小 64 MiB |
 | `block_size` | 64 KiB | SST data block 大小 |
 | `bloom_bits` | 15 | 每 key Bloom 位数,实际假阳性率不是固定文档百分比 |
 | compression | none | 固定 RocksDB 选项;加密 chunk 已是高熵 |
 | `direct_reads` | true | 对支持的读取启用 UseDirectReads |
-| `write_buffer_bytes` | 256 MiB | write-buffer 大小配置输入 |
+| `write_buffer_bytes` | 256 MiB | 按 CF 的 write-buffer 大小,同时作为 DB 级 memtable 总预算;`max_write_buffer_number=4` |
 | `max_background_jobs` | 8 | 用于最大 background compactions;实现另设 2 个 background flush |
-| compaction | leveled/default | 实际组织遵守底层配置 |
+| `disk_high_watermark` | 0.85 | 达到 `disk_bytes` 的该比例时衰减 Sketch 并 compaction |
+| `disk_low_watermark` | 0.70 | 降到该比例后重新武装压力处理 |
+| `disk_maintenance_interval` | 30s | 磁盘使用轮询周期;`"0"` 或 `"off"` 关闭维护 |
+| compaction | leveled;data CF 使用 32 MiB L1 base 与 8 MiB target file size | 避免 blob reference 等待数百 GiB payload 才 compaction |
 | pin L0 filter/index | true | 同时设置 CacheIndexAndFilterBlocks 与 PinL0FilterAndIndexBlocksInCache,不表示所有 level metadata 永久 pin |
 
 index/filter 与 data block 共用 BlockCache。不能把它们当成独立保证常驻的预算,
@@ -415,12 +421,13 @@ cache 淘汰按频率进行,不等于 store 的 generation 生命周期。
 
 #### BlobDB 与写放大
 
-三个 CF 都启用 RocksDB BlobDB,固定参数(不暴露 YAML):
+三个 CF 都启用 RocksDB BlobDB:
 
 - `min_blob_size = 4 KiB`:小于阈值的 value 内联到 SST,大于的旁路到独立
   `.blob` 文件(达到阈值也可进入 blob 路径)。
-- `blob_file_size = 256 MiB`:blob 文件目标大小。
-- BlobDB GC 开启:后台回收无引用的 blob 文件。
+- `blob_file_size = clamp(disk_bytes / 16, 1 MiB, 256 MiB)`:blob 文件目标大小
+  跟随配置的 cache 大小。
+- BlobDB GC 开启,force threshold 为 0.5,使几乎全是垃圾的旧文件更快回收。
 
 大 value 在 LSM 中留下 key/blob reference，payload 追加到 blob 文件，可减少普通 key compaction 重写的大 value 数据。实际写放大取决于 key、RocksDB 格式、负载、compaction 和 blob GC。读取 blob value 可能在找到 SST reference 后还需额外 I/O。
 
@@ -438,8 +445,14 @@ UseDirectReads 默认 true,对支持的数据读取绕过 OS page cache。
 embedded RocksDB 在 Go 中维护 Count-Min Sketch。Get/Put Touch key;后台 compaction
 经 CGO 调用 filter 的 ShouldEvict。估计频率**小于或等于**阈值(默认 1)则删除。
 
-这不是容量执法:disk_bytes 不保证 compaction 清出足够空间避免磁盘写满,仍需单独观察
-使用量、写入错误和 compaction 行为。
+淘汰依赖 compaction,因此 store 还会监控物理使用量。每个 `disk_maintenance_interval`,
+它统计 `rocks.path` 下普通文件的总字节数(SST、blob、WAL、MANIFEST 和日志)。达到
+`disk_high_watermark` 时,它会衰减 Sketch,并 compact chunk、manifest 和 blob CF。
+使用量仍高时,重复 compaction 会被限速;降到 `disk_low_watermark` 会清除该冷却。
+`freq.disable_eviction` 也会关闭该维护。
+
+这是软压力目标,不是硬配额,也不是文件系统预留保证。热数据可能因 filter 有意保留而
+继续高于 watermark;仍需单独观察磁盘使用、写失败和 compaction 行为。
 
 ```text
 Get/Put:
@@ -449,7 +462,14 @@ reset_after 次 Touch 或 reset_interval:
     old active → previous;创建新的 active
     Estimate(key) = active estimate + previous estimate / 2
 
-chunk、manifest、blob CF 的后台 compaction:
+每个 disk_maintenance_interval:
+    usage = rocks.path 下普通文件总字节数
+    if usage >= disk_high_watermark:
+        sketch.Reset()
+        compact chunk、manifest、blob CF
+    if usage <= disk_low_watermark: 清除压力状态
+
+chunk、manifest、blob CF 的任意 compaction:
     若 armed 且 sketch.ShouldEvict(key):
         删除 key
 ```
@@ -945,9 +965,10 @@ origin 与 tiered 并扫并发。使用 [procmon.sh](../test/scripts/procmon.sh)
   miss/读盘不由该计数体现。看 shard 主机 `rd_iops` 等磁盘指标证明实际落盘。
 - **L3 建模**:`--cold-prefill N` 只写 origin,`--miss-ratio f` 让约 f 比例查询冷
   key。重复冷 key 经 fill-aside 变热,会降低实测回源率;冷池应大于窗口内预期冷读次数。
-- **aging/淘汰**:embedded 是频率式淘汰,不是 disk_bytes 配额。短窗 ops 远小于
-  reset_after 可能不触发次数衰减,但时间重置仍可能发生,一次访问的 key 也可能已在
-  阈值以内。用长窗与偏斜访问,观察实际 sketch/compaction,不能假定短测必不淘汰。
+- **aging/淘汰**:embedded 淘汰结合频率与磁盘压力维护(§4.5);`disk_bytes` 仍是
+  软目标,不是硬配额。短窗 ops 远小于 reset_after 可能不触发次数衰减,但时间重置
+  仍可能发生,一次访问的 key 也可能已在阈值以内。用长窗与偏斜访问,观察实际
+  sketch/compaction,不能假定短测必不淘汰。
 - **可能的瓶颈**:RAM-hot 读取可压满协调节点网络/拷贝/CPU,工作集落盘可压满 shard
   随机 I/O 并放大 quorum 尾延迟。EC 的 data shards 合计约一个对象的数据,另有 parity、
   hedge 与协议开销,不是固定 `value-size × data_shards` 个完整对象。

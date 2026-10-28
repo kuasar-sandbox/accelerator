@@ -27,9 +27,12 @@ globally, or provide a general Go object model.
 | Errors and properties | Copied to Go, then freed in the same bridge call. |
 
 The store's lifecycle lock drains complete requests before teardown. Close then
-joins the sketch's background workers, persists the final sketch, and closes
-the native owner. Concurrent Close calls wait for the same result. Late requests
-return a closed-store error; missing keys remain ordinary cache misses.
+stops disk-pressure maintenance, joins the sketch's background workers,
+persists the final sketch, and closes the native owner. Concurrent Close calls
+wait for the same result. Late requests return a closed-store error; missing
+keys remain ordinary cache misses. Maintenance sums regular files under the DB
+path and uses the wrapper's synchronous `Compact` method under the same
+lifecycle gate.
 
 ## Preserved configuration and data
 
@@ -39,16 +42,19 @@ return a closed-store error; missing keys remain ordinary cache misses.
 - `__freq_sketch__` remains in default CF with the existing version-2 encoding,
   counters, threshold, decay and persistence rules. Default CF is never filtered.
 - `disk_bytes` defaults to 1 TiB and scales the block cache with `mem_ratio`
-  (default 0.01, minimum cache 64 MiB). It is not a disk quota.
+  (default 0.01, minimum cache 64 MiB). It also sets soft high/low disk-pressure
+  targets; it is not a hard disk quota.
 - Block size defaults to 64 KiB, Bloom bits to 15; L0 index/filter pinning and
   index/filter caching remain enabled. The serialized Bloom description now
   includes its parameters instead of the old C wrapper's generic name.
 - Direct reads still default to true. Direct flush/compaction I/O is unchanged.
-- `write_buffer_bytes` (default 256 MiB) and four write buffers still apply only
-  to default CF. Data CFs retain the engine defaults. Background compactions
-  default to 8 and background flushes to 2.
-- Data CFs retain BlobDB, the 4 KiB inline threshold, 256 MiB blob files and GC.
-  Compression remains off; default WAL and sync settings are unchanged.
+- `write_buffer_bytes` (default 256 MiB) applies to every CF, with
+  `max_write_buffer_number=4`; the same value is the DB-wide memtable budget.
+  Background compactions default to 8 and background flushes to 2.
+- Data CFs use BlobDB with the 4 KiB inline threshold, disk-adaptive blob-file
+  sizing (`disk_bytes/16`, clamped to 1 MiB..256 MiB), GC force threshold 0.5,
+  a 32 MiB L1 base and an 8 MiB target file size. Compression remains off;
+  default WAL and sync settings are unchanged.
 - Read-only opening remains `OpenForReadOnly` with WAL files tolerated. It may
   replay WAL into memory; it is not a secondary instance. It creates no sketch.
 - Inline filtering and `FilterBlobByKey` consult the same sketch and make only

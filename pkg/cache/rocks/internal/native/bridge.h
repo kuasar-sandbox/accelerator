@@ -9,7 +9,8 @@ typedef struct cache_rocks cache_rocks;
 typedef struct cache_pin cache_pin;
 typedef struct {
   uint64_t cache_bytes, block_bytes, write_buffer_bytes;
-  double bloom_bits;
+  uint64_t blob_file_size, max_bytes_for_level_base, target_file_size_base;
+  double bloom_bits, blob_gc_force_threshold;
   int background_compactions, direct_reads, track_blob_io;
 } cache_rocks_config;
 
