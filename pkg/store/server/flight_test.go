@@ -386,6 +386,14 @@ func TestGetObjectAfterPutDoesNotJoinPreWriteMissFlight(t *testing.T) {
 		t.Fatal("post-Put GetObject joined the blocked pre-write miss flight")
 	}
 
+	dedupResp, err := streamPut(t, cli, pb.Partition_PARTITION_CHUNK, key, payload)
+	if err != nil || dedupResp.GetIsNew() {
+		t.Fatalf("dedup streamPut = %v, %v; want isNew=false", dedupResp, err)
+	}
+	if got := srv.flights.writeEpoch(store.PartitionChunk, key); got != 2 {
+		t.Fatalf("writeEpoch while pre-write flight is active = %d, want 2", got)
+	}
+
 	close(backend.missRelease)
 	select {
 	case res := <-preWriteDone:
@@ -395,13 +403,7 @@ func TestGetObjectAfterPutDoesNotJoinPreWriteMissFlight(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("pre-Put GetObject did not finish")
 	}
-
-	dedupResp, err := streamPut(t, cli, pb.Partition_PARTITION_CHUNK, key, payload)
-	if err != nil || dedupResp.GetIsNew() {
-		t.Fatalf("dedup streamPut = %v, %v; want isNew=false", dedupResp, err)
-	}
-	if got := srv.flights.writeEpoch(store.PartitionChunk, key); got != 2 {
-		t.Fatalf("writeEpoch after commit + dedup = %d, want 2", got)
+	if got := srv.flights.writeEpoch(store.PartitionChunk, key); got != 0 {
+		t.Fatalf("writeEpoch after flights drained = %d, want 0", got)
 	}
 }
-

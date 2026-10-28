@@ -30,9 +30,10 @@ type objectFlight struct {
 }
 
 type objectFlights struct {
-	mu          sync.Mutex
-	calls       map[objectFlightKey]*objectFlight
-	writeEpochs map[objectTargetKey]uint64
+	mu            sync.Mutex
+	calls         map[objectFlightKey]*objectFlight
+	writeEpochs   map[objectTargetKey]uint64
+	activeTargets map[objectTargetKey]int
 }
 
 func generationsKey(gens []store.Generation) string {
@@ -51,12 +52,32 @@ func (g *objectFlights) writeEpoch(partition store.Partition, key store.ContentK
 }
 
 func (g *objectFlights) advanceWriteEpoch(partition store.Partition, key store.ContentKey) {
+	target := objectTargetKey{partition: partition, key: key}
 	g.mu.Lock()
-	if g.writeEpochs == nil {
-		g.writeEpochs = make(map[objectTargetKey]uint64)
+	if g.activeTargets[target] > 0 {
+		if g.writeEpochs == nil {
+			g.writeEpochs = make(map[objectTargetKey]uint64)
+		}
+		g.writeEpochs[target]++
 	}
-	g.writeEpochs[objectTargetKey{partition: partition, key: key}]++
 	g.mu.Unlock()
+}
+
+func (g *objectFlights) activateTargetLocked(target objectTargetKey) {
+	if g.activeTargets == nil {
+		g.activeTargets = make(map[objectTargetKey]int)
+	}
+	g.activeTargets[target]++
+}
+
+func (g *objectFlights) deactivateTargetLocked(target objectTargetKey) {
+	remaining := g.activeTargets[target] - 1
+	if remaining > 0 {
+		g.activeTargets[target] = remaining
+		return
+	}
+	delete(g.activeTargets, target)
+	delete(g.writeEpochs, target)
 }
 
 func (g *objectFlights) do(ctx context.Context, key objectFlightKey, fn func(context.Context) (bool, []byte, error)) (bool, []byte, error) {
@@ -90,6 +111,8 @@ func (g *objectFlights) do(ctx context.Context, key objectFlightKey, fn func(con
 			g.calls = make(map[objectFlightKey]*objectFlight)
 		}
 		g.calls[key] = call
+		target := objectTargetKey{partition: key.partition, key: key.key}
+		g.activateTargetLocked(target)
 		g.mu.Unlock()
 
 		found, data, err := fn(ctx)
@@ -99,6 +122,7 @@ func (g *objectFlights) do(ctx context.Context, key objectFlightKey, fn func(con
 		call.found, call.data, call.err = found, data, err
 		call.leaderCanceled = leaderCanceled
 		delete(g.calls, key)
+		g.deactivateTargetLocked(target)
 		close(call.done)
 		g.mu.Unlock()
 		return found, data, err
