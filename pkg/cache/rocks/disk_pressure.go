@@ -29,6 +29,7 @@ type diskPressureConfig struct {
 	low      uint64
 	interval time.Duration
 	enabled  bool
+	now      func() time.Time
 }
 
 func parseDiskBytes(cfg runtime.RocksConfig) uint64 {
@@ -76,8 +77,15 @@ func resolveDiskPressureConfig(cfg runtime.RocksConfig) diskPressureConfig {
 }
 
 func diskUsageBytes(root string) (uint64, error) {
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
 	var total uint64
-	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+	err = filepath.WalkDir(resolved, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			if errors.Is(walkErr, fs.ErrNotExist) {
 				return nil
@@ -123,8 +131,8 @@ func (s *impl) startDiskMaintenance(p diskPressureConfig) {
 			select {
 			case <-stop:
 				return
-			case now := <-ticker.C:
-				s.runDiskPressure(p, now)
+			case <-ticker.C:
+				s.runDiskPressure(p, time.Now())
 			}
 		}
 	}()
@@ -192,7 +200,14 @@ func (s *impl) runDiskPressure(p diskPressureConfig, now time.Time) {
 	if after <= p.low {
 		s.pressureNext = time.Time{}
 	} else {
-		s.pressureNext = now.Add(diskPressureCompactionCooloff)
+		completedAt := time.Now()
+		if p.now != nil {
+			completedAt = p.now()
+		}
+		if completedAt.Before(now) {
+			completedAt = now
+		}
+		s.pressureNext = completedAt.Add(diskPressureCompactionCooloff)
 	}
 	s.pressureMu.Unlock()
 	log.Printf("rocks: disk pressure compaction finished; usage %s -> %s (high %s)",

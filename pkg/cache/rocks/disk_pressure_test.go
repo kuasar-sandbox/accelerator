@@ -35,6 +35,18 @@ func TestDiskUsageBytes(t *testing.T) {
 	if got != 3072 {
 		t.Fatalf("disk usage = %d, want 3072", got)
 	}
+
+	linkRoot := filepath.Join(t.TempDir(), "rocks-link")
+	if err := os.Symlink(root, linkRoot); err != nil {
+		t.Fatal(err)
+	}
+	gotLink, err := diskUsageBytes(linkRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotLink != 3072 {
+		t.Fatalf("symlinked disk usage = %d, want 3072", gotLink)
+	}
 }
 
 func TestDiskPressureCompactionEvictsColdKeys(t *testing.T) {
@@ -89,6 +101,56 @@ func TestDiskPressureCompactionEvictsColdKeys(t *testing.T) {
 	}
 	if !rawKeyExists(t, s, native.Chunk, hotKey[:]) {
 		t.Fatal("hot key was evicted by disk-pressure compaction")
+	}
+}
+
+func TestDiskPressureCooldownStartsAtCompletion(t *testing.T) {
+	cfg := tempRocksConfigT(t)
+	cfg.DiskBytes = "1MiB"
+	cfg.DiskHighWatermark = 0.0001
+	cfg.DiskLowWatermark = 0.00005
+	cfg.DiskMaintenanceInterval = "1h"
+	fc := runtime.FreqConfig{
+		Counters:       "1K",
+		ResetAfter:     "1G",
+		EvictThreshold: 1,
+	}
+	s, err := openImpl(cfg, fc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	hotKey := store.ContentKey(sha256.Sum256([]byte("hot-cooldown-completion")))
+	value := bytes.Repeat([]byte{0x42}, 16<<10)
+	if err := s.Fill(ctx, store.PartitionChunk, hotKey, value); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		res, blob, err := s.Get(ctx, store.PartitionChunk, hotKey)
+		if err != nil || res != cache.CacheHit || blob == nil {
+			t.Fatalf("hot Get = %v, %v, %v", res, blob, err)
+		}
+		blob.Release()
+	}
+	if err := s.db.Flush(native.Chunk); err != nil {
+		t.Fatal(err)
+	}
+
+	t0 := time.Now()
+	finishedAt := t0.Add(6 * time.Minute)
+	p := resolveDiskPressureConfig(cfg)
+	p.now = func() time.Time { return finishedAt }
+
+	s.runDiskPressure(p, t0)
+
+	wantNext := finishedAt.Add(diskPressureCompactionCooloff)
+	s.pressureMu.Lock()
+	gotNext := s.pressureNext
+	s.pressureMu.Unlock()
+	if !gotNext.Equal(wantNext) {
+		t.Fatalf("pressureNext = %v, want %v (5m after completion, not start)", gotNext, wantNext)
 	}
 }
 
