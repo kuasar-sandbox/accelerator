@@ -455,6 +455,8 @@ flowchart TD
 
 Manifest Stream.ReadAt resolves the requested visible runs, fetches Data concurrently and writes their logical ranges. A lower-layer hit asynchronously fills upper cache tiers. For 4+1, EC fans out to five peers and can return once four distinct valid indexes suffice; full reconstruction is needed only when data shards are missing. Read ordering and chunk visibility follow [manifest](manifest.md), including layered sparse semantics.
 
+Concurrent `Get` calls for the same `(partition, content key)` are coalesced inside one TieredCache process. One caller runs the lookup cascade; waiters receive independently owned `Blob` clones. A hit stays in the in-flight table until the Tier-0 backfill fill returns, so a request arriving during the RocksDB write-back window reuses the same result instead of starting a second origin read. If the leader fails because its own context was canceled, waiters with live contexts retry rather than inheriting that cancellation. Coalescing is process-local; it does not coordinate separate cache-ctl daemons.
+
 ### 4.7 Fill-aside
 
 A hit in layer i fills every cache tier above it; origin is layer N after N cache tiers.
@@ -466,7 +468,7 @@ On a hit at layer i (tiers 0..N-1; origin N):
         startFill(j, partition, key, blob)   # asynchronous
 ```
 
-**Blob ownership:** startFill clones an owned handle for the fill goroutine and defers its Release. The original handle belongs to the Get caller until its response has been written. Both handles reference the same immutable backing allocation; each has an independently owned reference, not an unrelated copy of the data.
+**Blob ownership:** startFill clones an owned handle for the fill goroutine and defers its Release. The original handle belongs to the Get caller until its response has been written. Coalesced waiters also receive clones of the retained flight handle. All handles reference the same immutable backing allocation; each has an independently owned reference, not an unrelated copy of the data.
 
 **Async behavior:** the read does not await fill completion. Fills use a context derived from TieredCache's base context, normally without a fill-specific deadline; Close cancels and joins them (§6.2). Backend cancellation capabilities and client timeouts still matter, especially synchronous RocksDB CGO. This is not an unconditional guarantee that any wedged backend can be interrupted.
 

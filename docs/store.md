@@ -198,6 +198,8 @@ for i := len(generations) - 1; i >= 0; i-- {
 }
 ```
 
+Concurrent reads for the same `(partition, content key, generation-list snapshot)` are coalesced inside one Server: the backend lookup runs once and callers share the immutable result bytes. A changed generation list forms a distinct snapshot and therefore a distinct flight. If the leader's request context is canceled, waiters with live contexts retry with their own context instead of inheriting that cancellation. Coalescing is process-local and does not make separate store-ctl daemons share reads.
+
 ### 3.1 Read attempt and write boundary
 
 Store `Get` performs one business read attempt. Failed streams are canceled/released, and a later call starts a complete new object read; confirmed absence remains different from transport/access failure. The existing endpoint and operation timeout bound that attempt, while caller context owns any later retry/backoff.

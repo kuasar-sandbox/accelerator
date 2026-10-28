@@ -27,6 +27,8 @@ type Server struct {
 	generations func() []store.Generation
 	verifyKey   bool
 
+	flights objectFlights
+
 	stats Stats
 }
 
@@ -95,10 +97,14 @@ func (s *Server) AdmitWrite(_ context.Context, req *pb.AdmitWriteRequest) (*pb.A
 }
 
 // GetObject performs the shared newest-to-oldest lookup used by both the
-// store gRPC Get and store-ctl's embedded cache wire listener.
+// store gRPC Get and store-ctl's embedded cache wire listener. Concurrent
+// reads with the same generation snapshot are coalesced.
 func (s *Server) GetObject(ctx context.Context, partition store.Partition, key store.ContentKey) (bool, []byte, error) {
 	gens := s.generations()
-	return getAcrossGenerations(ctx, s.backend, gens, partition, key)
+	fk := objectFlightKey{partition: partition, key: key, generations: generationsKey(gens)}
+	return s.flights.do(ctx, fk, func(ctx context.Context) (bool, []byte, error) {
+		return getAcrossGenerations(ctx, s.backend, gens, partition, key)
+	})
 }
 
 func getAcrossGenerations(ctx context.Context, backend Backend, generations []store.Generation, partition store.Partition, key store.ContentKey) (bool, []byte, error) {
