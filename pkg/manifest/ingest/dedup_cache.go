@@ -51,13 +51,6 @@ func newChunkDedupCache(limit int) *chunkDedupCache {
 	}
 }
 
-func (c *chunkDedupCache) len() int {
-	if c == nil {
-		return 0
-	}
-	return len(c.entries)
-}
-
 func (c *chunkDedupCache) get(fp [32]byte) (chunkMeta, bool) {
 	if c == nil {
 		return chunkMeta{}, false

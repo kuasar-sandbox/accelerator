@@ -24,6 +24,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"log"
 	"sync"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/chunker"
@@ -69,6 +70,20 @@ type StoreWriter interface {
 type OrderedChunkStoreWriter interface {
 	StoreWriter
 	PutChunkOrdered(ctx context.Context, admission store.WriteAdmission, key store.ContentKey, data []byte, ordinal uint64) (isNew bool, err error)
+}
+
+// OrderedChunkRequirement is an optional capability for writers that implement
+// OrderedChunkStoreWriter but do not always require ordinal sequencing.
+// Returning false lets ingest use StoreWriter.Put and coalesce more aggressively.
+type OrderedChunkRequirement interface {
+	RequiresOrderedChunks() bool
+}
+
+// DedupIndexValidator optionally confirms that a persistent dedup index marker
+// still names a live store object. Used to discard an index after a store wipe
+// or reinitialization.
+type DedupIndexValidator interface {
+	ValidateDedupIndexMarker(ctx context.Context, marker store.ContentKey) (bool, error)
 }
 
 // IngestOption holds the per-call knobs for Ingest. Zero value is
@@ -140,6 +155,7 @@ func NewIngesterWithCacheLimit(keyFn CustomerKeyFunc, extraSaltFn ExtraSaltFunc,
 		enc:          enc,
 		dedupCache:   newChunkDedupCache(cacheLimit),
 		dedupFlights: make(map[[32]byte]*chunkFlight),
+		dedupPath:    persistentDedupPathForWriter(sw),
 	}
 }
 
@@ -153,6 +169,7 @@ type ingester struct {
 	dedupMu      sync.Mutex
 	dedupCache   *chunkDedupCache
 	dedupFlights map[[32]byte]*chunkFlight
+	dedupPath    string
 }
 
 // Ingest consumes src in one forward pass: Hole runs are recorded as
@@ -257,8 +274,57 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 		opt.OnProgress(progDone, size)
 		progMu.Unlock()
 	}
-	_, isOrderedWriter := i.store.(OrderedChunkStoreWriter)
+	_, implementsOrderedWriter := i.store.(OrderedChunkStoreWriter)
+	isOrderedWriter := implementsOrderedWriter
+	if ordering, ok := i.store.(OrderedChunkRequirement); ok && !ordering.RequiresOrderedChunks() {
+		isOrderedWriter = false
+	}
 	orderedSkipper, canSkipOrdered := i.store.(OrderedChunkSkipper)
+
+	var persistent *persistentChunkIndex
+	persistReset := false
+	if i.dedupPath != "" {
+		var err error
+		persistent, err = openPersistentChunkIndexRead(i.dedupPath)
+		if err != nil {
+			log.Printf("ingest: persistent dedup index unavailable: %v", err)
+			persistReset = true
+		}
+		if persistent != nil {
+			marker, found, err := persistent.marker()
+			if err != nil {
+				log.Printf("ingest: persistent dedup index marker unavailable: %v", err)
+				_ = persistent.Close()
+				persistent = nil
+				persistReset = true
+			} else if !found {
+				_ = persistent.Close()
+				persistent = nil
+				persistReset = true
+			} else if validator, ok := i.store.(DedupIndexValidator); ok {
+				valid, err := validator.ValidateDedupIndexMarker(ctx, store.ContentKey(marker))
+				if err != nil || !valid {
+					if err != nil {
+						log.Printf("ingest: persistent dedup index marker validation failed: %v", err)
+					}
+					_ = persistent.Close()
+					persistent = nil
+					persistReset = true
+				}
+			}
+		}
+	}
+	var pending map[[32]byte]chunkMeta
+	if i.dedupPath != "" {
+		pending = make(map[[32]byte]chunkMeta)
+	}
+	var pendingMu sync.Mutex
+	var persistentLog sync.Once
+	logPersistentErr := func(err error) {
+		persistentLog.Do(func() {
+			log.Printf("ingest: persistent dedup index lookup unavailable: %v", err)
+		})
+	}
 
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
@@ -277,6 +343,18 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 					flight     *chunkFlight
 					isLeader   bool
 				)
+				releaseFlight := func() {
+					if !isLeader {
+						return
+					}
+					i.dedupMu.Lock()
+					if i.dedupFlights[fp] == flight {
+						delete(i.dedupFlights, fp)
+					}
+					close(flight.done)
+					i.dedupMu.Unlock()
+					isLeader = false
+				}
 
 				for {
 					if wctx.Err() != nil {
@@ -318,12 +396,26 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 				}
 
 				if wctx.Err() != nil {
-					if isLeader {
-						i.dedupMu.Lock()
-						delete(i.dedupFlights, fp)
-						close(flight.done)
-						i.dedupMu.Unlock()
+					releaseFlight()
+					continue
+				}
+
+				if !hit && isLeader && persistent != nil {
+					meta, found, err := persistent.lookup(fp)
+					if err != nil {
+						logPersistentErr(err)
 					}
+					if found {
+						i.dedupMu.Lock()
+						i.dedupCache.put(fp, meta)
+						i.dedupMu.Unlock()
+						releaseFlight()
+						cachedMeta = meta
+						hit = true
+					}
+				}
+				if wctx.Err() != nil {
+					releaseFlight()
 					continue
 				}
 
@@ -357,25 +449,26 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 				}
 
 			performEncryptAndStore:
-				ciphertext, hash, key, err := i.enc.EncryptChunk(wctx, salt, j.data)
+				var (
+					ciphertext []byte
+					hash       [32]byte
+					key        [32]byte
+					err        error
+				)
+				if keyed, ok := i.enc.(crypto.KeyedEncryptor); ok {
+					ciphertext, hash, err = keyed.EncryptChunkWithKey(wctx, fp, j.data)
+					key = fp
+				} else {
+					ciphertext, hash, key, err = i.enc.EncryptChunk(wctx, salt, j.data)
+				}
 				if err != nil {
-					if isLeader {
-						i.dedupMu.Lock()
-						delete(i.dedupFlights, fp)
-						close(flight.done)
-						i.dedupMu.Unlock()
-					}
 					fail(fmt.Errorf("ingest: encrypt chunk: %w", err))
+					releaseFlight()
 					continue
 				}
 				if err := validateEncryptedChunkObject(ciphertext, j.oc.size); err != nil {
-					if isLeader {
-						i.dedupMu.Lock()
-						delete(i.dedupFlights, fp)
-						close(flight.done)
-						i.dedupMu.Unlock()
-					}
 					fail(fmt.Errorf("ingest: encrypt chunk: %w", err))
+					releaseFlight()
 					continue
 				}
 				ck := store.ContentKey(hash)
@@ -387,13 +480,8 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 					isNew, err = i.store.Put(wctx, admission, store.PartitionChunk, ck, ciphertext)
 				}
 				if err != nil {
-					if isLeader {
-						i.dedupMu.Lock()
-						delete(i.dedupFlights, fp)
-						close(flight.done)
-						i.dedupMu.Unlock()
-					}
 					fail(fmt.Errorf("ingest: store put chunk: %w", err))
+					releaseFlight()
 					continue
 				}
 
@@ -407,11 +495,13 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 
 				i.dedupMu.Lock()
 				i.dedupCache.put(fp, meta)
-				if isLeader {
-					delete(i.dedupFlights, fp)
-					close(flight.done)
-				}
 				i.dedupMu.Unlock()
+				releaseFlight()
+				if pending != nil {
+					pendingMu.Lock()
+					pending[fp] = meta
+					pendingMu.Unlock()
+				}
 
 				j.oc.key = key
 				j.oc.ck = ck
@@ -495,6 +585,11 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 	}
 	close(jobs)
 	wg.Wait()
+	if persistent != nil {
+		if err := persistent.Close(); err != nil {
+			log.Printf("ingest: close persistent dedup index: %v", err)
+		}
+	}
 	if putErr != nil {
 		return nil, putErr
 	}
@@ -576,6 +671,11 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 	}
 
 	res.ManifestKey = manifestKey
+	if i.dedupPath != "" && (len(pending) > 0 || persistReset) {
+		if err := persistChunkMetas(i.dedupPath, pending, manifestKey, persistReset); err != nil {
+			log.Printf("ingest: persist chunk dedup index: %v", err)
+		}
+	}
 	return &res, nil
 }
 

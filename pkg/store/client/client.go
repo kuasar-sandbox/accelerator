@@ -36,10 +36,11 @@ const frameSize = 256 * 1024
 // HTTP/2 head-of-line-blocking relief for concurrent large transfers
 // while keeping the per-conn multiplexing benefits of gRPC.
 type Client struct {
-	conns   []*grpc.ClientConn
-	stubs   []pb.StoreClient
-	next    atomic.Uint32
-	timeout time.Duration
+	conns    []*grpc.ClientConn
+	stubs    []pb.StoreClient
+	next     atomic.Uint32
+	timeout  time.Duration
+	endpoint string
 }
 
 // New dials `pool` independent gRPC ClientConns against endpoint
@@ -72,9 +73,10 @@ func New(endpoint string, pool int, timeout time.Duration) (*Client, error) {
 		stubs = append(stubs, pb.NewStoreClient(cc))
 	}
 	return &Client{
-		conns:   conns,
-		stubs:   stubs,
-		timeout: timeout,
+		conns:    conns,
+		stubs:    stubs,
+		timeout:  timeout,
+		endpoint: target,
 	}, nil
 }
 
@@ -88,6 +90,16 @@ func (c *Client) Close() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// DedupIndexEndpoint identifies the store this client writes to.
+func (c *Client) DedupIndexEndpoint() string { return c.endpoint }
+
+// ValidateDedupIndexMarker checks that a persisted dedup index marker still
+// names a live manifest object in the store.
+func (c *Client) ValidateDedupIndexMarker(ctx context.Context, marker store.ContentKey) (bool, error) {
+	found, _, err := c.Get(ctx, store.PartitionManifest, marker)
+	return found, err
 }
 
 // PoolSize reports the number of independent gRPC connections (the

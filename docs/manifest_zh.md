@@ -559,6 +559,21 @@ derive/encode/encrypt/Put 使用**有界 worker pool**,worker 数来自 writer �
 `PoolSize()` 能力。标准 store client 对应 `store.pool`;未暴露能力的 writer
 使用 1 个 worker。这是 ingest 实现选择,不代表一个 gRPC connection 只能并发一个 RPC。
 
+Ingest 维护一个有界进程内 LRU 去重缓存,key 为
+`SHA256(salt || plaintext)`。相同 key 的并发 worker 会合并;后续命中直接复用已记录的
+physical key、ciphertext hash、编码长度和 format,不再重复 Snappy/AES/Put。缓存只在
+store 操作成功后写入。
+
+仅写 target、且暴露 store endpoint 的 writer 还会使用持久化本地索引,使新的
+`manifest-ctl store` / `flatten-ctl export --upload` 进程能够复用同一 endpoint 上
+较早进程写入的 chunk。默认路径位于用户 cache 目录下,按 endpoint 分命名空间,文件
+仅 owner 可读写。`ACCELERATOR_CHUNK_DEDUP_INDEX=<path>` 可指定单文件路径(专用于
+一个 store endpoint),`ACCELERATOR_CHUNK_DEDUP_INDEX=off` 可关闭持久化。索引会记录
+最近一次成功写入的 Manifest 作为 marker,信任条目之前先验证该 marker;store 被清空或
+重新初始化时会重建本地索引。索引只是优化:缺失、不可读或损坏的条目会回退到加密/上传。
+它假设同一 generation 的 store 对象持续存在;若发生离线 purge 或部分数据丢失,仍可能
+需要先清理本地索引。不同 host 不共享该索引。
+
 chunking 顺序执行,index 按 source 顺序组装,进度回调串行化;Put 乱序完成不会打乱
 Manifest。完整字节复现还要求相同 sparse 输入、chunker/codec 设置、salt/admission
 及 customer key/AAD;并发顺序本身不能证明跨配置确定性。有界并发可重叠多 GiB 快照的

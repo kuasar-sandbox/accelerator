@@ -17,6 +17,13 @@ type Encryptor interface {
 	SealKeyTable(customerKey [32]byte, keys, aad []byte) ([]byte, error)
 }
 
+// KeyedEncryptor is an optional fast path for callers that already derived the
+// chunk's convergent key. Implementations must produce the same object and hash
+// as EncryptChunk with that key.
+type KeyedEncryptor interface {
+	EncryptChunkWithKey(ctx context.Context, key [32]byte, plaintext []byte) (object []byte, hash [32]byte, err error)
+}
+
 // Decryptor is the read-side narrow interface. Symmetric counterpart
 // to Encryptor — same algorithms, opposite direction.
 type Decryptor interface {
@@ -58,6 +65,10 @@ type codec struct {
 
 func (c *codec) EncryptChunk(ctx context.Context, salt [32]byte, plaintext []byte) ([]byte, [32]byte, [32]byte, error) {
 	return c.chunk.EncryptChunk(ctx, salt, plaintext)
+}
+
+func (c *codec) EncryptChunkWithKey(ctx context.Context, key [32]byte, plaintext []byte) ([]byte, [32]byte, error) {
+	return c.chunk.EncryptChunkWithKey(ctx, key, plaintext)
 }
 
 func (c *codec) DecryptChunkTo(ctx context.Context, key [32]byte, ciphertext, dst []byte) error {
