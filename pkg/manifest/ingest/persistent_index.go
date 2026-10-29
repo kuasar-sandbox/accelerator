@@ -19,13 +19,25 @@ import (
 )
 
 const (
-	dedupIndexBucket     = "chunk-dedup-v1"
-	dedupIndexMetaBucket = "chunk-dedup-meta-v1"
-	dedupIndexMarkerKey  = "manifest-marker"
-	dedupIndexVersion    = byte(1)
-	dedupIndexValueSize  = 1 + 32 + 32 + 8 + 8 + 1 + 4
-	dedupIndexEnv        = "ACCELERATOR_CHUNK_DEDUP_INDEX"
+	dedupIndexBucket       = "chunk-dedup-v2"
+	dedupIndexMetaBucket   = "chunk-dedup-meta-v2"
+	dedupIndexLegacyBucket = "chunk-dedup-v1"
+	dedupIndexLegacyMeta   = "chunk-dedup-meta-v1"
+	dedupIndexMarkerKey    = "manifest-marker"
+	dedupIndexKeyDomain    = "accelerator-chunk-dedup-index-v2\x00"
+	dedupIndexVersion      = byte(2)
+	dedupIndexValueSize    = 1 + 32 + 8 + 8 + 1 + 4
+	dedupIndexEnv          = "ACCELERATOR_CHUNK_DEDUP_INDEX"
 )
+
+func chunkIndexKey(fp [32]byte) [32]byte {
+	h := sha256.New()
+	h.Write([]byte(dedupIndexKeyDomain))
+	h.Write(fp[:])
+	var key [32]byte
+	copy(key[:], h.Sum(nil))
+	return key
+}
 
 type persistentChunkIndex struct {
 	db *bbolt.DB
@@ -92,7 +104,8 @@ func (p *persistentChunkIndex) lookup(fp [32]byte) (chunkMeta, bool, error) {
 		if bucket == nil {
 			return nil
 		}
-		value := bucket.Get(fp[:])
+		indexKey := chunkIndexKey(fp)
+		value := bucket.Get(indexKey[:])
 		if value == nil {
 			return nil
 		}
@@ -101,10 +114,7 @@ func (p *persistentChunkIndex) lookup(fp [32]byte) (chunkMeta, bool, error) {
 			log.Printf("ingest: ignoring corrupt persistent dedup entry: %v", err)
 			return nil
 		}
-		if decoded.key != fp {
-			log.Printf("ingest: ignoring persistent dedup entry with mismatched key")
-			return nil
-		}
+		decoded.key = fp
 		meta = decoded
 		found = true
 		return nil
@@ -163,12 +173,18 @@ func persistChunkMetas(path string, entries map[[32]byte]chunkMeta, marker [32]b
 				}
 			}
 		}
+		for _, name := range []string{dedupIndexLegacyBucket, dedupIndexLegacyMeta} {
+			if err := tx.DeleteBucket([]byte(name)); err != nil && !errors.Is(err, bbolt.ErrBucketNotFound) {
+				return err
+			}
+		}
 		bucket, err := tx.CreateBucketIfNotExists([]byte(dedupIndexBucket))
 		if err != nil {
 			return err
 		}
 		for fp, meta := range entries {
-			if err := bucket.Put(fp[:], encodeChunkMeta(meta)); err != nil {
+			indexKey := chunkIndexKey(fp)
+			if err := bucket.Put(indexKey[:], encodeChunkMeta(meta)); err != nil {
 				return err
 			}
 		}
@@ -183,12 +199,11 @@ func persistChunkMetas(path string, entries map[[32]byte]chunkMeta, marker [32]b
 func encodeChunkMeta(meta chunkMeta) []byte {
 	value := make([]byte, dedupIndexValueSize)
 	value[0] = dedupIndexVersion
-	copy(value[1:33], meta.key[:])
-	copy(value[33:65], meta.ck[:])
-	binary.LittleEndian.PutUint64(value[65:73], meta.ctLen)
-	binary.LittleEndian.PutUint64(value[73:81], meta.encLen)
-	value[81] = meta.format
-	binary.LittleEndian.PutUint32(value[82:86], crc32.ChecksumIEEE(value[:82]))
+	copy(value[1:33], meta.ck[:])
+	binary.LittleEndian.PutUint64(value[33:41], meta.ctLen)
+	binary.LittleEndian.PutUint64(value[41:49], meta.encLen)
+	value[49] = meta.format
+	binary.LittleEndian.PutUint32(value[50:54], crc32.ChecksumIEEE(value[:50]))
 	return value
 }
 
@@ -199,15 +214,14 @@ func decodeChunkMeta(value []byte) (chunkMeta, error) {
 	if value[0] != dedupIndexVersion {
 		return chunkMeta{}, fmt.Errorf("unsupported version %d", value[0])
 	}
-	if got, want := binary.LittleEndian.Uint32(value[82:86]), crc32.ChecksumIEEE(value[:82]); got != want {
+	if got, want := binary.LittleEndian.Uint32(value[50:54]), crc32.ChecksumIEEE(value[:50]); got != want {
 		return chunkMeta{}, fmt.Errorf("checksum %08x, want %08x", got, want)
 	}
 	var meta chunkMeta
-	copy(meta.key[:], value[1:33])
-	copy(meta.ck[:], value[33:65])
-	meta.ctLen = binary.LittleEndian.Uint64(value[65:73])
-	meta.encLen = binary.LittleEndian.Uint64(value[73:81])
-	meta.format = value[81]
+	copy(meta.ck[:], value[1:33])
+	meta.ctLen = binary.LittleEndian.Uint64(value[33:41])
+	meta.encLen = binary.LittleEndian.Uint64(value[41:49])
+	meta.format = value[49]
 	if meta.ctLen == 0 || meta.encLen+1 != meta.ctLen {
 		return chunkMeta{}, fmt.Errorf("invalid physical/encoded lengths %d/%d", meta.ctLen, meta.encLen)
 	}

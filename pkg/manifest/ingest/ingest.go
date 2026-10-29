@@ -319,6 +319,10 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 		pending = make(map[[32]byte]chunkMeta)
 	}
 	var pendingMu sync.Mutex
+	pendingLimit := i.dedupCache.limit // bound metadata retained for index persistence
+	if pendingLimit <= 0 || pendingLimit > defaultChunkDedupCacheLimit {
+		pendingLimit = defaultChunkDedupCacheLimit
+	}
 	var persistentLog sync.Once
 	logPersistentErr := func(err error) {
 		persistentLog.Do(func() {
@@ -499,7 +503,9 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 				releaseFlight()
 				if pending != nil {
 					pendingMu.Lock()
-					pending[fp] = meta
+					if len(pending) < pendingLimit {
+						pending[fp] = meta
+					}
 					pendingMu.Unlock()
 				}
 

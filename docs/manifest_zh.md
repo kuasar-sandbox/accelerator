@@ -568,11 +568,12 @@ store 操作成功后写入。
 `manifest-ctl store` / `flatten-ctl export --upload` 进程能够复用同一 endpoint 上
 较早进程写入的 chunk。默认路径位于用户 cache 目录下,按 endpoint 分命名空间,文件
 仅 owner 可读写。`ACCELERATOR_CHUNK_DEDUP_INDEX=<path>` 可指定单文件路径(专用于
-一个 store endpoint),`ACCELERATOR_CHUNK_DEDUP_INDEX=off` 可关闭持久化。索引会记录
-最近一次成功写入的 Manifest 作为 marker,信任条目之前先验证该 marker;store 被清空或
-重新初始化时会重建本地索引。索引只是优化:缺失、不可读或损坏的条目会回退到加密/上传。
-它假设同一 generation 的 store 对象持续存在;若发生离线 purge 或部分数据丢失,仍可能
-需要先清理本地索引。不同 host 不共享该索引。
+一个 store endpoint),`ACCELERATOR_CHUNK_DEDUP_INDEX=off` 可关闭持久化。索引 key 为
+带域分离的单向 hash,索引中不保存未密封的 chunk key。索引会记录最近一次成功写入的
+Manifest 作为 marker,信任条目之前先验证该 marker;store 被清空或重新初始化时会重建
+本地索引。索引只是优化:缺失、不可读或损坏的条目会回退到加密/上传。它假设同一
+generation 的 store 对象持续存在;若发生离线 purge 或部分数据丢失,仍可能需要先清理
+本地索引。不同 host 不共享该索引。
 
 chunking 顺序执行,index 按 source 顺序组装,进度回调串行化;Put 乱序完成不会打乱
 Manifest。完整字节复现还要求相同 sparse 输入、chunker/codec 设置、salt/admission

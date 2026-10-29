@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"go.etcd.io/bbolt"
+
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
@@ -620,5 +622,46 @@ func TestIngestPersistentDedupResetsStaleIndex(t *testing.T) {
 	}
 	if res3.StoredChunks != 0 || res3.DedupChunks != 1 {
 		t.Fatalf("rebuilt index StoredChunks/DedupChunks = %d/%d, want 0/1", res3.StoredChunks, res3.DedupChunks)
+	}
+}
+
+func TestPersistentPendingIsBounded(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "dedup.db")
+	t.Setenv(dedupIndexEnv, indexPath)
+	const chunkSize = 4096
+	var payload []byte
+	for i := 0; i < 5; i++ {
+		payload = append(payload, bytes.Repeat([]byte{byte(0x80 + i)}, chunkSize)...)
+	}
+	enc, _, err := crypto.New(crypto.Config{Chunk: "aes", Manifest: "aes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newCountingStore(1)
+	store.endpoint = "unix:///test/store"
+	ing := NewIngesterWithCacheLimit(testKeyFn, nil, store, fixedChunker(t, chunkSize), enc, 2)
+	if _, err := ing.Ingest(context.Background(), sparse.Dense(bytes.NewReader(payload), uint64(len(payload))), IngestOption{}); err != nil {
+		t.Fatal(err)
+	}
+	db, err := bbolt.Open(indexPath, 0o600, &bbolt.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	count := 0
+	if err := db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(dedupIndexBucket))
+		if bucket == nil {
+			return nil
+		}
+		return bucket.ForEach(func(_, _ []byte) error {
+			count++
+			return nil
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("persistent pending entries = %d, want 2", count)
 	}
 }

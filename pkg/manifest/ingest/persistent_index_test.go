@@ -9,7 +9,6 @@ import (
 
 func TestChunkMetaEncodeDecode(t *testing.T) {
 	meta := chunkMeta{
-		key:    crypto.DeriveKey([32]byte{1}, []byte("plaintext")),
 		ck:     store.ContentKey{2},
 		ctLen:  123,
 		encLen: 122,
@@ -22,8 +21,15 @@ func TestChunkMetaEncodeDecode(t *testing.T) {
 	if decoded != meta {
 		t.Fatalf("decoded = %#v, want %#v", decoded, meta)
 	}
+	if decoded.key != ([32]byte{}) {
+		t.Fatal("persistent metadata decoded a plaintext chunk key")
+	}
+	fp := crypto.DeriveKey([32]byte{1}, []byte("plaintext"))
+	if chunkIndexKey(fp) == fp {
+		t.Fatal("persistent index key is not one-way")
+	}
 	corrupt := encodeChunkMeta(meta)
-	corrupt[40] ^= 0xff
+	corrupt[20] ^= 0xff
 	if _, err := decodeChunkMeta(corrupt); err == nil {
 		t.Fatal("corrupt entry was accepted")
 	}
