@@ -42,6 +42,7 @@ func (s *countedStore) AdmitWrite(ctx context.Context, r *pb.AdmitWriteRequest) 
 func transferConfig(t *testing.T, online bool) (*manifest.Config, string, *countedStore) {
 	t.Helper()
 	t.Setenv(manifest.CustomerKeyEnv, "")
+	t.Setenv("ACCELERATOR_CHUNK_DEDUP_INDEX", "off")
 	cfg := &manifest.Config{Manifest: manifest.ManifestSubConfig{Key: strings.Repeat("ab", 32), WriteGeneration: "G1"}, Chunker: chunker.Config{Mode: "fixed", Fixed: chunker.FixedConfig{Size: "4096"}}, Crypto: manifestcrypto.Config{Chunk: "aes", Manifest: "aes", Local: manifestcrypto.LocalOff}}
 	var server *countedStore
 	if online {
@@ -463,5 +464,33 @@ func TestTransferRejectsNonSeekablePathWithoutWaitingForWriter(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("input capability check blocked waiting for FIFO writer")
+	}
+}
+
+func TestStorePersistentDedupSkipsCrossInvocationChunkPuts(t *testing.T) {
+	_, config, server := transferConfig(t, true)
+	t.Setenv("ACCELERATOR_CHUNK_DEDUP_INDEX", filepath.Join(t.TempDir(), "dedup.db"))
+	body := bytes.Repeat([]byte("persistent-dedup-payload"), 4096)
+	source, _, _ := artifactFixture(t, body, nil, nil)
+
+	before := server.Stats().PutN
+	firstKey, _, err := invokeTransfer(t, config, true, nil, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterFirst := server.Stats().PutN
+	if afterFirst <= before+1 {
+		t.Fatalf("first ingest PutN = %d, want more than one chunk Put", afterFirst-before)
+	}
+	secondKey, _, err := invokeTransfer(t, config, true, nil, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(bytes.TrimSpace(firstKey), bytes.TrimSpace(secondKey)) {
+		t.Fatalf("persistent dedup changed manifest key: %q != %q", firstKey, secondKey)
+	}
+	afterSecond := server.Stats().PutN
+	if got := afterSecond - afterFirst; got != 1 {
+		t.Fatalf("second ingest PutN = %d, want 1 (manifest only)", got)
 	}
 }

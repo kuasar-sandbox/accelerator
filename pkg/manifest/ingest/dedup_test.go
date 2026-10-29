@@ -3,6 +3,8 @@ package ingest
 import (
 	"bytes"
 	"context"
+	"errors"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -22,6 +24,11 @@ func (c *countingEncryptor) EncryptChunk(ctx context.Context, salt [32]byte, pla
 	return c.Encryptor.EncryptChunk(ctx, salt, plaintext)
 }
 
+func (c *countingEncryptor) EncryptChunkWithKey(ctx context.Context, key [32]byte, plaintext []byte) ([]byte, [32]byte, error) {
+	c.encryptCalls.Add(1)
+	return c.Encryptor.(crypto.KeyedEncryptor).EncryptChunkWithKey(ctx, key, plaintext)
+}
+
 type countingStore struct {
 	mu           sync.Mutex
 	puts         atomic.Int64
@@ -29,6 +36,13 @@ type countingStore struct {
 	manifestPuts atomic.Int64
 	seenKeys     map[store.ContentKey]int
 	poolSize     int
+	endpoint     string
+}
+
+func (s *countingStore) DedupIndexEndpoint() string { return s.endpoint }
+
+func (s *countingStore) ValidateDedupIndexMarker(context.Context, store.ContentKey) (bool, error) {
+	return true, nil
 }
 
 func newCountingStore(poolSize int) *countingStore {
@@ -227,19 +241,26 @@ func TestIngestDedupCacheLRUEviction(t *testing.T) {
 	chunkC := bytes.Repeat([]byte{0x03}, chunkSize)
 
 	// 1. Ingest A, B -> cache contains [B, A]
-	ing.Ingest(context.Background(), sparse.Dense(bytes.NewReader(append(append([]byte(nil), chunkA...), chunkB...)), 2*chunkSize), IngestOption{})
+	if _, err := ing.Ingest(context.Background(), sparse.Dense(bytes.NewReader(append(append([]byte(nil), chunkA...), chunkB...)), 2*chunkSize), IngestOption{}); err != nil {
+		t.Fatal(err)
+	}
 	if countingEnc.encryptCalls.Load() != 2 {
 		t.Fatalf("encrypt calls = %d, want 2", countingEnc.encryptCalls.Load())
 	}
 
 	// 2. Ingest C -> cache capacity is 2, evicts oldest (A) -> cache contains [C, B]
-	ing.Ingest(context.Background(), sparse.Dense(bytes.NewReader(chunkC), chunkSize), IngestOption{})
+	if _, err := ing.Ingest(context.Background(), sparse.Dense(bytes.NewReader(chunkC), chunkSize), IngestOption{}); err != nil {
+		t.Fatal(err)
+	}
 	if countingEnc.encryptCalls.Load() != 3 {
 		t.Fatalf("encrypt calls = %d, want 3", countingEnc.encryptCalls.Load())
 	}
 
 	// 3. Ingest B -> hits cache! (B was not evicted)
-	resB, _ := ing.Ingest(context.Background(), sparse.Dense(bytes.NewReader(chunkB), chunkSize), IngestOption{})
+	resB, err := ing.Ingest(context.Background(), sparse.Dense(bytes.NewReader(chunkB), chunkSize), IngestOption{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if resB.DedupChunks != 1 {
 		t.Errorf("chunk B DedupChunks = %d, want 1 (should hit cache)", resB.DedupChunks)
 	}
@@ -249,7 +270,10 @@ func TestIngestDedupCacheLRUEviction(t *testing.T) {
 
 	// 4. Ingest A -> misses cache! (A was evicted from cache, so EncryptChunk and store.Put are called again)
 	chunkPutsBeforeA := cStore.chunkPuts.Load()
-	resA, _ := ing.Ingest(context.Background(), sparse.Dense(bytes.NewReader(chunkA), chunkSize), IngestOption{})
+	resA, err := ing.Ingest(context.Background(), sparse.Dense(bytes.NewReader(chunkA), chunkSize), IngestOption{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if countingEnc.encryptCalls.Load() != 4 {
 		t.Errorf("encrypt calls after A = %d, want 4 (A had to be re-encrypted)", countingEnc.encryptCalls.Load())
 	}
@@ -378,5 +402,223 @@ func TestIngestDeterministicManifestOutput(t *testing.T) {
 	}
 	if res1.RawChunks != res2.RawChunks || res1.CompressedChunks != res2.CompressedChunks {
 		t.Fatalf("Format chunk counts differ: raw %d/%d, compressed %d/%d", res1.RawChunks, res2.RawChunks, res1.CompressedChunks, res2.CompressedChunks)
+	}
+}
+
+func TestIngestDedupPersistsAcrossIngesters(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "dedup.db")
+	t.Setenv(dedupIndexEnv, indexPath)
+	const chunkSize = 4096
+	chunkA := bytes.Repeat([]byte{0x61}, chunkSize)
+	chunkB := bytes.Repeat([]byte{0x62}, chunkSize)
+	payload := append(append(append([]byte(nil), chunkA...), chunkB...), chunkA...)
+
+	enc1, _, err := crypto.New(crypto.Config{Chunk: "aes", Manifest: "aes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	counting1 := &countingEncryptor{Encryptor: enc1}
+	store1 := newCountingStore(4)
+	store1.endpoint = "unix:///test/store"
+	ing1 := NewIngester(testKeyFn, nil, store1, fixedChunker(t, chunkSize), counting1)
+	res1, err := ing1.Ingest(context.Background(), sparse.Dense(bytes.NewReader(payload), uint64(len(payload))), IngestOption{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := counting1.encryptCalls.Load(); got != 2 {
+		t.Fatalf("first ingester encrypt calls = %d, want 2", got)
+	}
+
+	enc2, _, err := crypto.New(crypto.Config{Chunk: "aes", Manifest: "aes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	counting2 := &countingEncryptor{Encryptor: enc2}
+	store2 := newCountingStore(4)
+	store2.endpoint = "unix:///test/store"
+	ing2 := NewIngester(testKeyFn, nil, store2, fixedChunker(t, chunkSize), counting2)
+	res2, err := ing2.Ingest(context.Background(), sparse.Dense(bytes.NewReader(payload), uint64(len(payload))), IngestOption{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := counting2.encryptCalls.Load(); got != 0 {
+		t.Fatalf("second ingester encrypt calls = %d, want 0", got)
+	}
+	if got := store2.chunkPuts.Load(); got != 0 {
+		t.Fatalf("second ingester chunk Puts = %d, want 0", got)
+	}
+	if res2.StoredChunks != 0 || res2.DedupChunks != 3 {
+		t.Fatalf("second ingester StoredChunks/DedupChunks = %d/%d, want 0/3", res2.StoredChunks, res2.DedupChunks)
+	}
+	if res1.ManifestKey != res2.ManifestKey {
+		t.Fatalf("persistent dedup changed manifest key: %x != %x", res1.ManifestKey, res2.ManifestKey)
+	}
+	if res1.LogicalChunkBytes != res2.LogicalChunkBytes || res1.EncodedChunkBytes != res2.EncodedChunkBytes {
+		t.Fatalf("persistent dedup changed chunk metrics: %+v vs %+v", res1, res2)
+	}
+}
+
+func TestIngestPersistentDedupCanBeDisabled(t *testing.T) {
+	t.Setenv(dedupIndexEnv, "off")
+	const chunkSize = 4096
+	payload := bytes.Repeat([]byte{0x63}, chunkSize)
+	enc1, _, err := crypto.New(crypto.Config{Chunk: "aes", Manifest: "aes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store1 := newCountingStore(1)
+	store1.endpoint = "unix:///test/store"
+	if _, err := NewIngester(testKeyFn, nil, store1, fixedChunker(t, chunkSize), enc1).Ingest(context.Background(), sparse.Dense(bytes.NewReader(payload), uint64(len(payload))), IngestOption{}); err != nil {
+		t.Fatal(err)
+	}
+
+	enc2, _, err := crypto.New(crypto.Config{Chunk: "aes", Manifest: "aes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	counting2 := &countingEncryptor{Encryptor: enc2}
+	res, err := NewIngester(testKeyFn, nil, store1, fixedChunker(t, chunkSize), counting2).Ingest(context.Background(), sparse.Dense(bytes.NewReader(payload), uint64(len(payload))), IngestOption{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := counting2.encryptCalls.Load(); got != 1 {
+		t.Fatalf("disabled index encrypt calls = %d, want 1", got)
+	}
+	if res.StoredChunks != 0 || res.DedupChunks != 1 {
+		t.Fatalf("disabled index StoredChunks/DedupChunks = %d/%d, want 0/1", res.StoredChunks, res.DedupChunks)
+	}
+}
+
+type failingKeyedEncryptor struct {
+	crypto.Encryptor
+	err error
+}
+
+func (e failingKeyedEncryptor) EncryptChunk(context.Context, [32]byte, []byte) ([]byte, [32]byte, [32]byte, error) {
+	return nil, [32]byte{}, [32]byte{}, e.err
+}
+
+func (e failingKeyedEncryptor) EncryptChunkWithKey(context.Context, [32]byte, []byte) ([]byte, [32]byte, error) {
+	return nil, [32]byte{}, e.err
+}
+
+func TestIngestCleansFlightsAfterEncryptionError(t *testing.T) {
+	enc, _, err := crypto.New(crypto.Config{Chunk: "aes", Manifest: "aes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failing := failingKeyedEncryptor{Encryptor: enc, err: errors.New("intentional encrypt failure")}
+	ing := NewIngester(testKeyFn, nil, newCountingStore(4), fixedChunker(t, 4096), failing).(*ingester)
+	payload := bytes.Repeat([]byte{0x71}, 4096*8)
+	if _, err := ing.Ingest(context.Background(), sparse.Dense(bytes.NewReader(payload), uint64(len(payload))), IngestOption{}); err == nil {
+		t.Fatal("Ingest unexpectedly succeeded")
+	}
+	ing.dedupMu.Lock()
+	flights := len(ing.dedupFlights)
+	ing.dedupMu.Unlock()
+	if flights != 0 {
+		t.Fatalf("in-flight dedup flights after error = %d, want 0", flights)
+	}
+}
+
+type saltCountingStore struct {
+	*countingStore
+	salt [32]byte
+}
+
+func (s *saltCountingStore) AdmitWrite(context.Context) (store.WriteAdmission, error) {
+	return store.WriteAdmission{Generation: "test-gen", Salt: s.salt}, nil
+}
+
+func TestIngestPersistentDedupIsSaltScoped(t *testing.T) {
+	t.Setenv(dedupIndexEnv, filepath.Join(t.TempDir(), "dedup.db"))
+	const chunkSize = 4096
+	payload := bytes.Repeat([]byte{0x64}, chunkSize)
+
+	base1 := newCountingStore(1)
+	base1.endpoint = "unix:///test/store"
+	store1 := &saltCountingStore{countingStore: base1, salt: [32]byte{1}}
+	enc1, _, err := crypto.New(crypto.Config{Chunk: "aes", Manifest: "aes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewIngester(testKeyFn, nil, store1, fixedChunker(t, chunkSize), enc1).Ingest(context.Background(), sparse.Dense(bytes.NewReader(payload), uint64(len(payload))), IngestOption{}); err != nil {
+		t.Fatal(err)
+	}
+
+	base2 := newCountingStore(1)
+	base2.endpoint = "unix:///test/store"
+	store2 := &saltCountingStore{countingStore: base2, salt: [32]byte{2}}
+	enc2, _, err := crypto.New(crypto.Config{Chunk: "aes", Manifest: "aes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	counting2 := &countingEncryptor{Encryptor: enc2}
+	if _, err := NewIngester(testKeyFn, nil, store2, fixedChunker(t, chunkSize), counting2).Ingest(context.Background(), sparse.Dense(bytes.NewReader(payload), uint64(len(payload))), IngestOption{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := counting2.encryptCalls.Load(); got != 1 {
+		t.Fatalf("different salt encrypt calls = %d, want 1", got)
+	}
+}
+
+type markerInvalidatingStore struct {
+	*countingStore
+}
+
+func (s *markerInvalidatingStore) ValidateDedupIndexMarker(context.Context, store.ContentKey) (bool, error) {
+	return false, nil
+}
+
+func TestIngestPersistentDedupResetsStaleIndex(t *testing.T) {
+	t.Setenv(dedupIndexEnv, filepath.Join(t.TempDir(), "dedup.db"))
+	const chunkSize = 4096
+	payload := bytes.Repeat([]byte{0x65}, chunkSize)
+
+	enc1, _, err := crypto.New(crypto.Config{Chunk: "aes", Manifest: "aes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base1 := newCountingStore(1)
+	base1.endpoint = "unix:///test/store"
+	if _, err := NewIngester(testKeyFn, nil, base1, fixedChunker(t, chunkSize), enc1).Ingest(context.Background(), sparse.Dense(bytes.NewReader(payload), uint64(len(payload))), IngestOption{}); err != nil {
+		t.Fatal(err)
+	}
+
+	base2 := newCountingStore(1)
+	base2.endpoint = "unix:///test/store"
+	stale := &markerInvalidatingStore{countingStore: base2}
+	enc2, _, err := crypto.New(crypto.Config{Chunk: "aes", Manifest: "aes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	counting2 := &countingEncryptor{Encryptor: enc2}
+	res2, err := NewIngester(testKeyFn, nil, stale, fixedChunker(t, chunkSize), counting2).Ingest(context.Background(), sparse.Dense(bytes.NewReader(payload), uint64(len(payload))), IngestOption{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := counting2.encryptCalls.Load(); got != 1 {
+		t.Fatalf("stale index encrypt calls = %d, want 1", got)
+	}
+	if res2.StoredChunks != 1 {
+		t.Fatalf("stale index StoredChunks = %d, want 1", res2.StoredChunks)
+	}
+
+	base3 := newCountingStore(1)
+	base3.endpoint = "unix:///test/store"
+	enc3, _, err := crypto.New(crypto.Config{Chunk: "aes", Manifest: "aes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	counting3 := &countingEncryptor{Encryptor: enc3}
+	res3, err := NewIngester(testKeyFn, nil, base3, fixedChunker(t, chunkSize), counting3).Ingest(context.Background(), sparse.Dense(bytes.NewReader(payload), uint64(len(payload))), IngestOption{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := counting3.encryptCalls.Load(); got != 0 {
+		t.Fatalf("rebuilt index encrypt calls = %d, want 0", got)
+	}
+	if res3.StoredChunks != 0 || res3.DedupChunks != 1 {
+		t.Fatalf("rebuilt index StoredChunks/DedupChunks = %d/%d, want 0/1", res3.StoredChunks, res3.DedupChunks)
 	}
 }
