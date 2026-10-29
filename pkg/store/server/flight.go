@@ -81,8 +81,10 @@ func (g *objectFlights) deactivateTargetLocked(target objectTargetKey) {
 }
 
 func (g *objectFlights) do(ctx context.Context, key objectFlightKey, fn func(context.Context) (bool, []byte, error)) (bool, []byte, error) {
+	target := objectTargetKey{partition: key.partition, key: key.key}
 	for {
 		g.mu.Lock()
+		key.writeEpoch = g.writeEpochs[target]
 		if call := g.calls[key]; call != nil {
 			call.waiterN++
 			g.mu.Unlock()
@@ -98,12 +100,10 @@ func (g *objectFlights) do(ctx context.Context, key objectFlightKey, fn func(con
 			call.waiterN--
 			found, data, err := call.found, call.data, call.err
 			leaderCanceled := call.leaderCanceled
+			g.mu.Unlock()
 			if err != nil && leaderCanceled && ctx.Err() == nil {
-				key.writeEpoch = g.writeEpochs[objectTargetKey{partition: key.partition, key: key.key}]
-				g.mu.Unlock()
 				continue
 			}
-			g.mu.Unlock()
 			return found, data, err
 		}
 		call := &objectFlight{done: make(chan struct{})}
@@ -111,7 +111,6 @@ func (g *objectFlights) do(ctx context.Context, key objectFlightKey, fn func(con
 			g.calls = make(map[objectFlightKey]*objectFlight)
 		}
 		g.calls[key] = call
-		target := objectTargetKey{partition: key.partition, key: key.key}
 		g.activateTargetLocked(target)
 		g.mu.Unlock()
 

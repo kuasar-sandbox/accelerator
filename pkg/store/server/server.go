@@ -105,7 +105,6 @@ func (s *Server) GetObject(ctx context.Context, partition store.Partition, key s
 		partition:   partition,
 		key:         key,
 		generations: generationsKey(gens),
-		writeEpoch:  s.flights.writeEpoch(partition, key),
 	}
 	return s.flights.do(ctx, fk, func(ctx context.Context) (bool, []byte, error) {
 		return getAcrossGenerations(ctx, s.backend, gens, partition, key)

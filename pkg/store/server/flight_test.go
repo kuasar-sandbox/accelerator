@@ -407,3 +407,46 @@ func TestGetObjectAfterPutDoesNotJoinPreWriteMissFlight(t *testing.T) {
 		t.Fatalf("writeEpoch after flights drained = %d, want 0", got)
 	}
 }
+
+func TestObjectFlightsReadsWriteEpochInsideDo(t *testing.T) {
+	target := objectTargetKey{partition: store.PartitionChunk, key: store.ContentKey{1, 2, 3}}
+	for _, tc := range []struct {
+		name       string
+		current    map[objectTargetKey]uint64
+		staleEpoch uint64
+		want       uint64
+	}{
+		{name: "epoch reset while caller delayed", staleEpoch: 7, want: 0},
+		{name: "canonical epoch wins", current: map[objectTargetKey]uint64{target: 3}, staleEpoch: 1, want: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var g objectFlights
+			g.writeEpochs = tc.current
+			key := objectFlightKey{partition: target.partition, key: target.key, generations: "G1", writeEpoch: tc.staleEpoch}
+			started := make(chan struct{})
+			release := make(chan struct{})
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				_, _, _ = g.do(context.Background(), key, func(context.Context) (bool, []byte, error) {
+					close(started)
+					<-release
+					return true, nil, nil
+				})
+			}()
+			<-started
+
+			g.mu.Lock()
+			var created objectFlightKey
+			for k := range g.calls {
+				created = k
+			}
+			g.mu.Unlock()
+			if created.writeEpoch != tc.want {
+				t.Fatalf("flight writeEpoch = %d, want %d", created.writeEpoch, tc.want)
+			}
+			close(release)
+			<-done
+		})
+	}
+}
