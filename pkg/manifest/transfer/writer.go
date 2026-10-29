@@ -90,6 +90,15 @@ func (w *transferWriter) PutChunkOrdered(ctx context.Context, a store.WriteAdmis
 	}
 	return fresh, nil
 }
+func (w *transferWriter) SkipChunkOrdered(ctx context.Context, a store.WriteAdmission, key store.ContentKey, size uint64, ordinal uint64) (bool, error) {
+	if a != w.admission {
+		return false, errors.New("write admission changed")
+	}
+	if w.local != nil {
+		return w.local.SkipChunkOrdered(ctx, a, key, size, ordinal)
+	}
+	return true, nil
+}
 func (w *transferWriter) commit(ctx context.Context) (bool, error) {
 	if w.target == nil {
 		return true, nil
