@@ -12,27 +12,24 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
-	"go.etcd.io/bbolt"
+	"golang.org/x/sys/unix"
 
 	"github.com/kuasar-sandbox/accelerator/internal/util"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 )
 
 const (
-	dedupIndexBucket        = "chunk-dedup-v2"
-	dedupIndexMetaBucket    = "chunk-dedup-meta-v2"
-	dedupIndexLegacyBucket  = "chunk-dedup-v1"
-	dedupIndexLegacyMeta    = "chunk-dedup-meta-v1"
-	dedupIndexMarkerKey     = "manifest-marker"
-	dedupIndexEntryCountKey = "entry-count"
-	dedupIndexKeyDomain     = "accelerator-chunk-dedup-index-v2\x00"
-	dedupIndexVersion       = byte(2)
-	dedupIndexValueSize     = 1 + 32 + 8 + 8 + 1 + 4
-	dedupIndexEnv           = "ACCELERATOR_CHUNK_DEDUP_INDEX"
-	dedupIndexLimitEnv      = "ACCELERATOR_CHUNK_DEDUP_INDEX_LIMIT"
-	dedupIndexMaxBytesEnv   = "ACCELERATOR_CHUNK_DEDUP_INDEX_MAX_BYTES"
+	dedupIndexMagic       = uint32(0x4b444544) // "KDED"
+	dedupIndexVersion16   = uint16(2)
+	dedupIndexHeaderSize  = 48
+	dedupIndexRecordSize  = 32 + dedupIndexValueSize // 32 + 54 = 86
+	dedupIndexKeyDomain   = "accelerator-chunk-dedup-index-v2\x00"
+	dedupIndexVersion     = byte(2)
+	dedupIndexValueSize   = 1 + 32 + 8 + 8 + 1 + 4 // 54
+	dedupIndexEnv         = "ACCELERATOR_CHUNK_DEDUP_INDEX"
+	dedupIndexLimitEnv    = "ACCELERATOR_CHUNK_DEDUP_INDEX_LIMIT"
+	dedupIndexMaxBytesEnv = "ACCELERATOR_CHUNK_DEDUP_INDEX_MAX_BYTES"
 
 	defaultPersistentIndexLimit    = 65536
 	defaultPersistentIndexMaxBytes = 32 << 20 // 32 MiB
@@ -48,7 +45,9 @@ func chunkIndexKey(fp [32]byte) [32]byte {
 }
 
 type persistentChunkIndex struct {
-	db *bbolt.DB
+	markerVal [32]byte
+	entries   map[[32]byte]chunkMeta
+	order     [][32]byte
 }
 
 func persistentDedupPathForWriter(sw StoreWriter) string {
@@ -86,79 +85,95 @@ func openPersistentChunkIndexRead(path string) (*persistentChunkIndex, error) {
 	if path == "" {
 		return nil, nil
 	}
-	if _, err := os.Stat(path); err != nil {
+	data, err := os.ReadFile(path)
+	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	db, err := bbolt.Open(path, 0o600, &bbolt.Options{ReadOnly: true, Timeout: 2 * time.Second})
-	if err != nil {
-		return nil, err
+	return parsePersistentChunkIndex(data)
+}
+
+func parsePersistentChunkIndex(data []byte) (*persistentChunkIndex, error) {
+	if len(data) < dedupIndexHeaderSize {
+		return nil, nil
 	}
-	return &persistentChunkIndex{db: db}, nil
+	magic := binary.LittleEndian.Uint32(data[0:4])
+	if magic != dedupIndexMagic {
+		return nil, nil
+	}
+	ver := binary.LittleEndian.Uint16(data[4:6])
+	if ver != dedupIndexVersion16 {
+		return nil, nil
+	}
+	expectedCRC := binary.LittleEndian.Uint32(data[44:48])
+	if crc32.ChecksumIEEE(data[:44]) != expectedCRC {
+		return nil, nil
+	}
+
+	var marker [32]byte
+	copy(marker[:], data[8:40])
+	entryCount := int(binary.LittleEndian.Uint32(data[40:44]))
+
+	entries := make(map[[32]byte]chunkMeta, entryCount)
+	order := make([][32]byte, 0, entryCount)
+
+	offset := dedupIndexHeaderSize
+	for i := 0; i < entryCount && offset+dedupIndexRecordSize <= len(data); i++ {
+		var key [32]byte
+		copy(key[:], data[offset:offset+32])
+		valBytes := data[offset+32 : offset+dedupIndexRecordSize]
+		decoded, err := decodeChunkMeta(valBytes)
+		if err == nil {
+			entries[key] = decoded
+			order = append(order, key)
+		} else {
+			log.Printf("ingest: ignoring corrupt persistent dedup entry: %v", err)
+		}
+		offset += dedupIndexRecordSize
+	}
+
+	return &persistentChunkIndex{
+		markerVal: marker,
+		entries:   entries,
+		order:     order,
+	}, nil
 }
 
 func (p *persistentChunkIndex) lookup(fp [32]byte) (chunkMeta, bool, error) {
-	if p == nil || p.db == nil {
+	if p == nil || p.entries == nil {
 		return chunkMeta{}, false, nil
 	}
-	var (
-		meta  chunkMeta
-		found bool
-	)
-	err := p.db.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket([]byte(dedupIndexBucket))
-		if bucket == nil {
-			return nil
-		}
-		indexKey := chunkIndexKey(fp)
-		value := bucket.Get(indexKey[:])
-		if value == nil {
-			return nil
-		}
-		decoded, err := decodeChunkMeta(value)
-		if err != nil {
-			log.Printf("ingest: ignoring corrupt persistent dedup entry: %v", err)
-			return nil
-		}
-		decoded.key = fp
-		meta = decoded
-		found = true
-		return nil
-	})
-	return meta, found, err
+	indexKey := chunkIndexKey(fp)
+	meta, found := p.entries[indexKey]
+	if !found {
+		return chunkMeta{}, false, nil
+	}
+	meta.key = fp
+	return meta, true, nil
 }
 
 func (p *persistentChunkIndex) marker() ([32]byte, bool, error) {
-	var marker [32]byte
-	var found bool
-	if p == nil || p.db == nil {
-		return marker, false, nil
+	if p == nil {
+		return [32]byte{}, false, nil
 	}
-	err := p.db.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket([]byte(dedupIndexMetaBucket))
-		if bucket == nil {
-			return nil
-		}
-		value := bucket.Get([]byte(dedupIndexMarkerKey))
-		if len(value) != len(marker) {
-			return nil
-		}
-		copy(marker[:], value)
-		found = true
-		return nil
-	})
-	return marker, found, err
+	return p.markerVal, true, nil
+}
+
+func (p *persistentChunkIndex) entryCount() int {
+	if p == nil {
+		return 0
+	}
+	return len(p.entries)
 }
 
 func (p *persistentChunkIndex) Close() error {
-	if p == nil || p.db == nil {
-		return nil
+	if p != nil {
+		p.entries = nil
+		p.order = nil
 	}
-	err := p.db.Close()
-	p.db = nil
-	return err
+	return nil
 }
 
 func persistentIndexLimit() int {
@@ -179,145 +194,144 @@ func persistentIndexMaxBytes() int64 {
 	return defaultPersistentIndexMaxBytes
 }
 
-func compactPersistentIndex(path string) error {
-	tmpPath := path + ".compact.tmp"
-	_ = os.Remove(tmpPath)
-	src, err := bbolt.Open(path, 0o600, &bbolt.Options{ReadOnly: true, Timeout: 10 * time.Second})
+func writePersistentIndex(path string, merged map[[32]byte]chunkMeta, order [][32]byte, marker [32]byte) error {
+	tmpPath := path + ".tmp"
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
+		return fmt.Errorf("create temp index: %w", err)
+	}
+
+	var hdr [dedupIndexHeaderSize]byte
+	binary.LittleEndian.PutUint32(hdr[0:4], dedupIndexMagic)
+	binary.LittleEndian.PutUint16(hdr[4:6], dedupIndexVersion16)
+	binary.LittleEndian.PutUint16(hdr[6:8], 0) // reserved
+	copy(hdr[8:40], marker[:])
+	binary.LittleEndian.PutUint32(hdr[40:44], uint32(len(merged)))
+	binary.LittleEndian.PutUint32(hdr[44:48], crc32.ChecksumIEEE(hdr[:44]))
+
+	if _, err := f.Write(hdr[:]); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
 		return err
 	}
-	dst, err := bbolt.Open(tmpPath, 0o600, &bbolt.Options{Timeout: 10 * time.Second})
-	if err != nil {
-		_ = src.Close()
+
+	var rec [dedupIndexRecordSize]byte
+	for _, k := range order {
+		meta, ok := merged[k]
+		if !ok {
+			continue
+		}
+		copy(rec[0:32], k[:])
+		metaBytes := encodeChunkMeta(meta)
+		copy(rec[32:dedupIndexRecordSize], metaBytes)
+		if _, err := f.Write(rec[:]); err != nil {
+			_ = f.Close()
+			_ = os.Remove(tmpPath)
+			return err
+		}
+	}
+
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
 		_ = os.Remove(tmpPath)
 		return err
 	}
-	compactErr := bbolt.Compact(dst, src, 0)
-	srcCloseErr := src.Close()
-	dstCloseErr := dst.Close()
-	if compactErr != nil {
+	if err := f.Close(); err != nil {
 		_ = os.Remove(tmpPath)
-		return compactErr
+		return err
 	}
-	if srcCloseErr != nil || dstCloseErr != nil {
-		_ = os.Remove(tmpPath)
-		return errors.Join(srcCloseErr, dstCloseErr)
-	}
+
 	return os.Rename(tmpPath, path)
+}
+
+func compactPersistentIndex(path string) error {
+	lockPath := path + ".lock"
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("open dedup lock: %w", err)
+	}
+	defer lockFile.Close()
+	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX); err != nil {
+		return fmt.Errorf("lock dedup index: %w", err)
+	}
+	defer func() { _ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN) }()
+
+	existing, err := openPersistentChunkIndexRead(path)
+	if err != nil || existing == nil {
+		return err
+	}
+	defer existing.Close()
+	return writePersistentIndex(path, existing.entries, existing.order, existing.markerVal)
 }
 
 func persistChunkMetas(path string, entries map[[32]byte]chunkMeta, marker [32]byte, reset bool) error {
 	if path == "" {
 		return nil
 	}
-	maxBytes := persistentIndexMaxBytes()
-	if reset {
-		if fi, err := os.Stat(path); err == nil && fi.Size() > maxBytes {
-			_ = os.Remove(path)
-		}
-	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create dedup index directory: %w", err)
 	}
-	db, err := bbolt.Open(path, 0o600, &bbolt.Options{Timeout: 30 * time.Second})
+
+	lockPath := path + ".lock"
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return fmt.Errorf("open dedup index: %w", err)
+		return fmt.Errorf("open dedup lock: %w", err)
+	}
+	defer lockFile.Close()
+	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX); err != nil {
+		return fmt.Errorf("lock dedup index: %w", err)
+	}
+	defer func() { _ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN) }()
+
+	merged := make(map[[32]byte]chunkMeta)
+	order := make([][32]byte, 0)
+
+	if !reset {
+		if existing, _ := openPersistentChunkIndexRead(path); existing != nil {
+			for _, k := range existing.order {
+				if meta, ok := existing.entries[k]; ok {
+					merged[k] = meta
+					order = append(order, k)
+				}
+			}
+			_ = existing.Close()
+		}
+	}
+
+	for fp, meta := range entries {
+		k := chunkIndexKey(fp)
+		if _, exists := merged[k]; !exists {
+			order = append(order, k)
+		}
+		merged[k] = meta
 	}
 
 	limit := persistentIndexLimit()
-	updateErr := db.Update(func(tx *bbolt.Tx) error {
-		if reset {
-			for _, name := range []string{dedupIndexBucket, dedupIndexMetaBucket} {
-				if err := tx.DeleteBucket([]byte(name)); err != nil && !errors.Is(err, bbolt.ErrBucketNotFound) {
-					return err
-				}
-			}
-		}
-		for _, name := range []string{dedupIndexLegacyBucket, dedupIndexLegacyMeta} {
-			if err := tx.DeleteBucket([]byte(name)); err != nil && !errors.Is(err, bbolt.ErrBucketNotFound) {
-				return err
-			}
-		}
-		bucket, err := tx.CreateBucketIfNotExists([]byte(dedupIndexBucket))
-		if err != nil {
-			return err
-		}
-		metaBucket, err := tx.CreateBucketIfNotExists([]byte(dedupIndexMetaBucket))
-		if err != nil {
-			return err
-		}
-
-		currentCount := 0
-		if countRaw := metaBucket.Get([]byte(dedupIndexEntryCountKey)); len(countRaw) == 8 {
-			currentCount = int(binary.LittleEndian.Uint64(countRaw))
-		} else if !reset {
-			currentCount = bucket.Stats().KeyN
-		}
-
-		// Count how many keys are newly introduced by entries.
-		newKeys := 0
-		for fp := range entries {
-			indexKey := chunkIndexKey(fp)
-			if bucket.Get(indexKey[:]) == nil {
-				newKeys++
-			}
-		}
-
-		// If currentCount + newKeys exceeds limit, evict excess older entries before inserting.
-		if excess := (currentCount + newKeys) - limit; excess > 0 {
-			c := bucket.Cursor()
-			for k, _ := c.First(); k != nil && excess > 0; k, _ = c.Next() {
-				if err := c.Delete(); err != nil {
-					return err
-				}
+	if len(merged) > limit {
+		excess := len(merged) - limit
+		newOrder := make([][32]byte, 0, limit)
+		for _, k := range order {
+			if excess > 0 {
+				delete(merged, k)
 				excess--
-				currentCount--
+			} else {
+				newOrder = append(newOrder, k)
 			}
 		}
-
-		for fp, meta := range entries {
-			indexKey := chunkIndexKey(fp)
-			if bucket.Get(indexKey[:]) == nil {
-				currentCount++
-			}
-			if err := bucket.Put(indexKey[:], encodeChunkMeta(meta)); err != nil {
-				return err
-			}
-		}
-
-		if currentCount > limit {
-			excess := currentCount - limit
-			c := bucket.Cursor()
-			for k, _ := c.First(); k != nil && excess > 0; k, _ = c.Next() {
-				if err := c.Delete(); err != nil {
-					return err
-				}
-				excess--
-				currentCount--
-			}
-		}
-
-		var countBuf [8]byte
-		binary.LittleEndian.PutUint64(countBuf[:], uint64(currentCount))
-		if err := metaBucket.Put([]byte(dedupIndexEntryCountKey), countBuf[:]); err != nil {
-			return err
-		}
-		return metaBucket.Put([]byte(dedupIndexMarkerKey), marker[:])
-	})
-
-	closeErr := db.Close()
-	if updateErr != nil {
-		return updateErr
-	}
-	if closeErr != nil {
-		return closeErr
+		order = newOrder
 	}
 
+	if err := writePersistentIndex(path, merged, order, marker); err != nil {
+		return err
+	}
+
+	maxBytes := persistentIndexMaxBytes()
 	if fi, err := os.Stat(path); err == nil && fi.Size() > maxBytes {
 		if err := compactPersistentIndex(path); err != nil {
 			log.Printf("ingest: compact persistent dedup index: %v", err)
 		}
 	}
+
 	return nil
 }
 
