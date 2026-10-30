@@ -9,7 +9,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"go.etcd.io/bbolt"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
@@ -643,25 +642,12 @@ func TestPersistentPendingIsBounded(t *testing.T) {
 	if _, err := ing.Ingest(context.Background(), sparse.Dense(bytes.NewReader(payload), uint64(len(payload))), IngestOption{}); err != nil {
 		t.Fatal(err)
 	}
-	db, err := bbolt.Open(indexPath, 0o600, &bbolt.Options{ReadOnly: true})
+	p, err := openPersistentChunkIndexRead(indexPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
-	count := 0
-	if err := db.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket([]byte(dedupIndexBucket))
-		if bucket == nil {
-			return nil
-		}
-		return bucket.ForEach(func(_, _ []byte) error {
-			count++
-			return nil
-		})
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if count != 2 {
+	defer p.Close()
+	if count := p.entryCount(); count != 2 {
 		t.Fatalf("persistent pending entries = %d, want 2", count)
 	}
 }

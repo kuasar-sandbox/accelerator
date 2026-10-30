@@ -16,7 +16,6 @@ require (
 	github.com/klauspost/reedsolomon v1.13.3
 	github.com/kuasar-sandbox/go-erofs v0.0.0-20261014160540-827da6f90114
 	github.com/opencontainers/umoci v0.6.0
-	go.etcd.io/bbolt v1.4.3
 	golang.org/x/sys v0.47.0
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.11

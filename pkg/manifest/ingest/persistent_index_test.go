@@ -5,8 +5,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"go.etcd.io/bbolt"
-
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
@@ -123,21 +121,8 @@ func TestPersistentIndexEntryLimit(t *testing.T) {
 		}
 	}
 
-	// Verify the database has exactly 5 entries.
-	count := 0
-	if err := p2.db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket([]byte(dedupIndexBucket))
-		if b == nil {
-			return nil
-		}
-		return b.ForEach(func(_, _ []byte) error {
-			count++
-			return nil
-		})
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if count != 5 {
+	// Verify the index has exactly 5 entries.
+	if count := p2.entryCount(); count != 5 {
 		t.Fatalf("persistent index count = %d, want capped at 5", count)
 	}
 }
@@ -161,6 +146,10 @@ func TestPersistentIndexCompaction(t *testing.T) {
 	}
 	marker := [32]byte{0xcc}
 	if err := persistChunkMetas(indexPath, entries, marker, false); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := compactPersistentIndex(indexPath); err != nil {
 		t.Fatal(err)
 	}
 
