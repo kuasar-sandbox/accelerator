@@ -30,6 +30,7 @@ type transferWriter struct {
 	target    ingest.StoreWriter
 	local     *bundle.Writer
 	workers   int
+	ordered   bool
 	root      store.ContentKey
 	manifest  []byte
 }
@@ -38,6 +39,37 @@ func (w *transferWriter) AdmitWrite(ctx context.Context) (store.WriteAdmission, 
 	return w.admission, ctx.Err()
 }
 func (w *transferWriter) PoolSize() int { return w.workers }
+
+func (w *transferWriter) RequiresOrderedChunks() bool { return w.ordered || w.local != nil }
+
+func (w *transferWriter) DedupIndexEndpoint() string {
+	if w.target == nil || w.ordered || w.local != nil {
+		return ""
+	}
+	target, ok := w.target.(interface{ DedupIndexEndpoint() string })
+	if !ok {
+		return ""
+	}
+	if _, ok := w.target.(interface {
+		ValidateDedupIndexMarker(context.Context, store.ContentKey) (bool, error)
+	}); !ok {
+		return ""
+	}
+	return target.DedupIndexEndpoint()
+}
+
+func (w *transferWriter) ValidateDedupIndexMarker(ctx context.Context, marker store.ContentKey) (bool, error) {
+	if w.target == nil {
+		return true, nil
+	}
+	validator, ok := w.target.(interface {
+		ValidateDedupIndexMarker(context.Context, store.ContentKey) (bool, error)
+	})
+	if !ok {
+		return true, nil
+	}
+	return validator.ValidateDedupIndexMarker(ctx, marker)
+}
 func (w *transferWriter) Put(ctx context.Context, a store.WriteAdmission, p store.Partition, key store.ContentKey, data []byte) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
@@ -89,6 +121,18 @@ func (w *transferWriter) PutChunkOrdered(ctx context.Context, a store.WriteAdmis
 		return w.target.Put(ctx, a, store.PartitionChunk, key, data)
 	}
 	return fresh, nil
+}
+func (w *transferWriter) SkipChunkOrdered(ctx context.Context, a store.WriteAdmission, key store.ContentKey, size uint64, ordinal uint64) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if a != w.admission {
+		return false, errors.New("write admission changed")
+	}
+	if w.local != nil {
+		return w.local.SkipChunkOrdered(ctx, a, key, size, ordinal)
+	}
+	return true, nil
 }
 func (w *transferWriter) commit(ctx context.Context) (bool, error) {
 	if w.target == nil {
@@ -142,7 +186,7 @@ func writeTransfer(ctx context.Context, cfg *manifest.Config, key [32]byte, src 
 		if err != nil {
 			return result, err
 		}
-		writer = &transferWriter{admission: admission, workers: workers}
+		writer = &transferWriter{admission: admission, workers: workers, ordered: mode == "bundle"}
 		if client != nil {
 			writer.target = client
 		}
