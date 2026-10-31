@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -58,7 +59,18 @@ func WriteTo(ctx context.Context, w io.Writer, name string, src sparse.Source, o
 		artifactWriter = records
 	}
 
-	plainDigest, err := emitPlan(ctx, artifactWriter, plan, src, opts.beforeCommit)
+	beforeCommit := opts.beforeCommit
+	if records != nil && beforeCommit != nil {
+		beforeCommit = func(ctx context.Context) error {
+			// Surface completed-record output errors before checking the source.
+			// Keep the partial record buffered to preserve the v1 wire geometry.
+			if err := records.flushSealed(); err != nil {
+				return err
+			}
+			return opts.beforeCommit(ctx)
+		}
+	}
+	plainDigest, err := emitPlan(ctx, artifactWriter, plan, src, beforeCommit)
 	if err != nil {
 		return "", "", err
 	}
@@ -352,13 +364,25 @@ func emitPlan(ctx context.Context, w io.Writer, plan *writePlan, src sparse.Sour
 	if err := plan.writePrefix(w); err != nil {
 		return [32]byte{}, err
 	}
-	payloadWriter := io.MultiWriter(w, identity)
+	var identitySink io.Writer = identity
+	var hashWorker *identityWriter
+	if plan.payloadPacked >= 4*copyBufSize && runtime.GOMAXPROCS(0) > 1 {
+		hashWorker = newIdentityWriter(identity)
+		defer hashWorker.Close()
+		identitySink = hashWorker
+	}
+	payloadWriter := io.MultiWriter(w, identitySink)
 	if len(plan.extents) > 0 {
 		buf := make([]byte, copyBufSize)
 		for _, e := range plan.extents {
 			if err := copyExtent(ctx, payloadWriter, src, e, plan.name, buf); err != nil {
 				return [32]byte{}, err
 			}
+		}
+	}
+	if hashWorker != nil {
+		if err := hashWorker.Close(); err != nil {
+			return [32]byte{}, err
 		}
 	}
 	if beforeCommit != nil {
