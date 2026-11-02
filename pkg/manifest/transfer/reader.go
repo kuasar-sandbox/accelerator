@@ -140,18 +140,11 @@ func (r *Reader) Open(ctx context.Context, raw string) (*Opened, error) {
 	if err != nil {
 		return nil, err
 	}
-	file, err := os.OpenFile(path, os.O_RDONLY|unix.O_NONBLOCK, 0)
+	file, size, err := openRegular(path)
 	if err != nil {
 		return nil, err
 	}
 	fail := func(err error) (*Opened, error) { return nil, errors.Join(err, file.Close()) }
-	info, err := file.Stat()
-	if err != nil {
-		return fail(err)
-	}
-	if !info.Mode().IsRegular() {
-		return fail(errors.New("input ref must resolve to a regular random-access file"))
-	}
 	var magic [4]byte
 	n, probeErr := file.ReadAt(magic[:], 0)
 	if probeErr != nil && probeErr != io.EOF {
@@ -162,7 +155,7 @@ func (r *Reader) Open(ctx context.Context, raw string) (*Opened, error) {
 		if ref.DigestScheme != "" && ref.DigestScheme != "manifest" {
 			return fail(errors.New("Bundle requires a Manifest selector"))
 		}
-		reader, err := bundle.NewReader(file, info.Size())
+		reader, err := bundle.NewReader(file, size)
 		if err != nil {
 			return fail(err)
 		}
@@ -204,12 +197,39 @@ func (r *Reader) Open(ctx context.Context, raw string) (*Opened, error) {
 	if ref.DigestScheme != "" {
 		options = append(options, tarstream.WithExpectedDigest(ref.DigestScheme, ref.Digest))
 	}
-	src, _, err := tarstream.SourceAt(file, info.Size(), "", options...)
+	verify := ref.DigestScheme != "" || r.cfg.Manifest.VerifyContent == nil || *r.cfg.Manifest.VerifyContent
+	return openPinnedTarstream(file, size, options, verify)
+}
+
+// OpenTarstream pins a regular file for random access and full verification
+// with the caller's tarstream read policy. Verify consumes the same descriptor.
+func OpenTarstream(path string, options ...tarstream.ReadOption) (*Opened, error) {
+	file, size, err := openRegular(path)
 	if err != nil {
-		return fail(err)
+		return nil, err
 	}
-	if src.Size() > math.MaxInt64 {
-		return fail(errors.New("logical source is too large for random-access carrier operations"))
+	return openPinnedTarstream(file, size, options, true)
+}
+
+func openRegular(path string) (*os.File, int64, error) {
+	file, err := os.OpenFile(path, os.O_RDONLY|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, 0, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return nil, 0, errors.Join(err, file.Close())
+	}
+	if !info.Mode().IsRegular() {
+		return nil, 0, errors.Join(errors.New("input ref must resolve to a regular random-access file"), file.Close())
+	}
+	return file, info.Size(), nil
+}
+
+func openPinnedTarstream(file *os.File, size int64, options []tarstream.ReadOption, verify bool) (*Opened, error) {
+	src, _, err := tarstream.SourceAt(file, size, "", options...)
+	if err != nil {
+		return nil, errors.Join(err, file.Close())
 	}
 	closeSource := func() error {
 		var err error
@@ -218,11 +238,14 @@ func (r *Reader) Open(ctx context.Context, raw string) (*Opened, error) {
 		}
 		return errors.Join(err, file.Close())
 	}
-	return &Opened{Source: src, path: path, closeFn: closeSource, finish: func(ctx context.Context) (retErr error) {
-		if ref.DigestScheme == "" && r.cfg.Manifest.VerifyContent != nil && !*r.cfg.Manifest.VerifyContent {
+	if src.Size() > math.MaxInt64 {
+		return nil, errors.Join(errors.New("logical source is too large for random-access carrier operations"), closeSource())
+	}
+	return &Opened{Source: src, path: file.Name(), closeFn: closeSource, finish: func(ctx context.Context) (retErr error) {
+		if !verify {
 			return ctx.Err()
 		}
-		verified, _, err := tarstream.SourceFrom(io.NewSectionReader(file, 0, info.Size()), "", options...)
+		verified, _, err := tarstream.SourceFrom(io.NewSectionReader(file, 0, size), "", options...)
 		if err != nil {
 			return err
 		}
