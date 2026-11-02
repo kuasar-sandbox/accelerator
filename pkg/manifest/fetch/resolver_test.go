@@ -122,6 +122,66 @@ func TestResolverFailuresPropagateThroughEveryOperation(t *testing.T) {
 	}
 }
 
+func TestPrefetchCancelsJobsWhenWalkFails(t *testing.T) {
+	sentinel := errors.New("second run metadata failure")
+	tests := []struct {
+		name string
+		run  func(offset, limit uint64) (sparse.RunKind, uint64, error)
+		want error
+	}{
+		{
+			name: "RunAt",
+			run: func(offset, _ uint64) (sparse.RunKind, uint64, error) {
+				if offset == 0 {
+					return sparse.Data, 4, nil
+				}
+				return 0, 0, sentinel
+			},
+			want: sentinel,
+		},
+		{
+			name: "validateRun",
+			run: func(offset, _ uint64) (sparse.RunKind, uint64, error) {
+				if offset == 0 {
+					return sparse.Data, 4, nil
+				}
+				return sparse.Data, offset, nil
+			},
+			want: errInvalidRun,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			started := make(chan struct{})
+			stream := &prefetchWalkStream{
+				size: 8,
+				run:  tt.run,
+				prefetch: func(ctx context.Context) error {
+					close(started)
+					<-ctx.Done()
+					return ctx.Err()
+				},
+			}
+			done := make(chan error, 1)
+			go func() { done <- prefetchStream(context.Background(), stream) }()
+
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("first chunk prefetch did not start")
+			}
+			select {
+			case err := <-done:
+				if !errors.Is(err, tt.want) {
+					t.Fatalf("Prefetch error = %v, want %v", err, tt.want)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Prefetch did not return after walk failure; dispatched Get was not canceled")
+			}
+		})
+	}
+}
+
 func TestReadAtPlansAllRunsBeforeStartingIO(t *testing.T) {
 	sentinel := errors.New("second run metadata failure")
 	leaf := &resolverTestStream{
@@ -291,6 +351,43 @@ func (r resolverTestRun) ReadAt(ctx context.Context, buf []byte, inner uint64) (
 		return r.stream.read(ctx, buf, r.offset+inner)
 	}
 	return len(buf), nil
+}
+
+type prefetchWalkStream struct {
+	size     uint64
+	run      func(offset, limit uint64) (sparse.RunKind, uint64, error)
+	prefetch func(context.Context) error
+}
+
+func (s *prefetchWalkStream) Size() uint64 { return s.size }
+func (s *prefetchWalkStream) Close() error { return nil }
+func (s *prefetchWalkStream) RunAt(offset, limit uint64) (sparse.Run, error) {
+	kind, end, err := s.run(offset, limit)
+	if err != nil {
+		return nil, err
+	}
+	return prefetchWalkRun{stream: s, offset: offset, end: end, kind: kind}, nil
+}
+func (s *prefetchWalkStream) ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error) {
+	return readStreamAt(ctx, s, buf, offset)
+}
+
+type prefetchWalkRun struct {
+	stream *prefetchWalkStream
+	offset uint64
+	end    uint64
+	kind   sparse.RunKind
+}
+
+func (r prefetchWalkRun) Offset() uint64       { return r.offset }
+func (r prefetchWalkRun) End() uint64          { return r.end }
+func (r prefetchWalkRun) Kind() sparse.RunKind { return r.kind }
+func (r prefetchWalkRun) chunkRun()            {}
+func (r prefetchWalkRun) ReadAt(context.Context, []byte, uint64) (int, error) {
+	return 0, errors.New("prefetchWalkRun: unexpected ReadAt")
+}
+func (r prefetchWalkRun) prefetch(ctx context.Context) error {
+	return r.stream.prefetch(ctx)
 }
 
 func resolverHoleStream(size uint64) *resolverTestStream {

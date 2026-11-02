@@ -232,31 +232,94 @@ func readStreamAt(ctx context.Context, stream Stream, buf []byte, offset uint64)
 	return int(readLen), eof
 }
 
+type prefetchJob struct {
+	run sparse.Run
+	fn  func(context.Context) error
+}
+
 func prefetchStream(ctx context.Context, stream Stream) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	jobs := make(chan prefetchJob, maxPrefetchGets)
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+
+	report := func(err error) {
+		if err == nil {
+			return
+		}
+		select {
+		case errCh <- err:
+			cancel()
+		default:
+		}
+	}
+
+	wg.Add(maxPrefetchGets)
+	for range maxPrefetchGets {
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				err := job.fn(ctx)
+				releaseRun(job.run)
+				if err != nil {
+					report(err)
+				}
+			}
+		}()
+	}
+
+	var walkErr error
 	for offset, end := uint64(0), stream.Size(); offset < end; {
 		if err := ctx.Err(); err != nil {
-			return err
+			walkErr = err
+			break
 		}
+		// A resolver failure must abort Gets already in flight, otherwise
+		// Prefetch waits for the backend before it can return walkErr.
 		run, err := stream.RunAt(offset, end-offset)
 		if err != nil {
 			releaseRun(run)
-			return err
+			walkErr = err
+			cancel()
+			break
 		}
 		if err := validateRun(run, offset, end); err != nil {
 			releaseRun(run)
-			return err
+			walkErr = err
+			cancel()
+			break
 		}
 		next := run.End()
 		if run.Kind() == sparse.Data {
 			if chunk, ok := run.(prefetchChunkRun); ok {
-				if err := chunk.prefetch(ctx); err != nil {
+				select {
+				case jobs <- prefetchJob{run: run, fn: chunk.prefetch}:
+					offset = next
+					continue
+				case <-ctx.Done():
 					releaseRun(run)
-					return err
+					walkErr = ctx.Err()
 				}
+				break
 			}
 		}
 		releaseRun(run)
 		offset = next
 	}
-	return nil
+	close(jobs)
+	wg.Wait()
+	// report stores the worker's Get error and cancels the derived context so
+	// the walk can stop. That cancel is not the cause; prefer the buffered
+	// worker error unless the walk failed independently.
+	select {
+	case err := <-errCh:
+		if walkErr == nil || errors.Is(walkErr, context.Canceled) {
+			return err
+		}
+		return walkErr
+	default:
+		return walkErr
+	}
 }
