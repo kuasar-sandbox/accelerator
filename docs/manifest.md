@@ -290,6 +290,7 @@ crypto:
   chunk: aes                     # Only supported value
   manifest: aes                  # Only supported value
   local: off                     # off | auto | required; default off
+  ref: auto                      # off | auto | required, independent of local
 ```
 
 Fields:
@@ -302,6 +303,9 @@ Fields:
 - `chunker.mode` is `cdc` (FastCDC) or `fixed`; see §4.1.
 - `crypto.chunk` and `crypto.manifest` each accept only `aes`; other values fail when the crypto objects are constructed (§4.3–4.4).
 - `crypto.local` is a local-format compatibility/enforcement policy, not an algorithm selector. `off` does not enable the local codec; `auto` reads legacy plaintext or encrypted carriers; `required` accepts only encrypted carriers. The default is `off`.
+- `crypto.ref` controls tarstreams in sandboxer named ref locations. Its independent default, `auto`, accepts plaintext or correctly keyed encrypted inputs and encrypts new output with the same customer key. Existing plaintext dependencies can remain in a published graph. `off` accepts and writes plaintext only. `required` accepts and writes encrypted tarstreams only. Manifest and Bundle keep their existing encoding.
+
+Enable this policy with a sandboxer version that implements ref-location reads, reuse and publication. Older loaders can ignore an unknown field. With a supporting sandboxer, upgrading an existing `local: off` configuration makes new ref writes require a key. To preserve the former publication behavior, set `ref` to the previous `local` value. In particular, set `ref: required` to keep rejecting plaintext ref inputs after upgrading from `local: required`.
 
 ### 3.2 Loading order
 
