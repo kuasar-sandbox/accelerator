@@ -37,6 +37,9 @@ func New(cfg Config) (Encryptor, Decryptor, error) {
 	if _, err := cfg.LocalPolicy(); err != nil {
 		return nil, nil, err
 	}
+	if _, err := cfg.RefPolicy(); err != nil {
+		return nil, nil, err
+	}
 	chunk, err := NewChunkEncryptor(cfg.Chunk)
 	if err != nil {
 		return nil, nil, fmt.Errorf("crypto: chunk: %w", err)

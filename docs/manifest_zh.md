@@ -314,6 +314,7 @@ crypto:
   chunk: aes                      # aes(唯一支持)
   manifest: aes                   # aes(唯一支持)
   local: off                      # off | auto | required;缺省 off
+  ref: auto                       # off | auto | required，独立于 local
 ```
 
 字段说明:
@@ -353,6 +354,9 @@ crypto:
 - `crypto.local` — 本地存储兼容/强制 policy,不是算法选择。`off` 不启用本地
   codec,`auto` 同时接受历史 plaintext 与加密格式,`required` 只接受加密格式。
   缺省为 `off`。
+- `crypto.ref` 控制 sandboxer 命名 ref location 中的 tarstream。它独立缺省为 `auto`，接受明文和可用同一客户密钥解密的输入，新写入使用该密钥加密。发布图可以保留已有明文依赖。`off` 只接受和写入明文，`required` 只接受和写入密文。Manifest 和 Bundle 沿用现有编码。
+
+请搭配完整支持 ref 读取、复用和发布的 sandboxer 启用此配置。旧 loader 可能忽略未知字段。升级到支持该策略的 sandboxer 后，原有 `local: off` 配置发布新的 ref 时需要密钥。若要保留原发布策略，将旧 `local` 值显式配置到 `ref`。原有 `local: required` 用户要继续严格拒绝明文 ref，应显式设置 `ref: required`。
 
 ### 3.2 加载顺序
 
