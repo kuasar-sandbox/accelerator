@@ -48,12 +48,12 @@ func prepareSource(ctx context.Context, src Source, opts Options) (*PreparedImag
 			return nil, fmt.Errorf("flatten: nil layer opener %d", i)
 		}
 	}
-	return prepareLayers(ctx, config, len(layers), opts, func(i int, root string) error {
-		return applySourceLayer(ctx, layers[i], diffIDs[i], root, opts.LayerLimits)
+	return prepareLayers(ctx, config, len(layers), opts, func(i int, tree *virtualTree) error {
+		return applySourceLayer(ctx, layers[i], diffIDs[i], tree, opts.LayerLimits)
 	}, nil)
 }
 
-func applySourceLayer(ctx context.Context, open LayerOpener, diffID, root string, limits LayerLimits) (retErr error) {
+func applySourceLayer(ctx context.Context, open LayerOpener, diffID string, tree *virtualTree, limits LayerLimits) (retErr error) {
 	limits, err := limits.normalized()
 	if err != nil {
 		return err
@@ -77,7 +77,7 @@ func applySourceLayer(ctx context.Context, open LayerOpener, diffID, root string
 	s := &layerStream{body: body, compressed: r, decoded: r, cancelDone: make(chan struct{})}
 	s.stopCancel = context.AfterFunc(ctx, func() { s.closeBody(); close(s.cancelDone) })
 	defer func() { retErr = errors.Join(retErr, s.Close()) }()
-	if err = unpackLayer(ctx, r, root, limits.MetadataBytes); err != nil {
+	if err = unpackLayer(ctx, r, tree, limits.MetadataBytes); err != nil {
 		return err
 	}
 	if _, err = io.Copy(io.Discard, r); err != nil {

@@ -3,12 +3,14 @@
 package flatten
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSelectionDefaultAndExplicitBudget(t *testing.T) {
@@ -44,5 +46,47 @@ func TestSelectionDefaultAndExplicitBudget(t *testing.T) {
 	}
 	if err = s.validate(context.Background()); err == nil || !strings.Contains(err.Error(), "source tree changed") {
 		t.Fatalf("source mutation was not detected: %v", err)
+	}
+}
+
+func TestVirtualSelectionCapturesSpoolIdentityBeforePlanning(t *testing.T) {
+	scratch := t.TempDir()
+	b := testLayerTar(t, layerEntry{name: "payload", body: "verified-data"})
+	body := &observedBody{Reader: bytes.NewReader(b)}
+	layer := streamInput(b, b, "application/vnd.oci.image.layer.v1.tar", body)
+	config := []byte(fmt.Sprintf(`{"rootfs":{"type":"layers","diff_ids":[%q]}}`, layer.DiffID))
+	in, err := NewImageInput(config, []LayerInput{layer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated := false
+	_, err = PrepareImage(context.Background(), in, Options{
+		TmpDir: scratch,
+		Progress: func(stage string, _, _ int) {
+			if stage != "build-erofs" {
+				return
+			}
+			matches, globErr := filepath.Glob(filepath.Join(scratch, "flatten-prepared-*", "payloads"))
+			if globErr != nil || len(matches) != 1 {
+				t.Errorf("expected one payload spool in %s, got %v (%v)", scratch, matches, globErr)
+				return
+			}
+			now := time.Now().Add(2 * time.Second)
+			if writeErr := os.WriteFile(matches[0], []byte("tampered-data"), 0600); writeErr != nil {
+				t.Errorf("tamper payload spool: %v", writeErr)
+				return
+			}
+			if chtimesErr := os.Chtimes(matches[0], now, now); chtimesErr != nil {
+				t.Errorf("chtimes payload spool: %v", chtimesErr)
+				return
+			}
+			mutated = true
+		},
+	})
+	if !mutated {
+		t.Fatal("build-erofs progress callback did not mutate payload spool")
+	}
+	if err == nil || !strings.Contains(err.Error(), "virtual payload spool changed") {
+		t.Fatalf("expected virtual payload spool changed error, got %v", err)
 	}
 }
