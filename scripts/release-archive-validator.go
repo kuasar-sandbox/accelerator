@@ -36,10 +36,6 @@ var archiveContract = map[string]entryContract{
 	"./share/licenses/accelerator/rocksdb/COPYING":         {typeflag: tar.TypeReg, mode: 0o644},
 	"./share/licenses/accelerator/rocksdb/LICENSE.Apache":  {typeflag: tar.TypeReg, mode: 0o644},
 	"./share/licenses/accelerator/rocksdb/LICENSE.leveldb": {typeflag: tar.TypeReg, mode: 0o644},
-	"./share/sources/accelerator/GO-BUILD-INFO.tsv":        {typeflag: tar.TypeReg, mode: 0o644},
-	"./share/sources/accelerator/GO-MODULES.tsv":           {typeflag: tar.TypeReg, mode: 0o644},
-	"./share/sources/accelerator/MATERIALS.sha256":         {typeflag: tar.TypeReg, mode: 0o644},
-	"./share/sources/accelerator/SOURCES.tsv":              {typeflag: tar.TypeReg, mode: 0o644},
 }
 
 func materialContract(name string) (entryContract, bool) {
@@ -47,8 +43,6 @@ func materialContract(name string) (entryContract, bool) {
 		"./share/",
 		"./share/licenses/",
 		"./share/licenses/accelerator/",
-		"./share/sources/",
-		"./share/sources/accelerator/",
 	} {
 		if name == directory {
 			return entryContract{typeflag: tar.TypeDir, mode: 0o755}, true

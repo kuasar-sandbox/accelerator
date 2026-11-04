@@ -70,8 +70,8 @@ func TestSourceMetadataHasNoDynamicFallback(t *testing.T) {
 		t.Fatal("ordinary nested license material was rejected")
 	}
 	for _, name := range []string{"SOURCES.tsv", "GO-BUILD-INFO.tsv", "GO-MODULES.tsv", "MATERIALS.sha256"} {
-		if _, ok := archiveContract["./share/sources/accelerator/"+name]; !ok {
-			t.Fatalf("declared source metadata missing: %s", name)
+		if _, ok := archiveContract["./share/sources/accelerator/"+name]; ok {
+			t.Fatalf("retired source metadata required: %s", name)
 		}
 	}
 }
