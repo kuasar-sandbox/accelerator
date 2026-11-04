@@ -3,11 +3,13 @@
 package flatten
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -439,5 +441,54 @@ func TestGoPlannerCrossArchitectureGolden(t *testing.T) {
 	const want = "6978a0c147d368c148c453b16d90b1dcff5026b7cd682b66379d6a6eff74b1ca"
 	if got := fmt.Sprintf("%x", sha256.Sum256(artifact.Bytes())); got != want {
 		t.Fatalf("fixed Go EROFS artifact changed on %s: got %s, want %s", runtime.GOARCH, got, want)
+	}
+}
+
+func TestVirtualTreeCrossArchitectureGoldenRootless(t *testing.T) {
+	payload := make([]byte, planReadBatch+73)
+	for i := range payload {
+		payload[i] = byte((i*17 + i/4096) % 251)
+	}
+	layerBytes := testLayerTar(t,
+		layerEntry{name: ".", kind: tar.TypeDir, mode: 0751, uid: 12345, gid: 23456, hasOwner: true},
+		layerEntry{name: "data", body: string(payload), mode: 0640, uid: 12345, gid: 23456, hasOwner: true},
+		layerEntry{name: "duplicate", body: string(payload), mode: 0640, uid: 12345, gid: 23456, hasOwner: true},
+		layerEntry{name: "short", body: "fixed tail\n", mode: 0640, uid: 12345, gid: 23456, hasOwner: true},
+		layerEntry{name: "empty-file", body: "", mode: 0640, uid: 12345, gid: 23456, hasOwner: true},
+		layerEntry{name: "hardlink", kind: tar.TypeLink, link: "data", mode: 0640, uid: 12345, gid: 23456, hasOwner: true},
+		layerEntry{name: "symlink", kind: tar.TypeSymlink, link: "data", mode: 0777, uid: 12345, gid: 23456, hasOwner: true},
+		layerEntry{name: "empty-directory", kind: tar.TypeDir, mode: 0751, uid: 12345, gid: 23456, hasOwner: true},
+		layerEntry{name: "fifo", kind: tar.TypeFifo, mode: 0640, uid: 12345, gid: 23456, hasOwner: true},
+	)
+	diffID := fmt.Sprintf("sha256:%x", sha256.Sum256(layerBytes))
+	cfg := []byte(fmt.Sprintf(`{"rootfs":{"type":"layers","diff_ids":[%q]}}`, diffID))
+	in, err := NewImageInput(cfg, []LayerInput{{
+		MediaType: "application/vnd.oci.image.layer.v1.tar",
+		Digest:    diffID,
+		DiffID:    diffID,
+		Size:      int64(len(layerBytes)),
+		Open: func(context.Context) (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(layerBytes)), nil
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := PrepareImage(context.Background(), in, Options{TmpDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := p.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	var artifact bytes.Buffer
+	if _, _, err := p.WriteArtifact(context.Background(), &artifact, "image"); err != nil {
+		t.Fatal(err)
+	}
+	const want = "6978a0c147d368c148c453b16d90b1dcff5026b7cd682b66379d6a6eff74b1ca"
+	if got := fmt.Sprintf("%x", sha256.Sum256(artifact.Bytes())); got != want {
+		t.Fatalf("rootless golden artifact digest = %s, want %s", got, want)
 	}
 }

@@ -21,6 +21,7 @@ import (
 // final validation. It detects changes; it is not an atomic filesystem snapshot.
 type sourceSelection struct {
 	root     string
+	virtual  *virtualTree
 	excludes []string
 	stamp    [32]byte
 	budget   uint64
@@ -60,6 +61,9 @@ func (s *sourceSelection) validate(ctx context.Context) error {
 	if got != s.stamp {
 		return fmt.Errorf("flatten: selected source tree changed")
 	}
+	if s.virtual != nil {
+		return s.virtual.validateWork(s.root)
+	}
 	return nil
 }
 
@@ -68,6 +72,9 @@ func (s *sourceSelection) validate(ctx context.Context) error {
 type selectionVisitor func(rel string, st *unix.Stat_t, leave bool) error
 
 func (s *sourceSelection) walk(ctx context.Context, rel string, h hash.Hash, remaining *uint64, visit selectionVisitor) error {
+	if s.virtual != nil {
+		return s.walkVirtual(ctx, rel, s.virtual.root, h, remaining, visit)
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -182,6 +189,80 @@ func (s *sourceSelection) walk(ctx context.Context, rel string, h hash.Hash, rem
 		return visit(rel, &st, true)
 	}
 	return nil
+}
+
+func (s *sourceSelection) walkVirtual(ctx context.Context, rel string, v *virtualInode, h hash.Hash, remaining *uint64, visit selectionVisitor) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if rel != "." && s.excluded(rel) {
+		return nil
+	}
+	charge := uint64(512 + 4*len(rel))
+	if len(rel) > 4096 || charge > *remaining {
+		return fmt.Errorf("flatten: source selection budget exceeded")
+	}
+	*remaining -= charge
+	if v == nil {
+		return os.ErrNotExist
+	}
+	st := v.stat()
+	id := statID(&st)
+	if visit != nil {
+		if err := visit(rel, &st, false); err != nil {
+			return err
+		}
+	}
+	if st.Mode&unix.S_IFMT == unix.S_IFDIR {
+		id.size, id.nlink, id.mtime, id.ctime, id.mtimeNS, id.ctimeNS = 0, 0, 0, 0, 0, 0
+	}
+	h.Write([]byte(rel))
+	h.Write([]byte{0})
+	var encoded [12 * 8]byte
+	for i, n := range [...]uint64{id.dev, id.ino, id.size, id.nlink, uint64(id.mtime), uint64(id.ctime), uint64(id.mtimeNS), uint64(id.ctimeNS), uint64(id.mode), uint64(id.uid), uint64(id.gid), uint64(st.Rdev)} {
+		binary.LittleEndian.PutUint64(encoded[i*8:], n)
+	}
+	h.Write(encoded[:])
+	if st.Mode&unix.S_IFMT == unix.S_IFLNK {
+		h.Write([]byte(v.linkTarget))
+		h.Write([]byte{0})
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return nil
+	}
+	var entries []string
+	for name := range v.children {
+		r := filepath.Join(rel, name)
+		if s.excluded(r) {
+			continue
+		}
+		cost := uint64(128 + 2*len(name))
+		if cost > *remaining {
+			return fmt.Errorf("flatten: directory index budget exceeded")
+		}
+		*remaining -= cost
+		entries = append(entries, name)
+	}
+	sort.Strings(entries)
+	for _, entry := range entries {
+		if err := s.walkVirtual(ctx, filepath.Join(rel, entry), v.children[entry], h, remaining, visit); err != nil {
+			return err
+		}
+	}
+	if visit != nil {
+		return visit(rel, &st, true)
+	}
+	return nil
+}
+
+func selectVirtualSource(ctx context.Context, work string, tree *virtualTree, budget uint64) (*sourceSelection, error) {
+	if tree == nil || tree.root == nil {
+		return nil, fmt.Errorf("flatten: nil virtual source tree")
+	}
+	s := &sourceSelection{root: work, virtual: tree, budget: budget}
+	var err error
+	s.stamp, err = s.snapshot(ctx)
+	return s, err
 }
 
 func selectSource(ctx context.Context, root string, excludes []string, budget uint64) (*sourceSelection, error) {

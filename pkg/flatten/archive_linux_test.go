@@ -24,7 +24,12 @@ import (
 func archiveFixture(t *testing.T, codec string) ([]byte, *ImageInput) {
 	t.Helper()
 	plains := [][]byte{
-		testLayerTar(t, layerEntry{name: "dir/old", body: "old"}, layerEntry{name: "keep", body: "kept"}),
+		testLayerTar(t,
+			layerEntry{name: ".", kind: tar.TypeDir, mode: 0755},
+			layerEntry{name: "dir", kind: tar.TypeDir, mode: 0755},
+			layerEntry{name: "dir/old", body: "old"},
+			layerEntry{name: "keep", body: "kept"},
+		),
 		testLayerTar(t, layerEntry{name: "dir/new", body: "new"}, layerEntry{name: "dir/.wh..wh..opq"}),
 	}
 	var diffIDs []string
@@ -133,8 +138,8 @@ func TestArchiveLegacySkopeoAlias(t *testing.T) {
 			}
 			if p != nil {
 				defer p.Close()
-				assertLayerFile(t, p.selection.root, "payload", "legacy save contents")
-				if _, err := os.Lstat(filepath.Join(p.selection.root, aliasName)); !os.IsNotExist(err) {
+				assertVirtualFile(t, p.selection.virtual, "payload", "legacy save contents")
+				if _, err := p.selection.virtual.lstat(aliasName); !os.IsNotExist(err) {
 					t.Fatal("outer alias was extracted:", err)
 				}
 				if err := p.WriteRaw(context.Background(), io.Discard); err != nil {
@@ -164,7 +169,27 @@ func TestArchiveFilePipeAndDirectoryEqual(t *testing.T) {
 					scratch := t.TempDir()
 					var p *PreparedImage
 					if mode == "directory" {
-						p, err = PrepareDir(context.Background(), baseline.selection.root, Options{TmpDir: baseline.selection.root}, DirOptions{ConfigJSON: in.ConfigJSON()})
+						dirRoot := t.TempDir()
+						if e := os.Chmod(dirRoot, 0755); e != nil {
+							t.Fatal(e)
+						}
+						sub := filepath.Join(dirRoot, "dir")
+						if e := os.Mkdir(sub, 0755); e != nil {
+							t.Fatal(e)
+						}
+						if e := os.Chmod(sub, 0755); e != nil {
+							t.Fatal(e)
+						}
+						for rel, body := range map[string]string{"dir/new": "new", "keep": "kept"} {
+							fp := filepath.Join(dirRoot, rel)
+							if e := os.WriteFile(fp, []byte(body), 0644); e != nil {
+								t.Fatal(e)
+							}
+							if e := os.Chmod(fp, 0644); e != nil {
+								t.Fatal(e)
+							}
+						}
+						p, err = PrepareDir(context.Background(), dirRoot, Options{TmpDir: dirRoot}, DirOptions{ConfigJSON: in.ConfigJSON()})
 					} else {
 						var input io.ReadCloser
 						if mode == "file" {
@@ -198,7 +223,11 @@ func TestArchiveFilePipeAndDirectoryEqual(t *testing.T) {
 					if !bytes.Equal(expected.Bytes(), got.Bytes()) {
 						t.Fatal("equivalent input changed raw output")
 					}
-					if _, err = os.Stat(filepath.Join(p.selection.root, "dir", "old")); !os.IsNotExist(err) {
+					if p.selection.virtual != nil {
+						if _, err = p.selection.virtual.stat("dir/old"); !os.IsNotExist(err) {
+							t.Fatal("late opaque failed")
+						}
+					} else if _, err = os.Stat(filepath.Join(p.selection.root, "dir", "old")); !os.IsNotExist(err) {
 						t.Fatal("late opaque failed")
 					}
 				})
