@@ -137,24 +137,7 @@ An organization namespace alone does not exempt modules from notice collection.
 This component has no internal sibling dependencies. Unsupported local replacements
 need versioned module inputs for the official package.
 
-Materials live under `share/licenses/<component>` and
-`share/sources/<component>`. The latter contains `SOURCES.tsv`,
-`GO-BUILD-INFO.tsv`, `GO-MODULES.tsv` and `MATERIALS.sha256`.
-Collection fails on missing notices, unreadable subtrees or partial traversals.
-Independent validation checks the shipped inventory, checksums, required files,
-source-record consistency, payload identities and archive paths/types/modes.
-It does not fetch source checkouts or Go modules, compare notices with remote
-source trees, or download/authenticate compiler distributions. Checksums and
-VCS records are consistency checks, not proof of an arbitrary producer's identity.
-
-The archive name identifies the requested release target. Project and internal
-dependency records use a release version when its local tag matches the selected
-commit, otherwise `git:<commit>`; packaging does not require creating future
-target tags. The publisher passes the selected project SHA to validation before
-Tag/Release writes, uses the bundle's `release-notes.md` body, and appends the
-existing source/Preview markers. Trusted source selection, build/publish permission
-separation and the refusal to replace published assets remain required.
-Producer-supplied notes may not contain the publisher's reserved source/Preview markers.
+Licenses and notices live under `share/licenses/<component>`. Collection fails on missing notices, unreadable subtrees or partial traversals. Package validation checks required files, payload identities and archive paths, types and modes. Downloads use native GitHub asset sizes and digests. New packages and Releases contain no source or historical test records, independent `SHA256SUMS`, or source/Preview markers. The publisher uses human release notes, checks the current build outputs, and refuses to replace existing assets with different bytes.
 
 The official package requires the three Linux command binaries for its selected
 native architecture (amd64 for x86_64, arm64 for aarch64), with
