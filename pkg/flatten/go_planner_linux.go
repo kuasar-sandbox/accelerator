@@ -160,14 +160,16 @@ func buildGoPlan(ctx context.Context, selection *sourceSelection, layoutPath, na
 	g.blocks = planningTable[[32]byte, uint64]{hash: func(k [32]byte) uint64 { return binary.LittleEndian.Uint64(k[:8]) }, memory: &g.memory}
 	g.links = planningTable[inodeKey, erofs.NodeID]{hash: inodeHash, memory: &g.memory}
 	var err error
-	if g.root, err = os.OpenRoot(selection.root); err != nil {
-		return err
+	if selection.virtual == nil {
+		if g.root, err = os.OpenRoot(selection.root); err != nil {
+			return err
+		}
+		defer func() { retErr = errors.Join(retErr, g.root.Close()) }()
+		if g.rootDescriptor, err = g.root.OpenFile(".", unix.O_PATH|unix.O_DIRECTORY, 0); err != nil {
+			return err
+		}
+		defer func() { retErr = errors.Join(retErr, g.rootDescriptor.Close()) }()
 	}
-	defer func() { retErr = errors.Join(retErr, g.root.Close()) }()
-	if g.rootDescriptor, err = g.root.OpenFile(".", unix.O_PATH|unix.O_DIRECTORY, 0); err != nil {
-		return err
-	}
-	defer func() { retErr = errors.Join(retErr, g.rootDescriptor.Close()) }()
 	var files []*os.File
 	defer func() {
 		for _, f := range files {
@@ -321,7 +323,15 @@ func (g *goPlanner) visit(rel string, st *unix.Stat_t, leave bool) error {
 		}
 	}
 	if n.Mode&fs.ModeSymlink != 0 {
-		target, err := g.root.Readlink(rel)
+		var (
+			target string
+			err    error
+		)
+		if g.selection.virtual != nil {
+			target, err = g.selection.virtual.readlink(rel)
+		} else {
+			target, err = g.root.Readlink(rel)
+		}
 		if err != nil {
 			return err
 		}
@@ -348,14 +358,27 @@ func (g *goPlanner) visit(rel string, st *unix.Stat_t, leave bool) error {
 }
 
 func (g *goPlanner) file(rel string, expected fileIdentity, id erofs.NodeID) (retErr error) {
-	f, err := openPlanSource(g.root, g.rootDescriptor, rel)
-	if err != nil {
-		return err
-	}
-	defer func() { retErr = errors.Join(retErr, f.Close()) }()
-	actual, err := descriptorID(f.fd)
-	if err != nil {
-		return err
+	var (
+		f      *planSource
+		vnode  *virtualInode
+		actual fileIdentity
+		err    error
+	)
+	if g.selection.virtual != nil {
+		vnode, actual, err = g.selection.virtual.openFile(rel)
+		if err != nil {
+			return err
+		}
+	} else {
+		f, err = openPlanSource(g.root, g.rootDescriptor, rel)
+		if err != nil {
+			return err
+		}
+		defer func() { retErr = errors.Join(retErr, f.Close()) }()
+		actual, err = descriptorID(f.fd)
+		if err != nil {
+			return err
+		}
 	}
 	if actual != expected || actual.mode&unix.S_IFMT != unix.S_IFREG {
 		return fmt.Errorf("flatten: selected file changed: %s", rel)
@@ -363,7 +386,12 @@ func (g *goPlanner) file(rel string, expected fileIdentity, id erofs.NodeID) (re
 	var source uint64
 	for offset := uint64(0); offset < actual.size; {
 		want := min(uint64(len(g.buffer)), actual.size-offset)
-		n, err := f.readAt(g.ctx, g.buffer[:want], int64(offset))
+		var n int
+		if g.selection.virtual != nil {
+			n, err = g.selection.virtual.readAt(g.ctx, vnode, g.buffer[:want], int64(offset))
+		} else {
+			n, err = f.readAt(g.ctx, g.buffer[:want], int64(offset))
+		}
 		if err != nil || uint64(n) != want {
 			return fmt.Errorf("flatten: read selected file %s: %w", rel, errors.Join(err, io.ErrUnexpectedEOF))
 		}
@@ -419,7 +447,11 @@ func (g *goPlanner) file(rel string, expected fileIdentity, id erofs.NodeID) (re
 		}
 		offset += want
 	}
-	actual, err = descriptorID(f.fd)
+	if g.selection.virtual != nil {
+		actual, err = g.selection.virtual.statFile(vnode)
+	} else {
+		actual, err = descriptorID(f.fd)
+	}
 	if err != nil {
 		return err
 	}

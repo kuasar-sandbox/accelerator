@@ -125,12 +125,12 @@ func prepareImage(ctx context.Context, in *ImageInput, opts Options, afterApply 
 	if in == nil {
 		return nil, fmt.Errorf("flatten: nil image input")
 	}
-	return prepareLayers(ctx, in.config, len(in.layers), opts, func(i int, root string) error {
-		return applyVerifiedLayer(ctx, in.layers[i], root, opts.LayerLimits)
+	return prepareLayers(ctx, in.config, len(in.layers), opts, func(i int, tree *virtualTree) error {
+		return applyVerifiedLayer(ctx, in.layers[i], tree, opts.LayerLimits)
 	}, afterApply)
 }
 
-func prepareLayers(ctx context.Context, config []byte, count int, opts Options, apply func(int, string) error, afterApply func() error) (_ *PreparedImage, retErr error) {
+func prepareLayers(ctx context.Context, config []byte, count int, opts Options, apply func(int, *virtualTree) error, afterApply func() error) (_ *PreparedImage, retErr error) {
 	cfg, err := image.ExtractRuntimeConfigFromJSON(config)
 	if err != nil {
 		return nil, err
@@ -152,20 +152,17 @@ func prepareLayers(ctx context.Context, config []byte, count int, opts Options, 
 	if err != nil {
 		return nil, err
 	}
+	tree := newVirtualTree(work)
 	defer func() {
 		if retErr != nil {
-			retErr = errors.Join(retErr, removeOwnedWork(work))
+			retErr = errors.Join(retErr, tree.Close(), removeOwnedWork(work))
 		}
 	}()
-	root := filepath.Join(work, "rootfs")
-	if err = os.Mkdir(root, 0755); err != nil {
-		return nil, err
-	}
 	for i := 0; i < count; i++ {
 		if opts.Progress != nil {
 			opts.Progress("apply-layers", i+1, count)
 		}
-		if err = apply(i, root); err != nil {
+		if err = apply(i, tree); err != nil {
 			return nil, fmt.Errorf("flatten: layer %d: %w", i, err)
 		}
 	}
@@ -174,7 +171,7 @@ func prepareLayers(ctx context.Context, config []byte, count int, opts Options, 
 			return nil, err
 		}
 	}
-	selection, err := selectSource(ctx, root, nil, limits.IndexMemoryBytes/4)
+	selection, err := selectVirtualSource(ctx, work, tree, limits.IndexMemoryBytes/4)
 	if err != nil {
 		return nil, err
 	}
@@ -193,7 +190,7 @@ func prepareSelected(ctx context.Context, work string, selection *sourceSelectio
 	// planning or layer application; GC remains the Go runtime's responsibility.
 	readerLimits := limits
 	readerLimits.IndexMemoryBytes /= 2
-	p, err := openPlan(ctx, selection.root, layout, name, readerLimits)
+	p, err := openPlanWithVirtual(ctx, selection.root, selection.virtual, layout, name, readerLimits)
 	if err != nil {
 		return nil, err
 	}
@@ -202,6 +199,11 @@ func prepareSelected(ctx context.Context, work string, selection *sourceSelectio
 			retErr = errors.Join(retErr, p.Close())
 		}
 	}()
+	if selection.virtual != nil {
+		if err = selection.virtual.sealWork(work); err != nil {
+			return nil, err
+		}
+	}
 	if err = selection.validate(ctx); err != nil {
 		return nil, err
 	}
@@ -244,10 +246,12 @@ func (p *PreparedImage) begin(ctx context.Context) (context.Context, func(), err
 func (p *PreparedImage) validate(ctx context.Context) error {
 	if p.plan.current != nil {
 		err := p.plan.current.Close()
-		p.plan.current, p.plan.currentID, p.plan.dataValid = nil, 0, 0
+		p.plan.current, p.plan.currentVirtual, p.plan.currentID, p.plan.dataValid = nil, nil, 0, 0
 		if err != nil {
 			return err
 		}
+	} else {
+		p.plan.currentVirtual, p.plan.currentID, p.plan.dataValid = nil, 0, 0
 	}
 	if err := p.plan.verifyPlanFiles(ctx); err != nil {
 		return err
@@ -318,7 +322,11 @@ func (p *PreparedImage) Close() error {
 		p.mu.Unlock()
 		p.writeMu.Lock()
 		defer p.writeMu.Unlock()
-		p.closeErr = errors.Join(p.plan.Close(), removeOwnedWork(p.work))
+		var virtualErr error
+		if p.selection != nil && p.selection.virtual != nil {
+			virtualErr = p.selection.virtual.Close()
+		}
+		p.closeErr = errors.Join(p.plan.Close(), virtualErr, removeOwnedWork(p.work))
 	})
 	return p.closeErr
 }

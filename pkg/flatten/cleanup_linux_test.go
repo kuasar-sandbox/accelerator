@@ -44,8 +44,8 @@ func TestPreparedReadOnlyTreeCleanup(t *testing.T) {
 				}
 			})
 			rejected := errors.New("next layer rejected")
-			p, err := prepareLayers(context.Background(), []byte("{}"), 2, Options{TmpDir: scratch}, func(i int, root string) error {
-				owned = filepath.Dir(root)
+			p, err := prepareLayers(context.Background(), []byte("{}"), 2, Options{TmpDir: scratch}, func(i int, tree *virtualTree) error {
+				owned = tree.work
 				if i == 1 {
 					if failed {
 						return rejected
@@ -57,7 +57,7 @@ func TestPreparedReadOnlyTreeCleanup(t *testing.T) {
 					entries = append(entries, layerEntry{name: fmt.Sprintf("readonly/child-%03d/file", j), body: "payload"})
 				}
 				entries = append(entries, layerEntry{name: "readonly", kind: tar.TypeDir, mode: 0500}, layerEntry{name: "external", kind: tar.TypeSymlink, link: outside})
-				applyTestLayer(t, root, entries...)
+				applyTestLayer(t, tree, entries...)
 				return nil
 			}, nil)
 			if failed {
@@ -72,9 +72,9 @@ func TestPreparedReadOnlyTreeCleanup(t *testing.T) {
 					p.Close()
 					t.Fatal(err)
 				}
-				st, statErr := os.Stat(filepath.Join(owned, "rootfs", "readonly"))
-				if statErr != nil || st.Mode().Perm() != 0500 {
-					t.Fatalf("source mode changed before cleanup: %v %v", st, statErr)
+				vnode, statErr := p.selection.virtual.stat("readonly")
+				if statErr != nil || vnode.mode&0777 != 0500 {
+					t.Fatalf("source mode changed before cleanup: %v %v", vnode, statErr)
 				}
 				if err = p.Close(); err != nil {
 					t.Fatal(err)

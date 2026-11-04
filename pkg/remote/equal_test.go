@@ -21,12 +21,9 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/flatten"
 )
 
-// syntheticImage builds a small single-layer image whose files have normal
-// 0644 modes. ggcr's random.Image / crane.Image emit mode-0 (0000) tar
-// entries, which flatten faithfully writes to the staging tree — then a
-// an ordinary-user exporter cannot read them. Readable modes are needed
-// for this fixture; production image export preserves ownership as root
-// or with CAP_CHOWN.
+// syntheticImage builds a small single-layer image with varied ownership and
+// modes (including mode 0000 and non-current numeric UID/GID) to verify
+// rootless virtual overlay preservation and cross-source determinism.
 func syntheticImage(t *testing.T) v1.Image {
 	t.Helper()
 	var buf bytes.Buffer
@@ -34,13 +31,16 @@ func syntheticImage(t *testing.T) v1.Image {
 	// Deterministic entry order → reproducible layer.
 	entries := []struct {
 		name, body string
+		mode       int64
+		uid, gid   int
 	}{
-		{"app/run.sh", "#!/bin/sh\necho hi\n"},
-		{"data/blob", "some content here\n"},
-		{"etc/conf", "k=v\n"},
+		{"app/run.sh", "#!/bin/sh\necho hi\n", 0o755, 0, 0},
+		{"data/blob", "some content here\n", 0o644, 10001, 10002},
+		{"etc/conf", "k=v\n", 0o640, 0, 42},
+		{"etc/shadow", "root:*:19000:0:99999:7:::\n", 0o000, 0, 0},
 	}
 	for _, e := range entries {
-		hdr := &tar.Header{Name: e.name, Mode: 0o644, Size: int64(len(e.body)), Typeflag: tar.TypeReg}
+		hdr := &tar.Header{Name: e.name, Mode: e.mode, Uid: e.uid, Gid: e.gid, Size: int64(len(e.body)), Typeflag: tar.TypeReg}
 		if err := tw.WriteHeader(hdr); err != nil {
 			t.Fatal(err)
 		}
@@ -82,14 +82,9 @@ func sha256File(t *testing.T, path string) string {
 // TestCrossSourceByteEqual — the same image flattened from a registry pull and
 // from an equivalent docker-archive must produce byte-identical EROFS. This is
 // the core determinism guarantee of routing both sources through flatten.Build.
-// The linked Go planner needs no external generator. Linux and image ownership
-// privileges remain prerequisites for applying the fixture's numeric owners.
 func TestCrossSourceByteEqual(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("EROFS generation requires Linux")
-	}
-	if err := flatten.RequireOwnershipCap(); err != nil {
-		t.Skipf("flatten preserves image file ownership and needs root/CAP_CHOWN (%v); cross-source equality runs in e2e/CI", err)
 	}
 	host := startRegistry(t)
 	img := syntheticImage(t)

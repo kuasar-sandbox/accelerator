@@ -75,12 +75,14 @@ type erofsPlan struct {
 	layout, records, sourceIndex       *os.File
 	root                               *os.Root
 	rootDescriptor                     *os.File
+	virtual                            *virtualTree
 	layoutID, recordsID, sourceIndexID fileIdentity
 	size, dataStart, dataLength, count uint64
 	files                              []planFile
 	holes                              []sparse.Extent
 	indexBytes                         uint64
 	current                            *planSource
+	currentVirtual                     *virtualInode
 	currentID                          uint64
 	data                               []byte
 	dataStartOffset                    uint64
@@ -91,6 +93,10 @@ type erofsPlan struct {
 }
 
 func openPlan(ctx context.Context, root, layout, name string, limits PlanLimits) (_ *erofsPlan, retErr error) {
+	return openPlanWithVirtual(ctx, root, nil, layout, name, limits)
+}
+
+func openPlanWithVirtual(ctx context.Context, root string, virtual *virtualTree, layout, name string, limits PlanLimits) (_ *erofsPlan, retErr error) {
 	limits, err := limits.defaults()
 	if err != nil {
 		return nil, err
@@ -146,11 +152,14 @@ func openPlan(ctx context.Context, root, layout, name string, limits PlanLimits)
 	if p.sourceIndex, err = os.Open(name + ".sources"); err != nil {
 		return nil, err
 	}
-	if p.root, err = os.OpenRoot(root); err != nil {
-		return nil, err
-	}
-	if p.rootDescriptor, err = p.root.OpenFile(".", unix.O_PATH|unix.O_DIRECTORY, 0); err != nil {
-		return nil, err
+	p.virtual = virtual
+	if virtual == nil {
+		if p.root, err = os.OpenRoot(root); err != nil {
+			return nil, err
+		}
+		if p.rootDescriptor, err = p.root.OpenFile(".", unix.O_PATH|unix.O_DIRECTORY, 0); err != nil {
+			return nil, err
+		}
 	}
 	for _, item := range []struct {
 		f    *os.File
@@ -477,11 +486,19 @@ func (p *erofsPlan) chunk(ctx context.Context, rec chunkRecord) ([]byte, error) 
 			}
 			p.current = nil
 		}
+		p.currentVirtual = nil
 		p.currentID, p.dataValid = 0, 0
 		var err error
-		p.current, err = openPlanSource(p.root, p.rootDescriptor, f.name)
-		if err != nil {
-			return nil, fmt.Errorf("flatten: open planned source %q: %w", f.name, err)
+		if p.virtual != nil {
+			p.currentVirtual, _, err = p.virtual.openFile(f.name)
+			if err != nil {
+				return nil, fmt.Errorf("flatten: open planned source %q: %w", f.name, err)
+			}
+		} else {
+			p.current, err = openPlanSource(p.root, p.rootDescriptor, f.name)
+			if err != nil {
+				return nil, fmt.Errorf("flatten: open planned source %q: %w", f.name, err)
+			}
 		}
 		p.currentID = rec.source
 	}
@@ -489,7 +506,15 @@ func (p *erofsPlan) chunk(ctx context.Context, rec chunkRecord) ([]byte, error) 
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		id, err := descriptorID(p.current.fd)
+		var (
+			id  fileIdentity
+			err error
+		)
+		if p.virtual != nil {
+			id, err = p.virtual.statFile(p.currentVirtual)
+		} else {
+			id, err = descriptorID(p.current.fd)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -498,7 +523,12 @@ func (p *erofsPlan) chunk(ctx context.Context, rec chunkRecord) ([]byte, error) 
 		}
 		p.dataStartOffset = rec.offset / planReadBatch * planReadBatch
 		want := min(uint64(len(p.data)), f.id.size-p.dataStartOffset)
-		n, err := p.current.readAt(ctx, p.data[:want], int64(p.dataStartOffset))
+		var n int
+		if p.virtual != nil {
+			n, err = p.virtual.readAt(ctx, p.currentVirtual, p.data[:want], int64(p.dataStartOffset))
+		} else {
+			n, err = p.current.readAt(ctx, p.data[:want], int64(p.dataStartOffset))
+		}
 		if err != nil || uint64(n) != want {
 			return nil, fmt.Errorf("flatten: truncated source %q: %w", f.name, errors.Join(err, io.ErrUnexpectedEOF))
 		}
