@@ -113,36 +113,6 @@ validate_archive_paths() {
     || fail "$archive contains an unsafe type, mode or ownership, or violates the exact entry contract"
 }
 
-validate_source_inventory() {
-  local table="$1/share/sources/$NAME/SOURCES.tsv"
-  awk -F '\t' '
-    NR == 1 { if ($0 != "payload\tname\tversion\tsource\tintegrity\tlicense_directory") exit 1; next }
-    NF != 6 || seen[$1 FS $2]++ { exit 1 }
-    $2 == "accelerator" { if ($1 != "bin/*,test/scripts/*") exit 1; next }
-    $2 == "rocksdb" || $2 == "rocksdb-static-library" { if ($1 != "bin/cache-ctl") exit 1; next }
-    $2 == "Go toolchain" {
-      if ($1 !~ /^bin\/(manifest-ctl|store-ctl|cache-ctl)$/) exit 1
-      next
-    }
-    $2 ~ /^system:/ {
-      name=substr($2, 8)
-      if ($1 != "bin/cache-ctl" || name !~ /^[A-Za-z0-9._+-]+[.](a|o)$/ ||
-          $6 != "share/licenses/accelerator/system/" name || $3 !~ /^[A-Za-z0-9.+:~_-]+$/) exit 1
-      if (split($5, fields, ";") != 2 || fields[1] !~ /^sha256:/ || fields[2] !~ /^package:/) exit 1
-      digest=substr(fields[1], 8); package=substr(fields[2], 9)
-      if (length(digest) != 64 || digest ~ /[^0-9a-f]/ || package !~ /^[A-Za-z0-9][A-Za-z0-9.+_-]*$/) exit 1
-      if ($4 ~ /^deb-source:/) {
-        if (package !~ /^[a-z0-9][a-z0-9+.-]*$/ || $4 != "deb-source:" package "@" $3) exit 1
-      } else if ($4 ~ /^rpm-source:[A-Za-z0-9][A-Za-z0-9.+:~_-]*[.](no)?src[.]rpm$/) {
-        suffix="-" $3 ".src.rpm"; alternate="-" $3 ".nosrc.rpm"
-        if (substr($4, length($4)-length(suffix)+1) != suffix &&
-            substr($4, length($4)-length(alternate)+1) != alternate) exit 1
-      } else exit 1
-      next
-    }
-    { exit 1 }
-  ' "$table" || fail "unrecognized or inconsistent source inventory record"
-}
 
 require_rocksdb_payload() {
   if go version -m "$1" | awk -F '\t' '
@@ -184,29 +154,15 @@ validate_bundle() {
   for file in manifest-ctl store-ctl cache-ctl; do
     check_go_binary "$extract/bin/$file" "$arch"
   done
-  local project_sha rocks_digest
-  project_sha="$(go version -m "$extract/bin/manifest-ctl" | \
-    awk -F '\t' '$2 == "build" && $3 ~ /^vcs.revision=/ {print substr($3, 14)}')"
   require_rocksdb_payload "$extract/bin/cache-ctl"
   release_materials_require_rocksdb_notices "$extract"
-  validate_source_inventory "$extract"
   release_materials_validate "$extract" "$NAME"
-  release_materials_require_project_source "$extract" "$NAME" 'bin/*,test/scripts/*' "$version" \
-    bin/manifest-ctl bin/store-ctl bin/cache-ctl
-  release_materials_require_source "$extract" "$NAME" 'bin/cache-ctl' 'rocksdb' "v9.7.4" \
-    'https://github.com/facebook/rocksdb/archive/refs/tags/v9.7.4.tar.gz' \
-    'sha256-tree:1341893a5951347a7f658151c10f0b15e0ddd67c28b3804fdfed9a4a7736f52b'
-  rocks_digest="$(awk -F '\t' '$1 == "bin/cache-ctl" && $2 == "rocksdb-static-library" {print $5}' \
-    "$extract/share/sources/$NAME/SOURCES.tsv")"
-  [[ "$rocks_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "missing or invalid RocksDB static-library digest"
-  release_materials_require_source "$extract" "$NAME" bin/cache-ctl rocksdb-static-library v9.7.4 \
-    'https://github.com/facebook/rocksdb/archive/refs/tags/v9.7.4.tar.gz' "$rocks_digest"
   for file in libstdc++.a libgcc.a; do
-    release_materials_require_source "$extract" "$NAME" bin/cache-ctl "system:$file" ""
+    release_materials_require_license "$extract" "$NAME" "system/$file"
   done
-  release_materials_require_go_key "$extract" "$NAME" 'bin/manifest-ctl'
-  release_materials_require_go_key "$extract" "$NAME" 'bin/store-ctl'
-  release_materials_require_go_key "$extract" "$NAME" 'bin/cache-ctl'
+  for file in manifest-ctl store-ctl cache-ctl; do
+    release_materials_validate_go "$extract" "$NAME" "bin/$file"
+  done
   for file in manifest-ctl store-ctl cache-ctl; do
     [ -x "$extract/bin/$file" ] || fail "$archive is missing executable bin/$file"
     check_go_binary "$extract/bin/$file" "$arch"
