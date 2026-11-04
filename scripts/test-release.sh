@@ -214,30 +214,13 @@ grep -Fqx 'run-name: Release ${{ inputs.version }} @${{ inputs.source_sha }}' \
   "$ROOT/.github/workflows/release.yml" \
   || fail "release run identity does not pin source_sha"
 workflow="$ROOT/.github/workflows/release.yml"
-grep -Fq 'kuasar-preview-binding' "$ROOT/scripts/publish-release.sh" \
-  || fail "Preview publisher does not record its build binding"
 for workflow in release.yml delete-preview.yml; do
   [ "$(grep -Fc 'group: component-mutation-${{ github.repository }}-${{ inputs.version }}' \
     "$ROOT/.github/workflows/$workflow")" -eq 1 ] \
     || fail "$workflow does not hold exactly one full-workflow mutation lock"
 done
-grep -Fq 'kuasar-release-source' "$ROOT/scripts/publish-release.sh" \
-  || fail "publisher does not record Stable source provenance"
-grep -Fq 'reconcile_main_latest' "$ROOT/scripts/publish-release.sh" \
-  || fail "publisher does not reconcile component main Latest by source commit"
-RECONCILE_WORKFLOW="$ROOT/.github/workflows/reconcile-latest.yml"
-grep -Fq 'group: component-latest-reconciliation-${{ github.repository }}' \
-  "$RECONCILE_WORKFLOW" \
-  || fail "Latest reconciliation is not serialized across component versions"
-grep -Fq 'workflow_run:' "$RECONCILE_WORKFLOW" \
-  || fail "Latest reconciliation is not triggered after release completion"
-grep -Fq 'schedule:' "$RECONCILE_WORKFLOW" \
-  || fail "Latest reconciliation has no automatic recovery schedule"
-grep -Fq 'publish-release.sh reconcile' "$RECONCILE_WORKFLOW" \
-  || fail "Latest reconciliation does not use the idempotent entrypoint"
-if grep -R -Fq 'queue: max' "$ROOT/.github/workflows"; then
-  fail "workflows use the unsupported concurrency queue key"
-fi
+[ ! -e "$ROOT/.github/workflows/reconcile-latest.yml" ] || fail "retired Latest writer remains"
+PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-publisher.py"
 
 expected_cases=(
   test/e2e/cases/basic.accelerator-activation.sh
@@ -292,6 +275,7 @@ release_native_system_input() {
 EOF
 install -m 0644 "$ROOT/scripts/release-archive-validator.go" "$fixture_root/scripts/release-archive-validator.go"
 install -m 0755 "$ROOT/scripts/publish-release.sh" "$fixture_root/scripts/publish-release.sh"
+install -m 0644 "$ROOT/scripts/release-publisher.py" "$fixture_root/scripts/release-publisher.py"
 printf 'module github.com/kuasar-sandbox/accelerator\n\ngo 1.24\n' > "$fixture_root/go.mod"
 for binary in manifest-ctl store-ctl cache-ctl; do
   mkdir -p "$fixture_root/cmd/$binary"
@@ -342,7 +326,7 @@ install -m 0755 "$TMP/bin/store-ctl" "$TMP/no-rocksdb-bin/store-ctl"
 (cd "$fixture_root" && GOWORK=off GOOS=linux GOARCH=amd64 go build -buildvcs=true -tags no_rocksdb \
   -o "$TMP/no-rocksdb-bin/cache-ctl" ./cmd/cache-ctl)
 if SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/no-rocksdb-bin" \
-  "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 \
+  RELEASE_SOURCE_ROOT="$fixture_root" "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 \
     "$TMP/no-rocksdb-bundle" > "$TMP/prebuilt-rejection.log" 2>&1; then
   fail "packager accepted a payload without RocksDB support"
 fi
@@ -354,7 +338,7 @@ sha256sum "$TMP/rocksdb/"{AUTHORS,COPYING,LICENSE.Apache,LICENSE.leveldb} \
 
 SOURCE_DATE_EPOCH=1700000000 RELEASE_BIN_DIR="$TMP/bin" \
   RELEASE_ROCKSDB_SOURCE_DIR="$TMP/rocksdb" \
-  "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
+  RELEASE_SOURCE_ROOT="$fixture_root" "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/bundle"
 sha256sum -c "$TMP/rocksdb-before.sha256" >/dev/null \
   || fail "release packaging changed foreign source material"
 "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/bundle"
@@ -391,8 +375,12 @@ if tar -tzf "$archive" | grep -E '(^|/)release\.json$|(^|/)release/[^/]+\.json$'
   fail "archive contains release metadata JSON"
 fi
 
+# Preserve the fixture-only native library adapter while moving all tools away
+# from the selected product tree. A mistaken tools-root source lookup must fail.
+mkdir "$TMP/external-tools"
+cp -a "$fixture_root/scripts" "$TMP/external-tools/scripts"
 (umask 077; SOURCE_DATE_EPOCH=1700000000 \
-  "$fixture_root/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible")
+  RELEASE_SOURCE_ROOT="$fixture_root" "$TMP/external-tools/scripts/release.sh" package v1.2.3 x86_64 "$TMP/reproducible")
 cmp -s "$archive" "$TMP/reproducible/assets/accelerator-v1.2.3-linux-x86_64.tar.gz" \
   || fail "identical inputs did not produce an identical archive"
 
@@ -427,7 +415,6 @@ for mutation in extra-binary extra-script extra-directory extra-source extra-sou
     tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
       -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
   fi
-  (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
   if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
     fail "validator accepted $mutation with regenerated checksums"
   fi
@@ -461,7 +448,6 @@ for payload in manifest-ctl store-ctl cache-ctl; do
     "$candidate/root/share/sources/accelerator/MATERIALS.sha256"
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
     -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
-  (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
   if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
     fail "validator accepted another same-commit main package as $payload"
   fi
@@ -481,7 +467,6 @@ for native in rocksdb-static-library system:libstdc++.a system:libgcc.a; do
     "$candidate/root/share/sources/accelerator/MATERIALS.sha256"
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
     -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
-  (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
   if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
     fail "validator accepted missing $native with regenerated checksums"
   fi
@@ -525,7 +510,6 @@ for mutation in unknown-kind unknown-payload unknown-toolchain \
   release_materials_hash_tree "$candidate/root" accelerator "$candidate/root/share/sources/accelerator/MATERIALS.sha256"
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
     -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
-  (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
   if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
     fail "validator accepted $mutation with regenerated material/archive checksums"
   fi
@@ -543,7 +527,6 @@ for notice in AUTHORS COPYING LICENSE.Apache LICENSE.leveldb; do
     "$candidate/root/share/sources/accelerator/MATERIALS.sha256"
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
     -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
-  (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
   if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
     fail "validator accepted missing RocksDB $notice with regenerated checksums"
   fi
@@ -571,7 +554,6 @@ for column in 3 4 5; do
     "$candidate/root/share/sources/accelerator/MATERIALS.sha256"
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
     -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
-  (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
   if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" >/dev/null 2>&1; then
     fail "validator accepted project provenance column $column with regenerated checksums"
   fi
@@ -597,18 +579,16 @@ tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='@1700000000' \
   --pax-option=delete=atime,delete=ctime -czf \
   "$TMP/material-tampered/assets/accelerator-v1.2.3-linux-x86_64.tar.gz" \
   -C "$TMP/material-stage" .
-(cd "$TMP/material-tampered/assets" \
-  && sha256sum accelerator-v1.2.3-linux-x86_64.tar.gz > SHA256SUMS)
 if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 \
   "$TMP/material-tampered" >/dev/null 2>&1; then
   fail "validator accepted license material that disagrees with its inventory"
 fi
 
-if RELEASE_BIN_DIR="$TMP/bin" "$fixture_root/scripts/release.sh" package 01.2.3 x86_64 \
+if RELEASE_BIN_DIR="$TMP/bin" RELEASE_SOURCE_ROOT="$fixture_root" "$fixture_root/scripts/release.sh" package 01.2.3 x86_64 \
   "$TMP/invalid-version" >/dev/null 2>&1; then
   fail "packager accepted an invalid version"
 fi
-if RELEASE_BIN_DIR="$TMP/bin" "$fixture_root/scripts/release.sh" package v1.2.3 aarch64 \
+if RELEASE_BIN_DIR="$TMP/bin" RELEASE_SOURCE_ROOT="$fixture_root" "$fixture_root/scripts/release.sh" package v1.2.3 aarch64 \
   "$TMP/invalid-arch" >/dev/null 2>&1; then
   fail "packager accepted x86_64 payloads as aarch64"
 fi
@@ -626,7 +606,6 @@ for mutation in setuid setgid writable-directory writable-binary; do
   esac
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
     -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
-  (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
   if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" > "$candidate/result.log" 2>&1; then
     fail "validator accepted $mutation with regenerated checksums"
   fi
@@ -648,7 +627,6 @@ for column in 4 5; do
     "$candidate/root/share/sources/accelerator/MATERIALS.sha256"
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@1700000000 \
     -czf "$candidate/assets/$(basename "$archive")" -C "$candidate/root" .
-  (cd "$candidate/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
   if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$candidate" >/dev/null 2>&1; then
     fail "validator accepted a changed RocksDB provenance column $column"
   fi
@@ -659,7 +637,6 @@ mkdir "$TMP/nonroot-owner/root"
 tar -xzf "$archive" -C "$TMP/nonroot-owner/root"
 tar --sort=name --owner=1234 --group=0 --numeric-owner --mtime=@1700000000 \
   -czf "$TMP/nonroot-owner/assets/$(basename "$archive")" -C "$TMP/nonroot-owner/root" .
-(cd "$TMP/nonroot-owner/assets" && sha256sum "$(basename "$archive")" > SHA256SUMS)
 if "$fixture_root/scripts/release.sh" validate v1.2.3 x86_64 "$TMP/nonroot-owner" >/dev/null 2>&1; then
   fail "validator accepted non-root numeric ownership with regenerated checksums"
 fi

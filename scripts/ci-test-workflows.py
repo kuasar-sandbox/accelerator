@@ -107,7 +107,7 @@ def check(platform):
     shared["check"]()
     subprocess.run([sys.executable, str(platform / "ci/hosted/test-bootstrap.py")], check=True)
     workflows = {}
-    for filename in ("release.yml", "delete-preview.yml", "reconcile-latest.yml"):
+    for filename in ("release.yml", "delete-preview.yml"):
         document = yaml.safe_load((ROOT / ".github/workflows" / filename).read_text())
         workflows[filename] = document
         assert document["permissions"] == {"contents": "read"}
@@ -122,7 +122,7 @@ def check(platform):
             permissions = job.get("permissions", document["permissions"])
             assert permissions == ({"actions": "read", "contents": "write"} if name == "publish" else
                                    {"actions": "write", "contents": "read"} if name == "cleanup" else
-                                   {"contents": "write"} if name in ("delete", "reconcile") else {"contents": "read"})
+                                   {"contents": "write"} if name in ("delete",) else {"contents": "read"})
             for step in job["steps"]:
                 assert "create-github-app-token" not in step.get("uses", "")
                 assert "actions/cache@" not in step.get("uses", "")
@@ -185,8 +185,8 @@ def check(platform):
     assert names.index("Build, test and package accelerator") < names.index("Check the released accelerator ABI") < names.index("Upload validated release bundle")
     package = step["with"]["run"]
     assert '[ "$(git rev-parse HEAD)" = "${{ needs.preflight.outputs.source_sha }}" ]' in package
-    assert 'bash scripts/release.sh package "$VERSION" "$TARGET_ARCH" release-bundle' in package
-    assert 'bash scripts/release.sh validate "$VERSION" "$TARGET_ARCH" release-bundle' in package
+    assert 'RELEASE_SOURCE_ROOT="$PWD" bash /inputs/release/.ci/component-packaging/scripts/release.sh package "$VERSION" "$TARGET_ARCH" release-bundle' in package
+    assert 'RELEASE_SOURCE_ROOT="$PWD" bash /inputs/release/.ci/component-packaging/scripts/release.sh validate "$VERSION" "$TARGET_ARCH" release-bundle' in package
     upload = build["Upload validated release bundle"]["with"]
     assert "matrix.arch" in upload["name"] and upload["path"] == "src/accelerator/release-bundle"
     assert upload["retention-days"] == 1 and upload["if-no-files-found"] == "error"
@@ -239,9 +239,11 @@ def check_build_shell(steps):
                        '"rev-parse HEAD") printf "%s\\n" "$GIT_SHA" ;;\n'
                        '"show -s --format=%ct "*) echo 12345 ;;\n*) exit 90 ;;\nesac\n')
         git.chmod(0o755)
-        (source / "scripts").mkdir()
-        (source / "scripts/release.sh").write_text(
-            'set -eu\n[ "$SOURCE_DATE_EPOCH" = 12345 ]\n'
+        framework = root / "framework"
+        packer = framework / ".ci/component-packaging/scripts/release.sh"
+        packer.parent.mkdir(parents=True)
+        packer.write_text(
+            'set -eu\n[ "$RELEASE_SOURCE_ROOT" = "$PWD" ]\n[ "$SOURCE_DATE_EPOCH" = 12345 ]\n'
             '[ "$(cat "$CACHE_LOG.state")" = "$TARGET_ARCH" ]\n'
             'printf "%s\\n" "$1" >> "$RELEASE_LOG"\n'
             'if [ "$1" = "${FAIL_RELEASE:-}" ]; then\n'
