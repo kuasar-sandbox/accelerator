@@ -146,6 +146,13 @@ jobs:
       - name: Check CI regression contracts
         if: matrix.arch == 'x86_64'
         run: python3 trusted/accelerator/scripts/ci-test-workflows.py trusted/platform
+      - name: Stage current packaging tools outside selected product sources
+        run: |
+          set -euo pipefail
+          destination=trusted/platform/.ci/component-packaging
+          test ! -e "$destination"
+          mkdir -p "$destination"
+          git -C trusted/accelerator archive --format=tar HEAD scripts | tar -xf - -C "$destination"
       - name: Build, test and package accelerator
         uses: ./trusted/platform/.github/actions/workbench
         with:
@@ -170,8 +177,8 @@ jobs:
             [ "$(git rev-parse HEAD)" = "${{ needs.preflight.outputs.source_sha }}" ]
             export SOURCE_DATE_EPOCH
             SOURCE_DATE_EPOCH=$(git show -s --format=%ct "${{ needs.preflight.outputs.source_sha }}")
-            bash scripts/release.sh package "$VERSION" "$TARGET_ARCH" release-bundle
-            bash scripts/release.sh validate "$VERSION" "$TARGET_ARCH" release-bundle
+            RELEASE_SOURCE_ROOT="$PWD" bash /inputs/release/.ci/component-packaging/scripts/release.sh package "$VERSION" "$TARGET_ARCH" release-bundle
+            RELEASE_SOURCE_ROOT="$PWD" bash /inputs/release/.ci/component-packaging/scripts/release.sh validate "$VERSION" "$TARGET_ARCH" release-bundle
       - name: Check the released accelerator ABI
         run: python3 trusted/accelerator/scripts/ci-check-abi.py "src/accelerator/bin/$TARGET_ARCH"
       - name: Upload validated release bundle
@@ -191,6 +198,10 @@ jobs:
           - arch: aarch64
             runner: ubuntu-24.04-arm
   publish:
+    concurrency:
+      group: component-publication-${{ github.repository }}
+      queue: max
+      cancel-in-progress: false
     needs:
       - preflight
       - build
