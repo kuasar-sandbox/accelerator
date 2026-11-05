@@ -202,6 +202,12 @@ func (w *generationStoreWriter) Put(ctx context.Context, admission store.WriteAd
 
 func (w *generationStoreWriter) PoolSize() int { return w.client.PoolSize() }
 
+func (w *generationStoreWriter) DedupIndexEndpoint() string { return w.client.DedupIndexEndpoint() }
+
+func (w *generationStoreWriter) ValidateDedupIndexMarker(ctx context.Context, marker store.ContentKey) (bool, error) {
+	return w.client.ValidateDedupIndexMarker(ctx, marker)
+}
+
 // NewIngesterWithWriter wires Chunker + Crypto to a caller-owned writer. It is
 // used by local containers such as Manifest Bundles; writer lifetime and
 // admission acquisition remain the caller's responsibility.

@@ -58,17 +58,36 @@ func (e *AESChunkEncryptor) EncryptChunk(
 	if len(plaintext) > MaxChunkDecodedSize {
 		return nil, zero, zero, fmt.Errorf("%w: %d > %d", ErrChunkTooLarge, len(plaintext), MaxChunkDecodedSize)
 	}
+	key := DeriveKey(salt, plaintext)
+	object, hash, err := e.EncryptChunkWithKey(ctx, key, plaintext)
+	return object, hash, key, err
+}
+
+// EncryptChunkWithKey uses a pre-derived convergent key while preserving the
+// canonical Snappy/AES-CTR object format.
+func (e *AESChunkEncryptor) EncryptChunkWithKey(
+	ctx context.Context,
+	key [32]byte,
+	plaintext []byte,
+) ([]byte, [32]byte, error) {
+	var zero [32]byte
+	if err := ctx.Err(); err != nil {
+		return nil, zero, err
+	}
+	if len(plaintext) > MaxChunkDecodedSize {
+		return nil, zero, fmt.Errorf("%w: %d > %d", ErrChunkTooLarge, len(plaintext), MaxChunkDecodedSize)
+	}
 	maxEncoded := snappy.MaxEncodedLen(len(plaintext))
 	if maxEncoded < 0 {
-		return nil, zero, zero, fmt.Errorf("crypto: snappy max encoded length for %d", len(plaintext))
+		return nil, zero, fmt.Errorf("crypto: snappy max encoded length for %d", len(plaintext))
 	}
 	lease, err := e.encScratch().acquire(ctx, maxEncoded)
 	if err != nil {
-		return nil, zero, zero, fmt.Errorf("crypto: acquire encode scratch: %w", err)
+		return nil, zero, fmt.Errorf("crypto: acquire encode scratch: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		lease.release()
-		return nil, zero, zero, err
+		return nil, zero, err
 	}
 	// golang/snappy requires len(dst), rather than only cap(dst), to cover
 	// MaxEncodedLen. Passing the complete lease prevents a fallback allocation
@@ -77,26 +96,26 @@ func (e *AESChunkEncryptor) EncryptChunk(
 	if err != nil {
 		lease.markTouched(cap(lease.buf))
 		lease.release()
-		return nil, zero, zero, fmt.Errorf("crypto: Snappy encode: %w", err)
+		return nil, zero, fmt.Errorf("crypto: Snappy encode: %w", err)
 	}
 	if len(encoded) > maxEncoded || (len(encoded) > 0 && &encoded[0] != &lease.buf[0]) {
 		lease.markTouched(cap(lease.buf))
 		lease.release()
-		return nil, zero, zero, fmt.Errorf("crypto: Snappy encoder did not reuse bounded scratch: encoded=%d max=%d", len(encoded), maxEncoded)
+		return nil, zero, fmt.Errorf("crypto: Snappy encoder did not reuse bounded scratch: encoded=%d max=%d", len(encoded), maxEncoded)
 	}
 	lease.markTouched(len(encoded))
 	decodedLen, err := snappy.DecodedLen(encoded)
 	if err != nil {
 		lease.release()
-		return nil, zero, zero, fmt.Errorf("crypto: invalid Snappy encoder output length: %w", err)
+		return nil, zero, fmt.Errorf("crypto: invalid Snappy encoder output length: %w", err)
 	}
 	if decodedLen != len(plaintext) {
 		lease.release()
-		return nil, zero, zero, fmt.Errorf("crypto: invalid Snappy encoder output: encoded=%d decoded=%d, want %d", len(encoded), decodedLen, len(plaintext))
+		return nil, zero, fmt.Errorf("crypto: invalid Snappy encoder output: encoded=%d decoded=%d, want %d", len(encoded), decodedLen, len(plaintext))
 	}
 	if err := ctx.Err(); err != nil {
 		lease.release()
-		return nil, zero, zero, err
+		return nil, zero, err
 	}
 
 	format := ChunkFormatAESRaw
@@ -106,11 +125,10 @@ func (e *AESChunkEncryptor) EncryptChunk(
 		payload = encoded
 	}
 
-	key := DeriveKey(salt, plaintext)
 	block, err := aes.NewCipher(key[:])
 	if err != nil {
 		lease.release()
-		return nil, zero, zero, fmt.Errorf("crypto: aes.NewCipher: %w", err)
+		return nil, zero, fmt.Errorf("crypto: aes.NewCipher: %w", err)
 	}
 	object := make([]byte, 1+len(payload))
 	object[0] = format
@@ -119,7 +137,7 @@ func (e *AESChunkEncryptor) EncryptChunk(
 	lease.release()
 
 	hash := sha256.Sum256(object)
-	return object, hash, key, nil
+	return object, hash, nil
 }
 
 func encodeSnappyBlock(dst, src []byte) (encoded []byte, err error) {

@@ -66,6 +66,28 @@ func TestChunkCodecRawAndSnappyRoundTrip(t *testing.T) {
 	}
 }
 
+func TestEncryptChunkWithKeyMatchesEncryptChunk(t *testing.T) {
+	var salt [32]byte
+	copy(salt[:], "pre-derived-key-test")
+	codec := &AESChunkEncryptor{}
+	for _, plain := range [][]byte{
+		deterministicNoise(32 << 10),
+		bytes.Repeat([]byte("compressible chunk"), 1<<12),
+	} {
+		object, hash, key, err := codec.EncryptChunk(context.Background(), salt, plain)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keyedObject, keyedHash, err := codec.EncryptChunkWithKey(context.Background(), key, plain)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(keyedObject, object) || keyedHash != hash {
+			t.Fatal("pre-derived key produced a different chunk object")
+		}
+	}
+}
+
 func TestCanonicalChunkGoldenVectors(t *testing.T) {
 	var salt [32]byte
 	for i := range salt {
