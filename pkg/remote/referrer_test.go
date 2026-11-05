@@ -217,7 +217,7 @@ func TestReferrerConversionPolicyMissAndWriteback(t *testing.T) {
 		t.Fatal(err)
 	}
 	oldID := strings.Repeat("1", 64)
-	for _, policy := range []string{"", "legacy-erofs-v0"} {
+	for _, policy := range []string{"", "legacy-erofs-v0", "umoci-go-erofs-no-xattr-v2"} {
 		anns := map[string]string{AnnOwner: owner, AnnID: oldID, AnnValidAt: time.Now().UTC().Add(-time.Second).Format(time.RFC3339Nano)}
 		if policy != "" {
 			anns[AnnConversion] = policy

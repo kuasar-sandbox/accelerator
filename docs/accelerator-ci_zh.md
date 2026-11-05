@@ -111,8 +111,14 @@ Builder Guest/执行资源仍是外层内存边界；独立调用方必须自行
 固定跨架构 golden 包含 tarstream 格式变更引入的 presence 载体。
 
 payload 记录按来源首次出现顺序写入既有 KERPLAN v1 文件，不创建完整数据 blob
-或 raw 中间文件。转换 lookup/writeback 使用 `umoci-go-erofs-no-xattr-v1`；旧转换
-结果视作 miss，显式指定的旧工件仍可读取。
+或 raw 中间文件。转换 lookup/writeback 使用 `umoci-go-erofs-no-xattr-v1`。层条目按
+umoci `CleanPath` 规范化为根相对路径后再计费，并跳过指向解包根目录的条目，
+根条目处理与 containerd/Moby 一致。原始 `..` 路径段遵循 umoci 的根内规范化，
+不再单独拒绝；链接目标仍由 umoci 处理。镜像层输出根目录固定为 `0755`、UID/GID `0:0`，不受构建进程的 umask、身份或父目录
+setgid 继承影响；目录来源输出保留其源根目录元数据。本次兼容性修复保留 v1，
+既有 v1 转换缓存仍可复用，不会为了规范化根目录元数据而重新生成。缺失或不同的
+政策值视作 miss；显式指定的旧工件和压缩层缓存仍可使用。Builder 与 Guest 必须
+选择相同的转换政策。
 
 最后一行包含显式启用的真实挂载测试。普通用户编译测试程序，再在新的私有 mount
 namespace 中以挂载权限仅运行这些用例。将 `TMPDIR` 设为私有测试目录，
