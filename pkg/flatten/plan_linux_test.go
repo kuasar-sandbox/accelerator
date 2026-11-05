@@ -66,7 +66,7 @@ func makePlanFixture(t *testing.T, empty bool) (*erofsPlan, string, string, stri
 		t.Fatal(err)
 	}
 	layout, name := filepath.Join(work, "layout"), filepath.Join(work, "plan")
-	if err = buildGoPlan(context.Background(), selection, layout, name, l); err != nil {
+	if err = buildGoPlan(context.Background(), selection, layout, name, l, nil); err != nil {
 		t.Fatal(err)
 	}
 	p, err := openPlan(context.Background(), root, layout, name, l)

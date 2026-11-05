@@ -67,13 +67,12 @@ func unpackLayer(ctx context.Context, r io.Reader, root string, budget int64) er
 		if err != nil {
 			return fmt.Errorf("flatten: tar header: %w", err)
 		}
-		if err := layerPath(hdr.Name); err != nil {
-			return err
-		}
-		if hdr.Typeflag == tar.TypeLink {
-			if err := layerPath(hdr.Linkname); err != nil {
-				return err
-			}
+		// Use umoci's lexical normalization before root filtering and accounting.
+		// Relative names make the budget's ancestor walk terminate at ".".
+		// UnpackEntry scopes symlinks and hardlinks to the image root.
+		hdr.Name = strings.TrimPrefix(layer.CleanPath(hdr.Name), "/")
+		if hdr.Name == "" || hdr.Name == "." {
+			continue
 		}
 		if limited {
 			// Charge every entry and ancestor, including duplicates. This is a
@@ -98,18 +97,6 @@ func unpackLayer(ctx context.Context, r io.Reader, root string, budget int64) er
 			return err
 		}
 	}
-}
-
-func layerPath(name string) error {
-	if name == "" || len(name) > 4096 || strings.HasPrefix(name, "/") || strings.IndexByte(name, 0) >= 0 {
-		return fmt.Errorf("flatten: invalid layer path %q", name)
-	}
-	for _, part := range strings.Split(name, "/") {
-		if part == ".." {
-			return fmt.Errorf("flatten: parent traversal in layer path %q", name)
-		}
-	}
-	return nil
 }
 
 func checkLayerXattrs(root string, hdr *tar.Header) error {

@@ -126,6 +126,7 @@ type goPlanner struct {
 	limits                                       PlanLimits
 	memory                                       planningMemory
 	builder                                      *erofs.LayoutBuilder
+	rootNode                                     *erofs.Node
 	parents                                      [2049]erofs.NodeID // paths are limited to 4096 bytes by selection
 	depth                                        int
 	root                                         *os.Root
@@ -140,7 +141,7 @@ type goPlanner struct {
 	records, sourceCount, sourceBytes, planBytes uint64
 }
 
-func buildGoPlan(ctx context.Context, selection *sourceSelection, layoutPath, name string, limits PlanLimits) (retErr error) {
+func buildGoPlan(ctx context.Context, selection *sourceSelection, layoutPath, name string, limits PlanLimits, rootNode *erofs.Node) (retErr error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -153,7 +154,7 @@ func buildGoPlan(ctx context.Context, selection *sourceSelection, layoutPath, na
 	if limits.PlanBytes < planHeaderSize {
 		return fmt.Errorf("flatten: plan byte budget exceeded")
 	}
-	g := &goPlanner{ctx: ctx, selection: selection, limits: limits, planBytes: planHeaderSize, memory: memory}
+	g := &goPlanner{ctx: ctx, selection: selection, limits: limits, planBytes: planHeaderSize, memory: memory, rootNode: rootNode}
 	g.buffer = make([]byte, planReadBatch)
 	// Bound hashing CPU pressure as well as buffer memory.
 	g.hashWorkers = min(2, runtime.GOMAXPROCS(0))
@@ -304,6 +305,9 @@ func (g *goPlanner) visit(rel string, st *unix.Stat_t, leave bool) error {
 	}
 	n := nodeMetadata(st)
 	if rel == "." {
+		if g.rootNode != nil {
+			n = *g.rootNode
+		}
 		var err error
 		g.builder, err = erofs.NewLayoutBuilder(n, erofs.LayoutOptions{BlockSize: planBlockSize, MemoryLimit: g.limits.NativeMemoryBytes - g.memory.limit, MetadataLimit: g.limits.PlanBytes})
 		g.depth = 1

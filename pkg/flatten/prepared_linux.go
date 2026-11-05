@@ -15,6 +15,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tailzip"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	erofs "github.com/kuasar-sandbox/go-erofs"
 )
 
 // PreparedImage retains the stable source, layout and open plan files until
@@ -111,7 +112,7 @@ func PrepareDir(ctx context.Context, root string, opts Options, dopts DirOptions
 			dopts.Warnf("flatten: excluding source path %s", p)
 		}
 	}
-	return prepareSelected(ctx, work, selection, cfg, opts, limits)
+	return prepareSelected(ctx, work, selection, cfg, opts, limits, nil)
 }
 
 // PrepareImage verifies and applies each complete layer into one private rootfs.
@@ -161,6 +162,11 @@ func prepareLayers(ctx context.Context, config []byte, count int, opts Options, 
 	if err = os.Mkdir(root, 0755); err != nil {
 		return nil, err
 	}
+	// Root headers are ignored, so establish the root mode independently of
+	// the caller's umask and inherited setgid bit. Retain staging ownership.
+	if err = os.Chmod(root, 0755); err != nil {
+		return nil, err
+	}
 	for i := 0; i < count; i++ {
 		if opts.Progress != nil {
 			opts.Progress("apply-layers", i+1, count)
@@ -178,15 +184,18 @@ func prepareLayers(ctx context.Context, config []byte, count int, opts Options, 
 	if err != nil {
 		return nil, err
 	}
-	return prepareSelected(ctx, work, selection, cfg, opts, limits)
+	// The image sees container root, not the builder's host UID/GID. Directory
+	// inputs instead retain their source metadata by passing no override.
+	rootNode := &erofs.Node{Mode: os.ModeDir | 0755, UID: 0, GID: 0}
+	return prepareSelected(ctx, work, selection, cfg, opts, limits, rootNode)
 }
 
-func prepareSelected(ctx context.Context, work string, selection *sourceSelection, cfg *image.RuntimeConfig, opts Options, limits PlanLimits) (_ *PreparedImage, retErr error) {
+func prepareSelected(ctx context.Context, work string, selection *sourceSelection, cfg *image.RuntimeConfig, opts Options, limits PlanLimits, rootNode *erofs.Node) (_ *PreparedImage, retErr error) {
 	layout, name := filepath.Join(work, "layout"), filepath.Join(work, "plan")
 	if opts.Progress != nil {
 		opts.Progress("build-erofs", 0, 0)
 	}
-	if err := buildGoPlan(ctx, selection, layout, name, limits); err != nil {
+	if err := buildGoPlan(ctx, selection, layout, name, limits, rootNode); err != nil {
 		return nil, err
 	}
 	// Planning has returned and released its indexes. No data emission overlaps

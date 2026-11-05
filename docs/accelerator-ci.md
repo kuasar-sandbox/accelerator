@@ -131,8 +131,18 @@ includes the presence carrier introduced by the tarstream format change.
 
 All payload records remain in first-seen source order and are streamed to the
 existing KERPLAN v1 files. No full payload blob or raw intermediate is created.
-Conversion lookup and writeback use `umoci-go-erofs-no-xattr-v1`; older conversion
-results miss, while explicitly selected old artifacts remain readable.
+Conversion lookup and writeback use `umoci-go-erofs-no-xattr-v1`. Layer entry names
+use umoci `CleanPath`, become root-relative before metadata accounting, and
+entries naming the extraction root are skipped, matching containerd/Moby root
+handling. Raw `..` components follow umoci normalization within the image root
+instead of a separate rejection rule; link targets remain under umoci handling.
+Image-layer output uses root mode `0755` and UID/GID `0:0`,
+independently of the builder umask, identity or inherited setgid directories.
+Directory-source output retains its source root metadata. The compatibility fix
+retains v1: existing v1 conversion results remain reusable and are not regenerated
+to normalize root metadata. Missing or different policy values miss; explicitly
+selected old artifacts and the compressed-layer cache remain usable. Builder and
+Guest must select the same conversion policy.
 
 The last row includes opt-in real mount tests. Compile the test executable as an
 ordinary user, then run only those cases with mount privilege in a new private
