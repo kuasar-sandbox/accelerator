@@ -1,4 +1,4 @@
-[English](README.md) | [简体中文](README_zh.md)
+[English](#accelerator-product-e2e-cases) | [简体中文](README_zh.md)
 
 # Accelerator product E2E cases
 

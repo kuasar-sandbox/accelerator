@@ -37,7 +37,7 @@
 | `pkg/tarstream` | 携带身份及完整性元数据的本地稀疏传输工件 |
 | `pkg/flatten`、`pkg/image`、`pkg/remote`、`pkg/tar` | OCI/目录拉取、镜像配置与 EROFS 展平基础能力 |
 
-重服务端后端保留在组件二进制和 server package 后面。稀疏 Run/Stream、chunk-window 与本地 tarstream 的详细契约归属于 [Manifest §4.8](docs/manifest_zh.md#48-读路径细节)及[文件工件](docs/file-artifacts_zh.md),README 不另建一套协议。
+重服务端后端保留在组件二进制和 server package 后面。稀疏 Run/Stream、chunk-window 与本地 tarstream 的详细契约归属于 [Manifest 稀疏读路径](docs/artifacts_zh.md#读路径细节)及[文件工件](docs/artifacts_zh.md),README 不另建一套协议。
 
 ## 二进制
 
@@ -55,30 +55,17 @@
 
 内容加密不意味着任何威胁模型下都不泄露元数据,也不意味着所有租户私有数据都应全局去重。部署应根据数据分类与信任边界选择共享域。直接本地或共享文件路径也可应用项目定义的本地工件保护策略。
 
-## 构建与测试
+## 按完整任务或契约阅读
 
-构建使用环境提供的 Go，并继承 `GOROOT`、`GOTOOLCHAIN` 等工具链选择；发布自动化需要环境在 `PATH` 中提供支持 `api --slurp` 的 `gh`。项目不下载、替换或按固定二进制摘要认证这些环境工具。
+| 需要完成的任务 | 权威指南 |
+| --- | --- |
+| 导入、取回、检查、变换或比较工件 | [传输](docs/transfer_zh.md)：完整本地 Store 往返与精确 manifest-ctl 参数 |
+| 实现稀疏 reader/writer，或解释引用与载体 | [数据契约](docs/artifacts_zh.md)：稀疏模型、身份、Chunk/Manifest、加密、tarstream 与 Bundle |
+| 部署或嵌入权威持久服务 | [Store](docs/store_zh.md)：FS/S3、generation、可见性、管理与 App 生命周期 |
+| 部署/嵌入加速层，诊断 miss 与恢复 | [Cache](docs/cache_zh.md)：tier、sharding/EC、RocksDB/Redis 后端与 App 生命周期 |
+| 通过共享库制备 OCI、归档或目录镜像 | [镜像制备](docs/image-preparation_zh.md)：生命周期、镜像 payload、布局与发布 |
 
-```bash
-make manifest-ctl store-ctl     # 纯 Go 命令行服务
-make cache-ctl                  # 缓存服务及当前后端依赖
-make cache-ctl NO_ROCKSDB=1     # 不带 RocksDB (-tags no_rocksdb, CGO_ENABLED=0)
-make build                      # 全部组件二进制
-make build TARGET_ARCH=aarch64  # 交叉编译;接受 amd64/arm64 别名
-make vet                        # 检查面向下游的薄 Go 导出面
-make test                       # 单元、后端及 source/helper 回归
-make test-e2e-scripts           # 离线 E2E fixture/helper 回归，不是产品 E2E
-```
-
-产品 E2E 由平台统一的 prepared-workspace runner 对预构建制品执行；组件不再提供独立 owner `run_all.sh` 或 `make test-e2e` 入口。`prepare -> <suite>.<case>.sh -> run` 契约及 accelerator 用例前置条件见 [`test/e2e/README_zh.md`](test/e2e/README_zh.md)。
-
-源码构建需要 Go 1.26.1 或更新版本，原生前置依赖随构建目标而异。当前源码通过仓库脚本说明并构建所需原生缓存依赖。真实对象存储测试必须使用显式测试凭据或本地 S3-compatible 服务;普通单元测试与本地文件系统测试不应要求生产云凭据。
-
-`cache-ctl` 通常使用 CGO 以及 `deps/build-rocksdb.sh` 在本地构建的静态 `librocksdb.a`;`manifest-ctl`、`store-ctl` 与下游 import 面不需要 RocksDB。`make release VERSION=vX.Y.Z` 生成并检查本地发行 bundle;官方缓存载荷必须保留 RocksDB 支持。
-
-### 私网与离线构建
-
-EROFS 规划器依赖外部模块 `github.com/kuasar-sandbox/go-erofs`。离线构建前，应将 `go.mod` 选定的精确版本（包括适用时的伪版本）镜像或预先缓存，并按 `go.sum` 校验。可将 `GOPROXY` 指向部署镜像并使用对应 checksum database 策略，或使用已填充、经过验证的 module cache。无需检出 go-erofs 源码或配置本地替换。兄弟仓协调开发可使用[项目工作区](https://github.com/kuasar-sandbox/kuasar-sandbox)，但它不是本组件独立构建的前提。
+[flatten-ctl 操作](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten-cli_zh.md)归发布该程序的 guest-runtime。每篇均有完整英文版，可通过语言选择器切换。
 
 ## 独立运行
 
@@ -91,64 +78,21 @@ EROFS 规划器依赖外部模块 `github.com/kuasar-sandbox/go-erofs`。离线�
 
 配置示例使用本地路径、文档保留 endpoint 和占位凭据。生产部署应使用受保护的 endpoint、显式资源预算、持久的权威存储,以及适合所选缓存拓扑的可观测性。
 
-## 发行模型
+## 构建并验证修改
 
-Preview 清理忽略历史 `SHA256SUMS` 和正文记录。完整性按精确包名、原生资产 ID、大小、摘要与上传状态判断；历史单 x86_64 包和完整双架构包均受保护，缺失或歧义元数据保留并报错。删除前复核实际 Tag 与 Release，部分删除可重试；只有明确 404 视为不存在。保留范围与期限由项目发行清理规则决定。
+在满足文档所述 Go/Native 前置条件的 Accelerator checkout 中运行：
 
-所选 owner 源码在 `release/helper-inputs.json` 显式声明编译型 E2E helper 清单。当前清单为空。后续 helper 及其构建配方由此 owner 声明维护，聚合打包自动发现，无需平台文件名清单。
+```bash
+make manifest-ctl store-ctl
+make cache-ctl
+make test
+```
 
-发行测试需要匹配的原生 EROFS Plan 能力。预检仅一次准入同一发行线上的
-`guest-runtime` 源码分支，并记录精确提交。现有固定输入传输将该源码树交给
-两个架构的构建任务；它们使用原生 EROFS 配方和缓存，在测试前检查 Plan 能力。
-这是测试工具的源码依赖；组件构建无需已发布的 Runtime 二进制，Runtime
-发布仍消费所选 accelerator 发行版。
+工具链前置、交叉/离线构建、no-RocksDB 选项、ABI/Native 检查、镜像夹具、包验证与完整 prepared E2E 命令见[贡献指南](CONTRIBUTING_zh.md#构建与测试)。单元或夹具通过不构成真实云或 VM 覆盖。
 
-使用组件 Makefile 从选定源码构建。`release.sh package` 使用匹配的
-`bin/<arch>` 二进制,或显式指定的 `RELEASE_BIN_DIR`;只收集材料并生成 bundle,
-不重新构建二进制,不重置源码或构建缓存。所选源码 checkout、依赖版本、原生
-构建记录与产物应一并保留。
+## 选择已发行产品
 
-打包记录实际 Go 版本和生效的 module 替换。Go/module LICENSE、NOTICE 取自所选
-编译器安装和匹配的 module 源码,保留嵌套路径。模块解析沿用正常 Go 缓存与路由,
-下载模块的校验和须匹配二进制记录。组织命名空间本身不豁免模块的声明收集。
-本组件没有内部兄弟组件依赖。官方包中不受支持的本地替换需要改用带版本的
-module 输入。
-
-许可证和声明放在 `share/licenses/<component>`。声明缺失、目录不可读或遍历不完整时收集失败。包验证检查必需文件、载荷身份及归档路径、类型和权限。下载使用 GitHub 原生资产大小和摘要。新包和 Release 不携带来源或历史测试记录、独立 `SHA256SUMS`、来源/Preview 标记。发布者使用人类说明，检查本次构建输出，并拒绝覆盖同名不同内容资产。
-
-官方包要求三个 Linux 命令二进制匹配所选原生架构（x86_64 对应 amd64，aarch64 对应
-arm64），并分别具有自身的 Accelerator main-package
-身份;`cache-ctl` 必须包含 RocksDB。五个交付运维脚本取自所选源码树。
-解包前拒绝额外/重复载荷、链接、错误属主或权限,以及其他组件的材料命名空间。
-
-正常 cache 构建保留 `build/<arch>/cache-ctl.map`。打包读取该链接映射及匹配的
-RocksDB 静态库/源码树;显式提供时使用 `RELEASE_ROCKSDB_SOURCE_DIR`。
-记录实际 RocksDB、libstdc++、libgcc 等链接输入的摘要及 Debian/RPM 源包版本,
-从对应包复制版权、许可、NOTICE 和引用的公共许可正文,不按包数据库摘要认证
-已安装文件字节。RocksDB 材料必须包含 `AUTHORS`、`COPYING`、
-`LICENSE.Apache`、`LICENSE.leveldb`。不同原生输入不能以相同材料名称相互覆盖;
-RPM 收集要求完整枚举同源兄弟包。这些材料支持发行检视,不构成法律认证,
-也不改变 RocksDB 后端或持久化策略。
-
-本仓独立发布 `vX.Y.Z` 组件版本。已发布原生架构的组件归档包含三个服务二进制及发行合同选定的运维/性能辅助脚本。聚合 platform 包按显式文档/测试选择携带用户指南与规范 E2E 运行输入，内部设计文档和源码专用测试保留在源码仓。
-
-项目主仓独立发布 `release-vX.Y.Z` 聚合版本,选择 `accelerator` 和其他发行单元的精确版本,验证资产并执行跨组件测试。聚合与组件版本号相互独立。
-
-发布分支、Preview、Latest 协调及并发/取消处理以[项目发行文档](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release_zh.md)为准;普通使用可从[最新 Stable 聚合渠道](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest)进入。
-
-## 文档
-
-Manifest、Store 和 Cache 提供完整英中版本。既有英文后端指南仍可使用:
-
-- [Manifest - 英文](docs/manifest.md) / [中文](docs/manifest_zh.md) - 稀疏 Manifest、ingest/fetch、分块、加密、密钥表和公共 SDK;
-- [文件工件与载体](docs/file-artifacts_zh.md) - 不可变 tarstream 加密、Bundle 布局、访问及发布;
-- [Store - 英文](docs/store.md) / [中文](docs/store_zh.md) - 文件系统与 S3-compatible store、代保留、完整性和显式 purge(不是可达性 GC);
-- [Cache - 英文](docs/cache.md) / [中文](docs/cache_zh.md) - 本地、分片、分层与纠删码缓存;
-- [`docs/cache-redis.md`(英文)](docs/cache-redis.md) - Redis-compatible UDS/TCP 后端与外部服务部署示例。
-
-OCI/目录到 EROFS 的 CLI 用法归属于 [`guest-runtime`](https://github.com/kuasar-sandbox/guest-runtime),因为 `flatten-ctl` 属于 Runtime 发行单元。
-
-README 提供组件公开入口;完整设计指南定义格式、运行限制、失败行为和测量要求。
+本组件发布 `vX.Y.Z`，聚合 `release-vX.Y.Z` 精确选择独立组件 Tag。经验证的组合从 [Stable 聚合渠道](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest)选择。精确工件清单、Native 材料收集与打包检查见[组件发行准备](CONTRIBUTING_zh.md#构建与打包组件发行版)。共享 Preview 保留/清理、Latest 对齐和发行线规则由[项目发行契约](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release_zh.md)统一定义。
 
 ## 项目边界
 

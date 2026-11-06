@@ -1,10 +1,334 @@
-[English](file-artifacts.md) | [简体中文](file-artifacts_zh.md)
+[English](artifacts.md) | [简体中文](artifacts_zh.md)
 
-# 文件工件与载体
+# 数据对象、引用与不可变载体
 
-本篇定义通用不可变文件加密、tarstream 与多 Manifest Bundle 契约。[manifest_zh.md](manifest_zh.md) 定义逻辑 Manifest/Chunk 对象与密钥，[store_zh.md](store_zh.md) 定义持久化和准入。本篇不定义 Sandbox E/S 内容或 OCI/EROFS 镜像语义；对应消费者按自身 [Sandbox 工件](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/sandbox_zh.md#artifact-model) 和 [镜像](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten_zh.md) 契约使用这些载体。
+本篇是 Accelerator reader、writer 与下游消费者共同遵守的数据契约，定义稀疏逻辑字节、引用、Chunk/Manifest 对象、身份和物理载体。完整命令与流程见[数据传输](transfer_zh.md)，admission 与持久性见 [Store](store_zh.md)，OCI/EROFS payload 语义见[镜像制备](image-preparation_zh.md)。
 
-## 1. 不可变本地 tarstream 与加密
+本篇定义通用不可变文件加密、tarstream 与多 Manifest Bundle 契约。[manifest_zh.md](transfer_zh.md) 定义逻辑 Manifest/Chunk 对象与密钥，[store_zh.md](store_zh.md) 定义持久化和准入。本篇不定义 Sandbox E/S 内容或 OCI/EROFS 镜像语义；对应消费者按自身 [Sandbox 工件](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/artifacts_zh.md#artifact-model) 和 [镜像](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten-cli_zh.md) 契约使用这些载体。
+
+## 逻辑数据与职责
+
+### 模块定位
+
+```mermaid
+flowchart TD
+  S["Sparse source:文件、stdin 或 tarstream"] --> C["分块数据并记录空洞"]
+  C --> E["选择 RAW 或 Snappy,然后加密"]
+  E --> P["写入 chunk 对象"]
+  E --> M["构建索引并密封密钥表"]
+  P --> M
+  M --> O["写入 Manifest,返回 content key"]
+```
+
+读取时解析逻辑来源，经配置的 cache 或直接 Store 取得 chunk。传输可以输出 tarstream/Bundle、写入 Store 或提取元数据，命令和输出政策见[数据传输](transfer_zh.md)。配置 cache 表示选择该远端读路径，不意味着 cache 报错后自动绕过它访问 Store。
+
+### 设计原则
+
+- **写入路径**:`sparse.Source → chunker → Snappy/RAW 选择 → encrypt → store.Put → Manifest`
+  (Hole 段记为 manifest 空洞、不读取;Zero 段合成零字节过 chunker、免取数)
+- **读取路径**:`Manifest → fetch → decrypt → io.Writer`
+- **去重单位**:chunk(可变长 FastCDC 或固定长度)
+- **去重域**:salt 区分收敛密钥域。chunk payload 以密文存储,但 Manifest 的
+  索引/geometry 与密封密钥表容器并未整体加密。salt 隔离和加密不实现租户授权([加密模式 — Manifest](#加密模式--manifest)–4.5)。
+
+### 不做什么
+
+- 不直接管理后端字节(委派给 [`store_zh.md`](store_zh.md));
+- 不维护缓存(委派给 [cache_zh.md](cache_zh.md));
+- 不感知 docker / OCI / EROFS 等高层格式(它只看字节流);
+- 不做 ACL —— customer key、端点和引用的保护属于调用方/部署责任。
+
+## 引用语法与命名位置
+
+`pkg/manifest` 同时提供 canonical ref parser。`manifest://` 只允许一个 64 位
+小写十六进制 content key;多层组合必须由调用方传入显式 ref 数组并使用
+`fetch.NewLayered`,不再使用 `manifest://k1:k2`。文件引用为
+`file://<path>[@digest:<digest>|@hmac:<digest>|@manifest:<key>][@location:<name>]`;
+三个 identity qualifier 互斥。`@manifest` 选择 Manifest Bundle 中的根 Manifest，
+tarstream opener 必须拒绝它；反之 Bundle opener 必须拒绝 `@digest/@hmac`。带
+location 时 path 必须是 basename,location 匹配
+`[A-Za-z0-9][A-Za-z0-9._-]*`,只保存逻辑名称,不携带宿主目录。允许数字开头以直接
+容纳 UUIDv7 sandbox/build ID。
+
+## Manifest 对象与稀疏访问
+
+### chunking
+
+把字节流切成可去重单位。两种模式:
+
+#### FastCDC (cdc)
+
+变长内容定义分块,基于 rolling hash + Gear 表选择切点。
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `min` | 128 KiB | 最小切点长度;数据段最后一个片段可更短 |
+| `avg` | 512 KiB | 期望平均长度;Gear mask 按此值设置 |
+| `max` | 1 MiB   | 切点的最大长度;到此强制切 |
+
+这些尺寸及 fixed `size` 必须是 4 KiB 的整数倍,由 chunker 构造器验证;
+单纯 YAML 解析不等于构造有效 chunker。Manifest ingester 还限制 decoded chunk
+最大为 64 MiB。
+
+内容定义切点可在**插入/删除**后重新对齐,保留修改区域之外的去重机会。但本实现按
+4 KiB 对齐切点,扰动范围取决于编辑、对齐、sparse 分段与内容,不能保证任意单字节
+插入只影响固定少量 chunk。
+
+#### Fixed-size (fixed)
+
+固定分块默认 512 KiB,布局简单、可预测;插入/删除若移动后续固定边界,可能显著降低
+去重率。它可用于性能基线或可预测布局;内容复用默认使用 CDC。相对速度与命中率仍取决于负载。
+
+切换模式修改 YAML `chunker.mode`,命令接口不变。
+
+### 收敛加密(convergent encryption)
+
+不变量为 **相同明文 + 相同 salt 生成相同密文**,允许共享 dedup 域复用 chunk。
+chunk payload 被加密,但不是所有 Manifest 字段都保密,也不阻止 store 推断重复内容。
+
+#### Key 派生
+
+```
+salt = server_salt (+ extra_salt mixing)   # 见 Salt 与去重域
+key  = SHA256(salt || plaintext)           # convergent key
+```
+
+AES-CTR 的 IV 取全零。key 始终由**原始 plaintext**派生,而固定 canonical
+encoder 又保证同一 plaintext 只对应一个 RAW 或 Snappy payload,因此受支持的 canonical writer 不用同一 `(key,
+IV=0)` 加密两个不同的编码 payload。下述相同/不同 key 与 hash 推论依赖哈希假设。由 `salt + plaintext` 决定 chunk 的密钥,
+同 salt 域内同 plaintext 必然产出同 physical object;同 object → 同
+ContentKey(= `SHA256(object)`)→ store 上同一份字节。
+
+此不变量要求 Go Snappy 版本、`snappy.Encode`、收益门槛和格式规则固定。当前 reader
+拒绝旧开发布局;不能在同一 salt/key 域混用不兼容 writer。未来修改 encoder 输出或门槛
+需要域分离与明确评审的迁移方案,仅换 format byte 不够。核验所选版本的 reader/writer
+兼容性,保留既有资产与回滚数据,不能把过时的“尚未发布”备注当作删除在线 salt 域的依据。
+
+canonical encoder 固定为 `github.com/golang/snappy` v1.0.0 的 block API。相同
+输入的 encoded bytes 由 amd64、amd64 `noasm` 与 arm64 golden 共同约束；这项
+逐字节一致性优先于更高压缩比。`klauspost/compress/s2` 的标准及 Snappy-compatible
+encoder 会因架构实现产生不同 block bytes，因此不用于 canonical 写路径。
+
+#### Content key
+
+Chunk 上传时,`SHA256(physical_object)` 是 store 的寻址键;Manifest 上传时同样
+按 `SHA256(physical_envelope)`。Salt **不参与寻址** —— 寻址完全由物理字节哈希决定,
+保留 salt 的隔离性,但允许 store 端以单一 KV 视图存储(详见 [`store_zh.md`](store_zh.md))。
+
+### 加密模式 — chunk
+
+YAML `crypto.chunk` 仅支持 `aes`;任何其它值在构造时即被拒绝(无明文回退)。
+每个非零 chunk 固定执行 Go Snappy block `snappy.Encode`。仅当同时满足以下 canonical
+门槛才选 Snappy,否则选 RAW；这不是配置项：
+
+```text
+saved = rawSize - encodedSize
+Snappy iff saved >= 4 KiB AND encodedSize * 4 <= rawSize * 3
+```
+
+物理格式：
+
+| format byte | payload | physical object |
+|---|---|---|
+| `0x01` (`AESRaw`) | 原始 plaintext | `[0x01] || AES-256-CTR(key, IV=0, plaintext)` |
+| `0x02` (`AESSnappy`) | `snappy.Encode(plaintext)` | `[0x02] || AES-256-CTR(key, IV=0, snappy_block)` |
+
+chunk key 为加密层内部派生的 `SHA256(salt‖plaintext)`,调用方只传 salt,不传 key。
+在哈希假设及 canonical 合同下,不同明文使用不同 key,不故意重用 CTR keystream。
+format byte 未加密但被 physical ContentKey 覆盖。Manifest entry 仍只记录原始
+plaintext size 与完整 physical hash,不增加 codec 字段。unknown format、长度不
+匹配、截断、非法 Snappy block 或不满足固定收益门槛的 Snappy object 一律失败,
+没有格式猜测或 fallback。开启 SHA 校验时,被改动的物理对象会失败;关闭它后,
+AES-CTR 和结构检查不能认证所有可能的明文损坏。
+
+### 加密模式 — Manifest
+
+Manifest 中**密钥表 (key table)** 是一段编码了所有 chunk 加密 key 的二进
+制:
+
+| 模式 | 行为 |
+|---|---|
+| `aes` | AES-GCM 用 `manifest.key` 和 Manifest AAD 密封 key table,customer key 解封 |
+
+保护的是 key table,不是整个 Manifest 索引;对象不会直接给 store 提供 customer key。
+但 chunk key 独立于 customer key,由 salt 与明文派生。掌握相应 salt 且能猜测明文的
+主体可以派生候选 key 并检验对应对象;同域去重还会暴露相等性。因此只保护 customer key
+不构成“永远无法推断 chunk 内容”的普遍保证。按部署信任边界保护 key/salt、引用与服务授权。
+
+### Salt 与 dedup 域
+
+Salt 隔离 dedup 域 —— 同样的明文用不同 salt 派生不同 key → 不同 ciphertext
+→ 不同 ContentKey → store 上是两份。
+
+实际 salt 由两部分组合:
+
+- `server_salt` — 每次 ingest 获得一次 write admission,默认 `AdmitWrite()`,显式
+  write generation 则用 `AdmitWriteFor`,取得 generation
+  与 opaque salt；全部 chunk 和最终 manifest Put 复用该 admission。切换写入
+  generation 后，新 ingest 使用新的 salt，已开始的 ingest 不会跨代。
+- `extra_salt` — `--extra-salt <bytes>` flag([`manifest-ctl store` — 数据写入](transfer_zh.md#manifest-ctl-store--数据写入)),叠加到上面。
+
+最终:
+
+```
+final_salt = server_salt                                                       # extra_salt 为空
+final_salt = SHA256("accelerator-extra-salt-v1" || server_salt || extra_salt)  # extra_salt 非空
+```
+
+`extra_salt` 在同一 store generation 中建立更细粒度去重域,例如按租户;它不是 ACL。
+
+### Manifest 二进制格式
+
+Manifest 的当前 Version1 physical envelope 是：
+
+```text
+[4 bytes "MANI"][1 byte encoding][payload]
+
+encoding 0x00 (RAW): payload = logical manifest bytes after magic
+encoding 0x01 (Snappy):  payload = snappy.Encode(logical manifest bytes after magic)
+```
+
+RAW/Snappy 使用与 Chunk 相同的固定 4 KiB + 75% 收益门槛。reader 不接受旧的
+`[MANI][Version1]...` 表示。Snappy decode 前先调用 `snappy.DecodedLen`,完整 logical
+manifest（含 magic）硬限制为 64 MiB；encoded length、table offset/length 和所有
+整数加法均先做边界检查，并拒绝不满足固定收益门槛的 Snappy envelope。RAW 直接在
+envelope payload 上解析,不为重建旧布局复制
+完整 Manifest；Snappy 只保留一个有界 decoded buffer。
+
+envelope 内的 logical Manifest 是一段紧凑二进制(整数 little-endian；magic 本身
+是字节串 `MANI`)：
+
+| 区域 | 布局 |
+|---|---|
+| Header,64 B | `magic[4]`、`version u8`、`chunk_mode u8` 与 reserved padding;`image_size u64`、`chunk_count u32`、配置的 `chunk_min/max u32 × 2`;key-table offset/length、hole count/offset,补 reserved 到 64 B。模式 1=CDC、2=fixed。 |
+| Chunk index,每项 56 B | `image_offset u64`、`plain_len u32`、`flags u32`(bit0=zero chunk)、`cipher_hash[32]`、**8 B reserved zero**。按 image offset 排序。 |
+| Hole,每项 16 B | `offset u64`、`size u64`;与 data entries 精确铺满 `[0,image_size)`。 |
+| Key table | customer key 通过 AES-GCM 密封非零 chunk keys:`key_0[32],key_1[32],...`。 |
+
+零 chunk(明文全零,flags bit0)不加密、不入库、不占密钥表条目,读取时本地
+合成零字节;hole 是外部声明的"无数据"区间(文件系统空洞等),与数据 chunk
+无重叠、无缝隙地铺满整个镜像。
+
+普通读取在 `manifest.verify_content=true` 时先验证 physical envelope 的 SHA-256
+与 requested ManifestKey,然后解析。读取 header/index,二分定位 chunk,解封密钥表,
+经 cache/store 按 cipher_hash 取数,解密后输出逻辑字节。关闭普通校验会按 [manifest-config.yaml](transfer_zh.md#manifest-configyaml) 跳过
+hash 步骤;显式 verify 始终强制开启。
+
+### 写路径(细节)
+
+下表描述单个逻辑 chunk 的顺序;不同 chunk 的加密与上传并发执行。
+
+| 阶段 | 操作 |
+|---|---|
+| Sparse 输入 | Hole 记录后跳过;Zero 不取 payload,本地合成。 |
+| 分块 | 对连续非 Hole 段按 CDC/fixed 切分。 |
+| 派生 key | `key = SHA256(salt || original_plaintext)`。 |
+| 编码 | 计算 Go Snappy 候选,按固定收益规则选择 RAW/Snappy。 |
+| 加密 | AES-CTR 加 format byte,得到 physical object 与 SHA-256。 |
+| 寻址 | 复用 crypto 返回的 physical hash 为 ContentKey,ingest 不重复 hash。 |
+| 上传 chunk | `store-ctl Put(admission, partition=chunk, key=ContentKey, size, ciphertext)`。服务端先查 Exists,去重命中可不上传 body。fs backend 写 `chunk/{generation}/aa/bb/<hash>`;其他 backend 遵守各自布局。 |
+| 元数据 | 按逻辑顺序追加 chunk metadata 与 key。 |
+| 密封 | 用 customer key 与 Manifest AAD 密封 key table。 |
+| 信封 | 逻辑 Manifest 编码为 canonical RAW/Snappy physical envelope。 |
+| 发布 | 使用**同一 admission**,在 Manifest partition Put。 |
+
+derive/encode/encrypt/Put 使用**有界 worker pool**,worker 数来自 writer 的
+`PoolSize()` 能力。标准 store client 对应 `store.pool`;未暴露能力的 writer
+使用 1 个 worker。这是 ingest 实现选择,不代表一个 gRPC connection 只能并发一个 RPC。
+
+chunking 顺序执行,index 按 source 顺序组装,进度回调串行化;Put 乱序完成不会打乱
+Manifest。完整字节复现还要求相同 sparse 输入、chunker/codec 设置、salt/admission
+及 customer key/AAD;并发顺序本身不能证明跨配置确定性。有界并发可重叠多 GiB 快照的
+后端往返;测量入口见[项目性能文档](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/performance_zh.md),
+没有固定负载与运行记录时不承诺具体吞吐收益。
+
+### 读路径(细节)
+
+| 接口/阶段 | 职责 |
+|---|---|
+| Manifest key | on-demand Getter 读取 Manifest partition 对象。 |
+| Metadata | 解析 index,解封 key table。 |
+| Stream | 单 Manifest 对应单 Stream;调用方用 `NewLayered` 显式组合 top-to-bottom 数组。 |
+| `RunAt` | 解析可执行 sparse Run:Hole/Zero/Data;Manifest Data 额外实现 `fetch.ChunkRun`。 |
+| `ResolveChunkWindow` | 可选地在最终可见视图中扩展一个物理 chunk。 |
+| `Run.ReadAt` | 读取已解析的单个可见 Run。 |
+| `Stream.ReadAt` | 先收集 Run,再并发读取可见 Data,经 on-demand Getter、按策略校验/解密及有界明文 chunk cache。 |
+| 可选 `Prefetcher.Prefetch` | 经 prefetch Getter 预热 cache/store 对象,立即 Release。 |
+
+`Stream.RunAt` 返回不可变的 `sparse.Run`,其逻辑范围为
+`[Offset(), End())`,`Run.ReadAt` 使用相对 `Offset()` 的 inner offset,且拒绝
+跨越 `End()`。`RunAt` 只查询 sparse map、manifest index 或 tar extent map,
+不读取 payload,不调用 cache/store Get,也不校验、解密或改变一次性 source 的
+读取位置。manifest Data Run 保存首次解析得到的 chunk index,并额外实现
+`fetch.ChunkRun`;Hole、Zero 和 tar/file Data Run 只实现普通 `sparse.Run`。
+
+`fetch.ResolveChunkWindow(stream, anchor, maxBytes)`为需要复用一次物理chunk读取的
+调用方提供可选的双向元数据解析。`anchor`必须来自同一个最终组合`stream`的
+`RunAt`;当物理chunk不大于`maxBytes`时,helper返回包含anchor、由同一物理chunk
+服务的最大连续最终可见窗口。上层Hole透明,上层Data或Zero为硬边界,根Stream的
+`Size()`也是硬边界;同一下层chunk被opaque区段分开后不会跨区段合并。解析过程不
+调用payload Getter,不校验、解密或解压。超出上限或无法识别物理身份的包内
+`ChunkRun`保持原anchor不变,调用方仍可使用原有forward语义。
+
+`Stream.ReadAt` 先收集覆盖请求窗口的全部 Run,完成解析后再修改目标 buffer;
+随后只对 Data Run 并发调用 `Run.ReadAt`,Hole 和 Zero 直接填零。多层 Stream
+采用 top-to-bottom 可见性:Data 和 Zero 遮挡下层,只有 Hole 或超出层大小才继续
+向下。每个 upper Hole 会先收紧 bound,命中后直接返回最终 child Run,因此嵌套
+overlay 不丢失 `ChunkRun` 能力,下层 chunk 也不能越过任一上层重新出现内容的
+位置。部分读(`--offset` / `--length`)只触发涉及窗口的物理 chunks,不会扫描或
+物化完整镜像。
+
+支持预取的 Stream 额外实现 `fetch.Prefetcher`。`Prefetch(ctx)` 遍历整个逻辑
+Stream,只对最终可见且实现包内 prefetch 能力的 `ChunkRun` 调用完整物理
+chunk 的 cache Get;普通 Data Run、Hole 和 Zero 都是 no-op。成功命中后立即
+Release,不读取 Blob、不校验、不解密、不 pin。预取作用于当前组合 Stream 的
+完整可见视图,不再提供按 manifest key 选择叶子的接口。
+
+同一 Fetcher 的 manifest metadata、普通 ReadAt 和所有 Stream 共用一个底层
+Getter 与请求调度器。on-demand 请求从不等待已开始的 prefetch;存在任意
+on-demand 时不再准入新的 prefetch,且每个 Fetcher 最多一个 prefetch Get 在
+途。已开始的 prefetch 不抢占,可与后来到达的 on-demand 短暂重叠。不同
+Fetcher 相互独立,调度器不创建后台 goroutine,也不拥有底层 Getter 生命周期。
+
+每个 manifest Stream 内部维护独立的解密 chunk cache,仅服务 on-demand 部分读。
+cache key 包含 `CiphertextHash`、chunk decrypt key 和 plaintext size,因此同一
+Stream 内重复物理内容可以复用,不同密钥或逻辑大小不会错误别名。cache 同时受
+`32 entries` 和 `32 MiB` 两个硬预算约束,按 LRU 淘汰;entry 自最后一次命中起空闲
+`5s` 后过期。每个 Stream 只保留一个指向最早到期 entry 的 timer,即使后续没有
+读请求也会主动回收陈旧数据,不为每个 entry 创建 timer 或常驻扫描 goroutine。
+
+同一 cache key 的并发 miss 合并为一次 Get、按策略执行的 SHA-256 校验、解密和可选 Snappy
+decode,不同 key 仍可并行加载。加载失败不进入 cache;等待者如果自身 context 仍有效会重新尝试,不会
+永久继承首个加载者的取消。partial miss 只分配一个 plaintext-sized cache buffer,
+在 immutable Blob 仍存活时直接写入该 buffer；不复制或修改 ciphertext。淘汰、TTL
+到期和 `Close()` 都会清零明文;正在复制
+的 entry 先从 LRU 移除,待最后一个 reader 释放后再清零。
+
+冷态完整物理 chunk 读取保持直通路径,避免一次性顺序扫描污染 cache;已有 cache
+命中仍可服务完整读取。单个 plaintext chunk 超过 `32 MiB` 时同样直通且不准入。
+RAW 整块由 AES 直接写 caller buffer,没有 plaintext allocation 或额外整块 copy；
+RAW 超大 partial 按 CTR block/offset 直接解密请求范围。Snappy 整块把 encrypted payload
+解到有界 encoded scratch,校验 `DecodedLen == entry.Size`,再直接 decode 到 caller
+buffer；Snappy 超大 partial 因 block format 限制必须完整 decode 到有界临时 plaintext
+后复制范围。
+
+Snappy encoded scratch 使用显式 size class free-list,不是无峰值保证的 `sync.Pool`。
+encode/decode 分别有独立的 `max(1, GOMAXPROCS)` CPU slot、192 MiB active byte budget
+和 64 MiB retained budget（每方向合计最多 256 MiB codec-owned scratch）；常用最大
+retained buffer 为 2 MiB,异常大 buffer 用后丢弃。slot 和 weighted byte admission
+都响应调用方 context；RAW 读取不获取 decode slot。没有后台 goroutine。
+
+`Prefetch` 仍只执行完整物理 chunk 的 cache Get 并立即 Release,不校验、解密或
+填充上述明文 cache。因此 Prefetch 与 on-demand ReadAt 可以各自产生 Get,而重复
+的 on-demand 部分读由 Stream 内部合并和复用。
+
+### 来源选择与惰性恢复
+
+Manifest/Bundle 读取继续遵守既有 metadata 和有序引用规则选中的来源。一次本地读取失败不会仅因失败就转向另一 Bundle 或 Store。有序 refs 不可用而使查找结果不确定时，后续 remote miss 不能升级为全局缺失证明；原始原因链保持可检查。
+
+Chunk 索引准备串行加载，在单次尝试的局部状态中构建并验证完整 map，只在成功后发布。失败或取消不会缓存，因此后续 Open 可以在同一已选来源重新初始化。Reader Close 继续等待现有 source lease 并阻止延迟发布。成功准备会复用，失败准备不会留下中毒索引状态。
+
+## 不可变本地 tarstream 与加密
 
 新写出的 canonical tarstream 的 plaintext 结构为 presence entry、payload、
 `.kuasar.digest.<plainDigest>` marker body 和两个 trailer block。Reader 也接受不含
@@ -66,8 +390,7 @@ expected `digest|hmac` 和outer EOF。跨artifact record splice会在顺序读�
 调用方主动停止消费时,尚未读取部分不具备完整验证结论;任何发布、上传或转换
 路径必须消费全部 Data extents并传播终点错误。
 
-
-### 1.1 页 presence 与 Zero 传输
+### 页 presence 与 Zero 传输
 
 所有新写出的 tarstream 均使用 presence v1 profile。逻辑 payload 可以为空，也可以
 以不足 4 KiB 的部分页结尾，上限为 **1 TiB**。Hole run 必须从页边界开始，在页边界
@@ -131,7 +454,15 @@ Zero 为字面 Data 规避上限。测试及性能结果须区分索引预算、
 随机打开仍保持其局部验证边界。不能据此声称身份计算为
 常数时间，也不能把该结果当作磁盘 I/O 吞吐。
 
-## 2. 多 Manifest Bundle 载体
+### 程序化 tarstream 入口
+
+编程接口:`accelerator/pkg/tarstream` 的 `WriteTo`(吃任意 `sparse.Source`,返回
+写入时生成的摘要)/`ReadFrom`/`ReadSeekFrom`(洞图精确往返、tar 内零拷贝随机
+访问)/`SourceFrom`(tar 流直接开成 `sparse.Source`,可直通 manifest ingest
+等管线消费者)/`SourceAt`(随机访问,完整平台工件通过可选 `Digester` 暴露 marker),
+本仓与各下游仓均可 import。
+
+## 多 Manifest Bundle 载体
 
 本地 Manifest 快照使用支持 ZIP64 的标准 ZIP 容器,带强制尾部索引。当前 profile 直接要求
 `bundle/index`，没有旧格式探测、无索引兼容或 Central Directory fallback。所有新
@@ -160,9 +491,9 @@ Local Entry；其 payload 最后 256 bytes 与真实 Central Directory 紧邻。
 ZIP Deflate、ZIP encryption、整文件 SHA/HMAC、外层加密、自定义 pack、root entry 或
 JSON/YAML metadata。旧 `admission/*`、旧的无索引 Bundle、重复或未知 entry、目录、
 非法 key/admission 与截断由对应 profile/验证路径拒绝。普通 Open 有意延迟部分对象与
-容器检查,不等于严格 full-container verifier([§2.4](#24-显式严格验证与-exact-upload))。
+容器检查,不等于严格 full-container verifier([显式严格验证与 exact upload](#显式严格验证与-exact-upload))。
 
-### 2.1 `bundle/index` v1
+### `bundle/index` v1
 
 索引 payload 依次是 Chunk section、Manifest section 和固定 footer。两个 section 各自
 按 ContentKey 严格递增，partition 由 section 隐含；重复或未排序 key 非法。每条 record
@@ -225,7 +556,7 @@ root Manifest，再分别排序并编码 Chunk/Manifest records，写出最后�
 最后才由标准 ZIP writer 写 Central Directory/ZIP64/EOCD。严格 verifier 和测试会把
 每个 record 的 offset、size、CRC 与实际 CD/LFH/data range 交叉核对。
 
-### 2.2 metadata prefix 与 Reader I/O
+### metadata prefix 与 Reader I/O
 
 `bundle/refs` 存在时必须非空并作为第一个物理 Local File Header；admission 必须紧随
 其后，否则 admission 必须是第一个 entry。admission payload 为空。`bundle/refs`
@@ -265,7 +596,7 @@ preflight 只需发现 location/admission 时可使用 `OpenMetadata`/`ReadMetad
 文件打开仍优先使用 read-only mmap；ReaderAt 对象 payload 回退路径使用按
 4 KiB～2 MiB 分级、每个 Reader 最多保留 32 MiB 的有界 buffer pool。
 
-### 2.3 source selection、Chunk preparation 与普通 restore
+### source selection、Chunk preparation 与普通 restore
 
 一个 Bundle 从首版容纳根内存 Manifest、根/数据盘当前层 Manifest，以及必要时
 收编的父层 Manifest。全部对象共用 admission entry 中的同一完整
@@ -324,7 +655,7 @@ Store。`manifest.verify_content=false` 仍不会隐式执行 physical SHA 扫�
 Manifest/Chunk physical hash 与 key table authentication 遵守普通读合同。无论开关取值,
 普通 lazy restore 都不等于完整可用性验证。
 
-### 2.4 显式严格验证与 exact upload
+### 显式严格验证与 exact upload
 
 单 Bundle full verify/upload 与多 source `VerifyExactManifests` /
 `UploadExactManifests` 均先运行显式 container verifier，不受
@@ -362,9 +693,9 @@ snapshot-specific metadata 后可通过 `ExpectedManifests` 提交精确的本�
 Manifest 集，从而拒绝无关 Manifest，而无需让 accelerator 解释
 `snapshot.cfg`。
 
-读取错误分类、随机访问失败与恢复见[§4](#4-读取错误随机访问与恢复).
+读取错误分类、随机访问失败与恢复见[读取错误、随机访问与恢复](#读取错误随机访问与恢复).
 
-## 3. 共享后缀 ZIP 处理
+## 共享后缀 ZIP 处理
 
 `pkg/tailzip` 是追加在逻辑镜像字节之后的 ZIP 的格式无关实现。
 `Locate(io.ReaderAt, size, Options)` 返回 payload 边界和后缀长度，`Read` 返回用于
@@ -384,7 +715,6 @@ writer 保持历史确定性 entry 名称、STORED method、时间戳和字节�
 已支持的 image ZIP profile。因此 `flatten.Build` 与 `flatten.BuildFromDir` 都间接通过
 `pkg/tailzip` 生成 trailer，所有 image config 读取也共享同一 payload 边界实现。
 
-
 ### 共享 reader/writer 与严格 profile
 
 `WithIndexMemoryLimit(bytes)` 可选地在首字节输出之前限制 writer 规划预算。它计入 2 MiB 基础开销，并为每个不连续 Data extent 计入 512 字节，以覆盖切片扩容、sparse map 编码和元数据副本。超限会在读取 payload 或写出 envelope 之前失败。此预算单独覆盖 writer 索引，不替代源、native 和 decoder 预算，也不限制调用方分配的源对象。省略此限制时保持原行为和 artifact 身份。
@@ -401,7 +731,7 @@ Suffix ZIP 在构造 ZIP reader 前检查 EOCD 条目数量与有界目录布局
 
 规范后缀的 footer、名称和正文读取接口显式接受 io.ReaderAt 与逻辑大小。先读 footer 的流程要求真正随机访问；单调 sparse source 使用顺序传输路径。规范编码在输出前拒绝 ZIP64 条目数量。读取完整有界后缀时，即使已返回完整缓冲，也保留后端故障。
 
-## 4. 读取错误、随机访问与恢复
+## 读取错误、随机访问与恢复
 
 Accelerator 不可变 reader 执行单次尝试，把业务重试/退避留给消费者。`pkg/readerr.Mark(err, retryable)` 保留 `Error()`/`Unwrap()`，只增加 `Retryable() bool`；标记 nil 仍返回 nil。未知错误不代表已确认永久失败。永久语义原因在包装和 joined errors 中保持可见，语义边界上的 marker 对其包装分支具有权威性。正常对象结束 EOF 与已确认缺失保留原接口；必需不可变对象查找把已确认缺失转换为永久原因。已验证格式/范围/完整性/认证失败在掌握语义的位置标记；网络 EOF、半帧/半流、后端内部取消和不透明访问/decode 错误保留原始原因，除非实际验证已经证明损坏。
 
@@ -410,3 +740,36 @@ Accelerator 不可变 reader 执行单次尝试，把业务重试/退避留给�
 并行 range read 在返回前 join 所有 worker，包括取消路径。原失败保留，派生同级取消不能替换它，其他 worker 的永久原因仍保留在聚合结果中；返回后 worker 不得继续修改调用者 buffer。既有 Hole/Zero/Data 流式语义保持不变。
 
 直接 CLI 不可变读取向命令所有者报告单次尝试错误。该合同不增加 retry 设置、fallback 来源、健康屏蔽、服务重启或兼容模式。测试覆盖半帧/半流清理、初始化恢复、来源隔离、joined permanent error 与 worker 生命周期；端到端重试策略仍由消费者负责。
+
+## 开销与测量边界
+
+[项目性能文档](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/performance_zh.md)
+提供冷/热 L1 下 `manifest://` 端到端加载的测量背景。记录实际 revision、负载和 cache
+状态;章节位置或 benchmark 名称本身不构成新的实测结果。
+
+主要变量:
+
+- chunk 模式:CDC 可提高修改后的复用率,但有分块成本;相对 fixed 的优势取决于负载。
+- 固定 RAW/Snappy 与 AES:不可压缩内容保持 RAW,可压缩内容减少 physical hash/AES/wire 字节。
+- store 延迟及 backend 行为,例如本地 fs 与远端 S3-compatible object storage,见 [store](store_zh.md)。
+
+可重复 microbenchmark 为 `BenchmarkCompressionCandidates`(RAW、Go Snappy、S2、
+S2 Better、Zstd SpeedFastest 对照组)、`BenchmarkAESChunkCanonicalCodec` 和
+`BenchmarkManifestAESPhysicalRead`。只有 Go Snappy 进入生产 codec,候选 benchmark
+不是配置/协商项。`scratch-misses/op` 可检查 warm size class 是否复用 payload-sized buffer。
+
+Bundle tail-index 的 4K/20K/100K 打开成本由 `BenchmarkBundleOpen4K`、
+`BenchmarkBundleOpen20K`、`BenchmarkBundleOpen100K` 报告。Open 只加载 Manifest
+index,不读 Chunk index、Central Directory、对象 Local Header 或 payload。
+`BenchmarkBundlePrepareChunks4K/20K` 测量选源后一次 Chunk section 准备;
+`BenchmarkBundleGetAfterPrepare` 测量 O(1) lookup 加 payload read。
+
+`BenchmarkBundleOpenHighRTT20K` 注入固定 ReaderAt RTT,报告 `read-calls/op` 与
+`read-bytes/op`。`BenchmarkVerifyContent` 比较校验开/关时 Manifest Open 和冷态
+1 MiB chunk 读取。
+
+`BenchmarkManifestSourceSearch` 测量 refs 为 0/1/8/32 时 clean miss 与最终 remote
+fallback。`BenchmarkMetadataOpen4K` / `BenchmarkMetadataOpen20K` 测量 prefix-only
+metadata 读取及其与 chunk 数的关系。benchmark fixture 名称不覆盖容器 entry 上限。
+
+载体与应用格式无关。Sandbox E/S 的角色和可达图归 sandboxer，镜像运行配置与 EROFS 内容归镜像制备；消费者应用本契约，不重新定义身份或完成规则。

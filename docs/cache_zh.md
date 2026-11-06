@@ -1,6 +1,8 @@
 [English](cache.md) | [简体中文](cache_zh.md)
 
-# cache — 分层内容缓存
+# Cache：层级、后端与恢复
+
+本篇统一描述内容缓存服务：部署配置、wire 操作、tier/EC 行为、后端实现、故障处理和诊断。RocksDB 与独立管理的 Redis-compatible 后端都是同一服务的选择。权威回源层见 [Store](store_zh.md)，客户端路径见[数据传输](transfer_zh.md)。
 
 `cache-ctl` 是项目里**跨 sandbox 共享**的内容缓存层。它把客户端反复
 读取的 chunk 在节点本地与节点间集群里重复使用,把远端 S3-compatible
@@ -9,43 +11,43 @@ object storage 的读取。embedded 部署可从本地 RocksDB BlockCache 服务
 通过 YAML 配置切换三种运行形态(`local` / `shard` / `tiered`),
 适配不同部署场景。
 
-## 1. 概述
+## 概述
 
-### 1.1 解决的问题
+### 解决的问题
 
 并发消费者常常读取相同的不可变 chunk。本地和分布式缓存减少重复回源，同时保持 Manifest/Store 的身份与完整性契约。复用程度取决于工作集、安全域、缓存容量和请求时序；并发 miss、淘汰或 fill 失败仍可能导致重复回源。
 
 按需加载只读取消费者需要的范围，不要求所有工件都经过缓存或对象存储。端到端启动/恢复还包含 VMM/Guest 执行及数据访问时延。命中率是具有明确分母的观测平均值，不是逐请求上界；索引/filter 驻留、误报、SST/blob 读取和 compaction 都会影响磁盘 I/O。
 
-### 1.2 设计原则
+### 设计原则
 
 - **数据面**:自定义 wire 协议(39 B 请求头 / 8 B 响应头,6 个 opcode)。
 - **控制面**:`health_listen` 独立端口同时跑两个 gRPC 服务——标准 `grpc.health.v1.Health`
   探活,以及 `cac.cache.v1.Info`(`Get` 拉运行时计数快照)。
 - **监听地址**:`listen` / `health_listen` 均取 `host:port`(TCP)或一个 Unix
   socket 路径(`/run/sandbox/cache.sock` 或 `unix:///...`;普通 UDS bind 时清理 stale
-  socket、chmod 0600),还可显式使用 `fd=<name>` 继承 manager listener (§6.7)。数据面客户端 `cache.endpoint` 填同址即可;控制面经 socket
+  socket、chmod 0600),还可显式使用 `fd=<name>` 继承 manager listener ([命名监听与 socket activation](#命名监听与-socket-activation))。数据面客户端 `cache.endpoint` 填同址即可;控制面经 socket
   时,`ping` / `info --endpoint` 用 `unix:///` 形式。
 - **本地存储**:进程内 RocksDB,或通过 UDS/TCP 访问 Redis-compatible server;
-  后者的配置、取消语义和外部 Dragonfly 部署示例见 [cache-redis.md（英文）](cache-redis.md)。
+  后者的配置、取消语义和外部 Dragonfly 部署示例见 [cache-redis.md（英文）](cache.md#redis-adapter-semantics)。
 - **写入语义**:无应用层频率准入过滤。embedded 淘汰由 RocksDB CompactionFilter
   按 CMS 驱动;外部 Redis server 管理自己的淘汰/容量。两者都不保证存储/资源故障时写入成功。
 - **填充语义**:fill-aside,读路径上隐式回填上层。
 
-## 2. 命令行接口
+## 命令行接口
 
-`cache-ctl bench` 命令、工作负载控制和保护措施见 [§7.1](#71-后端与-wire-基准测试)。
+`cache-ctl bench` 命令、工作负载控制和保护措施见 [后端与 wire 基准测试](#后端与-wire-基准测试)。
 
-### 2.1 `cache-ctl serve`
+### `cache-ctl serve`
 
 ```
 cache-ctl serve --config FILE [--drain-timeout DURATION]
 ```
 
 `--config` 与 `CACHE_CONFIG` 必有其一(flag 优先);两者皆缺则报错。
-YAML 示例见 §3。
+YAML 示例见 [配置](#配置)。
 
-### 2.2 `cache-ctl config`
+### `cache-ctl config`
 
 ```
 cache-ctl config show     [--config <path>]
@@ -54,10 +56,10 @@ cache-ctl config generate
 
 `generate` 输出带注释模板(默认 tiered:rocksdb L1 + store origin)。
 
-### 2.3 `cache-ctl object` — 完整对象操作
+### `cache-ctl object` — 完整对象操作
 
 使用数据端点,通常 7070。预期 local 用于写、local/tiered 用于读;当前 local/shard
-实际都暴露完整对象操作(§4.10):
+实际都暴露完整对象操作([跨形态混发的行为](#跨形态混发的行为)):
 
 ```
 cache-ctl object get --endpoint host:port --namespace chunk --hash HEX
@@ -65,9 +67,9 @@ cache-ctl object put --endpoint host:port --namespace chunk --hash HEX --value F
 ```
 
 `--endpoint` 与 `CACHE_ENDPOINT` 二选一;`get` 输出到 stdout;
-`--value -` 从 stdin 读。`put` 不可连 tiered(拒绝写,§3.1)。
+`--value -` 从 stdin 读。`put` 不可连 tiered(拒绝写,[三形态对比](#三形态对比))。
 
-### 2.4 `cache-ctl shard` — EC 分片操作
+### `cache-ctl shard` — EC 分片操作
 
 连 `shard` 端点:
 
@@ -81,7 +83,7 @@ cache-ctl shard put --endpoint host:port --namespace chunk --hash HEX --idx N --
 (`--total` 默认 5,须 `--idx < --total`),是单 peer 的调试入口;真实写入由
 fill-aside 经 `EncodePrefixed` 完成。
 
-### 2.5 `cache-ctl ping` / `info`
+### `cache-ctl ping` / `info`
 
 ```
 cache-ctl ping --endpoint host:port            # gRPC 健康探测 (--endpoint 指向 health_listen)
@@ -97,29 +99,28 @@ cache-ctl info --rocks-path PATH               # 离线只读打开 RocksDB,查�
 检查运行中 daemon 应用远端 Info;本地只读打开用于离线/故障后检查,不承诺其他进程修改
 DB 文件时得到一致 live view。
 
+## 配置
 
-## 3. 配置
-
-### 3.1 三形态对比
+### 三形态对比
 
 | 维度 | local | shard | tiered |
 |---|---|---|---|
 | 定位 | 单节点完整对象 KV | EC 分片 KV(集群成员) | 多级缓存代理 |
-| handler 后端 | embedded RocksDB / Redis-compatible | embedded RocksDB / Redis-compatible | TieredCache(§4.6) |
+| handler 后端 | embedded RocksDB / Redis-compatible | embedded RocksDB / Redis-compatible | TieredCache([TieredCache 与读路径](#tieredcache-与读路径)) |
 | tier chain | 无 | 无 | 按 YAML `tiers:` 顺序 |
 | 写操作 | object/shard 操作直写所选 backend | object/shard 操作直写所选 backend | 拒绝(`StatusError`) |
 | 读操作 | 查所选 backend | 查所选 backend | clean miss 继续查链,命中后异步 fill-aside |
 | origin 依赖 | 无 | 无 | 配置 Store/upstream RPC 访问;对象存储凭证在拥有该 backend 的服务中 |
 | 典型部署 | 测试/调试/单节点 | 保持 RS(4+1) 时至少 5 peer | 与 Manifest consumer 同节点的缓存代理 |
 
-### 3.2 local 模式
+### local 模式
 
 ```yaml
 mode: local
 type: embedded
 listen: 0.0.0.0:7070           # wire 数据面;host:port 或 Unix socket(/run/sandbox/cache.sock 或 unix:///...)
 health_listen: 0.0.0.0:7071    # gRPC 健康检查(可省);同支持 Unix socket 路径
-stats_interval: 30s            # 周期自适应统计行(§6.6);缺省 30s,"0"/"off" 关闭
+stats_interval: 30s            # 周期自适应统计行(自适应统计);缺省 30s,"0"/"off" 关闭
 rpc_timeout: ""                # 空/非法/非正数表示不设置请求 context deadline
                                # 正 Go duration 设置 context 预算,不能中断同步 CGO
 
@@ -138,7 +139,7 @@ rocks:
   bloom_bits: 15
 ```
 
-### 3.3 shard 模式
+### shard 模式
 
 ```yaml
 mode: shard
@@ -164,7 +165,7 @@ rocks:
   max_background_jobs: 16
 ```
 
-### 3.4 tiered 模式
+### tiered 模式
 
 ```yaml
 mode: tiered
@@ -232,7 +233,7 @@ WARN,**优先保住 parity(容错)、缩小 data**:
 
 零 peer 非法。若需保持 **4+1**,初始至少配置 5 peer。clamp 仅在**构造时**执行;
 SIGHUP 只更新 membership,不重建 RS codec。热更新后的可达 peer 少于既有 total 时,
-可能产生 routing error,不会自动再次 clamp(§4.9)。
+可能产生 routing error,不会自动再次 clamp([EC 客户端](#ec-客户端))。
 
 #### upstream 层(可选)
 
@@ -240,7 +241,7 @@ SIGHUP 只更新 membership,不重建 RS codec。热更新后的可达 peer 少�
 EC 前,在聚合节点集中热点,减少 shard 压力。
 
 fill-aside 需要**可写的完整对象端点**。local 是预期角色;当前 shard 也支持 object
-操作(§4.10),tiered 则拒绝 Put。中间 tier 若指向只读 tiered,读取可能可用,但 async
+操作([跨形态混发的行为](#跨形态混发的行为)),tiered 则拒绝 Put。中间 tier 若指向只读 tiered,读取可能可用,但 async
 fill 错误会被丢弃且无法填充;它不把已成功的读追溯变成 miss,也没有启动写能力握手或
 必然显眼的首次回填错误。只读端点也可作为 `origin.type: upstream`,该角色只被代理读取。
 
@@ -255,23 +256,63 @@ tiers:
     timeout: 2s
 ```
 
-### 3.5 关键参数
+### 关键参数
 
 | 参数 | 说明 |
 |---|---|
-| `listen` | wire 数据面 TCP、Unix socket 或 `fd=<name>` 监听 (§6.7) |
+| `listen` | wire 数据面 TCP、Unix socket 或 `fd=<name>` 监听 ([命名监听与 socket activation](#命名监听与-socket-activation)) |
 | `health_listen` | TCP/UDS 或 `fd=<name>` 的 gRPC 控制面监听,同端口跑两个服务:`grpc.health.v1.Health`(探活)+ `cac.cache.v1.Info`(`Get` 拉计数快照)。省略则两者都不启动 |
-| `stats_interval` | 周期自适应 stderr 统计行的基准周期(§6.6)。缺省/空 = 30s(默认开);`0`/`off` 关闭。有流量的周期打一行(吞吐/带宽/时延 p50/p99/max/并发/命中级联/rocks 量规),空闲周期静默 |
+| `stats_interval` | 周期自适应 stderr 统计行的基准周期([周期自适应统计行(`stats_interval`)](#周期自适应统计行stats_interval))。缺省/空 = 30s(默认开);`0`/`off` 关闭。有流量的周期打一行(吞吐/带宽/时延 p50/p99/max/并发/命中级联/rocks 量规),空闲周期静默 |
 | `freq.disable_eviction` | embedded 的 sketch 仍维护,但已安装 filter 保持 unarmed、保留 key。可用于测试 local origin;不把 cache 变成无故障权威持久层,也不控制外部 Redis 淘汰 |
 | `pool` | 到单个 peer 的并行 TCP 连接数。wire 是 sync request/response,单连接会把并发请求串行化 |
 | `max_inflight` | 到该 tier 的同步查询并发上限;`0` 表示不限制。异步 fill 使用各 backend 自身的连接池/并发控制。Redis tier 禁止设置,应使用 `redis.get_pool` / `redis.set_pool` |
-| `rpc_timeout` | 服务端请求 context 预算。缺省/空/非法/非正数不设 deadline;正 duration 可取消响应 context 的工作,不能中断同步 RocksDB CGO。超时/错误不普遍变成 cache miss(§4.2);慢请求可用 §6.5 tracer 观察 |
+| `rpc_timeout` | 服务端请求 context 预算。缺省/空/非法/非正数不设 deadline;正 duration 可取消响应 context 的工作,不能中断同步 RocksDB CGO。超时/错误不普遍变成 cache miss([Wire 协议](#wire-协议));慢请求可用 [慢/卡请求追踪(`CACHE_CTL_DEBUG`)](#慢卡请求追踪cache_ctl_debug) tracer 观察 |
 | `timeout`(tier/origin) | 客户端每次操作超时。**中间 upstream tier 的 `tiers[].timeout` 与 EC 的 `tiers[].cluster.timeout` 在空/非法/非正值时默认 2s**；**origin 客户端的 `origin.store.timeout` 与 `origin.upstream.timeout` 默认 0**，受 caller/connection 生命周期约束。Redis 有独立默认与严格校验，显式值必须有效且为正 |
-| `pprof_listen` | 非空时另起一个 HTTP listener 暴露 `/debug/pprof/*`(如 `127.0.0.1:6060` 或 `fd=pprof`)。**生产留空**;仅离线诊断临时开启(§6.4) |
+| `pprof_listen` | 非空时另起一个 HTTP listener 暴露 `/debug/pprof/*`(如 `127.0.0.1:6060` 或 `fd=pprof`)。**生产留空**;仅离线诊断临时开启([离线诊断](#离线诊断)) |
 
-## 4. 设计
+### Redis-compatible 后端配置
 
-### 4.1 总体架构
+直接提供 local 或 shard 服务的 daemon 在顶层选择后端：
+
+```yaml
+mode: shard # or local
+type: redis
+listen: 0.0.0.0:7070
+health_listen: 0.0.0.0:7071
+rpc_timeout: 2s
+
+redis:
+  endpoint: unix:///run/kuasar-cache/redis.sock
+  get_pool: 32
+  set_pool: 8
+  timeout: 2s
+```
+
+Tiered daemon 在有序 tier 列表中直接声明 Redis：
+
+```yaml
+mode: tiered
+tiers:
+  - type: redis
+    redis:
+      endpoint: 10.0.1.60:6379
+      get_pool: 32
+      set_pool: 8
+      timeout: 2s
+  - type: ec
+    cluster: ...
+origin: ...
+```
+
+没有 `type: dragonfly`，也没有通用 `storage` 包装层。现有进程内 RocksDB 配置使用 `type: embedded`。
+
+Redis tier 不能设置通用 `max_inflight`。`redis.get_pool` 与 `redis.set_pool` 分别提供硬并发预算，防止异步 fill/repair 写入占用读预算；校验拒绝同时设置含义不明确的组合限制。
+
+`redis.endpoint` 接受绝对 socket 路径、`unix:/abs/path`、`unix:///abs/path` 或单一 TCP `host:port`。IPv6 字面量须加方括号，例如 `[2001:db8::60]:6379`。节点本地低延迟连接优先选择 UDS。TCP 使用明文 RESP2，此后端不支持 AUTH/ACL 或 TLS；只在由 bind 规则与防火墙保护的可信网络中使用。不支持 Redis Cluster 发现。
+
+## 设计
+
+### 总体架构
 
 ```mermaid
 flowchart TD
@@ -287,7 +328,7 @@ Manifest ingest 绕过 cache-ctl,直接写 store-ctl。缓存 fill 是另一条�
 触发 TieredCache 内部 fill-aside,不绕回本 daemon 的 wire listener。供 backend
 填充与显式运维使用的 cache Put/ShardPut 操作仍存在。
 
-### 4.2 Wire 协议
+### Wire 协议
 
 数据面使用紧凑二进制协议代替 gRPC/protobuf,减少 framing/serialization 工作,
 并支持 backend/response 间 Blob 所有权传递;这不自动证明普遍吞吐收益或消除所有拷贝。
@@ -354,19 +395,19 @@ I/O 可停止;同步 RocksDB CGO 不能在调用中途打断,因此不是任意 
 EC 在收到 **data 个不同且有效 shard idx** 后取消余下前台 ShardGet 的 context。
 wire client 通过 deadline 中断 socket 操作, 等待取消回调结束后丢弃该连接。
 关闭连接也会取消服务端 handler。EC 无需等待每个 peer 完成。
-被取消的慢 peer 是 unknown,不是 confirmed miss;修复必须区分它们(§4.7)。
+被取消的慢 peer 是 unknown,不是 confirmed miss;修复必须区分它们([fill-aside](#fill-aside))。
 
 #### 不提供的操作
 
-- **Delete**:没有 wire 删除操作。embedded 按 §4.5 CMS/CompactionFilter 异步淘汰;
+- **Delete**:没有 wire 删除操作。embedded 按 [频率统计与磁盘淘汰](#频率统计与磁盘淘汰) CMS/CompactionFilter 异步淘汰;
   外部 Redis 由自己的 server 管理。此说明不改变 store 独立的 generation/GC API。
-- **AdminService**:没有独立 admin RPC。Info/Get 拉取计数(§1.2、§6.3),默认开启
-  自适应 stderr 统计(§6.6)。离线诊断用 read-only `info --rocks-path`,不是 secondary API。
+- **AdminService**:没有独立 admin RPC。Info/Get 拉取计数([设计原则](#设计原则)、[运行时计数(pull-only)](#运行时计数pull-only)),默认开启
+  自适应 stderr 统计([周期自适应统计行(`stats_interval`)](#周期自适应统计行stats_interval))。离线诊断用 read-only `info --rocks-path`,不是 secondary API。
 - **Streaming**:value 采用 one-shot request/response,受 MaxFrameSize 限制。EC 可把
   存储拆给多个 peer,但 tiered 返回的完整对象仍必须装入一个 wire frame,不能借此传输任意
   大对象。上层选择适合的 object/chunk 大小,或使用合适的非 wire 路径。
 
-### 4.3 Key 编码与 opcode 分派
+### Key 编码与 opcode 分派
 
 | Opcode | Wire Hash | RocksDB Key | Value | 说明 |
 |---|---|---|---|---|
@@ -382,11 +423,11 @@ Wire 帧头只携带 32 字节 `Hash`——Object 与 Shard 都不需要告诉�
 时让幸存节点上的现有分片立即可用**——客户端不再需要"peer X 持有 idx Y"
 的位置假设;但仍需取得适合当前编码方案的足够**不同且有效 idx**。
 
-### 4.4 RocksDB 调优
+### RocksDB 调优
 
 | 参数/选项 | 默认 | 含义 |
 |---|---|---|
-| `disk_bytes` | 1 TiB | BlockCache 大小计算输入及每个 Sketch generation 的成功写入字节预算(§4.5),**不是强制磁盘配额** |
+| `disk_bytes` | 1 TiB | BlockCache 大小计算输入及每个 Sketch generation 的成功写入字节预算([频率统计与磁盘淘汰](#频率统计与磁盘淘汰)),**不是强制磁盘配额** |
 | `mem_ratio` | 0.01 | 共享 BlockCache=disk_bytes×mem_ratio,最小 64 MiB |
 | `block_size` | 64 KiB | SST data block 大小 |
 | `bloom_bits` | 15 | 每 key Bloom 位数,实际假阳性率不是固定文档百分比 |
@@ -407,7 +448,7 @@ chunk / manifest / blob 各用独立 CF:
 - **chunk CF**:高频写入(fill-aside),大 value(256 KiB 级);
 - **manifest CF**:低频写入,value 几 KiB 到若干 MiB;
 - **blob CF**:任意内容寻址数据(store 的第三 partition,见 [`store_zh.md`](store_zh.md)
-  §4.6),与其他 cache CF 使用同样 BlobDB/Bloom/compaction-filter 机制。cache key
+  [TieredCache 与读路径](#tieredcache-与读路径)),与其他 cache CF 使用同样 BlobDB/Bloom/compaction-filter 机制。cache key
   不含 generation,因此 cached blob 不会自动随 store generation 删除而清除。
 
 独立 CF 隔离 write-buffer/filter/compaction 状态,但仍共享进程资源和 BlockCache。
@@ -446,7 +487,77 @@ UseDirectReads 默认 true,对支持的数据读取绕过 OS page cache。
 
 这不表示进程 page-cache 使用为零、I/O 记账完全自管,或不存在 native/write-buffer 内存。
 
-### 4.5 频率统计与磁盘淘汰
+#### 原生 bridge 所有权
+
+私有 binding 位于 `pkg/cache/rocks/internal/native`，仅实现缓存存储需要的固定四个
+Column Family、打开、pinned 读取、写入、flush、compaction、属性和频率过滤。
+RocksDB 版本和构建仍由原有 `deps/build-rocksdb.sh` 管理，wrapper 不新增 native
+依赖构建流程。
+
+##### 公开引擎接口与所有权
+
+RocksDB 9.7.4 的 C API 提供 pinned 读取，但不提供 `FilterBlobByKey`，也没有公开
+转换接口让 opaque Options 接受自定义 C++ filter。因此，最小 C++ bridge 通过公开
+头文件直接持有 DB，不转换 C handle 布局、不引用内部头文件、不全局注册 factory，
+也不提供通用 Go 对象模型。
+
+| 对象 | 生命周期 |
+| --- | --- |
+| DB 和四个 CF handle | 由一个 native owner 持有。打开部分失败时释放所有已返回的 handle 和 DB；先释放 handle，再关闭 DB。 |
+| Options 和表配置 | Open 的局部对象，DB 复制 Options；共享表工厂、LRU 和 Bloom policy 的引用随 DB 生命周期保留和自动释放。 |
+| ReadOptions / WriteOptions | 由 native owner 初始化一次，供并发同步操作共享；数据 CF 不写 WAL，default CF 保留 WAL。不再使用存放 native 对象的 `sync.Pool`。 |
+| PinnableSlice | 仅限一次 Get；Go bridge 复制到现有 BlobPool 后释放 pin，panic 路径也会清理。native 视图不进入网络发送阶段。 |
+| Compaction filter | 每个 DB 一个，由三个数据 CF 借用，存活至 DB 关闭、析构和后台 callback 结束之后。 |
+| Go callback | 一个 `runtime/cgo.Handle`，在打开失败或 DB 析构完成后删除；C++ 只保留整数。callback panic 会保留 key 并记录日志。 |
+| 错误和属性字符串 | 同一次 bridge 调用中复制到 Go 后释放。 |
+
+存储的生命周期锁先排空完整请求，再开始释放。Close 随后等待 Sketch 后台任务退出、
+持久化最终 Sketch。关闭可写 DB 前，native owner 显式等待三个数据 CF 分别 Flush
+完成；保留首个 Flush 错误，同时仍关闭 DB 并释放全部 handle。最终 Sketch 持久化
+错误也会返回调用方。只读 Close 跳过 Flush。并发 Close 等待同一个结果；关闭后
+请求返回存储已关闭错误，缺失 key 仍是普通缓存未命中。
+
+上文配置、aging 与用户可见持久性规则是此 wrapper 的唯一政策定义。固定 CF 为 `default`、`chunk`、`manifest`、`blob`，未知 partition 保留回落 chunk 的行为；object key 为 32 字节，shard key 追加 `0x00`。Bloom 属性描述包含其配置参数。只读打开使用允许 WAL 文件存在的 `OpenForReadOnly`，可能把 WAL 重放到内存；它不是 secondary instance，也不创建 sketch。inline filtering 与 `FilterBlobByKey` 查询同一 sketch，只作 keep/remove 决策；忽略 snapshot 的语义不变，必要的 BlobGC relocation 仍可能读取存活 value。
+
+原生构建与有针对性的生命周期测试见[贡献指南](../CONTRIBUTING_zh.md#原生缓存验证)。
+
+### Redis adapter 语义
+
+`cache-ctl` 可通过 Unix domain socket（UDS）或直连 TCP 使用 Redis-compatible 服务，覆盖所有物理缓存角色：
+
+- `mode: local`：完整对象；
+- `mode: shard`：EC 分片值；
+- `mode: tiered` 中的 `type: redis`：节点本地完整对象 tier。
+
+Accelerator 的配置与实现只依赖 Redis 协议。Dragonfly 是一种独立管理的外部服务示例，不是另一种 backend type，也不是 Accelerator 发行组件。
+
+#### Redis key 与 value 模型
+
+实现使用二进制 RESP2 bulk string，只发 GET/SET。Key 固定为 35 字节：
+
+```text
+version[1] | partition[1] | kind[1] | SHA-256[32]
+```
+
+`partition` 区分 chunk、manifest、blob；`kind` 区分完整对象与 EC 分片，使相同内容摘要不会冲突。对象值原样存储。分片值继续使用 `[idx][total][shard_data]` 格式。
+
+只有 RESP nil bulk response 才是 confirmed cache miss。Timeout、EOF、`-ERR` 和畸形 RESP 都是 backend error，不能因此触发 EC repair 或 tier fallthrough。
+
+#### Redis 连接与取消
+
+GET/SET 使用相互独立、启动时建立连接、大小固定的 worker pool。一个连接最多承载一个在途命令，明确 RESP FIFO 所有权，并防止 fill 流量占用读池。
+
+对象或 shard GET 取消时，调用者立即返回；worker 读取并丢弃迟到响应后才把连接归还池。正常取消不会关闭外部 wire 连接或 Redis backend 连接。畸形响应或真实 UDS/TCP I/O 故障只关闭该 worker 的连接，并按配置传输重连。
+
+SET 用 `net.Buffers` 对 header/key/value 执行 writev。在 socket 写入完成前借用调用者的 value。写入后发生取消时，调用者可以先返回，worker 继续 drain `+OK`；`Fill` 返回后 worker 不再持有调用者的 payload。
+
+#### Redis 就绪与可观测性
+
+gRPC health 服务使用专用 Redis 连接探测保留 key。探测不占用数据池，也不改变 hit/miss 计数。Redis probe 失败把 daemon 标成 `NOT_SERVING`，不改变 EC membership 或 placement epoch。
+
+`cache-ctl info` 暴露 backend type、endpoint、transport、pool size/connectivity、in-flight/draining 数量、cancellation、late bytes、reconnect、protocol/backend errors，以及 GET/SET 延迟分位数。
+
+### 频率统计与磁盘淘汰
 
 embedded RocksDB 在 Go 中维护 Count-Min Sketch。每次 Get(包括 miss)记录一次访问,
 成功的 Fill 或 FillShard 再记录一次。后台 compaction 经 CGO 调用 filter 的
@@ -532,7 +643,7 @@ CMS active/previous、重置/序列化临时
 buffer、wire pools、EC 工作和并发都占内存;RocksDB native allocation 又在 Go heap
 之外。Redis backend 遵守外部 server 的内存策略。
 
-### 4.6 TieredCache 与读路径
+### TieredCache 与读路径
 
 ```mermaid
 flowchart TD
@@ -550,9 +661,9 @@ flowchart TD
 
 Manifest Stream.ReadAt 解析请求的最终可见 Runs,并发读取 Data 并写入各逻辑范围。
 下层命中异步回填上层。4+1 对 5 peer fanout,4 个不同有效 idx 足够时即可返回;
-只有 data shard 缺失时才需重建。读取顺序和 sparse 多层可见性遵守 [manifest](manifest_zh.md)。
+只有 data shard 缺失时才需重建。读取顺序和 sparse 多层可见性遵守 [manifest](transfer_zh.md)。
 
-### 4.7 fill-aside
+### fill-aside
 
 layer i 命中时回填所有更上层 cache tiers;N 个 cache tiers 后的 origin 为第 N 层。
 
@@ -568,7 +679,7 @@ layer i 命中(0..N-1 为 tiers,N 为 origin):
 各自拥有一个引用,不是两份无关数据副本。
 
 **异步**:读不等待 fill。fill 使用 TieredCache base context 的派生 context,通常没有
-独立 fill deadline;Close 取消并 join(§6.2)。backend 取消能力与 client timeout 仍有效,
+独立 fill deadline;Close 取消并 join([信号处理](#信号处理))。backend 取消能力与 client timeout 仍有效,
 尤其同步 RocksDB CGO 不能中断;不能承诺任意 wedged backend 都立刻退出。
 
 测试/预热通过实际 Get/ShardGet 证明可读,不能只看 goroutine 暂时排空。
@@ -589,16 +700,16 @@ quorum 取消的慢 peer 是 **unknown**,不是 miss。有界后续 probe 可澄
 只对 confirmed miss 且 missing idx 与目的地精确对应的情况写修复。传输错误、坏 prefix、
 过时编码方案或歧义映射都不能作为覆盖 peer 现有 shard 的依据。重复 idx 不算足够 quorum。
 
-### 4.8 强制准入语义
+### 强制准入语义
 
 Put/PutShard 不使用应用层频率 admission filter。**不等于每次写入都成功**:
 read-only、磁盘/资源故障、非法输入和 backend error 仍可拒绝。
 
 正常 fill 代表刚读取的 chunk。再加一层 W-TinyLFU 式准入拒绝,可能导致下次再次回源,
-与逐步升温目标冲突。因此 embedded 用 §4.5 频率/compaction 回收空间,不靠准入;
+与逐步升温目标冲突。因此 embedded 用 [频率统计与磁盘淘汰](#频率统计与磁盘淘汰) 频率/compaction 回收空间,不靠准入;
 Redis-compatible server 管理自己的淘汰。
 
-### 4.9 EC 客户端
+### EC 客户端
 
 EC 客户端只在 tiered 的 tier chain 中使用。
 
@@ -657,7 +768,7 @@ placement,不假定精确 1/M。**reload 不重建 RS codec**,需为既有 data+
 同时替换至少 2 peer 可耗尽 parity、引发 miss/回源。一次 1 peer 也非零影响保证:
 既有数据缺失、probe 筛选与 origin 故障均影响结果。
 
-### 4.10 跨形态混发的行为
+### 跨形态混发的行为
 
 当前 local/shard 把同一所选 backend 接到 object 与 shard 两种接口。因此 ObjectPut
 发到 shard daemon 可被接受并真正写入完整对象;模式表示主要部署角色,不是独占协议权限。
@@ -665,7 +776,7 @@ placement,不假定精确 1/M。**reload 不重建 RS codec**,需为既有 data+
 tiered 仅提供 object read chain,拒绝 writes 和 shard operations。协议不应被误解为授权边界;
 端点访问控制属于部署。
 
-### 4.11 单次读取、连接池恢复与错误归属
+### 单次读取、连接池恢复与错误归属
 
 Cache 读取是单次尝试操作。`Get`/`GetShard` 会释放或取消失败的 payload/stream；后续调用在同一已选 endpoint 重新开始完整对象读取，不拼接旧前缀。已确认 miss 与无法联系 peer 保持不同含义，合法服务端取消仍可重试。现有 endpoint、pool 和单次操作 timeout 设置仍然权威；socket/RPC deadline 只约束一次尝试，是否允许下一次尝试由调用者的 operation context 决定。不增加 retry 参数、fallback endpoint、健康屏蔽、服务重启或兼容模式。
 
@@ -673,23 +784,23 @@ Cache 读取是单次尝试操作。`Get`/`GetShard` 会释放或取消失败的
 
 Cache 调用方使用的 `pkg/readerr` 分类在包装链中保持：已确认 miss 不是 transport failure，未知错误不会自动成为永久失败，joined/wrapped error 中的永久语义原因仍可见。业务重试/退避由消费者而非 accelerator 负责。
 
-## 5. 内存预算
+## 内存预算
 
-### 5.1 L1(tiered 进程内嵌 embedded tier)
+### L1(tiered 进程内嵌 embedded tier)
 
 配置的 BlockCache 是一项主要 native-memory 额度，不是完整进程上限。memtable/write buffer、native metadata、BlobDB/compaction、wire payload pool、active/previous CMS generation 与临时 buffer 需分别计入。缓存中的 index/filter block 共享 BlockCache，不能再次视为独立 pinned 区域重复计数。
 
-按 embedded 后端契约（§4.4）的实际配置和最小值推导 cache 额度。Go heap、在飞 request/fill 并发、native 与 OS 内存都取决于负载。DirectReads 可减少受支持数据读取的 page cache，但不表示全进程 page-cache 用量为零。应测量整个进程/cgroup，而非把单项额度当作总量限制。
+按 embedded 后端契约（[RocksDB 调优](#rocksdb-调优)）的实际配置和最小值推导 cache 额度。Go heap、在飞 request/fill 并发、native 与 OS 内存都取决于负载。DirectReads 可减少受支持数据读取的 page cache，但不表示全进程 page-cache 用量为零。应测量整个进程/cgroup，而非把单项额度当作总量限制。
 
-### 5.2 L2(shard 专用节点)
+### L2(shard 专用节点)
 
 按节点实际物理 key、分片编码、CF 分布和对象大小分布规划 shard 内存。理想化 Bloom 位预算为 `实际 key 数 × 每 key 位数 / 8`；索引、逐 entry 与 native 开销分别测量。不能把整个逻辑数据集重复计入每个 CF，也不能把完整对象数等同于编码后的 shard key 数。
 
 L0 pinning 与 index/filter cache 可减少 I/O，但不证明所有 metadata 常驻、miss 零 I/O 或 hit 只有一次 I/O。Bloom 误报、SST 遍历和 BlobDB payload 读取仍可能发生。应在真实 cold read、fill、repair 和 compaction 期间验收内存与磁盘行为，保留运维余量，不照搬历史主机分配表。
 
-## 6. 运维
+## 运维
 
-### 6.1 启动
+### 启动
 
 ```bash
 # shard 节点(L2 集群成员)
@@ -699,9 +810,9 @@ cache-ctl serve --config /etc/cache/shard.yaml
 cache-ctl serve --config /etc/cache/tiered.yaml
 ```
 
-### 6.2 信号处理
+### 信号处理
 
-第一次 SIGTERM/SIGINT 发起不可逆 drain,不取消已接纳业务的 context;第二次退出信号取消在途工作,后续信号幂等。SIGHUP 在服务运行时仍按 §4.9 刷新 EC membership,进入退出阶段后不再触发刷新。
+第一次 SIGTERM/SIGINT 发起不可逆 drain,不取消已接纳业务的 context;第二次退出信号取消在途工作,后续信号幂等。SIGHUP 在服务运行时仍按 [EC 客户端](#ec-客户端) 刷新 EC membership,进入退出阶段后不再触发刷新。
 
 1. 原子关闭 wire admission,撤销既有 health readiness。已开始的 Redis health probe 即使迟到成功,也不能把 NOT_SERVING 改回 SERVING。
 2. 排空执行中请求、reader 已接纳的请求、reqs 队列和 pending 请求。停止本地 reader 与 peer 断线分开处理;本地 drain 开始后,TCP/UDS half-close 保留已接纳响应。正常运行时,EOF/断线保持既有取消语义,包括客户端 Get/GetShard 的中止;仅凭 TCP FIN 无法区分 write-half close 与调用方关闭连接。Blob 和请求缓冲区在完整写出或明确写失败后才释放。Linux TCP 在最终 close 前等待已发送尾部得到 ACK,避免未读输入导致 RST 截断。
@@ -712,16 +823,16 @@ cache-ctl serve --config /etc/cache/tiered.yaml
 
 新业务会被拒绝,取消或故障可以产生真实运输层错误。服务端已提交但响应丢失仍是不确定结果,不能报告客户端成功。低层 Get/GetShard 仍为 single attempt。普通 bind 的监听在退出时释放,下一实例在旧实例退出后重新打开数据库并 bind;排空不保留监听或迁移连接。回滚不改变数据格式。
 
-### 6.3 运行时计数(pull-only)
+### 运行时计数(pull-only)
 
 精确累计计数按需经控制面 `cac.cache.v1.Info/Get` 拉取(`health_listen` 端口,见
-§1.2)。`cache-ctl info --endpoint host:port` 即取一次快照(`--json` 出原始
+[设计原则](#设计原则))。`cache-ctl info --endpoint host:port` 即取一次快照(`--json` 出原始
 JSON,否则人类可读表格),含 server hits/misses/fills、各 tier 与 origin 计数、
 EC 各 peer 计数、embedded/local/shard RocksDB CF 属性及 Redis-specific gauges。
 bench 比较窗口前后 delta。独立 atomic counters 是累计证据,整个多计数响应不是事务式
-同一时刻快照。日常观察用 §6.6 自适应统计,不必反复拉取 Info。
+同一时刻快照。日常观察用 [周期自适应统计行(`stats_interval`)](#周期自适应统计行stats_interval) 自适应统计,不必反复拉取 Info。
 
-### 6.4 离线诊断
+### 离线诊断
 
 ```bash
 cache-ctl info --rocks-path /var/cache/accel-l1
@@ -731,10 +842,10 @@ cache-ctl info --rocks-path /var/cache/accel-l1
 compaction stats。用于离线/故障后检查,**不是 secondary instance**,不承诺并发 writer
 修改文件时的 coherent view。运行中服务使用 gRPC Info。
 
-`pprof_listen` 非空时(§3.5)另起 `/debug/pprof/*` HTTP listener,可
+`pprof_listen` 非空时([关键参数](#关键参数))另起 `/debug/pprof/*` HTTP listener,可
 `go tool pprof` 抓 CPU / heap / goroutine。生产留空,仅排障临时开启。
 
-### 6.5 慢/卡请求追踪(`CACHE_CTL_DEBUG`)
+### 慢/卡请求追踪(`CACHE_CTL_DEBUG`)
 
 未配置请求 deadline 时,阻塞 backend 可一直等待 caller/connection 取消。
 env tracer 使慢/在途工作可观测:
@@ -746,7 +857,7 @@ CACHE_CTL_SLOW=2s CACHE_CTL_DEBUG=1 cache-ctl serve ...      # 自定慢阈值
 
 - `CACHE_CTL_DEBUG` truthy 时启用;关闭时仍有小量 enable-check 开销,不是字面零开销
 - **只有超过慢阈值**(`CACHE_CTL_SLOW`,Go duration,默认 1 s)的请求打一行
-  (WARN);快请求静默——稳态吞吐/时延看 §6.6 的周期统计行,这里只盯异常长尾
+  (WARN);快请求静默——稳态吞吐/时延看 [周期自适应统计行(`stats_interval`)](#周期自适应统计行stats_interval) 的周期统计行,这里只盯异常长尾
 - 后台 reporter 周期 dump **仍在飞**且超阈值的请求(op 名 + 已卡时长),
   不必等 deadline 即可观察慢 tier/origin
 - 覆盖 wire 服务端请求处理(一次请求一个 op;tier 链遍历与 origin 回源都在其内)
@@ -755,12 +866,12 @@ CACHE_CTL_SLOW=2s CACHE_CTL_DEBUG=1 cache-ctl serve ...      # 自定慢阈值
 (LocateN / fan-out / decode + shard 到达偏移),按 1% 采样、默认关闭。
 用于 EC quorum/hedge 尾延迟,与 CACHE_CTL_DEBUG 独立。
 
-两者生产默认关闭;与 `pprof_listen`(§6.4)互补——tracer 看"哪些请求慢/卡",
+两者生产默认关闭;与 `pprof_listen`([离线诊断](#离线诊断))互补——tracer 看"哪些请求慢/卡",
 pprof 看"卡在哪段代码"。
 
-### 6.6 周期自适应统计行(`stats_interval`)
+### 周期自适应统计行(`stats_interval`)
 
-daemon 默认每 30 s(`stats_interval`,§3)向 stderr 打一行运行时统计,**仿
+daemon 默认每 30 s(`stats_interval`,[配置](#配置))向 stderr 打一行运行时统计,**仿
 sandbox-ctl 的自适应输出**:有流量的周期打一行汇总,无流量的周期**静默**,启动
 后先以 2 s 快采样捕捉冷启突发,空闲两拍后退回基准周期。`stats_interval: 0`/`off`
 关闭。一行含:
@@ -781,11 +892,11 @@ sandbox-ctl 的自适应输出**:有流量的周期打一行汇总,无流量的�
 cache stat tiered | get 5.1k/s 620MiB/s p50 40µs/p99 700µs/max 9ms · hit 94% | inflight 18 conns 6 | hits L0 88% L1 6% origin 6% | rocks chunk 1.2M keys/3.4GiB
 ```
 
-与 §6.3 的 pull-only Info 互补:统计行给稳态全貌(默认开、自适应、低噪),Info
-给精确累计快照(bench / 脚本按需拉);与 §6.5 的 `CACHE_CTL_DEBUG` 正交(后者
+与 [运行时计数(pull-only)](#运行时计数pull-only) 的 pull-only Info 互补:统计行给稳态全貌(默认开、自适应、低噪),Info
+给精确累计快照(bench / 脚本按需拉);与 [慢/卡请求追踪(`CACHE_CTL_DEBUG`)](#慢卡请求追踪cache_ctl_debug) 的 `CACHE_CTL_DEBUG` 正交(后者
 只打异常长尾)。
 
-### 6.7 命名监听与 socket activation
+### 命名监听与 socket activation
 
 Linux 上,服务端 `listen`,`health_listen` 和已启用的 `pprof_listen` 还可取 `fd=<name>`.客户端继续使用 TCP/UDS endpoint;`fd=` 不是客户端地址.CLI 显式导入 `LISTEN_PID`,`LISTEN_FDS` 和 `LISTEN_FDNAMES`;App 只接收 `Options.ListenerFDs`,不读取这些环境变量.每个传入 FD 必须且只能被一个已配置入口消费.PID/数量/名称错误,缺失/多余/重复名称,socket 别名,不支持的地址族,非 stream 或非 listening FD,均在创建 backend 前报错.显式 FD 错误不会回退 bind.普通 pprof TCP bind 失败仍只记录 warning.其他平台继续支持普通 bind 构建,显式 activation 则拒绝.
 
@@ -811,17 +922,50 @@ socket units 拥有 `/run/kuasar-accelerator` 下的 UDS pathname;service 不将
 
 示例使用 [systemd 247 socket units](https://www.freedesktop.org/software/systemd/man/247/systemd.socket.html) 已支持的指令:`FlushPending=no` 在 service 退出时保留 pending connections;`TriggerLimitIntervalSec=2s`/`TriggerLimitBurst=20` 限制 activation 触发频率.[Service 配置](https://www.freedesktop.org/software/systemd/man/247/systemd.service.html) 使用 `Restart=on-failure`,`RestartSec=1s` 和 90 秒启动/停止预算;App 的 30 秒 drain 预算可提前取消工作,但不能关闭仍在使用的资源.`Type=exec` 下,启动 timeout 不限制 exec 之后的 App 初始化.[Start limits](https://www.freedesktop.org/software/systemd/man/247/systemd.unit.html) 允许十秒内启动五次.暂时初始化失败可通过既有 manager 策略重试;持续失败可能耗尽限制,应诊断并修复原因,再 reset 对应失败 units 并启动.不增加内部 restart loop.
 
-监听保留,connect 成功或 `Type=exec` 启动均不证明 ready;必须完成 backend/source 初始化并处理真实协议请求.EC 部署必须包含 §4.9 的真实 wire Ping 校验.membership 仍表达健康,placement/成员变更规则不变.socket activation 只保留入口及尚未 accept 的队列:不迁移旧连接,队列容量有限,中断请求仍返回错误.低层读取继续 single attempt.
+监听保留,connect 成功或 `Type=exec` 启动均不证明 ready;必须完成 backend/source 初始化并处理真实协议请求.EC 部署必须包含 [EC 客户端](#ec-客户端) 的真实 wire Ping 校验.membership 仍表达健康,placement/成员变更规则不变.socket activation 只保留入口及尚未 accept 的队列:不迁移旧连接,队列容量有限,中断请求仍返回错误.低层读取继续 single attempt.
 
 回滚时先 stop/disable 全部已启用的 socket units (包括可选 pprof),并停止 service;确认 inactive 后才能普通 bind 或清理 pathname.移除 service 的 activation `Requires`/`After`/`Sockets` 配置和 profiling drop-in,把每个 `fd=` 改回原 TCP/UDS endpoint,重新加载 systemd 并启动 service.保留 restart/drain 策略和原数据.socket unit 仍持有路径时不得 bind 或 unlink.移除真实 EC Ping 前,还须先撤销 EC socket activation 部署.
 
-## 7. 性能特征
+### 部署独立管理的 Dragonfly 服务
+
+示例 unit 为 [`deploy/systemd/dragonfly-cache.service`](../deploy/systemd/dragonfly-cache.service)，参数集固定匹配 [Dragonfly v1.39.0](https://github.com/dragonflydb/dragonfly/releases/tag/v1.39.0)。Accelerator 不下载、捆绑、发布或再分发 Dragonfly 二进制。选择该外部服务的运维方必须按自己的软件供应与许可证政策取得和管理它。仓内 hashes 是 v1.39.0 GitHub Release 为两种支持架构发布的资产元数据 SHA-256，可用于验证单独取得的归档。目标宿主应安装已验证产物，不能在服务启动时下载 Dragonfly：
+
+```bash
+sha256sum --check --ignore-missing deploy/dragonfly-v1.39.0.sha256
+```
+
+将已验证二进制安装到精确路径：
+
+```text
+/usr/local/libexec/kuasar-cache/dragonfly-v1.39.0
+```
+
+将 `deploy/systemd/dragonfly.env.example` 复制到 `/etc/kuasar-cache/dragonfly.env`，并按宿主容量配置。示例值为：
+
+```bash
+DRAGONFLY_MAX_MEMORY=412316860416
+DRAGONFLY_TIER_PREFIX=/mnt/ssd/dragonfly/tier
+DRAGONFLY_TIER_BYTES=5497558138880
+DRAGONFLY_TIER_OFFLOAD_THRESHOLD=0.4
+DRAGONFLY_TIER_UPLOAD_THRESHOLD=0.2
+DRAGONFLY_PROACTOR_THREADS=16
+```
+
+`DRAGONFLY_TIER_BYTES` 是总磁盘预算，由 Dragonfly 分给已配置的 proactor threads；须为 256 MiB 的倍数，并至少能为每个线程分配 256 MiB。在 NVMe 文件系统创建 tier-prefix 的父目录，启动前授予 `kuasar-cache` 写权限。
+
+让 Dragonfly 与 `cache-ctl` 分别运行在独立 cpuset，并与 NVMe NUMA 节点对齐。示例 unit 禁用 TCP listener，只暴露 `/run/kuasar-cache/redis.sock`；同时关闭 Dragonfly 的每日发行检查，使目标宿主上的服务不会请求版本网站。这是节点本地拓扑示例。独立管理的远程服务可以暴露 TCP，其 bind/firewall 策略与网络延迟由运维方负责。
+
+Dragonfly v1.39.0 使用 BSL 1.1。Accelerator 不包含或再分发它，因此该许可证不改变 Accelerator 发行许可或 backend 接受规则；运维方仍须遵守所选外部 Redis-compatible 服务的条款。
+
+Dragonfly 的 SSD tier 是缓存容量，不是权威持久层。local 或 tiered 实例重启后可回源。RS(4+1) 部署一次最多重启一个 shard peer，并在该 peer 冷启动时对 repair 限速。
+
+## 性能特征
 
 分别测量 local、shard 和 tiered 路径，记录源码/二进制版本、硬件、后端配置、对象大小、并发、缓存状态与失败。比较前明确计时边界及 hit/miss 分母；各层条件命中率不能简单相加。缓存拓扑本身不构成普遍时延、命中率或容量保证。
 
-证据要求和外部服务部署验证见 [项目性能方法](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf_zh.md) 与 [Redis-compatible 后端指南（英文）](cache-redis.md)，现有命令和保护措施完整保留在下方。
+证据要求和外部服务部署验证见 [项目性能方法](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/performance_zh.md) 与 [Redis-compatible 后端指南（英文）](cache.md#redis-adapter-semantics)，现有命令和保护措施完整保留在下方。
 
-### 7.1 后端与 wire 基准测试
+### 后端与 wire 基准测试
 
 内置吞吐/延迟基准,通过 wire 协议向运行中的 cache-ctl 发压。用于快速
 smoke 验证;不替代 `test/scripts/bench_cache.sh`(后者加 taskset CPU 固
@@ -981,7 +1125,7 @@ origin 与 tiered 并扫并发。使用 [procmon.sh](../test/scripts/procmon.sh)
 - **L3 建模**:`--cold-prefill N` 只写 origin,`--miss-ratio f` 让约 f 比例查询冷
   key。重复冷 key 经 fill-aside 变热,会降低实测回源率;冷池应大于窗口内预期冷读次数。
 - **aging/淘汰**:embedded 按频率历史淘汰,由成功写入字节、访问次数及显式配置的
-  reset 定时器推进老化(§4.5);`disk_bytes` 不是配额。访问次数未达到 `reset_after`
+  reset 定时器推进老化([频率统计与磁盘淘汰](#频率统计与磁盘淘汰));`disk_bytes` 不是配额。访问次数未达到 `reset_after`
   时,写入仍可能耗尽字节预算。记录 value 大小、重复 fill、热集合命中率和 compaction
   行为;仅访问一次的 key 也可能已符合淘汰条件。逻辑删除与 blob 物理回收需分别观察。
 - **可能的瓶颈**:RAM-hot 读取可压满协调节点网络/拷贝/CPU,工作集落盘可压满 shard
@@ -990,8 +1134,7 @@ origin 与 tiered 并扫并发。使用 [procmon.sh](../test/scripts/procmon.sh)
   “网卡必先满”“CPU 通常不影响”不是与硬件无关的事实。联合测量网络、磁盘、CPU、
   并发与时延;让实测热集驻留可能有益,但架构不自动带来固定数量级收益。
 
-
-## 8. 可复用的 Cache App 入口
+## 可复用的 Cache App 入口
 
 `app/cache.Run(ctx, cfg, opts)` 是 `cache-ctl serve` 与定制二进制共同使用的完整 Cache 服务实现。`app/cache.Config` 是 `pkg/cache/runtime.Config` 的别名；`Options` 包含 `Logger`、`Reload`、`LoadMembership`、`Drain`、`DrainTimeout` 和 `ListenerFDs`。App 不查找 `CACHE_CONFIG`、不注册进程信号，也不依赖官方 CLI。
 
@@ -1032,9 +1175,9 @@ KillSignal=SIGTERM
 
 EC membership 刷新时，调用方同时提供 `Reload` 与 `LoadMembership`。callback 只返回启动配置中已有 EC tier 的候选 peers。`Run` 先校验整批候选，再逐层 probe/apply；某层失败时保留该层旧 membership，不热替换拓扑或其他配置。关闭的 reload channel 会被禁用而不是持续轮询。
 
-App 拥有 listener、backend client、共享 BlobPool、Health/Info、统计、Redis health monitor 和可选的实例级 pprof HTTP server。所有实际使用者结束后才关闭依赖并返回;退出顺序见 §6.2。定制调用方拥有信号与借入输入。
+App 拥有 listener、backend client、共享 BlobPool、Health/Info、统计、Redis health monitor 和可选的实例级 pprof HTTP server。所有实际使用者结束后才关闭依赖并返回;退出顺序见 [信号处理](#信号处理)。定制调用方拥有信号与借入输入。
 
-`Options.Drain <-chan struct{}` 默认为 nil,保留上例的 ctx 取消行为。关闭显式传入的 Drain 发起软停;`Run(ctx)` 的 ctx 取消始终取消在途工作,不会偷偷改成等待排空,且与 drain 同时发生时优先。`Options.DrainTimeout time.Duration` 使用 §6.2 的共享预算。初始化期间收到 drain 后不再发布 started/SERVING。若宿主希望区分软停和取消,可传入 `Options{Drain: drain, DrainTimeout: 30*time.Second}`,自行将第一次退出请求适配为 `close(drain)`,将后续请求适配为 ctx 的 cancel;App 不接管宿主 signals、args 或进程退出。
+`Options.Drain <-chan struct{}` 默认为 nil,保留上例的 ctx 取消行为。关闭显式传入的 Drain 发起软停;`Run(ctx)` 的 ctx 取消始终取消在途工作,不会偷偷改成等待排空,且与 drain 同时发生时优先。`Options.DrainTimeout time.Duration` 使用 [信号处理](#信号处理) 的共享预算。初始化期间收到 drain 后不再发布 started/SERVING。若宿主希望区分软停和取消,可传入 `Options{Drain: drain, DrainTimeout: 30*time.Second}`,自行将第一次退出请求适配为 `close(drain)`,将后续请求适配为 ctx 的 cancel;App 不接管宿主 signals、args 或进程退出。
 
 `Options.ListenerFDs map[string]*os.File` 显式传入命名原始 FD;App 从不隐式读取 activation 环境.自定义 main 可使用公共 `pkg/activation.FilesFromEnv()` (下例还需导入 `errors`),也可从自己的 manager 取得 Files:
 
@@ -1050,16 +1193,16 @@ func runActivated(ctx context.Context, cfg cacheapp.Config) error {
 
 helper 成功后,调用方拥有从 FD 3 开始的原始 Files,须关闭它们;helper 设置 close-on-exec 并清除三个 `LISTEN_*` 变量.失败时不转移所有权,不关闭原始 FD,不遗留副本,原始 FD 仍由宿主负责.App 导入时借用稳定的 map/Files,校验完整入口集后创建 close-on-exec listener 副本;失败回滚关闭已创建副本,不关闭原始 Files.Go listener 导入会在共享 socket description 上设置 nonblocking I/O,该状态标志也影响原始 FD;close-on-exec 则属于每个 FD.调用方应在 Run 返回后关闭原始 Files;App 只关闭自己的副本,不删除继承 UDS pathname,不 shutdown manager socket.初始化失败,drain 或取消均遵守此所有权.上例保留 SDK ctx 取消方式;需要软停时同时传入前述 Drain/DrainTimeout.
 
-## 8. See Also
+## 相关契约
 
 - [store](store_zh.md):tiered origin 可用 store-ctl gRPC 或另一 cache wire endpoint。
   embedded cache-ctl 仍有本地文件 I/O,权威 origin 持久化在 store-ctl。后者可用
   `cache_listen` 提供只读 chunk/Manifest/blob wire 接口,无 L1,从而无需独立 cache daemon。
-- [manifest](manifest_zh.md):配置 cache 时 Fetcher 使用 wire ObjectGet;Manifest chunk
+- [manifest](transfer_zh.md):配置 cache 时 Fetcher 使用 wire ObjectGet;Manifest chunk
   hash 即对应 physical ContentKey。
-- [项目性能文档](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf_zh.md):缓存测量与证据边界。
+- [项目性能文档](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/performance_zh.md):缓存测量与证据边界。
 - [README](../README_zh.md) / [Makefile](../Makefile):`make cache-ctl` 自动 deps-rocksdb
   后静态链接 librocksdb,是本仓 CGO 二进制。
-- [系统架构](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox_zh.md):平台缓存模型。
+- [系统架构](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/architecture_zh.md):平台缓存模型。
 
-Cache 单次读取与 client 恢复见[§4.11](#411-单次读取连接池恢复与错误归属).
+Cache 单次读取与 client 恢复见[单次读取、连接池恢复与错误归属](#单次读取连接池恢复与错误归属).
