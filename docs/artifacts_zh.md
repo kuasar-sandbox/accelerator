@@ -4,7 +4,7 @@
 
 本篇是 Accelerator reader、writer 与下游消费者共同遵守的数据契约，定义稀疏逻辑字节、引用、Chunk/Manifest 对象、身份和物理载体。完整命令与流程见[数据传输](transfer_zh.md)，admission 与持久性见 [Store](store_zh.md)，OCI/EROFS payload 语义见[镜像制备](image-preparation_zh.md)。
 
-本篇定义通用不可变文件加密、tarstream 与多 Manifest Bundle 契约。[manifest_zh.md](transfer_zh.md) 定义逻辑 Manifest/Chunk 对象与密钥，[store_zh.md](store_zh.md) 定义持久化和准入。本篇不定义 Sandbox E/S 内容或 OCI/EROFS 镜像语义；对应消费者按自身 [Sandbox 工件](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/artifacts_zh.md#artifact-model) 和 [镜像](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten-cli_zh.md) 契约使用这些载体。
+本篇定义通用不可变文件加密、tarstream、多 Manifest Bundle 契约及下文的[逻辑 Manifest/Chunk 对象与密钥](#manifest-对象与稀疏访问)。[数据传输](transfer_zh.md) 定义命令与流程，[Store](store_zh.md) 定义持久化和准入。Sandbox E/S 内容由 [Sandbox 工件契约](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/artifacts_zh.md#artifact-model) 定义，OCI/EROFS payload 语义由[镜像制备](image-preparation_zh.md#镜像-payload-与运行配置)定义。
 
 ## 逻辑数据与职责
 

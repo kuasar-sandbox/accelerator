@@ -4,7 +4,7 @@
 
 This is the common data contract for Accelerator readers, writers and consumers. It defines sparse logical bytes, references, Chunk/Manifest objects, identity and physical carriers. Use [Data transfer](transfer.md) for complete commands and workflows, [Store](store.md) for admission and persistence, and [Image preparation](image-preparation.md) for OCI/EROFS payload semantics.
 
-This specification owns the generic immutable-file encryption, tarstream and multi-Manifest Bundle contracts. Logical Manifest/Chunk objects and keys remain in [manifest.md](transfer.md); persistence/admission belongs to [store.md](store.md). It does not define Sandbox E/S contents or OCI/EROFS image semantics. Those consumers apply these carriers according to their own [sandbox artifact](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/artifacts.md#artifact-model) and [image](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten-cli.md) contracts.
+This specification owns generic immutable-file encryption, tarstream and multi-Manifest Bundle contracts, together with the [logical Manifest/Chunk objects and keys](#manifest-objects-and-sparse-access). [Data transfer](transfer.md) owns commands and workflows; [Store](store.md) owns persistence and admission. Sandbox E/S contents belong to the [sandbox artifact contract](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/artifacts.md#artifact-model), while OCI/EROFS payload semantics belong to [Image preparation](image-preparation.md#image-payload-and-runtime-configuration).
 
 ## Logical data and responsibilities
 
