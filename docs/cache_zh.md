@@ -552,6 +552,12 @@ Manifest Stream.ReadAt 解析请求的最终可见 Runs,并发读取 Data 并写
 下层命中异步回填上层。4+1 对 5 peer fanout,4 个不同有效 idx 足够时即可返回;
 只有 data shard 缺失时才需重建。读取顺序和 sparse 多层可见性遵守 [manifest](manifest_zh.md)。
 
+同一个 TieredCache 进程内，相同 `(partition, content key)` 的并发 `Get` 会合并：
+一个 caller 执行查找链，waiter 获得独立持有的 `Blob` clone。命中项会保留在
+in-flight 表中，直到 Tier-0 回填 fill 返回，因此 RocksDB 写回窗口内到达的请求会复用
+同一结果，不会再次读取 origin。若 leader 因其自身 context 取消而失败，仍持有有效
+context 的 waiter 会重试，而不是继承该取消。合并仅限单进程，不协调不同 cache-ctl daemon。
+
 ### 4.7 fill-aside
 
 layer i 命中时回填所有更上层 cache tiers;N 个 cache tiers 后的 origin 为第 N 层。
@@ -563,9 +569,10 @@ layer i 命中(0..N-1 为 tiers,N 为 origin):
         startFill(j, partition, key, blob)   # 异步
 ```
 
-**Blob ownership**:startFill 克隆一个 owned handle 给 fill goroutine 并 defer Release。
-原 handle 由 Get caller 持有直到响应写完。两者引用同一 immutable backing allocation,
-各自拥有一个引用,不是两份无关数据副本。
+**Blob ownership**：startFill 克隆一个 owned handle 给 fill goroutine 并 defer Release。
+原 handle 由 Get caller 持有直到响应写完。合并的 waiter 也会获得 retained flight handle
+的 clone。所有 handle 引用同一 immutable backing allocation，各自拥有一个引用，
+不是多份无关数据副本。
 
 **异步**:读不等待 fill。fill 使用 TieredCache base context 的派生 context,通常没有
 独立 fill deadline;Close 取消并 join(§6.2)。backend 取消能力与 client timeout 仍有效,

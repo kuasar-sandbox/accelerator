@@ -138,12 +138,14 @@ func (tc *TieredCache) Stop() {
 	}
 }
 
-// Wait joins all asynchronous fill/repair work, including background work
-// owned by a tier. No new operations may be admitted while Wait is running.
+// Wait joins all asynchronous fill/repair and flight-retirement work,
+// including background work owned by a tier. No new operations may be
+// admitted while Wait is running.
 func (tc *TieredCache) Wait() {
 	for i := range tc.fillInflight {
 		tc.fillInflight[i].Wait()
 	}
+	tc.flightWG.Wait()
 	for _, tier := range tc.tiers {
 		if bg, ok := unwrapTier(tier).(backgroundTier); ok {
 			bg.WaitBackground()
@@ -171,6 +173,10 @@ type TieredCache struct {
 	origin       Getter
 	fillInflight []sync.WaitGroup // per-tier inflight fill WaitGroups
 	fillActive   []atomic.Int64   // observable fill/repair goroutines per tier
+
+	flightMu sync.Mutex
+	flights  map[getFlightKey]*getFlight
+	flightWG sync.WaitGroup
 
 	// baseCtx parents every async fill/repair goroutine; baseCancel
 	// (called by Close) cancels them all on shutdown. This is what
@@ -221,6 +227,7 @@ func NewTieredCache(origin Getter, tiers ...Tier) *TieredCache {
 		baseCancel:   baseCancel,
 		fillInflight: make([]sync.WaitGroup, len(tiers)),
 		fillActive:   make([]atomic.Int64, len(tiers)),
+		flights:      make(map[getFlightKey]*getFlight),
 		tierHits:     make([]atomic.Uint64, len(tiers)),
 		tierMisses:   make([]atomic.Uint64, len(tiers)),
 		tierFills:    make([]atomic.Uint64, len(tiers)),
@@ -269,14 +276,130 @@ func (tc *TieredCache) Counters() TieredCounters {
 }
 
 // Get attempts to read by key, looking through cache tiers and then the origin.
-// On hit, upper cache tiers are filled asynchronously. On terminal miss, FillMiss
-// is invoked on every tier that supports it.
+// Concurrent misses for the same key are coalesced. On hit, upper cache tiers
+// are filled asynchronously. On terminal miss, FillMiss is invoked on every tier
+// that supports it.
 //
 // Returned Blob ownership: the caller owns the handle and must Release
 // it exactly once after use. Fill-aside cloning is handled internally
 // by startFill, so the handle returned to the caller is distinct from
 // any clones in flight inside fill goroutines.
 func (tc *TieredCache) Get(ctx context.Context, p store.Partition, key store.ContentKey) (bool, Blob, error) {
+	if err := ctx.Err(); err != nil {
+		return false, nil, err
+	}
+	fk := getFlightKey{partition: p, key: key}
+	for {
+		tc.flightMu.Lock()
+		if f := tc.flights[fk]; f != nil {
+			f.waiterN++
+			f.waiters.Add(1)
+			tc.flightMu.Unlock()
+			found, blob, err, retry := tc.waitFlight(ctx, f)
+			if retry {
+				continue
+			}
+			return found, blob, err
+		}
+		f := &getFlight{ready: make(chan struct{})}
+		tc.flights[fk] = f
+		tc.flightMu.Unlock()
+
+		found, blob, fillDone, err := tc.lookup(ctx, p, key)
+		tc.publishFlight(fk, f, found, blob, err, fillDone, ctx.Err() != nil)
+		return found, blob, err
+	}
+}
+
+type getFlightKey struct {
+	partition store.Partition
+	key       store.ContentKey
+}
+
+type getFlight struct {
+	ready          chan struct{}
+	blob           Blob
+	found          bool
+	err            error
+	leaderCanceled bool
+	waiters        sync.WaitGroup
+	waiterN        int
+}
+
+func (tc *TieredCache) waitFlight(ctx context.Context, f *getFlight) (bool, Blob, error, bool) {
+	select {
+	case <-f.ready:
+	case <-ctx.Done():
+		f.waiters.Done()
+		return false, nil, ctx.Err(), false
+	}
+	var blob Blob
+	if f.blob != nil {
+		blob = f.blob.Clone()
+	}
+	f.waiters.Done()
+	if f.err != nil {
+		if f.leaderCanceled && ctx.Err() == nil {
+			return false, nil, nil, true
+		}
+		return false, nil, f.err, false
+	}
+	return f.found, blob, nil, false
+}
+
+func (tc *TieredCache) publishFlight(fk getFlightKey, f *getFlight, found bool, blob Blob, err error, fillDone <-chan struct{}, leaderCanceled bool) {
+	tc.flightMu.Lock()
+	if blob != nil && err == nil && (f.waiterN > 0 || fillDone != nil) {
+		f.blob = blob.Clone()
+	}
+	f.found = found
+	f.err = err
+	f.leaderCanceled = leaderCanceled
+	close(f.ready)
+	if err != nil || !found || fillDone == nil {
+		if tc.flights[fk] == f {
+			delete(tc.flights, fk)
+		}
+		waiters := f.waiterN
+		tc.flightMu.Unlock()
+		if waiters > 0 {
+			tc.flightWG.Add(1)
+			go func() {
+				defer tc.flightWG.Done()
+				tc.retireFlight(f)
+			}()
+		} else if f.blob != nil {
+			f.blob.Release()
+		}
+		return
+	}
+	tc.flightMu.Unlock()
+	tc.flightWG.Add(1)
+	go func() {
+		defer tc.flightWG.Done()
+		<-fillDone
+		tc.flightMu.Lock()
+		if tc.flights[fk] == f {
+			delete(tc.flights, fk)
+		}
+		waiters := f.waiterN
+		tc.flightMu.Unlock()
+		if waiters > 0 {
+			tc.retireFlight(f)
+		} else if f.blob != nil {
+			f.blob.Release()
+		}
+	}()
+}
+
+func (tc *TieredCache) retireFlight(f *getFlight) {
+	f.waiters.Wait()
+	if f.blob != nil {
+		f.blob.Release()
+	}
+}
+
+func (tc *TieredCache) lookup(ctx context.Context, p store.Partition, key store.ContentKey) (bool, Blob, <-chan struct{}, error) {
 	// Build the layer list once: cache tiers + origin.
 	layers := make([]Getter, 0, len(tc.tiers)+1)
 	for _, t := range tc.tiers {
@@ -297,7 +420,7 @@ restart:
 				} else {
 					tc.tierErrors[i].Add(1)
 				}
-				return false, nil, err
+				return false, nil, nil, err
 			}
 			if waited {
 				continue restart // restart from layer 0 — upper layers may be filled
@@ -326,13 +449,17 @@ restart:
 				if upper > len(tc.tiers) {
 					upper = len(tc.tiers)
 				}
+				var tier0Done <-chan struct{}
 				for j := upper - 1; j >= 0; j-- {
-					tc.startFill(j, p, key, blob)
+					done := tc.startFill(j, p, key, blob)
+					if j == 0 {
+						tier0Done = done
+					}
 				}
-				return true, blob, nil
+				return true, blob, tier0Done, nil
 
 			case CacheHitMiss:
-				return false, nil, nil
+				return false, nil, nil, nil
 
 			case CacheMiss:
 				continue
@@ -343,7 +470,7 @@ restart:
 		for j := len(tc.tiers) - 1; j >= 0; j-- {
 			tc.startFillMiss(j, p, key)
 		}
-		return false, nil, nil
+		return false, nil, nil, nil
 	}
 }
 
@@ -367,20 +494,21 @@ func tryTier(ctx context.Context, c Getter, p store.Partition, key store.Content
 }
 
 // startFill clones the blob (refcount++) and hands the clone to a
-// fire-and-forget goroutine that writes the bytes into the named tier.
-// The caller's original `blob` handle is unaffected — it continues to
-// own its own reference and must still be Released independently (the
-// wire server does so after writing the response frame). The clone is
-// Released inside the goroutine after Fill returns, balancing the
-// refcount.
+// background goroutine that writes the bytes into the named tier. The
+// returned channel closes after Fill returns. The caller's original `blob`
+// handle is unaffected — it continues to own its own reference and must
+// still be Released independently (the wire server does so after writing
+// the response frame). The clone is Released inside the goroutine after
+// Fill returns, balancing the refcount.
 //
 // This clone pattern is the whole reason cache.Blob exists: without
 // it, a pool-backed blob would be returned to its pool as soon as the
 // "main" Release fired, and the fill-goroutine's view of the buffer
 // would race with the next caller that pulled the same slice from the
 // pool. Refcounting turns the race into safe cooperative ownership.
-func (tc *TieredCache) startFill(tierIdx int, p store.Partition, key store.ContentKey, blob Blob) {
+func (tc *TieredCache) startFill(tierIdx int, p store.Partition, key store.ContentKey, blob Blob) <-chan struct{} {
 	cloned := blob.Clone()
+	done := make(chan struct{})
 	tc.fillInflight[tierIdx].Add(1)
 	tc.fillActive[tierIdx].Add(1)
 	tc.tierFills[tierIdx].Add(1)
@@ -388,10 +516,12 @@ func (tc *TieredCache) startFill(tierIdx int, p store.Partition, key store.Conte
 		defer tc.fillInflight[tierIdx].Done()
 		defer tc.fillActive[tierIdx].Add(-1)
 		defer cloned.Release()
+		defer close(done)
 		ctx, cancel := tc.fillCtx()
 		defer cancel()
 		_ = tc.tiers[tierIdx].Fill(ctx, p, key, cloned.Bytes())
 	}()
+	return done
 }
 
 // startFillMiss invokes FillMiss on the tier if it implements the optional interface.
