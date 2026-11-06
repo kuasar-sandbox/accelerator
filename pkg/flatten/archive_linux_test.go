@@ -145,7 +145,7 @@ func TestArchiveLegacySkopeoAlias(t *testing.T) {
 	}
 }
 
-func TestArchiveFilePipeAndDirectoryEqual(t *testing.T) {
+func TestArchiveFilePipeAndDirectoryScratchEqual(t *testing.T) {
 	for _, codec := range []string{"plain", "gzip", "zstd"} {
 		t.Run(codec, func(t *testing.T) {
 			outer, in := archiveFixture(t, codec)
@@ -157,6 +157,23 @@ func TestArchiveFilePipeAndDirectoryEqual(t *testing.T) {
 			defer baseline.Close()
 			var expected bytes.Buffer
 			if err = baseline.WriteRaw(context.Background(), &expected); err != nil {
+				t.Fatal(err)
+			}
+			// Layer inputs canonicalize root ownership to 0:0, while directory
+			// inputs preserve the staging root's host ownership. Compare directory
+			// output with the same directory prepared using external scratch, not
+			// with the metadata-distinct image output. The nested-scratch case below
+			// must still be byte-identical and exclude all of its owned work.
+			directoryBaseline, err := PrepareDir(context.Background(), baseline.selection.root, Options{TmpDir: parent}, DirOptions{ConfigJSON: in.ConfigJSON()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer directoryBaseline.Close()
+			var directoryExpected bytes.Buffer
+			if err := directoryBaseline.WriteRaw(context.Background(), &directoryExpected); err != nil {
+				t.Fatal(err)
+			}
+			if err := directoryBaseline.Close(); err != nil {
 				t.Fatal(err)
 			}
 			for _, mode := range []string{"file", "pipe", "directory"} {
@@ -195,7 +212,11 @@ func TestArchiveFilePipeAndDirectoryEqual(t *testing.T) {
 					if err = p.WriteRaw(context.Background(), &got); err != nil {
 						t.Fatal(err)
 					}
-					if !bytes.Equal(expected.Bytes(), got.Bytes()) {
+					want := expected.Bytes()
+					if mode == "directory" {
+						want = directoryExpected.Bytes()
+					}
+					if !bytes.Equal(want, got.Bytes()) {
 						t.Fatal("equivalent input changed raw output")
 					}
 					if _, err = os.Stat(filepath.Join(p.selection.root, "dir", "old")); !os.IsNotExist(err) {
