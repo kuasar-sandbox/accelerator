@@ -54,10 +54,10 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, `Usage: manifest-ctl <command> [flags]
 
 Commands:
-  store          Ingest a tarstream artifact (file or stdin) into the content
-                 store; holes come from the envelope's map. Prints the hex key.
-  load           Reconstruct (a window of) an image from a manifest key as a
-                 tarstream artifact (holes ride the envelope losslessly).
+  store          Ingest one logical source (tarstream, file ref, selected Bundle
+                 or Manifest ref) into Store. Stdin is tarstream; prints the key.
+  load           Read and transform logical sources (topmost first) into
+                 tarstream, Bundle and/or Store outputs, preserving sparse ranges.
   get-manifest   Fetch a manifest blob by hex content key.
   info           Print manifest metadata.
   verify         Verify chunk integrity against a manifest.

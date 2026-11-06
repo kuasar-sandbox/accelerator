@@ -1,39 +1,41 @@
 [English](cache.md) | [简体中文](cache_zh.md)
 
-# cache — tiered content caching
+# Cache: tiers, backends and recovery
+
+This guide owns the complete content-cache service: deployment and configuration, wire operations, tier/EC behavior, backend implementations, failure handling and diagnostics. Choose RocksDB or a separately managed Redis-compatible backend within this same service. The authoritative origin is [Store](store.md); [data transfer](transfer.md) describes the client path.
 
 `cache-ctl` is the platform's content cache **shared across sandboxes**. It reuses frequently read chunks on one node and across a shard cluster, reducing reads from remote S3-compatible object storage. Embedded deployments can serve hot content from RocksDB BlockCache; a Redis-compatible external backend is also available. One binary supports three YAML-selected modes: `local`, `shard` and `tiered`.
 
-## 1. Overview
+## Overview
 
-### 1.1 Problem
+### Problem
 
 Concurrent consumers often read common immutable chunks. Local and distributed cache tiers reduce repeated origin reads while preserving the Manifest/Store identity and integrity contracts. Reuse depends on the working set, configured security domain, cache capacity and request timing: concurrent misses, eviction and failed fills can cause repeated origin access.
 
 On-demand loading reads the ranges a consumer needs; it does not require every artifact to use a cache or object store. End-to-end startup/restore also includes VMM/guest execution and data-access latency. Cache hit ratios are observed averages with explicit denominators, not per-request bounds. Index/filter residency, false positives, SST/blob reads and compaction affect disk I/O even for a cache deployment.
 
-### 1.2 Principles
+### Principles
 
 - **Data plane:** a custom wire protocol with a 39-byte request header, 8-byte response header and six opcodes.
 - **Control plane:** `health_listen` serves both standard `grpc.health.v1.Health` probing and `cac.cache.v1.Info` (`Get` returns runtime counters) on a separate listener.
-- **Addresses:** `listen` and `health_listen` accept TCP `host:port` or a Unix socket such as `/run/sandbox/cache.sock` or `unix:///...`. Ordinary UDS bind handles stale socket paths and sets mode 0600; inherited `fd=<name>` listeners retain manager ownership (§6.7). The data client uses the same address in `cache.endpoint`; use a `unix:///` target for control-plane `ping`/`info --endpoint`.
-- **Physical cache backend:** embedded RocksDB or a Redis-compatible server over UDS/TCP. See [the Redis backend guide](cache-redis.md) for configuration, cancellation and an external Dragonfly deployment example.
+- **Addresses:** `listen` and `health_listen` accept TCP `host:port` or a Unix socket such as `/run/sandbox/cache.sock` or `unix:///...`. Ordinary UDS bind handles stale socket paths and sets mode 0600; inherited `fd=<name>` listeners retain manager ownership ([Named listeners and socket activation](#named-listeners-and-socket-activation)). The data client uses the same address in `cache.endpoint`; use a `unix:///` target for control-plane `ping`/`info --endpoint`.
+- **Physical cache backend:** embedded RocksDB or a Redis-compatible server over UDS/TCP. See [the Redis backend guide](#redis-adapter-semantics) for configuration, cancellation and an external Dragonfly deployment example.
 - **Writes:** no application-level frequency admission filter. Embedded disk eviction uses a CMS-driven RocksDB CompactionFilter; a Redis-compatible server owns its own eviction/capacity policy. Neither policy guarantees a write succeeds through storage/resource failures.
 - **Filling:** successful lower-tier reads asynchronously fill upper tiers.
 
-## 2. Command-line interface
+## Command-line interface
 
-For `cache-ctl bench` commands, workload controls and safeguards, see [§7.1](#71-backend-and-wire-benchmarks).
+For `cache-ctl bench` commands, workload controls and safeguards, see [Backend and wire benchmarks](#backend-and-wire-benchmarks).
 
-### 2.1 `cache-ctl serve`
+### `cache-ctl serve`
 
 ```text
 cache-ctl serve --config FILE [--drain-timeout DURATION]
 ```
 
-Either `--config` or `CACHE_CONFIG` is required; the flag takes precedence and both missing is an error. See §3 for YAML examples.
+Either `--config` or `CACHE_CONFIG` is required; the flag takes precedence and both missing is an error. See [Configuration](#configuration) for YAML examples.
 
-### 2.2 `cache-ctl config`
+### `cache-ctl config`
 
 ```text
 cache-ctl config show     [--config <path>]
@@ -42,18 +44,18 @@ cache-ctl config generate
 
 `generate` prints a commented template, defaulting to a tiered configuration with embedded RocksDB L1 and a store origin.
 
-### 2.3 `cache-ctl object` — complete objects
+### `cache-ctl object` — complete objects
 
-Use a data endpoint, conventionally port 7070. The normal intended roles are local for writes and local/tiered for reads; local and shard currently both expose complete-object operations (§4.10).
+Use a data endpoint, conventionally port 7070. The normal intended roles are local for writes and local/tiered for reads; local and shard currently both expose complete-object operations ([Mixing operations across modes](#mixing-operations-across-modes)).
 
 ```text
 cache-ctl object get --endpoint host:port --namespace chunk --hash HEX
 cache-ctl object put --endpoint host:port --namespace chunk --hash HEX --value FILE|-
 ```
 
-Supply `--endpoint` or `CACHE_ENDPOINT`. Get writes the value to stdout; `--value -` reads stdin. Tiered rejects Put (§3.1).
+Supply `--endpoint` or `CACHE_ENDPOINT`. Get writes the value to stdout; `--value -` reads stdin. Tiered rejects Put ([Mode comparison](#mode-comparison)).
 
-### 2.4 `cache-ctl shard` — EC shards
+### `cache-ctl shard` — EC shards
 
 The intended endpoint is a shard daemon:
 
@@ -64,7 +66,7 @@ cache-ctl shard put --endpoint host:port --namespace chunk --hash HEX --idx N --
 
 Get does not supply a shard index: the peer returns the shard it actually holds, with idx/total printed to stderr and shard data to stdout. Put prefixes raw data with `[idx][total]`; total defaults to 5 and idx must be smaller than total. This is a single-peer debugging interface. Normal fill-aside writes use `EncodePrefixed`.
 
-### 2.5 `cache-ctl ping` / `info`
+### `cache-ctl ping` / `info`
 
 ```text
 cache-ctl ping --endpoint host:port           # gRPC health listener
@@ -76,22 +78,21 @@ Ping and remote Info target the **control-plane `health_listen`**, conventionall
 
 `info --rocks-path` opens RocksDB through **OpenDbForReadOnlyColumnFamilies**, not a secondary-instance API. Use remote Info to inspect a running daemon; offline read-only opening is intended for postmortem inspection and does not promise a coherent live view while another process modifies the files.
 
+## Configuration
 
-## 3. Configuration
-
-### 3.1 Mode comparison
+### Mode comparison
 
 | Dimension | local | shard | tiered |
 |---|---|---|---|
 | Intended role | Complete-object KV on one node. | EC shard KV in a cluster. | Ordered multi-tier read proxy. |
-| Handler backend | Embedded RocksDB or Redis-compatible. | Embedded RocksDB or Redis-compatible. | TieredCache (§4.6). |
+| Handler backend | Embedded RocksDB or Redis-compatible. | Embedded RocksDB or Redis-compatible. | TieredCache ([TieredCache and the read path](#tieredcache-and-the-read-path)). |
 | Tier chain | None. | None. | Exactly the YAML `tiers:` order. |
 | Writes | Direct to selected backend; object and shard operations. | Direct to selected backend; object and shard operations. | Rejected with StatusError. |
 | Reads | Selected backend. | Selected backend. | Traverse the chain on clean misses; asynchronously fill upper tiers on a hit. |
 | Origin dependency | None. | None. | Configured Store/upstream RPC access; remote object-store credentials stay with the service owning that backend. |
 | Typical deployment | Tests, debugging or one-node cache. | Five peers for unchanged RS(4+1). | Beside Manifest consumers as a node-local cache proxy. |
 
-### 3.2 Local mode
+### Local mode
 
 ```yaml
 mode: local
@@ -117,7 +118,7 @@ rocks:
   bloom_bits: 15
 ```
 
-### 3.3 Shard mode
+### Shard mode
 
 ```yaml
 mode: shard
@@ -143,7 +144,7 @@ rocks:
   max_background_jobs: 16
 ```
 
-### 3.4 Tiered mode
+### Tiered mode
 
 ```yaml
 mode: tiered
@@ -201,13 +202,13 @@ At EC construction, defaults are first applied (`data≤0 → 4`, `parity≤0 �
 - If `parity ≥ n`, use `data = 1, parity = n - 1`. With one peer this is `1+0`, no redundancy; absent data is a miss, but reads/writes remain supported.
 - If `data + parity ≤ n`, keep the scheme. Selecting only a subset of a larger peer set is valid, distributes objects and can reduce each object's fanout.
 
-A zero-peer configuration is invalid. To retain **4+1**, supply at least five peers initially. The clamp is a **construction-time** operation. SIGHUP updates membership, not the codec's data/parity scheme; reducing live membership below the existing total can produce routing errors (§4.9).
+A zero-peer configuration is invalid. To retain **4+1**, supply at least five peers initially. The clamp is a **construction-time** operation. SIGHUP updates membership, not the codec's data/parity scheme; reducing live membership below the existing total can produce routing errors ([EC client](#ec-client)).
 
 #### Optional upstream tier
 
 A `type: upstream` tier reads/writes complete objects through another cache-ctl wire endpoint. It can sit after an embedded tier and before EC, concentrating hot content in an aggregation node.
 
-For fill-aside, use a **writable complete-object endpoint**. Local is the intended role; current shard mode also exposes object operations (§4.10). Tiered rejects Put. If a read-only tiered endpoint is used as an intermediate upstream tier, reads may work, but async fill errors are discarded and do not populate it. They do not retroactively change the successful read into a miss, and there is no startup write-capability handshake or guaranteed loud first-fill error. A read-only endpoint can instead be an `origin.type: upstream`, which is read only by the proxy.
+For fill-aside, use a **writable complete-object endpoint**. Local is the intended role; current shard mode also exposes object operations ([Mixing operations across modes](#mixing-operations-across-modes)). Tiered rejects Put. If a read-only tiered endpoint is used as an intermediate upstream tier, reads may work, but async fill errors are discarded and do not populate it. They do not retroactively change the successful read into a miss, and there is no startup write-capability handshake or guaranteed loud first-fill error. A read-only endpoint can instead be an `origin.type: upstream`, which is read only by the proxy.
 
 ```yaml
 tiers:
@@ -220,23 +221,72 @@ tiers:
     timeout: 2s
 ```
 
-### 3.5 Important parameters
+### Important parameters
 
 | Parameter | Meaning |
 |---|---|
-| `listen` | Wire data listener: TCP, Unix socket or `fd=<name>` (§6.7). |
+| `listen` | Wire data listener: TCP, Unix socket or `fd=<name>` ([Named listeners and socket activation](#named-listeners-and-socket-activation)). |
 | `health_listen` | TCP/UDS or `fd=<name>`. One gRPC listener for Health probes and Info counter snapshots; omitted means neither service starts. |
-| `stats_interval` | Adaptive stderr statistics base period (§6.6), default 30s. `0`/`off` disables it. Active windows print throughput, bandwidth, latency, concurrency, hit cascade and backend gauges; idle windows are silent. |
+| `stats_interval` | Adaptive stderr statistics base period ([Adaptive statistics: `stats_interval`](#adaptive-statistics-stats_interval)), default 30s. `0`/`off` disables it. Active windows print throughput, bandwidth, latency, concurrency, hit cascade and backend gauges; idle windows are silent. |
 | `freq.disable_eviction` | Embedded RocksDB frequency tracking continues, but the installed filter remains unarmed and preserves keys. Useful when a test local daemon serves as an origin. It does not turn cache storage into failure-proof authoritative persistence or control external Redis eviction. |
 | `pool` | Wire connections to one peer; each connection's synchronous request/response flow serializes its own requests. |
 | `max_inflight` | Synchronous tier-query concurrency, 0 for unlimited. Async fill uses backend pools/limits. Redis tiers reject this field; use their separate get_pool/set_pool. |
-| `rpc_timeout` | Server request context budget. Missing, empty, invalid or nonpositive means no per-request deadline. A positive duration cancels context-aware work; synchronous RocksDB CGO cannot be interrupted mid-operation. Timeout/errors are not universally converted into cache misses (§4.2). |
+| `rpc_timeout` | Server request context budget. Missing, empty, invalid or nonpositive means no per-request deadline. A positive duration cancels context-aware work; synchronous RocksDB CGO cannot be interrupted mid-operation. Timeout/errors are not universally converted into cache misses ([Wire protocol](#wire-protocol)). |
 | `timeout` | Client per-operation timeout. **An intermediate upstream tier (`tiers[].timeout`) and an EC cluster (`tiers[].cluster.timeout`) default to 2s** when empty/invalid/nonpositive. **Origin clients (`origin.store.timeout` and `origin.upstream.timeout`) default to 0**, bounded by caller/connection lifetime. Redis has its own validation/defaults and requires an explicitly supplied timeout to be positive and valid. |
-| `pprof_listen` | Optional HTTP `/debug/pprof/*` listener, for example 127.0.0.1:6060 or `fd=pprof`. Leave empty normally; enable temporarily for diagnostics (§6.4). |
+| `pprof_listen` | Optional HTTP `/debug/pprof/*` listener, for example 127.0.0.1:6060 or `fd=pprof`. Leave empty normally; enable temporarily for diagnostics ([Offline inspection](#offline-inspection)). |
 
-## 4. Design
+### Redis-compatible backend configuration
 
-### 4.1 Architecture
+Direct local and shard daemons select the backend at the top level:
+
+```yaml
+mode: shard # or local
+type: redis
+listen: 0.0.0.0:7070
+health_listen: 0.0.0.0:7071
+rpc_timeout: 2s
+
+redis:
+  endpoint: unix:///run/kuasar-cache/redis.sock
+  get_pool: 32
+  set_pool: 8
+  timeout: 2s
+```
+
+A tiered daemon declares Redis directly in the ordered tier list:
+
+```yaml
+mode: tiered
+tiers:
+  - type: redis
+    redis:
+      endpoint: 10.0.1.60:6379
+      get_pool: 32
+      set_pool: 8
+      timeout: 2s
+  - type: ec
+    cluster: ...
+origin: ...
+```
+
+There is no `type: dragonfly` and no generic `storage` wrapper. Existing
+in-process RocksDB configurations use `type: embedded`.
+
+Do not set the generic tier `max_inflight` on a Redis tier. `redis.get_pool`
+and `redis.set_pool` are the independent hard concurrency budgets; keeping
+them separate prevents asynchronous fill and repair writes from consuming the
+read-side budget. Validation rejects the ambiguous combined limit.
+
+`redis.endpoint` accepts an absolute socket path, `unix:/abs/path`,
+`unix:///abs/path`, or one TCP `host:port`. Bracket IPv6 literals, for example
+`[2001:db8::60]:6379`. UDS remains the recommended node-local low-latency
+transport. TCP is plain RESP2 and has no AUTH/ACL or TLS support in this
+backend; use it only on a trusted network protected by bind rules and a
+firewall. Redis Cluster discovery is not supported.
+
+## Design
+
+### Architecture
 
 ```mermaid
 flowchart TD
@@ -250,7 +300,7 @@ flowchart TD
 
 Manifest ingest writes directly to store-ctl, bypassing cache-ctl. Cache filling is a separate write path: successful reads trigger TieredCache's internal fill-aside calls, which do not loop through that same daemon's wire listener. Cache Put/ShardPut operations still exist for backend filling and explicit tooling.
 
-### 4.2 Wire protocol
+### Wire protocol
 
 The data plane uses a compact binary protocol instead of gRPC/protobuf. It reduces framing/serialization work and supports Blob ownership across backend/response paths; this alone does not prove a universal throughput gain or eliminate every copy.
 
@@ -305,15 +355,15 @@ Individual backends can have their own quorum semantics. For example, insufficie
 
 A client can send CancelRequest (0x06) while an operation is in flight. The server cancels the handler context and responds with StatusCancelled (0x03), also cancelling pending queued requests on that connection. Context-aware remote hops and origin I/O can stop; synchronous RocksDB CGO cannot be interrupted in the middle of its call, so cancellation is not a universal instantaneous backend-stop guarantee.
 
-Once **data distinct valid shard indexes** have arrived, EC cancels the remaining foreground ShardGet contexts. The wire client interrupts the socket operation through its deadline, joins the cancellation callback and discards that connection. Closing it also cancels the server handler. EC need not wait for every peer to serve the read. A cancelled slow peer is unknown, not a confirmed miss; repair handles that distinction (§4.7).
+Once **data distinct valid shard indexes** have arrived, EC cancels the remaining foreground ShardGet contexts. The wire client interrupts the socket operation through its deadline, joins the cancellation callback and discards that connection. Closing it also cancels the server handler. EC need not wait for every peer to serve the read. A cancelled slow peer is unknown, not a confirmed miss; repair handles that distinction ([Fill-aside](#fill-aside)).
 
 #### Operations not provided
 
-- **Delete:** no wire deletion operation. Embedded cache eviction is asynchronous CMS/CompactionFilter work (§4.5); external Redis eviction belongs to that server. This says nothing about the separate store generation/GC API.
-- **AdminService:** no standalone admin RPC. Info/Get pulls counters (§1.2, §6.3); adaptive stderr statistics are normally enabled (§6.6). Offline diagnostics use read-only `info --rocks-path`, not a secondary-instance API.
+- **Delete:** no wire deletion operation. Embedded cache eviction is asynchronous CMS/CompactionFilter work ([Frequency tracking and disk eviction](#frequency-tracking-and-disk-eviction)); external Redis eviction belongs to that server. This says nothing about the separate store generation/GC API.
+- **AdminService:** no standalone admin RPC. Info/Get pulls counters ([Principles](#principles), [Runtime counters: pull-only](#runtime-counters-pull-only)); adaptive stderr statistics are normally enabled ([Adaptive statistics: `stats_interval`](#adaptive-statistics-stats_interval)). Offline diagnostics use read-only `info --rocks-path`, not a secondary-instance API.
 - **Streaming:** values are one-shot request/response payloads bounded by MaxFrameSize. EC subdivides storage among peers, but the complete-object response from tiered still must fit a wire frame. It does not make arbitrary-size objects transportable; choose upper-layer object/chunk sizes that fit or use an appropriate non-wire path.
 
-### 4.3 Key encoding and opcode dispatch
+### Key encoding and opcode dispatch
 
 | Opcode family | Wire Hash | RocksDB key | Value | Role |
 |---|---|---|---|---|
@@ -324,11 +374,11 @@ The wire header always carries 32 hash bytes. A shard request does not assert wh
 
 Placing shard identity in the value makes a surviving peer's existing shard discoverable after membership changes. A client uses the reported index rather than assuming a fixed peer-position-to-shard-index mapping. It still needs enough **distinct** valid indexes for the active coding scheme.
 
-### 4.4 RocksDB tuning
+### RocksDB tuning
 
 | Parameter/option | Default | Meaning |
 |---|---|---|
-| `disk_bytes` | 1 TiB. | BlockCache sizing and successful-write byte budget per sketch generation (§4.5); **not an enforced disk quota**. |
+| `disk_bytes` | 1 TiB. | BlockCache sizing and successful-write byte budget per sketch generation ([Frequency tracking and disk eviction](#frequency-tracking-and-disk-eviction)); **not an enforced disk quota**. |
 | `mem_ratio` | 0.01. | Shared BlockCache budget = disk_bytes × mem_ratio, minimum 64 MiB. |
 | `block_size` | 64 KiB. | SST data-block size. |
 | `bloom_bits` | 15. | Bits per key for Bloom filters; actual false-positive behavior is not a fixed documented percentage. |
@@ -376,7 +426,104 @@ UseDirectReads defaults to true and bypasses the OS page cache for supported dat
 
 It does not mean the process has zero page-cache use, completely self-contained I/O accounting, or no other native/write-buffer memory.
 
-### 4.5 Frequency tracking and disk eviction
+#### Native bridge ownership
+
+The private binding is in `pkg/cache/rocks/internal/native`. It implements only
+the cache store's fixed four column families, opening, pinned reads, writes,
+flush, compaction, properties and frequency filtering. The normal
+`deps/build-rocksdb.sh` owns the RocksDB version and build; this wrapper adds no
+native dependency recipe.
+
+##### Public engine boundary and ownership
+
+RocksDB 9.7.4's C API exposes pinned reads but not `FilterBlobByKey`. Its opaque
+options cannot accept a custom C++ filter through a public conversion API.
+The small C++ bridge therefore owns the DB directly using public headers. It
+does not reinterpret C handles, include internal headers, register factories
+globally, or provide a general Go object model.
+
+| Object | Lifetime |
+| --- | --- |
+| DB and four CF handles | One native owner. Partial open failure destroys all returned handles and DB. Handles are destroyed before DB close. |
+| Options and table configuration | Local to Open. The DB copies options. Shared table factory, LRU and Bloom policy references survive through DB ownership and release automatically. |
+| ReadOptions / WriteOptions | Initialized once by the native owner and shared by concurrent synchronous operations. Data CFs use WAL-free writes; default CF retains WAL. There is no native-object `sync.Pool`. |
+| PinnableSlice | One Get. The Go bridge copies to the existing BlobPool before destroying the pin, including panic cleanup. No native view escapes to networking. |
+| Compaction filter | One owner per DB; borrowed by all three data CFs. It outlives DB close/destruction and background callbacks. |
+| Go callback | One `runtime/cgo.Handle`, deleted after failed Open or completed DB destruction. C++ retains the integer only. Callback panics preserve the key and are logged. |
+| Errors and properties | Copied to Go, then freed in the same bridge call. |
+
+The store's lifecycle lock drains complete requests before teardown. Close then
+joins the sketch's background workers and persists the final sketch. Before
+closing a writable DB, the native owner explicitly waits for each data CF to
+Flush. It preserves the first flush error while still closing the DB and
+releasing every handle; final sketch-persistence errors also reach the caller.
+Read-only Close skips Flush. Concurrent Close calls wait for the same result.
+Late requests return a closed-store error; missing keys remain ordinary misses.
+
+The configuration, aging and user-visible persistence policy above is the single definition for this wrapper. Its fixed CF names are `default`, `chunk`, `manifest` and `blob`; unknown partitions retain the chunk fallback. Object keys are 32 bytes and shard keys append `0x00`. The Bloom property description includes its configured parameters. Read-only opening uses `OpenForReadOnly` with WAL files tolerated: it may replay WAL into memory, is not a secondary instance, and creates no sketch. Inline filtering and `FilterBlobByKey` consult the same sketch and only decide keep/remove; their snapshot-ignoring semantics are unchanged, and necessary BlobGC relocation may still read surviving values.
+
+Native build and focused lifetime tests are documented in [Contributing](../CONTRIBUTING.md#native-cache-validation).
+
+### Redis adapter semantics
+
+`cache-ctl` can use a Redis-compatible server over a Unix domain socket (UDS)
+or a direct TCP connection for all physical cache roles:
+
+- `mode: local`: complete objects;
+- `mode: shard`: EC shard values;
+- `mode: tiered`, `type: redis`: a node-local complete-object tier.
+
+The Accelerator configuration and implementation refer only to the Redis
+protocol. Dragonfly is one example of a separately managed external server,
+not a separate backend type or an Accelerator release component.
+
+#### Redis key and value model
+
+The implementation uses binary RESP2 bulk strings and only GET/SET. A key is a
+fixed 35-byte value:
+
+```text
+version[1] | partition[1] | kind[1] | SHA-256[32]
+```
+
+`partition` separates chunk, manifest, and blob. `kind` separates complete
+objects from EC shards, so identical content hashes cannot collide. Object
+values are stored unchanged. Shard values retain the existing
+`[idx][total][shard_data]` format.
+
+Only a RESP nil bulk response is a confirmed cache miss. Timeout, EOF, `-ERR`,
+and malformed RESP are backend errors and must not trigger EC repair or tier
+fallthrough.
+
+#### Redis connections and cancellation
+
+GET and SET use separate, eagerly connected, fixed-size worker pools. One
+connection carries at most one in-flight command, making RESP FIFO ownership
+explicit and preventing fill traffic from consuming the read pool.
+
+When an object or shard GET is cancelled, the caller returns immediately. The
+worker reads and discards the late response before returning the connection to
+the pool. A normal cancellation never closes the external wire connection or
+the Redis backend connection. A malformed response or real UDS/TCP I/O failure
+closes and reconnects only that worker using the configured transport.
+
+SET uses `net.Buffers` for header/key/value `writev`. The caller's value remains
+borrowed until the socket write completes. If cancellation arrives after the
+write, the caller can return while the worker drains `+OK`; the worker never
+retains the caller's payload after `Fill` returns.
+
+#### Redis readiness and observability
+
+The gRPC health service probes a reserved key over a dedicated Redis
+connection. Probe traffic does not use the data pools or alter hit/miss
+counters. A failed Redis probe marks the daemon `NOT_SERVING`; it does not
+change EC membership or placement epochs.
+
+`cache-ctl info` exposes backend type, endpoint, transport, pool
+size/connectivity, in-flight and draining counts, cancellations, late bytes,
+reconnects, protocol errors, backend errors, and GET/SET latency percentiles.
+
+### Frequency tracking and disk eviction
 
 Embedded RocksDB maintains a Go Count-Min Sketch. Each Get, including a miss, records an access; a successful Fill or FillShard records another. Background compaction invokes the CGO-backed CompactionFilter, which asks ShouldEvict. An estimate **at or below** the threshold (default 1) removes the key.
 
@@ -437,7 +584,7 @@ The cache application does not maintain a second payload SLRU/LRU in Go:
 
 CMS active/previous generations, transient reset/serialization buffers, wire pools, EC work and concurrency consume memory, while RocksDB's native allocations are outside Go heap. Redis backends follow their external server's memory policy.
 
-### 4.6 TieredCache and the read path
+### TieredCache and the read path
 
 ```mermaid
 flowchart TD
@@ -453,9 +600,9 @@ flowchart TD
   O -->|"error"| X
 ```
 
-Manifest Stream.ReadAt resolves the requested visible runs, fetches Data concurrently and writes their logical ranges. A lower-layer hit asynchronously fills upper cache tiers. For 4+1, EC fans out to five peers and can return once four distinct valid indexes suffice; full reconstruction is needed only when data shards are missing. Read ordering and chunk visibility follow [manifest](manifest.md), including layered sparse semantics.
+Manifest Stream.ReadAt resolves the requested visible runs, fetches Data concurrently and writes their logical ranges. A lower-layer hit asynchronously fills upper cache tiers. For 4+1, EC fans out to five peers and can return once four distinct valid indexes suffice; full reconstruction is needed only when data shards are missing. Read ordering and chunk visibility follow [manifest](transfer.md), including layered sparse semantics.
 
-### 4.7 Fill-aside
+### Fill-aside
 
 A hit in layer i fills every cache tier above it; origin is layer N after N cache tiers.
 
@@ -468,7 +615,7 @@ On a hit at layer i (tiers 0..N-1; origin N):
 
 **Blob ownership:** startFill clones an owned handle for the fill goroutine and defers its Release. The original handle belongs to the Get caller until its response has been written. Both handles reference the same immutable backing allocation; each has an independently owned reference, not an unrelated copy of the data.
 
-**Async behavior:** the read does not await fill completion. Fills use a context derived from TieredCache's base context, normally without a fill-specific deadline; Close cancels and joins them (§6.2). Backend cancellation capabilities and client timeouts still matter, especially synchronous RocksDB CGO. This is not an unconditional guarantee that any wedged backend can be interrupted.
+**Async behavior:** the read does not await fill completion. Fills use a context derived from TieredCache's base context, normally without a fill-specific deadline; Close cancels and joins them ([Signals and shutdown](#signals-and-shutdown)). Backend cancellation capabilities and client timeouts still matter, especially synchronous RocksDB CGO. This is not an unconditional guarantee that any wedged backend can be interrupted.
 
 Tests and warmup must confirm availability with actual Get/ShardGet calls, not merely observe that fill goroutines briefly drained. Repeated fills of the same key/bytes are idempotent in the intended content-addressed usage: RocksDB or wire writes overwrite the same value. Fill errors are discarded by startFill and do not retroactively fail the successful read.
 
@@ -484,13 +631,13 @@ For a healthy fixed 4+1 scheme:
 
 Foreground quorum cancellation leaves a peer **unknown**, not missing. A bounded follow-up probe can resolve unknown peers; repair writes only confirmed misses whose missing indexes map exactly to destinations. Transport errors, invalid prefixes, stale coding schemes and ambiguous mappings do not justify overwriting a peer's existing shard. Enough responses is insufficient if indexes are duplicated.
 
-### 4.8 Unconditional admission policy
+### Unconditional admission policy
 
 Put/PutShard has no application-level frequency admission filter. **This does not mean every write succeeds:** read-only mode, disk/resource failure, invalid input or backend errors can reject it.
 
-A normal fill represents a chunk that was just read. An additional W-TinyLFU-style admission rejection could cause the next access to go to origin again, conflicting with progressive warming. Embedded space reclamation instead uses the frequency/compaction policy (§4.5), not admission. Redis-compatible backends own their own eviction decisions.
+A normal fill represents a chunk that was just read. An additional W-TinyLFU-style admission rejection could cause the next access to go to origin again, conflicting with progressive warming. Embedded space reclamation instead uses the frequency/compaction policy ([Frequency tracking and disk eviction](#frequency-tracking-and-disk-eviction)), not admission. Redis-compatible backends own their own eviction decisions.
 
-### 4.9 EC client
+### EC client
 
 The EC client is used as a tier in tiered mode.
 
@@ -537,13 +684,13 @@ To add/remove a peer, update YAML and send HUP, then inspect the logged membersh
 
 Change **one peer at a time** for a 4+1 rollout, verify readiness and let repair/warming complete. Replacing two or more simultaneously can exhaust parity and cause misses/origin reads. Even a one-peer change is not a guarantee of zero impact; preexisting loss, membership filtering and origin failures matter.
 
-### 4.10 Mixing operations across modes
+### Mixing operations across modes
 
 Current local and shard modes connect the same selected backend to both object and shard interfaces. Therefore ObjectPut to a shard daemon is accepted by the handler and can really write a complete object. This reflects a primary deployment role, not exclusive protocol permission.
 
 Tiered exposes only the object read chain. It rejects writes and shard operations. The protocol should not be mistaken for an authorization boundary; endpoint access belongs to the deployment.
 
-### 4.11 Read attempts, pool recovery and error ownership
+### Read attempts, pool recovery and error ownership
 
 Cache reads are single-attempt operations. `Get`/`GetShard` release or cancel failed payloads and streams; a later call starts a complete new object read at the same selected endpoint and never splices an old prefix. A confirmed miss remains distinct from inability to contact a peer, and legal server cancellation remains retryable. Existing endpoint, pool and per-operation timeout settings remain authoritative; socket/RPC deadlines bound one attempt, while the caller's operation context decides whether another attempt is allowed. No retry flag, fallback endpoint, health mask, service restart or compatibility mode is added.
 
@@ -551,23 +698,23 @@ Connection capacity counts idle, borrowed and dialing connections under the same
 
 `pkg/readerr` classification used by cache callers is preserved across wrappers: confirmed miss is not a transport failure, unknown errors are not automatically permanent, and permanent semantic causes remain visible through joined/wrapped errors. Consumers, not accelerator, own business retry/backoff.
 
-## 5. Memory budgeting
+## Memory budgeting
 
-### 5.1 L1: an embedded tier inside a tiered process
+### L1: an embedded tier inside a tiered process
 
 The configured BlockCache is one major native-memory allowance, not a complete process limit. Account separately for memtables/write buffers, native metadata, BlobDB/compaction activity, wire payload pools, active/previous CMS generations and transient buffers. Cached index/filter blocks share the configured BlockCache; do not count them again as independently pinned memory.
 
-Derive the cache allowance from the actual sizing configuration and minimum size in the embedded-backend contract (§4.4). Go heap, in-flight request/fill concurrency and native/OS memory are workload-dependent. DirectReads can reduce supported data-read page caching but does not imply zero process-wide page-cache use. Measure the whole process/cgroup rather than treating one allowance as an enforced total.
+Derive the cache allowance from the actual sizing configuration and minimum size in the embedded-backend contract ([RocksDB tuning](#rocksdb-tuning)). Go heap, in-flight request/fill concurrency and native/OS memory are workload-dependent. DirectReads can reduce supported data-read page caching but does not imply zero process-wide page-cache use. Measure the whole process/cgroup rather than treating one allowance as an enforced total.
 
-### 5.2 L2: dedicated shard nodes
+### L2: dedicated shard nodes
 
 Size shard nodes from their actual physical keys, shard coding, CF distribution and object-size distribution. An idealized Bloom bit budget is `actual keys × bits per key / 8`; index and per-entry/native overhead are separate and should be measured. Do not multiply the entire logical dataset by every CF or equate complete-object count with encoded shard-key count.
 
 L0 pinning and cached indexes/filters can reduce I/O but do not prove all metadata stays resident, zero-I/O misses or single-I/O hits. Bloom false positives, SST traversal and BlobDB payload reads remain possible. Validate memory and disk behavior under actual cold reads, fills, repair and compaction, leaving operating margin rather than copying a historical host allocation.
 
-## 6. Operations
+## Operations
 
-### 6.1 Startup
+### Startup
 
 ```bash
 # L2 shard peer
@@ -577,9 +724,9 @@ cache-ctl serve --config /etc/cache/shard.yaml
 cache-ctl serve --config /etc/cache/tiered.yaml
 ```
 
-### 6.2 Signals and shutdown
+### Signals and shutdown
 
-The first SIGTERM/SIGINT starts irreversible drain without cancelling admitted business work. The second exit signal cancels in-flight work; further signals are idempotent. SIGHUP retains the EC membership refresh behavior in §4.9 while running and stops triggering refresh once shutdown starts.
+The first SIGTERM/SIGINT starts irreversible drain without cancelling admitted business work. The second exit signal cancels in-flight work; further signals are idempotent. SIGHUP retains the EC membership refresh behavior in [EC client](#ec-client) while running and stops triggering refresh once shutdown starts.
 
 1. Atomically close wire admission and withdraw existing health readiness. A late successful Redis health probe cannot change NOT_SERVING back to SERVING.
 2. Drain executing requests, requests admitted by the reader, the reqs queue and pending requests. Local reader shutdown is distinct from peer disconnection. TCP/UDS half-close after local drain starts preserves admitted responses. Outside drain, EOF/disconnection retains its existing cancellation semantics, including client Get/GetShard aborts; a TCP FIN alone cannot distinguish a write-half close from a closed caller. Release Blobs and request buffers only after the full write or a definite write failure. On Linux TCP, wait for the transmitted tail to be acknowledged before final close so unread input cannot cause an RST that truncates the response.
@@ -590,13 +737,13 @@ The first SIGTERM/SIGINT starts irreversible drain without cancelling admitted b
 
 New business is rejected, and cancellation or failure can produce real transport errors. A server commit followed by a lost response remains an uncertain result, never fabricated client success. Low-level Get/GetShard remain single attempt. Ordinary bind releases its listeners on exit; the next instance reopens the database and binds after the old instance exits. Drain does not retain listeners or migrate connections. Rollback requires no data-format change.
 
-### 6.3 Runtime counters: pull-only
+### Runtime counters: pull-only
 
 Pull cumulative counters through `cac.cache.v1.Info/Get` on health_listen. `cache-ctl info --endpoint host:port` returns one snapshot, as a table or raw JSON. It includes server hits/misses/fills, tier/origin counters, EC peer counters and backend information, including embedded/local/shard RocksDB CF properties and Redis-specific gauges.
 
-Benchmark scripts compare snapshots before/after the window. Individual atomic counters are useful cumulative evidence; the entire multi-counter response is not a transactional point-in-time snapshot. For routine observation, use the adaptive statistics line (§6.6) without repeatedly pulling Info.
+Benchmark scripts compare snapshots before/after the window. Individual atomic counters are useful cumulative evidence; the entire multi-counter response is not a transactional point-in-time snapshot. For routine observation, use the adaptive statistics line ([Adaptive statistics: `stats_interval`](#adaptive-statistics-stats_interval)) without repeatedly pulling Info.
 
-### 6.4 Offline inspection
+### Offline inspection
 
 ```bash
 cache-ctl info --rocks-path /var/cache/accel-l1
@@ -606,7 +753,7 @@ The tool opens DB files through OpenDbForReadOnlyColumnFamilies and prints prope
 
 A nonempty pprof_listen starts an HTTP `/debug/pprof/*` listener. Use `go tool pprof` for CPU, heap or goroutine investigation. Leave it empty during normal operation and enable only for the diagnostic need.
 
-### 6.5 Slow/stalled request tracing: `CACHE_CTL_DEBUG`
+### Slow/stalled request tracing: `CACHE_CTL_DEBUG`
 
 Without a configured request deadline, a blocked backend may wait until caller/connection cancellation. The environment-controlled tracer makes slow/in-flight work visible:
 
@@ -616,7 +763,7 @@ CACHE_CTL_SLOW=2s CACHE_CTL_DEBUG=1 cache-ctl serve ...
 ```
 
 - A truthy CACHE_CTL_DEBUG enables tracing. Disabled tracing retains only its small enable-check overhead; “zero overhead” is not literal.
-- Only requests exceeding CACHE_CTL_SLOW, a Go duration defaulting to one second, generate slow-request WARN lines. Fast requests are silent; steady throughput/latency belongs to §6.6.
+- Only requests exceeding CACHE_CTL_SLOW, a Go duration defaulting to one second, generate slow-request WARN lines. Fast requests are silent; steady throughput/latency belongs to [Adaptive statistics: `stats_interval`](#adaptive-statistics-stats_interval).
 - A background reporter periodically reports still-running operations beyond the threshold, with operation name and elapsed time. Visibility does not require waiting for a request deadline.
 - Coverage is the wire handler operation, including tier traversal and origin lookup inside that request.
 
@@ -624,7 +771,7 @@ Separately, **CACHE_CTL_TIMING=1**, read at process startup, enables sampled EC 
 
 Both normally stay disabled. They complement pprof: operation traces identify slow/stalled requests; profiles identify where time/resources are spent.
 
-### 6.6 Adaptive statistics: `stats_interval`
+### Adaptive statistics: `stats_interval`
 
 The daemon normally emits runtime statistics to stderr on a **30-second base period**, following the same adaptive approach as sandbox-ctl. Active windows produce a summary, idle windows are silent. Startup uses two-second sampling to catch cold-start bursts, then returns to the base period after two idle samples. `stats_interval: 0`/`off` disables output.
 
@@ -648,7 +795,7 @@ This is a format example, not a fresh benchmark. In tiered mode, internal fill w
 
 Adaptive statistics give ongoing window-level visibility; Info provides cumulative values for scripts and benchmark deltas. CACHE_CTL_DEBUG instead focuses on abnormal long tails.
 
-### 6.7 Named listeners and socket activation
+### Named listeners and socket activation
 
 On Linux, server `listen`, `health_listen` and an enabled `pprof_listen` also accept `fd=<name>`. Clients keep their TCP/UDS endpoint; `fd=` is never a client address. The CLI explicitly imports `LISTEN_PID`, `LISTEN_FDS` and `LISTEN_FDNAMES`. The App accepts `Options.ListenerFDs` and never reads those variables. Every supplied descriptor must be used exactly once by a configured entrance. Wrong PID/count/name, missing/extra/duplicate names, aliased sockets, unsupported address families, non-stream or non-listening descriptors are fatal before backend creation. An explicit FD error never falls back to bind. Ordinary pprof TCP bind retains its warning-only failure behavior. Ordinary bind builds remain supported on other platforms; explicit activation is rejected there.
 
@@ -674,17 +821,75 @@ The socket units own their UDS pathnames under `/run/kuasar-accelerator`; the se
 
 The example uses directives available in [systemd 247 socket units](https://www.freedesktop.org/software/systemd/man/247/systemd.socket.html): `FlushPending=no` retains pending connections when the service exits; `TriggerLimitIntervalSec=2s`/`TriggerLimitBurst=20` bounds activation triggers. [Service settings](https://www.freedesktop.org/software/systemd/man/247/systemd.service.html) use `Restart=on-failure`, `RestartSec=1s`, and 90-second start/stop budgets; the 30-second App drain budget can cancel work earlier but cannot close resources still in use. With `Type=exec`, the start timeout does not bound post-exec App initialization. [Start limits](https://www.freedesktop.org/software/systemd/man/247/systemd.unit.html) allow five starts in ten seconds. A temporary initialization failure can retry through the existing manager policy. Persistent failures can exhaust these limits; diagnose and repair the cause, then reset the failed owned units and start them. No internal restart loop is added.
 
-A retained listener, successful connect or `Type=exec` startup does not prove readiness. Complete backend/source initialization and a real protocol request are required. EC deployments require the real wire Ping validation in §4.9. Membership still expresses health and keeps the existing placement/change rules. Socket activation retains only the entrance and not-yet-accepted queue: old connections are not migrated, queue capacity is finite, and interrupted requests remain errors. Low-level reads remain single attempt.
+A retained listener, successful connect or `Type=exec` startup does not prove readiness. Complete backend/source initialization and a real protocol request are required. EC deployments require the real wire Ping validation in [EC client](#ec-client). Membership still expresses health and keeps the existing placement/change rules. Socket activation retains only the entrance and not-yet-accepted queue: old connections are not migrated, queue capacity is finite, and interrupted requests remain errors. Low-level reads remain single attempt.
 
 For rollback, stop/disable all enabled socket units (including optional pprof) and stop the service; verify they are inactive before any ordinary bind or pathname cleanup. Remove the service's activation `Requires`/`After`/`Sockets` settings and profiling drop-in, change every `fd=` setting back to the original TCP/UDS endpoint, reload systemd and start the service. Keep its restart/drain policy and existing data. Never bind or unlink a pathname while its socket unit still holds it. Removing real EC Ping also requires withdrawing EC socket activation first.
 
-## 7. Performance characteristics
+### Deploy a separately managed Dragonfly service
+
+The sample unit is
+[`deploy/systemd/dragonfly-cache.service`](../deploy/systemd/dragonfly-cache.service).
+Its flag set is pinned to
+[Dragonfly v1.39.0](https://github.com/dragonflydb/dragonfly/releases/tag/v1.39.0).
+Accelerator does not download, bundle, publish, or redistribute the Dragonfly
+binary. An operator choosing this external service must obtain and manage it
+separately under its own software-supply and license policy. The checked-in
+hashes are the SHA-256 digests published in the v1.39.0 GitHub Release asset
+metadata for both supported architectures, so an operator can verify its
+separately acquired archive. The target host should install an already
+verified artifact and must not download Dragonfly at service start time:
+
+```bash
+sha256sum --check --ignore-missing deploy/dragonfly-v1.39.0.sha256
+```
+
+Install the verified binary exactly as:
+
+```text
+/usr/local/libexec/kuasar-cache/dragonfly-v1.39.0
+```
+
+Copy `deploy/systemd/dragonfly.env.example` to
+`/etc/kuasar-cache/dragonfly.env` and size it for the host. The example is:
+
+```bash
+DRAGONFLY_MAX_MEMORY=412316860416
+DRAGONFLY_TIER_PREFIX=/mnt/ssd/dragonfly/tier
+DRAGONFLY_TIER_BYTES=5497558138880
+DRAGONFLY_TIER_OFFLOAD_THRESHOLD=0.4
+DRAGONFLY_TIER_UPLOAD_THRESHOLD=0.2
+DRAGONFLY_PROACTOR_THREADS=16
+```
+
+`DRAGONFLY_TIER_BYTES` is a total disk budget; Dragonfly divides it across the
+configured proactor threads. It must be a multiple of 256 MiB and large enough
+to provide at least 256 MiB per thread. Provision the tier-prefix parent on the
+NVMe filesystem and grant `kuasar-cache` write access before starting the unit.
+
+Run Dragonfly and `cache-ctl` in separate cpusets and align them with the NVMe
+NUMA node. The unit disables the TCP listener and exposes only
+`/run/kuasar-cache/redis.sock`. It also disables Dragonfly's daily release
+check, so the service performs no version-site request from the target host.
+This unit is a sample node-local topology. A separately managed remote server
+may expose TCP, but its bind/firewall policy and network latency are operator
+responsibilities.
+
+Dragonfly v1.39.0 is distributed under BSL 1.1. Because Accelerator neither
+contains nor redistributes it, that license does not change the Accelerator
+release license or backend acceptance. Operators remain responsible for the
+terms of any external Redis-compatible server they select.
+
+Dragonfly's SSD tier is cache capacity, not authoritative persistence. A local
+or tiered instance can refill after restart. For RS(4+1), restart at most one
+shard peer at a time and rate-limit repair while that peer is cold.
+
+## Performance characteristics
 
 Measure local, shard and tiered paths separately, recording source/binary revisions, hardware, backend configuration, object sizes, concurrency, cache state and failures. Define timing boundaries and hit/miss denominators before comparing measurements. Conditional per-tier hit rates cannot simply be added. No universal latency, hit-rate or capacity guarantee follows from a cache topology.
 
-Use the [project performance methodology](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf.md) and [Redis-compatible backend guide](cache-redis.md) for evidence and external-service deployment validation. Existing commands and safeguards follow below.
+Use the [project performance methodology](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/performance.md) and [Redis-compatible backend guide](#redis-adapter-semantics) for evidence and external-service deployment validation. Existing commands and safeguards follow below.
 
-### 7.1 Backend and wire benchmarks
+### Backend and wire benchmarks
 
 The built-in benchmark sends wire-protocol traffic to a running daemon for quick throughput/latency smoke checks. It does not replace [bench_cache.sh](../test/scripts/bench_cache.sh), which adds CPU affinity and parameter sweeps.
 
@@ -827,11 +1032,10 @@ Record workload controls `VALUE_SIZE`, `PREFILL`, `COLD_PREFILL`, `MISS_RATIO`, 
 - **Access distribution:** uniform reads spread over the working set and expose the disk path. Zipf models hot-content skew, but excessive skew can fit the effective hot set in RAM and conceal disk behavior. Use uniform access or a much larger working set when measuring disk.
 - **EC hit rate is not RAM hit rate:** an EC hit means the shard cluster supplied enough data. RocksDB BlockCache misses and disk reads occur below that counter. Inspect shard-host disk IOPS, such as procmon `rd_iops`, to establish that the workload actually reached disk.
 - **L3 modeling:** `--cold-prefill N` writes only to origin, while `--miss-ratio f` selects those cold keys for roughly fraction f of reads. Repeated cold keys warm through fill-aside, lowering the measured origin-read ratio. Size the cold pool larger than the expected cold reads during the window.
-- **Aging/eviction:** embedded eviction uses frequency history aged by successful-write bytes, access counts and any explicitly configured reset timer (§4.5); `disk_bytes` is not a quota. Even when accesses remain below `reset_after`, successful writes can exhaust the byte budget. Record the value sizes, repeated fills, hot-hit rate and compaction behavior; a once-touched key can already be eligible for removal. Logical eviction and physical blob reclamation are separate observations.
+- **Aging/eviction:** embedded eviction uses frequency history aged by successful-write bytes, access counts and any explicitly configured reset timer ([Frequency tracking and disk eviction](#frequency-tracking-and-disk-eviction)); `disk_bytes` is not a quota. Even when accesses remain below `reset_after`, successful writes can exhaust the byte budget. Record the value sizes, repeated fills, hot-hit rate and compaction behavior; a once-touched key can already be eligible for removal. Logical eviction and physical blob reclamation are separate observations.
 - **Possible bottlenecks:** RAM-hot shard reads can saturate coordinator network/copy/CPU resources; disk-heavy working sets can saturate shard random I/O and amplify quorum tails. EC collects approximately one object's worth of data across data shards, with parity/hedging/protocol overhead, not automatically `value-size × data_shards` full-object bytes. Neither “the NIC always bottlenecks first” nor “CPU is usually irrelevant” is hardware-independent. Measure network, disk, CPU, concurrency and latency together. Keeping a measured hot set resident can improve performance, but no fixed order-of-magnitude gain follows from the architecture alone.
 
-
-## 8. Reusable Cache application entry point
+## Reusable Cache application entry point
 
 `app/cache.Run(ctx, cfg, opts)` is the complete Cache service used by both `cache-ctl serve` and custom executables. `app/cache.Config` aliases `pkg/cache/runtime.Config`; `Options` contains `Logger`, `Reload`, `LoadMembership`, `Drain`, `DrainTimeout` and `ListenerFDs`. The App does not discover `CACHE_CONFIG`, register process signals, or depend on the official CLI.
 
@@ -872,9 +1076,9 @@ KillSignal=SIGTERM
 
 For EC membership refresh, the caller supplies both `Reload` and `LoadMembership`. The callback returns candidate peers only for EC tiers that already exist in the startup configuration. `Run` validates the whole candidate batch, probes and applies each tier independently, and retains that tier's previous membership on failure. It does not hot-replace the topology or other configuration. A closed reload channel is disabled rather than polled.
 
-The App owns listeners, backend clients, the shared BlobPool, Health/Info, statistics, Redis health monitoring and an optional instance-local pprof HTTP server. It closes dependencies and returns only after actual users finish; §6.2 defines the ordering. Custom callers own their signals and borrowed inputs.
+The App owns listeners, backend clients, the shared BlobPool, Health/Info, statistics, Redis health monitoring and an optional instance-local pprof HTTP server. It closes dependencies and returns only after actual users finish; [Signals and shutdown](#signals-and-shutdown) defines the ordering. Custom callers own their signals and borrowed inputs.
 
-`Options.Drain <-chan struct{}` defaults to nil, preserving the ctx cancellation behavior of the example above. Closing an explicitly supplied Drain starts soft shutdown. Cancelling the `Run(ctx)` context always cancels in-flight work, takes priority over simultaneous drain, and does not silently become a graceful wait. `Options.DrainTimeout time.Duration` uses the shared budget in §6.2. Drain during initialization prevents subsequent started/SERVING publication. A host that distinguishes soft shutdown from cancellation can pass `Options{Drain: drain, DrainTimeout: 30*time.Second}`, adapt its first exit request to `close(drain)` and later requests to its context cancel function. The App does not take over host signals, args or process exit.
+`Options.Drain <-chan struct{}` defaults to nil, preserving the ctx cancellation behavior of the example above. Closing an explicitly supplied Drain starts soft shutdown. Cancelling the `Run(ctx)` context always cancels in-flight work, takes priority over simultaneous drain, and does not silently become a graceful wait. `Options.DrainTimeout time.Duration` uses the shared budget in [Signals and shutdown](#signals-and-shutdown). Drain during initialization prevents subsequent started/SERVING publication. A host that distinguishes soft shutdown from cancellation can pass `Options{Drain: drain, DrainTimeout: 30*time.Second}`, adapt its first exit request to `close(drain)` and later requests to its context cancel function. The App does not take over host signals, args or process exit.
 
 `Options.ListenerFDs map[string]*os.File` supplies named original descriptors explicitly; the App never discovers activation environment. A custom main can use public `pkg/activation.FilesFromEnv()` (also import `errors` for this example) or obtain Files from its own manager:
 
@@ -890,12 +1094,12 @@ func runActivated(ctx context.Context, cfg cacheapp.Config) error {
 
 On helper success, the caller owns the original Files starting at FD 3 and must close them. The helper marks them close-on-exec and clears the three `LISTEN_*` variables. On failure it transfers no ownership, closes no original and leaves no duplicate behind; the host still owns the originals. App import borrows a stable map/Files, validates the whole entrance set and creates close-on-exec listener duplicates. Failure rollback closes created duplicates without closing originals. Go listener import sets nonblocking I/O on the shared socket description; this status flag also affects originals, while close-on-exec is per descriptor. Close the originals after Run returns. The App closes only its copies, without unlinking inherited UDS or shutting down the manager socket. Initialization failure, drain and cancellation follow the same ownership. This example keeps SDK context cancellation; pass the Drain/DrainTimeout inputs above as well when soft shutdown is wanted.
 
-## 8. See Also
+## Related contracts
 
 - [store](store.md): a tiered origin can use store-ctl gRPC or another cache wire endpoint. Embedded cache-ctl still has local filesystem I/O; authoritative origin persistence belongs to store-ctl. Its optional cache_listen exposes a **read-only** chunk/Manifest/blob wire interface with no L1, allowing direct wire reads without a separate cache daemon.
-- [manifest](manifest.md): the Fetcher uses wire ObjectGet when cache is configured; Manifest chunk hashes are the corresponding physical ContentKeys.
-- [project performance guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/perf.md): cache measurement and evidence limits.
+- [manifest](transfer.md): the Fetcher uses wire ObjectGet when cache is configured; Manifest chunk hashes are the corresponding physical ContentKeys.
+- [project performance guide](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/performance.md): cache measurement and evidence limits.
 - [README](../README.md) / [Makefile](../Makefile): `make cache-ctl` builds the repository's CGO binary after deps-rocksdb, statically linking librocksdb.
-- [system architecture](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/kuasar-sandbox.md): the cache model in the platform.
+- [system architecture](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/architecture.md): the cache model in the platform.
 
-Cache read attempts and client recovery are specified in [§4.11](#411-read-attempts-pool-recovery-and-error-ownership).
+Cache read attempts and client recovery are specified in [Read attempts, pool recovery and error ownership](#read-attempts-pool-recovery-and-error-ownership).

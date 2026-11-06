@@ -1,4 +1,4 @@
-[English](README.md) | [简体中文](README_zh.md)
+[English](README.md) | [简体中文](#accelerator-产品-e2e-用例)
 
 # Accelerator 产品 E2E 用例
 

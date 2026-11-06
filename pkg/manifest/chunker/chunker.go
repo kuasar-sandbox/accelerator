@@ -82,7 +82,7 @@ type Info struct {
 // an error if any size string is malformed or any resolved size is
 // not a multiple of PageSize.
 //
-// Default values match docs/manifest.md §4.1:
+// Default values match docs/artifacts.md#chunking:
 //
 //	mode: cdc
 //	cdc:   min 128 KiB / avg 512 KiB / max 1 MiB
