@@ -6,14 +6,14 @@ Accelerator 维护 `pkg/flatten`、`pkg/image`、`pkg/remote` 中共享的 OCI/�
 
 ## 库入口与消费者责任
 
-`PrepareImage`、`PrepareArchive`、`PrepareDir` 选择并制备不可变逻辑内容，返回的 `PreparedImage` 持有选定来源、layout、Plan 和 FD，直到输出结束并由 Close 等待工作退出。调用者负责执行资源、输入稳定性、目标 writer 和结果发布。以下章节定义精确边界；只写完 payload 不等于工件发布成功。
+`PrepareImage`、`PrepareArchive`、`PrepareDir` 选择并制备不可变逻辑内容，返回的 `PreparedImage` 持有制备出的私有 rootfs（或借用选定目录）、layout、Plan 和 FD，直到 `Close` 等待活动输出结束并释放自有资源。原始归档和层 body 在制备期间消费并关闭，不会保留到 `PreparedImage.Close`。调用者负责执行资源、输入稳定性、目标 writer 和结果发布。以下章节定义精确边界；只写完 payload 不等于工件发布成功。
 
 ## 镜像 payload 与运行配置
 
 ### 字节布局
 
-外层 `.img` 是 tarstream 工件,含一个 `image` payload 和 `.kuasar.digest.<hex>`
-marker。以下偏移均相对于**解封后的 payload**:
+外层 `.img` 是 tarstream 工件，明文（或解密后）的流含一个 `image` payload 和
+`.kuasar.digest.<hex>` marker。以下偏移均相对于**解封后的 payload**:
 
 | payload 偏移 | 内容 |
 |---|---|
@@ -64,8 +64,10 @@ Healthcheck      *Healthcheck,omitempty   (Test/Interval/Timeout/StartPeriod/Ret
 ```
 
 **为什么 Architecture / Os 不 omitempty**:即使空值也要写入,让下游观察者
-看到"源镜像没填这两项"的问题,而不是默默继承默认值。flatten-ctl 是字节级
-转换工具,不验证平台兼容(amd64 vs arm64 决策属于上层调度器)。
+看到“源镜像没填这两项”的问题，而不是默默继承默认值。投影本身不验证平台兼容性。
+Registry 制备使用的 `remote.Stream` 会单独检查 config OS/architecture 是否匹配
+所选平台；所选平台和 config 都声明 variant 时，冲突也会被拒绝。选择能够在目标
+环境执行的平台仍由调用者/调度器负责。
 
 未列出的源字段(`OnBuild` / `ArgsEscaped` / `Domainname` / `Hostname` /
 `AttachStdin` / `Tty` / `MacAddress` 等)被静默丢弃——不在沙箱启动模型中
@@ -93,16 +95,19 @@ hash 相同**:rootfs 数据/元数据、构建工具/参数,以及工件稀疏�
 
 `remote.Stream` 在打开层之前固定平台 manifest、config、descriptor 和对应 DiffID。
 每次 `LayerInput.Open` 必须为同一不可变身份返回从零开始的新 body；prepared 操作
-拥有它，精确关闭一次并检查 Close 错误。对于受支持的 layer media type，实际存储字节决定 plain/gzip/zstd 压缩格式，媒体标签不能覆盖内容识别；stored-byte checker 只计量和哈希一次嗅探前缀，共享 detector 也处理前导 zstd skippable 帧。
+拥有它，精确关闭一次并检查 Close 错误。body 的 `Close` 必须能解除并发 `Read`
+的阻塞，取消才可完成。对于受支持的 layer media type，实际存储字节决定 plain/gzip/zstd 压缩格式，媒体标签不能覆盖内容识别；stored-byte checker 只计量和哈希一次嗅探前缀，共享 detector 也处理前导 zstd skippable 帧。
 tar EOF 不等于流结束：有界尾部读取覆盖完整未压缩 DiffID、压缩 size/digest 和
 decoder trailer。错误、超限或取消停止输入，不无限 drain。全部层成功前不输出工件。
 `remote.Pull` 保留完整下载、可重开的 Source 合同；旧 `Build(Source, ...)` 仍接受
 未压缩、可重开的层。
 
 `PrepareArchive` 校验外层成员、offset/length、结束标志及索引预算，按 manifest
-顺序开启层。可 seek 输入原位读取，管道只 spool 一次。`PrepareImage`、
-`PrepareArchive`、`PrepareDir` 返回的 `PreparedImage` 持有选定源、layout、计划和 FD。
-旧 `Flatten` 借用 reader；`PrepareArchive` 拥有并关闭传入 body。
+顺序开启层。可 seek 的 `ReaderAt` 原位建立索引，其他输入只 spool 一次。
+`PrepareArchive` 拥有传入 body，包括失败路径在内精确关闭一次；其 `Close` 必须
+能解除并发 `Read` 的阻塞。层校验完成后、规划之前释放归档 body 和 spool，得到
+的私有 rootfs 归 `PreparedImage` 所有。`PrepareImage` 同样拥有制备出的私有
+rootfs；`PrepareDir` 借用已有目录，`Close` 不删除该目录。旧 `Flatten` 借用 reader。
 选定的 config 和层必须是普通成员。既有 Skopeo 旧格式别名
 `<hex>/layer.tar -> ../<diff-id>.tar` 仅在目标为选定普通层时接受，只建立索引，
 不跟随或提取该链接。其他外层链接和 sparse 成员均拒绝。
@@ -118,7 +123,10 @@ Linux 适配调用 **umoci v0.6.0** 层 API，不引入其 CLI、CAS 或 runtime
 私有 rootfs 在层应用后停止写入。已有目录须由调用者在准备和输出全程保持稳定；
 选集和摘要只能检测变化，不能把并发目录变成原子快照。规划、读取和最终校验共享
 同一选集，包括 `Skip`、`SkipMounts` 及全部自有 scratch/spool/layout/输出排除。
-读取产生的 atime 和排除区域内部变化不导致失效；纳入选集的元数据、链接、对象及
+库调用者须在 `PrepareDir` 建立选集前，通过 `DirOptions.OutputPaths` 提供自有
+目标路径、通过 `OutputFiles` 提供已打开的输出文件；后续传给 `WriteArtifact` 或
+`WriteRaw` 的任意 writer 不会被自动识别。`BuildFromDir` 会加入自己的目标与
+pending 文件路径。读取产生的 atime 和排除区域内部变化不导致失效；纳入选集的元数据、链接、对象及
 目录成员变化会导致失效。
 
 ### 布局与元数据政策
@@ -141,11 +149,8 @@ Linux 适配调用 **umoci v0.6.0** 层 API，不引入其 CLI、CAS 或 runtime
 逻辑长度、源身份/路径、有序目标和源 offset、length、SHA-256 及 padding。Reader
 拒绝未知能力、溢出、数量/字节超限、缺源/截断、重叠和越界。
 
-库的 `LayerLimits.MetadataBytes` 和 `PlanLimits` 字段是可选准入配额。零值不再
-额外限制层元数据、规划、落盘 Plan 或索引；整数/分配表示范围及格式边界检查仍然
-生效。CLI 使用这些零值选项，因此增加 Builder 资源不再被这些固定的层/计划配额
-抵消，不需要新的 CLI 参数或 Builder API。执行资源仍是外层内存/存储边界；独立
-调用方必须约束自己的执行环境。这不保证任意大的输入都能完成。
+可选元数据/Plan 配额与独立的解码/归档默认限额见
+[准入配额与转换兼容](#准入配额与转换兼容)。
 
 显式正值保留原有保守计费。兼容字段名 `NativeMemoryBytes` 限制 Go 规划器的受控
 分配，分给库和调用方去重/硬链接表，各占一半；扩容计入新旧存储并存。
@@ -189,6 +194,21 @@ Plan/layout 身份。接收方必须同时要求完整工件身份/尾以及 pro
 完整 SHA-256，worker 数量不改变块身份与输出顺序。
 
 ### 准入配额与转换兼容
+
+不同公开限额字段的零值含义不同：
+
+| 限额 | 零值行为 |
+|---|---|
+| `LayerLimits.DecodedBytes` | 每层解码字节默认上限 128 GiB。 |
+| `LayerLimits.DecoderBytes` | 每层解码器内存默认上限 64 MiB。 |
+| `ArchiveLimits.Bytes` | 外层归档默认上限 128 GiB，原位索引与 spool 输入相同。 |
+| `ArchiveLimits.IndexBytes` / `Members` | 默认索引预算 32 MiB / 成员数量 131,072。 |
+| `LayerLimits.MetadataBytes` 及所有 `PlanLimits` 字段 | 不增加准入配额；整数/分配表示范围和格式上限仍然有效。 |
+
+前四项可通过对应公开限额字段调整。镜像输入还固定检查 config JSON 不超过
+16 MiB、层数不超过 65,536。CLI 使用零值选项：取消元数据/Plan 配额不等于取消
+解码/归档默认限额或这些固定检查。调用者仍须约束执行环境的内存/存储；增加
+Builder 资源不保证任意输入都能完成。
 
 `LayerLimits.MetadataBytes` 和三个 `PlanLimits` 字段改为显式启用的准入配额。
 零值不再隐式施加原先 128 MiB 层估算或 512/512/128 MiB 规划/计划/索引默认值。
@@ -294,9 +314,7 @@ OCI image config 字段繁多,大量与启动无关:`created` / `author` / `hist
   但不把任意该格式目录解码为 OCI 镜像。可先用
   `skopeo copy oci:./dir docker-archive:x.tar` 转换,或用 crane 推到 registry 后拉取。
   直接传普通本地目录会选择 rootfs 导出,不会识别 OCI layout。
-- **展平阶段的镜像签名/加密**:加密与内容寻址由
-  [manifest 阶段](transfer_zh.md)
-  负责;这不构成镜像签名校验流程。
+- **镜像签名验证**：制备流程不建立镜像签名验证工作流。工件加密独立受支持：`PreparedImage.WriteArtifact` 转发 `tarstream.WithCodec`，加密含 marker 与 trailer 的完整 tarstream envelope。这与[传输阶段](transfer_zh.md)的 Manifest chunk 加密不同；载体身份和加密契约见[数据契约](artifacts_zh.md)。
 - **层级保留**:输出把各层合并为一个 EROFS payload。manifest chunk dedup 可复用
   不变内容,但不保留原始层结构。
 
