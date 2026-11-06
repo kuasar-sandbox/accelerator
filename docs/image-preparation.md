@@ -6,13 +6,13 @@ Accelerator owns the shared OCI/directory/archive preparation libraries in `pkg/
 
 ## Library entry points and consumer responsibilities
 
-`PrepareImage`, `PrepareArchive` and `PrepareDir` select and prepare immutable logical content. Their `PreparedImage` retains the selected source, layout, Plan and descriptors until output finishes and Close joins the work. Callers own execution-resource limits, stable input, the requested writer and publication of the final result. The sections below define the exact boundaries; successful payload writes alone are not successful artifact publication.
+`PrepareImage`, `PrepareArchive` and `PrepareDir` select and prepare immutable logical content. Their `PreparedImage` retains the prepared rootfs (or borrows the selected directory), layout, Plan and descriptors until `Close` joins any active output and releases owned resources. Original archive and layer bodies are consumed and closed during preparation, not retained until `PreparedImage.Close`. Callers own execution-resource limits, stable input, the requested writer and publication of the final result. The sections below define the exact boundaries; successful payload writes alone are not successful artifact publication.
 
 ## Image payload and runtime configuration
 
 ### Byte layout
 
-There are two layers of format. The delivered `.img` file is a tarstream artifact with one `image` payload and a `.kuasar.digest.<hex>` marker. Within the **unwrapped payload**, the layout is:
+There are two layers of format. The delivered `.img` file is a tarstream artifact whose plaintext (or decrypted) stream contains one `image` payload and a `.kuasar.digest.<hex>` marker. Within the **unwrapped payload**, the layout is:
 
 | Payload offsets | Contents |
 |---|---|
@@ -56,7 +56,7 @@ Healthcheck      *Healthcheck,omitempty   (Test/Interval/Timeout/StartPeriod/Ret
                                             durations are native nanosecond int64 values)
 ```
 
-**Why Architecture and Os do not use omitempty:** even empty values are emitted so downstream readers can see that the source omitted them, rather than silently inheriting defaults. `flatten-ctl` performs byte-level conversion; platform compatibility decisions, including amd64 versus arm64, belong to the caller/scheduler.
+**Why Architecture and Os do not use omitempty:** even empty values are emitted so downstream readers can see that the source omitted them, rather than silently inheriting defaults. The projection itself does not validate platform compatibility. Registry preparation through `remote.Stream` separately requires config OS/architecture to match the selected platform and rejects a conflicting variant when both selected and config variants are specified. Choosing a platform that can execute on the target still belongs to the caller/scheduler.
 
 Unlisted fields such as `OnBuild`, `ArgsEscaped`, `Domainname`, `Hostname`, `AttachStdin`, `Tty` and `MacAddress` are silently discarded because they are not part of this sandbox launch projection.
 
@@ -80,7 +80,7 @@ Equal runtime projections produce equal JSON and ZIP bytes. **Equal config alone
 `remote.Stream` pins the platform manifest, config, descriptors and matching
 DiffIDs before opening layers. Each `LayerInput.Open` returns a fresh body for
 that immutable identity. Preparation owns it, closes it exactly once, and checks
-Close errors. For supported layer media types, stored bytes determine plain/gzip/zstd compression; media-type labels do not override content detection. The stored-byte checker counts and hashes the sniffed prefix once. The shared detector also handles leading zstd skippable frames.
+Close errors. The body's `Close` must unblock a concurrent `Read` so cancellation can finish. For supported layer media types, stored bytes determine plain/gzip/zstd compression; media-type labels do not override content detection. The stored-byte checker counts and hashes the sniffed prefix once. The shared detector also handles leading zstd skippable frames.
 Tar EOF is not stream EOF: bounded tail reads verify the entire decoded DiffID,
 compressed size/digest and decoder trailer. Errors or cancellation stop input;
 they do not drain an unbounded failed body. No artifact is emitted until every
@@ -88,10 +88,13 @@ layer passes. `remote.Pull` retains its complete-download, reopenable Source
 contract; legacy `Build(Source, ...)` still accepts uncompressed reopenable layers.
 
 `PrepareArchive` bounds its outer index, validates members, offsets, lengths and
-archive termination, and opens layers in manifest order. A seekable archive stays
-in place; a pipe is spooled once. `PrepareImage`, `PrepareArchive` and `PrepareDir`
-all produce a `PreparedImage` owning its selected source, layout, plan and FDs.
-Legacy `Flatten` borrows its reader; `PrepareArchive` owns and closes its body.
+archive termination, and opens layers in manifest order. A seekable `ReaderAt` is
+indexed in place; other inputs are spooled once. `PrepareArchive` owns and closes
+its body exactly once, including on failure; its `Close` must unblock a concurrent
+`Read`. The archive body and any spool are released after layer validation, before
+planning; the resulting private rootfs belongs to `PreparedImage`. `PrepareImage`
+also owns its prepared rootfs. `PrepareDir` borrows the existing directory and
+never removes it on `Close`. Legacy `Flatten` borrows its reader.
 Selected config and layers must be regular members. The existing Skopeo legacy
 alias `<hex>/layer.tar -> ../<diff-id>.tar` is accepted only when its target is a
 selected regular layer; it is indexed but never followed or extracted. Other
@@ -111,7 +114,11 @@ Private rootfs writes end after layer application. An existing directory must
 remain stable for the complete prepare/output lifetime; selection and digest
 checks detect changes but cannot create an atomic snapshot of a concurrent tree.
 One selection, including `Skip`, `SkipMounts` and all owned scratch/spool/layout/
-output exclusions, is shared by planning, reading and final validation. Reading
+output exclusions, is shared by planning, reading and final validation. Library
+callers must provide caller-owned destinations through `DirOptions.OutputPaths`
+and open output files through `OutputFiles` before `PrepareDir` selects the tree.
+An arbitrary writer passed later to `WriteArtifact` or `WriteRaw` is not discovered
+automatically. `BuildFromDir` adds its own destination and pending-file paths. Reading
 atime or modifying excluded contents does not invalidate the selected tree.
 Changes to included metadata, links, objects or directory membership do.
 
@@ -139,14 +146,8 @@ length, source identity/path, ordered target/source offsets, lengths, SHA-256 an
 padding. The reader rejects unsupported features, overflow, excessive counts or
 bytes, missing/truncated inputs, overlaps and out-of-bounds references.
 
-The library's `LayerLimits.MetadataBytes` and `PlanLimits` fields are optional
-admission quotas. Zero imposes no additional layer, planning, on-disk Plan or
-index quota; checked integer/allocation and format boundaries still apply. The
-CLI uses these zero-valued options, so increasing Builder resources is no longer
-masked by these fixed layer/plan quotas. No new CLI flag or Builder API is
-required. Execution resources remain the outer memory/storage boundary;
-standalone callers must bound their environment. This does not guarantee that
-arbitrarily large input will complete.
+Optional metadata/Plan quotas and the separate decoded/archive defaults are
+listed in [Admission limits and conversion compatibility](#admission-limits-and-conversion-compatibility).
 
 Explicit positive values keep the existing conservative accounting. The legacy
 name `NativeMemoryBytes` bounds controlled Go planner allocations, split equally
@@ -203,6 +204,23 @@ An adjacent block can reuse a full SHA-256 only after comparing all 4096 bytes;
 worker count does not change block identities or output order.
 
 ### Admission limits and conversion compatibility
+
+Zero has different meanings across the public limit fields:
+
+| Limit | Behavior when zero |
+|---|---|
+| `LayerLimits.DecodedBytes` | Default 128 GiB decoded bytes per layer. |
+| `LayerLimits.DecoderBytes` | Default 64 MiB decoder-memory limit per layer. |
+| `ArchiveLimits.Bytes` | Default 128 GiB outer archive, for both indexed and spooled input. |
+| `ArchiveLimits.IndexBytes` / `Members` | Default 32 MiB index budget / 131,072 members. |
+| `LayerLimits.MetadataBytes` and all `PlanLimits` fields | No additional admission quota; checked representation and format ceilings still apply. |
+
+The first four rows can be changed through their public limit fields. Image input
+also has fixed checks of at most 16 MiB config JSON and 65,536 layers. The CLI uses
+zero-valued options: removing metadata/Plan quotas does not remove decoded/archive
+defaults or these fixed checks. Execution memory/storage must still be bounded
+by the caller; increasing Builder resources does not guarantee arbitrary inputs
+will complete.
 
 `LayerLimits.MetadataBytes` and the three `PlanLimits` fields are opt-in
 admission quotas. Zero no longer imposes the former 128 MiB layer estimate or
@@ -306,7 +324,7 @@ An explicit projection makes the supported launch fields predictable for downstr
 ### Unsupported or deferred features
 
 - **Direct arbitrary OCI-layout input:** registry pulling is supported ([Remote pulling, local caching and Referrers writeback](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten-cli.md#remote-pulling-local-caching-and-referrers-writeback)), and the pull cache uses OCI layout, but export does not interpret an arbitrary OCI-layout directory as an image source. Convert it with `skopeo copy oci:./dir docker-archive:x.tar`, or push with crane and pull from the registry. Passing that directory as a normal local directory would select rootfs export, not OCI-layout decoding.
-- **Image signing/encryption in flattening:** encryption and content addressing belong to the [manifest stage](transfer.md). This does not establish an image-signature verification workflow.
+- **Image-signature verification:** preparation does not establish an image-signature verification workflow. Artifact encryption is supported separately: `PreparedImage.WriteArtifact` forwards `tarstream.WithCodec` to encrypt the complete tarstream envelope, including its marker and trailer. This differs from Manifest chunk encryption in the [transfer stage](transfer.md); see [artifacts](artifacts.md) for carrier identity and encryption contracts.
 - **Layer preservation:** the output merges all layers into one EROFS payload. Downstream manifest chunk deduplication can reuse unchanged content, but it does not preserve the original layer structure.
 
 ## Performance and validation evidence
