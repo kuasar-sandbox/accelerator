@@ -713,6 +713,8 @@ Redis-compatible server 管理自己的淘汰。
 
 EC 客户端只在 tiered 的 tier chain 中使用。
 
+Peer 客户端按 endpoint 独立、按需初始化。拨号和关闭已移除客户端均不持有共享查找锁，因此一个慢初始化不会通过该锁阻塞其他已就绪 peer 的访问。同一 endpoint 的并发调用协调初始化；首次初始化失败后，等待者可以发起自己的尝试。被成员协调过程作废的初始化不能发布结果。关闭时禁止新初始化，并等待构造与清理完成。继续使用现有 pool 大小和连接 timeout。
+
 #### Reed-Solomon 4/5
 
 - 4 data + 1 parity 共 5 shards,除非初始配置/clamp 选择其他方案。

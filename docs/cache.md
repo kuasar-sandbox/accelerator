@@ -641,6 +641,8 @@ A normal fill represents a chunk that was just read. An additional W-TinyLFU-sty
 
 The EC client is used as a tier in tiered mode.
 
+Peer clients initialize lazily and independently per endpoint. Dialing and closing retired clients do not hold the shared lookup lock, so a slow initialization cannot block access to another ready peer through that lock. Concurrent callers for one endpoint coordinate initialization; after a failure, a waiting caller can make its own attempt. An initialization retired by membership reconciliation cannot publish its result. Shutdown prevents new initialization and joins construction and cleanup. Existing pool sizes and connection timeouts remain authoritative.
+
 #### Reed–Solomon 4/5
 
 - Four data shards and one parity shard, five total, unless initial configuration/clamping selects another scheme.
