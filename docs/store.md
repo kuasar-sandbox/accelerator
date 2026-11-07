@@ -14,7 +14,7 @@ There is one representation of generations:
 []store.Generation // oldest -> newest
 ```
 
-The last entry receives new writes; reads search backward from that entry. The list is neither sorted by name nor automatically deduplicated. Names must match `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`. Empty lists, duplicate entries, `.`, `..`, path separators, control characters and excessively long lists are rejected.
+The last entry receives default write admissions; reads search backward from that entry. The list is neither sorted by name nor automatically deduplicated. Names must match `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`. Empty lists, duplicate entries, `.`, `..`, path separators, control characters and lists exceeding 1024 entries are rejected.
 
 `AdmitWrite` / `AdmitWriteFor` return:
 
@@ -25,7 +25,7 @@ type WriteAdmission struct {
 }
 ```
 
-This contains routing and cryptographic-derivation information, not credentials. An empty `AdmitWrite` request chooses the last entry in the current list. `AdmitWriteFor(generation)` requests a specific entry that is still present. One manifest ingest performs one admission RPC; all chunk Puts and the final manifest Put reuse that admission. An admission remains writable while its generation is in the current list. Once removed, that generation accepts no Put and no longer participates in Get.
+This contains routing and cryptographic-derivation information, not credentials. An empty `AdmitWrite` request chooses the last entry in the current list. `AdmitWriteFor(generation)` requests a specific entry that is still present. One manifest ingest performs one admission RPC; all chunk Puts and the final manifest Put reuse that admission. An admission remains writable while its generation is in the list observed by a request. Once a request observes its removal, that generation accepts no new Put and no longer participates in Get. Refresh does not revoke a Put already admitted against an earlier list.
 
 Generation salt has one public implementation:
 
@@ -121,7 +121,7 @@ generations:
 
 `generations.s3.tls` is honored independently of the data backend's; when the `generations` section is omitted, the legacy backend-local S3 location inherits the data backend's setting.
 
-File and S3 sources use line-oriented text in oldest-to-newest order. They refresh periodically according to `refresh_interval`; `SIGHUP` also triggers an immediate refresh. For a config source, `SIGHUP` rereads the main YAML but does not dynamically change the backend, listener, credentials or other configuration. A new list replaces the current immutable slice only after complete loading, parsing and validation. A failed refresh is logged and retains the last valid list. Startup is rejected when no valid list is available.
+File and S3 sources use line-oriented text in oldest-to-newest order, limited to 256 KiB; blank lines and surrounding whitespace are ignored. Their `refresh_interval` defaults to `5s` and must be positive. `SIGHUP` also triggers an immediate refresh; a config source rejects `refresh_interval` rather than polling the main YAML. For a config source, `SIGHUP` rereads the main YAML but does not dynamically change the backend, listener, credentials or other configuration. A new list replaces the current immutable slice only after complete loading, parsing and validation. A failed refresh is logged and retains the last valid list. Startup is rejected when no valid list is available.
 
 Omitting `generations` preserves the legacy deployment locations:
 
@@ -139,7 +139,7 @@ When `false`, uploaded content is not hash-verified:
 - With a size: the actual upload size must equal it; an existing target with the same size is a dedup hit.
 - Without a size: the existence of a regular file/object is a dedup hit; a new upload has no expected-size check.
 
-Consequently, incorrect content of the same size cannot be identified. Without a size, leftover or incomplete files may also count as existing. This is an explicit tradeoff when disabling content verification.
+Disabling verification also permits newly uploaded bytes whose hash does not match the key. Separately, the size/existence-only dedup shortcut applies **even when verification is enabled**: a same-size corrupt existing object is not detected, and without a size an incomplete existing object may count as a hit. Upload verification is not an audit of existing stored data.
 
 ## Administrative commands
 
@@ -152,9 +152,9 @@ store-ctl purge   --config FILE --all --confirm
 store-ctl serve   --config FILE
 ```
 
-- `info` reads the oldest-to-newest list from the generation source and shows its last entry as the current write generation. Explicit generation admin helpers collect object statistics.
-- `init`/`rollout` modify file or S3 sources. A config source is explicitly read-only and must be updated by the configuration system.
-- `purge --generation` rejects the last entry, removes the generation from a writable source, then deletes FS/S3 data. S3 source updates use ETag `If-Match` CAS, rereading and retrying within a bound on conflicts.
+- `info` reads the oldest-to-newest list, shows its last entry as the current write generation, and scans each generation for chunk/manifest/blob object counts. A per-generation statistics failure is printed and processing continues; a zero command exit is not proof that every generation was counted successfully.
+- `init` creates a file or S3 source and refuses to overwrite an existing one; `rollout` appends a new generation. A config source is explicitly read-only and must be updated by the configuration system.
+- `purge --generation` rejects the last entry, removes the generation from a writable source, then deletes FS/S3 data. S3 source updates use ETag `If-Match` CAS, rereading and retrying within a bound on conflicts. This mode has no additional confirmation prompt. List removal and data deletion are not atomic: cleanup failure can leave the generation unlisted with some or all objects still present.
 - `purge --all` is offline maintenance and still requires `--confirm`: stop every `store-ctl serve` process and quiesce all writers first. File/S3 sources are removed. For a config source, only object data is removed, not the main YAML. A running server treats a missing source as refresh failure and deliberately retains its last valid list; therefore this command is not an online write-revocation mechanism.
 
 A write-generation rollout does not retire existing data:
@@ -412,11 +412,14 @@ The object layout matches FS:
 <prefix>/<partition>/<generation>/<aa>/<bb>/<content-key>
 ```
 
-PutHandle buffers within a memory bound and writes the fixed key with one PutObject. `max_inflight` limits concurrent S3 calls; an empty `op_timeout` leaves timeout control solely to the caller's context; `max_object_size_bytes` limits object size. The generation source may use an entirely different S3 endpoint, bucket, key and credentials from the data backend.
+PutHandle buffers one object and writes the fixed key with one PutObject. `max_object_size_bytes` defaults to 16 MiB and limits the buffered upload payload. Commit can make another full-size copy. For object Get, the current SDK path reads the response into memory before the backend checks this size limit; it is not a pre-allocation or process-wide memory ceiling. Concurrent buffered uploads are not bounded by `max_inflight`.
+
+`max_inflight` defaults to 64 and limits active data-plane S3 calls. A positive `op_timeout` starts **after** a call acquires its slot; queue waiting is bounded only by the caller's context. Each HEAD/Get/Put has its own budget, not one overall Store request budget. An empty timeout adds no per-call deadline. The separate generation source has its own client and may use an entirely different S3 endpoint, bucket, key and credentials; these data-plane limits do not govern its reads.
 
 ## Related contracts
 
-- [manifest.md](transfer.md): manifest ingest/fetch and encryption.
+- [Data transfer](transfer.md): manifest-ctl commands and transfer completion.
+- [Artifacts](artifacts.md): logical objects, carrier formats and encryption.
 - [cache.md](cache.md): tiered cache, origins and wire protocol.
 - Repository-root `README.md` / `Makefile`: build and full-test entry points.
 

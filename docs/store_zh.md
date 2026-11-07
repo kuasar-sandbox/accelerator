@@ -16,9 +16,9 @@ generation 只有一种表示：
 []store.Generation // oldest -> newest
 ```
 
-最后一项接收新写入，读取从最后一项向前查找。列表不按名称排序，也不自动去重。
+最后一项用于默认写入 admission，读取从最后一项向前查找。列表不按名称排序，也不自动去重。
 名称必须匹配 `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`；空列表、重复项、`.`、
-`..`、路径分隔符、控制字符和过长列表都会被拒绝。
+`..`、路径分隔符、控制字符和超过 1024 项的列表都会被拒绝。
 
 `AdmitWrite` / `AdmitWriteFor` 返回：
 
@@ -32,8 +32,8 @@ type WriteAdmission struct {
 它只是路由和加密派生信息，不是凭据。空请求的 `AdmitWrite` 选择当前列表最后一项；
 `AdmitWriteFor(generation)` 请求列表中仍存在的指定项。一次 manifest ingest 只调用
 一次 admission RPC，全部 chunk Put 和最后的 manifest Put 都复用同一个 admission。
-generation 仍在当前列表中时 admission 可继续写入；移出列表后，该 generation
-不再接受 Put，也不再参与 Get。
+generation 仍在请求观察到的列表中时 admission 可继续写入；请求观察到其移除后，
+该 generation 不再接受新的 Put，也不再参与 Get。刷新不会撤销已按旧列表接纳的 Put。
 
 generation salt 只有一个公共实现：
 
@@ -139,8 +139,9 @@ generations:
 `generations.s3.tls` 独立于数据后端的同名设置生效；省略 `generations` 段时，
 后端本地的 legacy S3 位置继承数据后端的设置。
 
-文件和 S3 object 都使用逐行文本格式，顺序为 oldest → newest。它们按
-`refresh_interval` 周期刷新；`SIGHUP` 也会立即刷新。config source 在
+文件和 S3 object 都使用逐行文本格式，顺序为 oldest → newest，上限为 256 KiB；
+空行及行首尾空白被忽略。`refresh_interval` 缺省为 `5s`，必须为正数；
+`SIGHUP` 也会立即刷新。config source 拒绝 `refresh_interval`，不会轮询主 YAML，在
 `SIGHUP` 时重读主 YAML，但不会动态改变 backend、listen、凭据或其他配置。
 只有完整加载、解析和校验成功的新列表才会替换当前不可变 slice；失败时记录错误
 并继续使用上一份有效列表。启动时没有有效列表则拒绝启动。
@@ -164,8 +165,9 @@ generation 凭据和对象读写凭据，而不需要修改 generation object �
 - 提供 size：实际上传大小必须等于 size；已有目标大小相等即 dedup。
 - 未提供 size：已有普通文件/对象存在即 dedup；新上传不做预期大小校验。
 
-因此，同大小错误内容无法被识别；未提供大小时，残留或不完整文件也可能被视为
-存在。这是关闭内容校验后的明确取舍。
+关闭校验还会允许写入 hash 与 key 不符的新内容。另须注意，**开启校验时也会**
+使用只检查大小/存在性的 dedup 快捷路径：既有同大小损坏对象不会被发现，未提供
+大小时既有不完整对象也可能命中。上传校验不是对已存数据的完整性审计。
 
 ## Admin 命令
 
@@ -178,11 +180,14 @@ store-ctl purge   --config FILE --all --confirm
 store-ctl serve   --config FILE
 ```
 
-- `info` 从 generation source 读取 oldest → newest 列表，最后一项显示为当前写入代，
-  对象统计由显式 generation admin helper 完成。
-- `init`/`rollout` 修改 file 或 S3 source；config source 明确只读，需由配置系统更新。
+- `info` 读取 oldest → newest 列表并显示当前写入代，还逐代扫描 chunk/manifest/blob
+  对象数量。某代统计失败时只打印错误并继续；命令退出码为零不能证明所有代均统计成功。
+- `init` 创建 file/S3 source，拒绝覆盖既有来源；`rollout` 追加新代。config source
+  明确只读，需由配置系统更新。
 - `purge --generation` 拒绝最后一项，先从可写 source 移出 generation，再删除 FS/S3
-  数据。S3 source 更新使用 ETag `If-Match` CAS，冲突后重读并有界重试。
+  数据。S3 source 更新使用 ETag `If-Match` CAS，冲突后重读并有界重试。此模式没有
+  额外确认提示。列表移除与数据删除不具原子性：清理失败可能留下已从列表移除、
+  但仍有部分或全部对象的代。
 - `purge --all` 是离线维护操作，仍要求 `--confirm`：执行前必须停止所有
   `store-ctl serve` 进程并静默所有 writer。file/S3 source 会被移除；config source
   下只清理对象数据，不修改主 YAML。source 缺失在运行中的 server 看来是刷新失败，
@@ -477,14 +482,21 @@ go test -run '^$' -bench 'BenchmarkGet(Buffer|Direct)' -benchmem ./pkg/store/fs
 <prefix>/<partition>/<generation>/<aa>/<bb>/<content-key>
 ```
 
-PutHandle 在内存中有界缓冲并以单次 PutObject 写入固定 key。`max_inflight` 限制
-并发 S3 调用；`op_timeout` 为空时只受调用方 context 控制；
-`max_object_size_bytes` 限制单对象大小。generation source 的 S3 endpoint、bucket、
-key 和凭据可与数据 backend 完全不同。
+PutHandle 缓冲单个对象并以单次 PutObject 写入固定 key。`max_object_size_bytes`
+缺省 16 MiB，限制缓冲的上传 payload；Commit 可能再复制一份完整对象。对象 Get
+当前先由 SDK 把响应读入内存，再由 backend 检查大小，因此该值不是预分配或进程
+总内存上限。`max_inflight` 也不限制并发上传缓冲的数量。
+
+`max_inflight` 缺省 64，限制活跃的数据面 S3 调用。正数 `op_timeout` 在调用
+**取得并发槽之后**才开始计时；排队等待只受调用方 context 约束。各 HEAD/Get/Put
+分别使用自己的预算，而非一份 Store 请求总预算；超时为空时不增加单次 deadline。
+独立 generation source 使用自己的 client，S3 endpoint、bucket、key 和凭据可
+完全不同；这些数据面限额不约束 generation source 的读取。
 
 ## 相关契约
 
-- [manifest_zh.md](transfer_zh.md) — manifest ingest/fetch 与加密流程
+- [数据传输](transfer_zh.md) — manifest-ctl 命令与传输完成边界
+- [数据契约](artifacts_zh.md) — 逻辑对象、载体格式与加密
 - [cache_zh.md](cache_zh.md) — tiered cache、origin 和 wire protocol
 - 仓库根目录 `README.md` / `Makefile` — 构建和完整测试入口
 
