@@ -226,6 +226,9 @@ func (s *impl) Get(ctx context.Context, p store.Partition, key store.ContentKey)
 	return cache.CacheHit, blob, nil
 }
 
+// StableFillTarget identifies this store's fixed database as the fill target.
+func (*impl) StableFillTarget() {}
+
 // Fill implements cache.Filler. Object-level write. Synchronous —
 // `data` is safe to release after Fill returns.
 func (s *impl) Fill(ctx context.Context, p store.Partition, key store.ContentKey, data []byte) error {

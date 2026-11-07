@@ -619,9 +619,11 @@ On a hit at layer i (tiers 0..N-1; origin N):
         startFill(j, partition, key, blob)   # asynchronous
 ```
 
-**Blob ownership:** startFill clones an owned handle for the fill goroutine and defers its Release. The original handle belongs to the Get caller until its response has been written. Both handles reference the same immutable backing allocation; each has an independently owned reference, not an unrelated copy of the data.
+**Blob ownership:** each actual fill clones an owned handle for its goroutine and releases it after Fill returns. The original handle belongs to the Get caller until its response has been written. Both handles reference the same immutable backing allocation; each has an independently owned reference, not an unrelated copy of the data.
 
 **Async behavior:** the read does not await fill completion. Fills use a context derived from TieredCache's base context, normally without a fill-specific deadline; Close cancels and joins them ([Signals and shutdown](#signals-and-shutdown)). Backend cancellation capabilities and client timeouts still matter, especially synchronous RocksDB CGO. This is not an unconditional guarantee that any wedged backend can be interrupted.
+
+**Reuse during Fill:** embedded RocksDB, Redis and fixed upstream object clients declare a stable fill destination. After a clean miss at such a tier, a read can take its own Blob reference to successful data already held by that tier's pending Fill; this counts as a hit at the target tier. Normal hits, negative hits and errors keep their existing paths, and a local hit does not consult the pending-fill table. An equivalent fill to the same target, partition and content key is suppressed only while that Fill is active. Its entry is removed when Fill returns, including failure; there is no additional retention TTL or configuration. Reads without a successful result remain independent, so retries and redundant requests can still escape an unfinished slow read. EC and other tiers without the `StableFillTarget` capability retain independent fills because their destinations may change. This reuse covers the successful-fill window, not the initial concurrent cold misses.
 
 Tests and warmup must confirm availability with actual Get/ShardGet calls, not merely observe that fill goroutines briefly drained. Repeated fills of the same key/bytes are idempotent in the intended content-addressed usage: RocksDB or wire writes overwrite the same value. Fill errors are discarded by startFill and do not retroactively fail the successful read.
 
