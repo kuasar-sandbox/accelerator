@@ -42,6 +42,8 @@ cache-ctl config show     [--config <path>]
 cache-ctl config generate
 ```
 
+`show` reads `--config` (or `CACHE_CONFIG`) and re-serializes the parsed YAML; it does not run the semantic `Validate` checks that `serve` runs. Successful output is not proof that the daemon can start.
+
 `generate` prints a commented template, defaulting to a tiered configuration with embedded RocksDB L1 and a store origin.
 
 ### `cache-ctl object` — complete objects
@@ -76,7 +78,9 @@ cache-ctl info --rocks-path PATH             # Offline read-only RocksDB inspect
 
 Ping and remote Info target the **control-plane `health_listen`**, conventionally 7071, not the data listener. They use different gRPC services: `grpc.health.v1.Health/Check` and `cac.cache.v1.Info/Get`. Info prints a table or raw JSON with `--json`.
 
-`info --rocks-path` opens RocksDB through **OpenDbForReadOnlyColumnFamilies**, not a secondary-instance API. Use remote Info to inspect a running daemon; offline read-only opening is intended for postmortem inspection and does not promise a coherent live view while another process modifies the files.
+`ping` defaults to `127.0.0.1:7071` and uses a 3-second RPC context; remote Info requires `--endpoint` and uses 5 seconds. Neither uses `CACHE_ENDPOINT`. Ping prints the returned health status and exits successfully even for `NOT_SERVING`; readiness checks must inspect the status, not only the exit code. Info requires exactly one of `--endpoint` and `--rocks-path`; `--json` affects only remote output.
+
+`info --rocks-path` opens RocksDB through `rocks.OpenReadOnly` (backed by `OpenForReadOnly`), not a secondary-instance API. Use remote Info to inspect a running daemon; offline read-only opening is intended for postmortem inspection and does not promise a coherent live view while another process modifies the files.
 
 ## Configuration
 
@@ -503,8 +507,10 @@ explicit and preventing fill traffic from consuming the read pool.
 
 When an object or shard GET is cancelled, the caller returns immediately. The
 worker reads and discards the late response before returning the connection to
-the pool. A normal cancellation never closes the external wire connection or
-the Redis backend connection. A malformed response or real UDS/TCP I/O failure
+the pool. Cancelling the Redis operation does not itself close the backend
+connection. This is not a promise to retain the client-facing wire connection:
+when its caller context is cancelled, the wire client interrupts an in-flight
+read with a socket deadline and discards that connection (see [Request cancellation](#cancellation-cancelrequest--statuscancelled)). A malformed response or real UDS/TCP I/O failure
 closes and reconnects only that worker using the configured transport.
 
 SET uses `net.Buffers` for header/key/value `writev`. The caller's value remains
@@ -751,7 +757,7 @@ Benchmark scripts compare snapshots before/after the window. Individual atomic c
 cache-ctl info --rocks-path /var/cache/accel-l1
 ```
 
-The tool opens DB files through OpenDbForReadOnlyColumnFamilies and prints properties such as estimated keys, disk usage and compaction statistics. It is intended for offline/postmortem inspection; it is **not** a RocksDB secondary instance and does not promise a coherent concurrent view of a live writer. For a running service, use Info over gRPC.
+The tool opens DB files through `rocks.OpenReadOnly` / `OpenForReadOnly` and prints properties such as estimated keys, disk usage and compaction statistics. It is intended for offline/postmortem inspection; it is **not** a RocksDB secondary instance and does not promise a coherent concurrent view of a live writer. For a running service, use Info over gRPC.
 
 A nonempty pprof_listen starts an HTTP `/debug/pprof/*` listener. Use `go tool pprof` for CPU, heap or goroutine investigation. Leave it empty during normal operation and enable only for the diagnostic need.
 
