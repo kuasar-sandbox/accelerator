@@ -27,7 +27,7 @@ Readers resolve logical sources and fetch chunks through the configured cache or
 - **Write path:** `sparse.Source → chunker → Snappy/RAW selection → encrypt → store.Put → Manifest`. Hole runs are recorded without reading them. Zero runs synthesize zero bytes for chunking without fetching a payload.
 - **Read path:** `Manifest → fetch → decrypt → io.Writer`.
 - **Deduplication unit:** a variable-length FastCDC chunk or a fixed-size chunk.
-- **Deduplication domains:** salt separates convergent-key domains. Chunk payloads are stored as ciphertext; the Manifest's index/geometry and sealed key-table container are not wholly encrypted. Salt separation and encryption do not implement tenant authorization ([Manifest encryption format](#manifest-encryption-format)–4.5).
+- **Deduplication domains:** salt separates convergent-key domains. Chunk payloads are stored as ciphertext; the Manifest's index/geometry and sealed key-table container are not wholly encrypted. Salt separation and encryption do not implement tenant authorization ([Manifest encryption format](#manifest-encryption-format)).
 
 ### Non-goals
 
@@ -75,7 +75,7 @@ Within one Fetcher, Manifest metadata reads, ordinary ReadAt calls and all Strea
 
 Each Manifest Stream has an independent decrypted-chunk cache for on-demand partial reads. Its key includes `CiphertextHash`, the chunk decryption key and plaintext size: repeated physical content within that Stream can be reused without aliasing different keys or logical sizes. Both **32 entries** and **32 MiB** are hard cache-admission limits, with LRU eviction. An entry expires after **5 seconds** idle since its last hit. Each Stream keeps one timer for the earliest expiry, actively reclaiming stale data even when reads stop, without one timer per entry or a resident scanning goroutine.
 
-Concurrent misses for one cache key coalesce into one Get, SHA verification, decryption and optional Snappy decode; different keys can load concurrently. Failed loads are not cached. Waiters with a still-valid context may retry rather than permanently inheriting the first loader's cancellation. A partial miss allocates one plaintext-sized cache buffer and writes directly into it while the immutable Blob remains alive; ciphertext is neither copied nor modified. Eviction, expiry and `Close()` clear plaintext. An entry currently being copied is removed from the LRU first and cleared after its last reader releases it.
+Concurrent misses for one cache key coalesce into one Get, policy-controlled SHA verification, decryption and optional Snappy decode; different keys can load concurrently. Failed loads are not cached. Waiters with a still-valid context may retry rather than permanently inheriting the first loader's cancellation. A partial miss allocates one plaintext-sized cache buffer and writes directly into it while the immutable Blob remains alive; ciphertext is neither copied nor modified. Eviction, expiry and `Close()` clear plaintext. An entry currently being copied is removed from the LRU first and cleared after its last reader releases it.
 
 A cold, full-physical-chunk read uses a direct path so a one-off sequential scan does not pollute the cache; an existing cache hit may still serve a full read. Plaintext chunks larger than 32 MiB also bypass cache admission. RAW full reads decrypt AES directly into the caller's buffer, without an extra plaintext allocation or full-chunk copy. Oversized RAW partial reads seek the CTR block/offset and decrypt only the requested range.
 
@@ -238,7 +238,7 @@ Chunking remains sequential, the index is assembled in source order and progress
 
 ## Immutable local tarstreams and encryption
 
-New canonical plaintext tarstreams contain a presence entry, the payload, a `.kuasar.digest.<plainDigest>` marker body and exactly two trailer blocks. Readers also accept existing portable carriers without presence. Payload PAX records define its boundary; the marker body records that boundary and the payload commitment. Full reads recompute the commitment from payload bytes.
+New canonical plaintext tarstreams contain a presence entry, the payload, a `.kuasar.digest.<plainDigest>` marker body and exactly two trailer blocks. Readers also accept existing portable carriers without presence. Payload PAX records define its boundary; the marker body records that boundary and the payload commitment. Fully consuming `SourceFrom` and checking its terminal error verifies the commitment against payload bytes.
 
 A complete carrier, or a derived source replacing only its dense metadata tail, can report identity through `CarrierDigest` without first encoding the payload into `io.Discard`. Without a codec, the public identity is `digest:<plainDigest>`. A derived dense metadata tail is limited to **64 MiB**; readers and writers share this limit and reject oversized declarations before hashing. Payload PAX/ustar transport metadata, including mode, ownership and timestamps, uses fixed canonical encoding and cannot change while retaining the same identity.
 
@@ -265,7 +265,7 @@ The header binds total plaintext size, packed-payload start/size and record geom
 
 Random artifact salt makes two writes of the same plaintext/customer key produce different physical ciphertext. The logical identity nevertheless remains exactly `HMAC-SHA256(customerKey, plainDigestRaw32Bytes)`, preserving the scheme, filename and logical deduplication key.
 
-`SourceAt` reads prefix salt, binds the artifact codec, authenticates the header and suffix records covering marker/trailer, then decrypts records by index for O(1) random access. This fast path does not pre-read all data records or recompute the complete plaintext digest. Different artifacts use different derived keys, so a spliced donor record fails authentication **when that record is actually read**. A donor record outside the fast-open read set does not cause an early error.
+`SourceAt` reads prefix salt, binds the artifact codec, authenticates the header and suffix records covering marker/trailer, then decrypts records by index for O(1) random access. This fast path does not pre-read all data records or recompute the complete plaintext digest. Different artifacts use different derived keys, so a spliced donor record fails authentication **when that record is actually read**. A donor record outside the fast-open read set does not cause an early error. For plaintext and encrypted artifacts alike, `SourceAt` checks an expected digest against the marker declaration; even reading every logical byte through this API does not recompute the whole-payload commitment.
 
 `SourceFrom` is the full-validation path. Complete consumption decrypts every record, recomputes payload/tail commitments and carrier identity using the authoritative sparse map, and verifies the marker body, exactly two trailer blocks, expected `digest|hmac` and outer EOF. A cross-artifact record splice fails when sequential consumption reaches it.
 
@@ -358,7 +358,7 @@ measurements do not imply constant-time identity or a disk-I/O throughput claim.
 
 ### Programmatic tarstream entry points
 
-The programmatic API in `accelerator/pkg/tarstream` includes `WriteTo` (any `sparse.Source`, returning the digest computed during writing), `ReadFrom` / `ReadSeekFrom` (exact sparse-map round trips and random access within tar), `SourceFrom` (open a stream as a `sparse.Source` for manifest ingest and other consumers), and `SourceAt` (random access; complete platform artifacts expose their marker through optional `Digester`). This repository and downstream repositories can import it.
+The programmatic API in `accelerator/pkg/tarstream` includes `WriteTo` (any `sparse.Source`, returning the digest computed during writing), `ReadFrom` / `ReadSeekFrom` (plaintext logical views, with holes reading as zeros and seekable access without extraction), `SourceFrom` (open a stream as a `sparse.Source` for manifest ingest and other consumers), and `SourceAt` (random access; complete platform artifacts expose their marker through optional `Digester`). The logical-view readers do not accept a codec or expected digest and do not provide full artifact validation; use complete `SourceFrom` consumption for that boundary. This repository and downstream repositories can import it.
 
 ## Multi-Manifest Bundle carrier
 
@@ -549,7 +549,7 @@ config reads share the same payload-boundary implementation.
 
 ### Shared readers, writers and strict profiles
 
-`WithIndexMemoryLimit(bytes)` optionally bounds writer planning before the first output byte. It charges a 2 MiB baseline plus 512 bytes per disjoint data extent for slice growth, sparse-map encoding and copied metadata. Exceeding the limit fails before reading payload or writing an envelope. This accounts for the writer's indexes separately from source/native/decoder budgets; it does not bound the caller's source allocations. Omitted limits preserve existing behavior and artifact identity.
+`WithIndexMemoryLimit(bytes)` optionally bounds writer planning before the first output byte. Its cumulative conservative accounting includes a 2 MiB baseline, 512 bytes per disjoint stored extent, name storage, the presence bitmap plus 4 KiB, and dense metadata-tail bytes. These charges cover planning buffers, slice growth, sparse-map encoding and copied metadata. Exceeding the limit fails before reading payload or writing an envelope. This accounts for the writer's indexes separately from source/native/decoder budgets; it does not bound the caller's source allocations. Omitted limits preserve existing behavior and artifact identity.
 
 `tarstream.WriteTo` accepts `WithBeforeCommit(check)` for caller-owned final source validation. It calls the check once after consuming all payload and metadata-tail bytes, before the carrier digest marker, archive trailer and final encrypted record. Empty, all-Hole and all-Zero sources also run the check, without an extra EOF read. Earlier read/write errors skip it; a check error is preserved and leaves an incomplete artifact. Callers keep the source stable and open until return and must discard failed output rather than publish a file, upload or conversion-cache result. Receivers require both a complete valid artifact and successful producer completion. The check does not provide an atomic snapshot or destination durability. Unconfigured writers retain their existing bytes and identity; `CarrierDigest` rejects this option because it performs no payload consumption.
 
