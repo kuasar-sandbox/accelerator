@@ -59,6 +59,7 @@ func TestBeforeCommitCompletionBoundary(t *testing.T) {
 		kind sparse.RunKind
 	}{
 		{"empty", 0, sparse.Data}, {"data", 2*copyBufSize + 19, sparse.Data},
+		{"pipelined-data", 6*copyBufSize + 19, sparse.Data},
 		{"hole", 4096, sparse.Hole}, {"zero", 4096, sparse.Zero},
 	} {
 		for _, encrypted := range []bool{false, true} {
@@ -170,6 +171,7 @@ func TestBeforeCommitEarlyFailuresAndOptions(t *testing.T) {
 		w   io.Writer
 	}{
 		{&commitSource{size: 4096, kind: sparse.Data, err: broken}, io.Discard},
+		{&commitSource{size: 6 * copyBufSize, kind: sparse.Data, err: broken}, io.Discard},
 		{&commitSource{}, commitErrorWriter{broken}},
 	} {
 		if _, _, err := WriteTo(context.Background(), test.w, "image", test.src, check); !errors.Is(err, broken) {
@@ -197,5 +199,25 @@ func TestBeforeCommitEarlyFailuresAndOptions(t *testing.T) {
 	_, _, err := WriteTo(ctx, &output, "image", &commitSource{}, WithBeforeCommit(func(ctx context.Context) error { return ctx.Err() }))
 	if !errors.Is(err, context.Canceled) || bytes.Contains(output.Bytes(), []byte(DigestMarkerPrefix)) {
 		t.Fatalf("cancelled check: %v", err)
+	}
+}
+
+func TestBeforeCommitSkipsBufferedOutputFailure(t *testing.T) {
+	broken := errors.New("buffered record output failed")
+	for _, size := range []uint64{0, 1, 4096, copyBufSize / 2} {
+		source := &commitSource{size: size, kind: sparse.Data}
+		// Accept the encrypted envelope header, then fail the first batch of
+		// complete records. These sources leave that batch pending at the hook.
+		output := &limitedRecordOutput{remaining: envelopePrefixSize + envelopeHeaderSealed, err: broken}
+		calls := 0
+		scheme, digest, err := WriteTo(context.Background(), output, "image", source,
+			WithCodec(&optionTestCodec{}, true),
+			WithBeforeCommit(func(context.Context) error { calls++; return nil }))
+		if !errors.Is(err, broken) || scheme != "" || digest != "" {
+			t.Fatalf("size=%d: %q %q %v", size, scheme, digest, err)
+		}
+		if calls != 0 {
+			t.Errorf("size=%d: callback ran before buffered output failure", size)
+		}
 	}
 }
