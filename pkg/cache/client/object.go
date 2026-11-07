@@ -140,6 +140,10 @@ func (c *impl) Get(ctx context.Context, p store.Partition, key store.ContentKey)
 	}
 }
 
+// StableFillTarget identifies the fixed complete-object endpoint selected by
+// New. ObjectPut writes to that endpoint; this client performs no peer routing.
+func (*impl) StableFillTarget() {}
+
 // Fill implements cache.Filler.
 func (c *impl) Fill(ctx context.Context, p store.Partition, key store.ContentKey, value []byte) error {
 	pc, err := c.fillPool.Acquire(ctx)

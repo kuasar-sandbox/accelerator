@@ -137,9 +137,9 @@ func TestTierAdapterLimitsLookupsAndPreservesOptionalCapabilities(t *testing.T) 
 // TestTieredCache_StartFillClonesBlob asserts the contract baked into
 // startFill:
 //
-//   - Every call to startFill produces exactly one Clone of the
-//     supplied blob (for the fill goroutine's own handle) and exactly
-//     one Release (after Fill returns).
+//   - Each actual fill produces exactly one Clone of the supplied blob
+//     (for the fill goroutine's own handle) and exactly one Release
+//     (after Fill returns).
 //   - The caller's original handle is neither cloned nor released by
 //     startFill itself.
 //   - The bytes received by Fill match the blob's contents verbatim.

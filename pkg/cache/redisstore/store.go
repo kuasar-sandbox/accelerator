@@ -218,6 +218,9 @@ func (s *Store) Get(ctx context.Context, p store.Partition, key store.ContentKey
 	return res.result, res.blob, res.err
 }
 
+// StableFillTarget identifies this store's fixed Redis endpoint and keyspace.
+func (*Store) StableFillTarget() {}
+
 func (s *Store) Fill(ctx context.Context, p store.Partition, key store.ContentKey, data []byte) error {
 	encoded, err := encodeKey(p, kindObject, key)
 	if err != nil {
