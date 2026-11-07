@@ -5,7 +5,7 @@
 本篇统一描述内容缓存服务：部署配置、wire 操作、tier/EC 行为、后端实现、故障处理和诊断。RocksDB 与独立管理的 Redis-compatible 后端都是同一服务的选择。权威回源层见 [Store](store_zh.md)，客户端路径见[数据传输](transfer_zh.md)。
 
 `cache-ctl` 是项目里**跨 sandbox 共享**的内容缓存层。它把客户端反复
-读取的 chunk 在节点本地与节点间集群里重复使用,把远端 S3-compatible
+读取的 chunk 在节点本地与节点间集群里重复使用,减少对远端 S3-compatible
 object storage 的读取。embedded 部署可从本地 RocksDB BlockCache 服务热点,
 也支持外部 Redis-compatible backend。同一份二进制,
 通过 YAML 配置切换三种运行形态(`local` / `shard` / `tiered`),
@@ -29,7 +29,7 @@ object storage 的读取。embedded 部署可从本地 RocksDB BlockCache 服务
   socket、chmod 0600),还可显式使用 `fd=<name>` 继承 manager listener ([命名监听与 socket activation](#命名监听与-socket-activation))。数据面客户端 `cache.endpoint` 填同址即可;控制面经 socket
   时,`ping` / `info --endpoint` 用 `unix:///` 形式。
 - **本地存储**:进程内 RocksDB,或通过 UDS/TCP 访问 Redis-compatible server;
-  后者的配置、取消语义和外部 Dragonfly 部署示例见 [cache-redis.md（英文）](cache.md#redis-adapter-semantics)。
+  后者的配置、取消语义和外部 Dragonfly 部署示例见 [Redis 后端语义](#redis-adapter-语义)。
 - **写入语义**:无应用层频率准入过滤。embedded 淘汰由 RocksDB CompactionFilter
   按 CMS 驱动;外部 Redis server 管理自己的淘汰/容量。两者都不保证存储/资源故障时写入成功。
 - **填充语义**:fill-aside,读路径上隐式回填上层。
@@ -53,6 +53,8 @@ YAML 示例见 [配置](#配置)。
 cache-ctl config show     [--config <path>]
 cache-ctl config generate
 ```
+
+`show` 读取 `--config`（或 `CACHE_CONFIG`）并重新序列化解析后的 YAML，不执行 `serve` 的语义 `Validate` 检查。成功输出不证明 daemon 能启动。
 
 `generate` 输出带注释模板(默认 tiered:rocksdb L1 + store origin)。
 
@@ -95,7 +97,9 @@ cache-ctl info --rocks-path PATH               # 离线只读打开 RocksDB,查�
 **不是**数据端口,都不走 wire 协议。两者调不同 gRPC 服务:`ping` 调
 `grpc.health.v1.Health/Check`;`info --endpoint` 调 `cac.cache.v1.Info/Get`,把运行时
 计数快照拉回来(`--json` 输出原始 JSON,否则人类可读表格)。
-`info --rocks-path` 调用 **OpenDbForReadOnlyColumnFamilies**,不是 secondary API。
+`ping` 默认连接 `127.0.0.1:7071`，RPC context 为 3 秒；远端 Info 必须提供 `--endpoint`，使用 5 秒。两者均不读取 `CACHE_ENDPOINT`。Ping 打印返回的健康状态，即使是 `NOT_SERVING` 也正常退出；就绪探测必须检查状态，不能只看退出码。Info 要求 `--endpoint` 和 `--rocks-path` 恰有其一；`--json` 仅影响远端输出。
+
+`info --rocks-path` 调用 `rocks.OpenReadOnly`（底层 `OpenForReadOnly`）,不是 secondary API。
 检查运行中 daemon 应用远端 Info;本地只读打开用于离线/故障后检查,不承诺其他进程修改
 DB 文件时得到一致 live view。
 
@@ -547,7 +551,7 @@ version[1] | partition[1] | kind[1] | SHA-256[32]
 
 GET/SET 使用相互独立、启动时建立连接、大小固定的 worker pool。一个连接最多承载一个在途命令，明确 RESP FIFO 所有权，并防止 fill 流量占用读池。
 
-对象或 shard GET 取消时，调用者立即返回；worker 读取并丢弃迟到响应后才把连接归还池。正常取消不会关闭外部 wire 连接或 Redis backend 连接。畸形响应或真实 UDS/TCP I/O 故障只关闭该 worker 的连接，并按配置传输重连。
+对象或 shard GET 取消时，调用者立即返回；worker 读取并丢弃迟到响应后才把连接归还池。取消 Redis 操作本身不会关闭 backend 连接，但不保证保留客户端 wire 连接：wire client 的调用方 context 取消时，会通过 socket deadline 中断在途读取并丢弃连接（见[请求取消](#请求取消cancelrequest--statuscancelled)）。畸形响应或真实 UDS/TCP I/O 故障只关闭该 worker 的连接，并按配置传输重连。
 
 SET 用 `net.Buffers` 对 header/key/value 执行 writev。在 socket 写入完成前借用调用者的 value。写入后发生取消时，调用者可以先返回，worker 继续 drain `+OK`；`Fill` 返回后 worker 不再持有调用者的 payload。
 
@@ -840,7 +844,7 @@ bench 比较窗口前后 delta。独立 atomic counters 是累计证据,整个�
 cache-ctl info --rocks-path /var/cache/accel-l1
 ```
 
-调用 OpenDbForReadOnlyColumnFamilies 打开文件,输出 estimated keys、disk usage、
+调用 `rocks.OpenReadOnly` / `OpenForReadOnly` 打开文件,输出 estimated keys、disk usage、
 compaction stats。用于离线/故障后检查,**不是 secondary instance**,不承诺并发 writer
 修改文件时的 coherent view。运行中服务使用 gRPC Info。
 
@@ -965,7 +969,7 @@ Dragonfly 的 SSD tier 是缓存容量，不是权威持久层。local 或 tiere
 
 分别测量 local、shard 和 tiered 路径，记录源码/二进制版本、硬件、后端配置、对象大小、并发、缓存状态与失败。比较前明确计时边界及 hit/miss 分母；各层条件命中率不能简单相加。缓存拓扑本身不构成普遍时延、命中率或容量保证。
 
-证据要求和外部服务部署验证见 [项目性能方法](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/performance_zh.md) 与 [Redis-compatible 后端指南（英文）](cache.md#redis-adapter-semantics)，现有命令和保护措施完整保留在下方。
+证据要求和外部服务部署验证见 [项目性能方法](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/performance_zh.md) 与 [Redis 后端语义](#redis-adapter-语义)，现有命令和保护措施完整保留在下方。
 
 ### 后端与 wire 基准测试
 
