@@ -38,6 +38,15 @@ type Filler interface {
 	Fill(ctx context.Context, p store.Partition, key store.ContentKey, data []byte) error
 }
 
+// StableFillTarget is an optional capability for a tier whose Fill destination
+// stays fixed for its lifetime. For immutable content keys, overlapping fills
+// to that target are equivalent. TieredCache may therefore reuse the successful
+// payload while Fill runs and suppress another fill for the same partition/key.
+// Routing tiers whose destinations can change must not implement this marker.
+type StableFillTarget interface {
+	StableFillTarget()
+}
+
 // Tier is a complete cache layer that supports both lookup and fill.
 // It is the object-level read+write contract: Getter + Filler.
 type Tier interface {
@@ -171,6 +180,7 @@ type TieredCache struct {
 	origin       Getter
 	fillInflight []sync.WaitGroup // per-tier inflight fill WaitGroups
 	fillActive   []atomic.Int64   // observable fill/repair goroutines per tier
+	pendingFills []*pendingFills  // nil for tiers without a stable fill destination
 
 	// baseCtx parents every async fill/repair goroutine; baseCancel
 	// (called by Close) cancels them all on shutdown. This is what
@@ -221,12 +231,16 @@ func NewTieredCache(origin Getter, tiers ...Tier) *TieredCache {
 		baseCancel:   baseCancel,
 		fillInflight: make([]sync.WaitGroup, len(tiers)),
 		fillActive:   make([]atomic.Int64, len(tiers)),
+		pendingFills: make([]*pendingFills, len(tiers)),
 		tierHits:     make([]atomic.Uint64, len(tiers)),
 		tierMisses:   make([]atomic.Uint64, len(tiers)),
 		tierFills:    make([]atomic.Uint64, len(tiers)),
 		tierErrors:   make([]atomic.Uint64, len(tiers)),
 	}
 	for i, t := range tiers {
+		if _, ok := unwrapTier(t).(StableFillTarget); ok {
+			tc.pendingFills[i] = &pendingFills{}
+		}
 		r, ok := unwrapTier(t).(Repairable)
 		if !ok {
 			continue
@@ -288,6 +302,15 @@ restart:
 	for {
 		for i, layer := range layers {
 			result, blob, waited, err := tryTier(ctx, layer, p, key)
+			// A normal hit, negative hit or error retains its existing path.
+			// Only a clean miss can use data already owned by this tier's
+			// pending Fill. There is never an entry for an unfinished read.
+			if result == CacheMiss && err == nil && !waited && i < len(tc.tiers) {
+				blob, err = tc.pendingFills[i].acquire(ctx, p, key)
+				if blob != nil {
+					result = CacheHit
+				}
+			}
 			if err != nil {
 				// Attribute the error to the tier (or origin) that
 				// tried to answer. Distinct from misses: "we failed
@@ -368,6 +391,9 @@ func tryTier(ctx context.Context, c Getter, p store.Partition, key store.Content
 
 // startFill clones the blob (refcount++) and hands the clone to a
 // fire-and-forget goroutine that writes the bytes into the named tier.
+// A stable target's equivalent pending fill already owns a successful payload,
+// so another fill is unnecessary. Its clone is also available to clean misses
+// at that tier until the actual Fill returns, whether successful or failed.
 // The caller's original `blob` handle is unaffected — it continues to
 // own its own reference and must still be Released independently (the
 // wire server does so after writing the response frame). The clone is
@@ -380,14 +406,18 @@ func tryTier(ctx context.Context, c Getter, p store.Partition, key store.Content
 // would race with the next caller that pulled the same slice from the
 // pool. Refcounting turns the race into safe cooperative ownership.
 func (tc *TieredCache) startFill(tierIdx int, p store.Partition, key store.ContentKey, blob Blob) {
-	cloned := blob.Clone()
+	pending := tc.pendingFills[tierIdx]
+	cloned := pending.begin(p, key, blob)
+	if cloned == nil {
+		return
+	}
 	tc.fillInflight[tierIdx].Add(1)
 	tc.fillActive[tierIdx].Add(1)
 	tc.tierFills[tierIdx].Add(1)
 	go func() {
 		defer tc.fillInflight[tierIdx].Done()
 		defer tc.fillActive[tierIdx].Add(-1)
-		defer cloned.Release()
+		defer pending.finish(p, key, cloned)
 		ctx, cancel := tc.fillCtx()
 		defer cancel()
 		_ = tc.tiers[tierIdx].Fill(ctx, p, key, cloned.Bytes())

@@ -674,13 +674,22 @@ layer i 命中(0..N-1 为 tiers,N 为 origin):
         startFill(j, partition, key, blob)   # 异步
 ```
 
-**Blob ownership**:startFill 克隆一个 owned handle 给 fill goroutine 并 defer Release。
+**Blob ownership**:每个实际 fill 克隆一个 owned handle 给其 goroutine,在 Fill 返回后释放。
 原 handle 由 Get caller 持有直到响应写完。两者引用同一 immutable backing allocation,
 各自拥有一个引用,不是两份无关数据副本。
 
 **异步**:读不等待 fill。fill 使用 TieredCache base context 的派生 context,通常没有
 独立 fill deadline;Close 取消并 join([信号处理](#信号处理))。backend 取消能力与 client timeout 仍有效,
 尤其同步 RocksDB CGO 不能中断;不能承诺任意 wedged backend 都立刻退出。
+
+**Fill 期间复用**:embedded RocksDB、Redis 和固定 upstream 对象客户端声明其回填目标稳定。
+这类 tier 出现 clean miss 后,读取可为该 tier 正在 Fill 的成功数据取得独立 Blob 引用;
+这次复用计为目标 tier 的一次 hit。普通 hit、negative hit 和 error 保持原有路径,
+本地命中不查询 pending-fill 表。仅在 Fill 仍执行时,才消减同一目标、partition 和
+content key 的等价重复回填。Fill 返回后即移除记录,失败也如此;不新增保留 TTL 或配置。
+没有成功结果时读取仍独立执行,重试和冗余请求仍能脱离尚未完成的慢读取。
+EC 及其他未声明 `StableFillTarget` 能力的 tier 保持独立回填,因为其目标可能变化。
+这项复用覆盖成功读取后的回填窗口,不消除最初的并发冷 miss。
 
 测试/预热通过实际 Get/ShardGet 证明可读,不能只看 goroutine 暂时排空。
 在内容寻址的相同 key/bytes 使用方式下重复 fill 幂等,覆盖同一值。
