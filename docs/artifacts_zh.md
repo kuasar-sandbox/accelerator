@@ -29,7 +29,7 @@ flowchart TD
 - **读取路径**:`Manifest → fetch → decrypt → io.Writer`
 - **去重单位**:chunk(可变长 FastCDC 或固定长度)
 - **去重域**:salt 区分收敛密钥域。chunk payload 以密文存储,但 Manifest 的
-  索引/geometry 与密封密钥表容器并未整体加密。salt 隔离和加密不实现租户授权([加密模式 — Manifest](#加密模式--manifest)–4.5)。
+  索引/geometry 与密封密钥表容器并未整体加密。salt 隔离和加密不实现租户授权([加密模式 — Manifest](#加密模式--manifest))。
 
 ### 不做什么
 
@@ -112,8 +112,8 @@ encoder 会因架构实现产生不同 block bytes，因此不用于 canonical �
 #### Content key
 
 Chunk 上传时,`SHA256(physical_object)` 是 store 的寻址键;Manifest 上传时同样
-按 `SHA256(physical_envelope)`。Salt **不参与寻址** —— 寻址完全由物理字节哈希决定,
-保留 salt 的隔离性,但允许 store 端以单一 KV 视图存储(详见 [`store_zh.md`](store_zh.md))。
+按 `SHA256(physical_envelope)`。Salt 不单独拼入寻址计算，但会改变加密后的物理字节及其哈希。
+因此不同 salt 域仍保留不同的加密对象，同时允许 store 端以单一 KV 视图存储(详见 [`store_zh.md`](store_zh.md))。
 
 ### 加密模式 — chunk
 
@@ -143,7 +143,7 @@ AES-CTR 和结构检查不能认证所有可能的明文损坏。
 
 ### 加密模式 — Manifest
 
-Manifest 中**密钥表 (key table)** 是一段编码了所有 chunk 加密 key 的二进
+Manifest 中**密钥表 (key table)** 是一段编码了所有非零 chunk 加密 key 的二进
 制:
 
 | 模式 | 行为 |
@@ -333,8 +333,8 @@ Chunk 索引准备串行加载，在单次尝试的局部状态中构建并验�
 新写出的 canonical tarstream 的 plaintext 结构为 presence entry、payload、
 `.kuasar.digest.<plainDigest>` marker body 和两个 trailer block。Reader 也接受不含
 presence 的既有便携 carrier。Payload PAX记录
-payload boundary;marker body记录boundary和payload commitment,完整读取时再用payload
-bytes复验。完整carrier或只替换dense metadata tail的派生source可通过
+payload boundary;marker body记录boundary和payload commitment。完整消费 `SourceFrom`
+并检查终点错误，才会用 payload bytes 复验该 commitment。完整carrier或只替换dense metadata tail的派生source可通过
 `CarrierDigest`直接给出identity,不需要先把payload编码到`io.Discard`。未传codec时
 对外identity为`digest:<plainDigest>`。可派生的dense metadata tail上限为64 MiB,
 writer和reader使用同一边界并在hash前拒绝超限声明。Payload的PAX/ustar权限、属主和
@@ -382,6 +382,8 @@ marker/trailer 的 suffix records,随后按 record index O(1) 随机解密。这
 path 不预读全部 data records,也不扫描并重算完整 plaintext digest。不同 artifact
 使用不同派生 key,所以跨 artifact splice 的 donor data record 会在该 record 被
 实际读取时认证失败;未被 fast open 读取的 donor record 不会提前触发错误。
+对于明文和加密工件，`SourceAt` 都只将 expected digest 与 marker 声明比较；即使
+通过该 API 读遍所有逻辑字节，也不会重算完整 payload commitment。
 
 `SourceFrom` 是 full-validation path。完整消费时它解密全部records,按权威sparse map
 重算payload/tail commitment与carrier identity,验证marker body、恰好两个trailer blocks、
@@ -457,10 +459,11 @@ Zero 为字面 Data 规避上限。测试及性能结果须区分索引预算、
 ### 程序化 tarstream 入口
 
 编程接口:`accelerator/pkg/tarstream` 的 `WriteTo`(吃任意 `sparse.Source`,返回
-写入时生成的摘要)/`ReadFrom`/`ReadSeekFrom`(洞图精确往返、tar 内零拷贝随机
-访问)/`SourceFrom`(tar 流直接开成 `sparse.Source`,可直通 manifest ingest
+写入时生成的摘要)/`ReadFrom`/`ReadSeekFrom`(明文逻辑视图，洞读为零，
+可 seek 时无需提取即可随机访问)/`SourceFrom`(tar 流直接开成 `sparse.Source`,可直通 manifest ingest
 等管线消费者)/`SourceAt`(随机访问,完整平台工件通过可选 `Digester` 暴露 marker),
-本仓与各下游仓均可 import。
+逻辑视图 reader 不接受 codec 或 expected digest，也不提供完整工件验证；该边界
+应使用完整的 `SourceFrom` 消费。本仓与各下游仓均可 import。
 
 ## 多 Manifest Bundle 载体
 
@@ -717,7 +720,7 @@ writer 保持历史确定性 entry 名称、STORED method、时间戳和字节�
 
 ### 共享 reader/writer 与严格 profile
 
-`WithIndexMemoryLimit(bytes)` 可选地在首字节输出之前限制 writer 规划预算。它计入 2 MiB 基础开销，并为每个不连续 Data extent 计入 512 字节，以覆盖切片扩容、sparse map 编码和元数据副本。超限会在读取 payload 或写出 envelope 之前失败。此预算单独覆盖 writer 索引，不替代源、native 和 decoder 预算，也不限制调用方分配的源对象。省略此限制时保持原行为和 artifact 身份。
+`WithIndexMemoryLimit(bytes)` 可选地在首字节输出之前限制 writer 规划预算。其累计保守计费包含 2 MiB 基础开销、每个不连续存储 extent 的 512 字节、名称存储、presence bitmap 加 4 KiB，以及 dense metadata tail 字节，以覆盖规划缓冲、切片扩容、sparse map 编码和元数据副本。超限会在读取 payload 或写出 envelope 之前失败。此预算单独覆盖 writer 索引，不替代源、native 和 decoder 预算，也不限制调用方分配的源对象。省略此限制时保持原行为和 artifact 身份。
 
 `tarstream.WriteTo` 接受 `WithBeforeCommit(check)`，用于调用方负责的最终源校验。它在消费全部 payload 和 metadata tail 字节之后、写出 carrier digest marker、归档尾和最终加密记录之前调用一次 check。空源、全 Hole 和全 Zero 源同样执行，不依赖额外 EOF 读取。更早的读写错误会跳过 check；check 错误会保留并使 artifact 不完整。调用方须让源在返回前保持稳定且打开，失败时丢弃输出，不发布文件、上传结果或转换缓存结果。接收方同时要求完整有效的 artifact 和生产者成功结束。此校验不提供原子快照或目标持久性。未配置此选项的 writer 保持原有字节和身份；`CarrierDigest` 不消费 payload，因此拒绝此选项。
 
