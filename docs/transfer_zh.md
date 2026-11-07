@@ -13,7 +13,7 @@ aggregate 所选的 `store-ctl`、`manifest-ctl` 和 guest-runtime 的 `flatten-
 旧版不适用。使用配套版本，不要分别下载各组件的 latest。
 
 以下临时 FS Store 使用私有 UDS 和临时客户密钥，不需要 L2、MicroVM、registry、
-公共 listener 或外部数据。[Store generation 初始化](store_zh.md) 和上文 [配置](#配置)
+公共 listener 或外部数据。[Store generation 初始化](store_zh.md) 和下文 [配置](#配置)
 仍是权威契约。请在新 shell 执行；退出时总会停止本次子进程，仅成功时删除
 临时目录。失败时保留私有目录并打印路径供诊断。
 
@@ -109,7 +109,7 @@ generation 初始化、socket 就绪与密钥；不要把结果未知的写操�
 
 需要配置的命令必须由 `--manifest-config` 或 `MANIFEST_CONFIG` 指向有效 YAML。
 **例外**:`config generate`、读取本地文件/stdin 的 `info`、本地文件 `diff`
-不需要配置文件。schema 见 [manifest-config.yaml](#manifest-configyaml)。该 flag 放在子命令后,不放在子命令前。
+不需要配置文件。schema 见 [manifest-config.yaml](#manifest-configyaml)。该 flag 放在子命令后,不放在子命令前。当前 `store` 和 `load` 在打开逻辑输入前还会解析有效 customer key，包括仅处理明文或仅提取元数据的操作。
 
 ### 子命令一览
 
@@ -143,7 +143,7 @@ Flags:
 
 输入是一个已选定的逻辑 source：本地 tarstream 路径、带身份或 location 的 file ref、Bundle selector，或者 Manifest key/ref。多 Manifest Bundle 必须指定 `@manifest:<key>`。文件提供有界随机读取视图，stdin 使用 tarstream 的单遍 `SourceFrom` 协议；两者共用 `pkg/manifest/transfer` 的 reader/writer。空洞来自 carrier 的权威元数据。`crypto.local=off|auto|required` 沿用已有本地 tarstream 加密策略。
 
-Store 同样接受 `--ref-location`、`--strip-tail`、`--extract-tail PATH` 和 `--append-tail PATH`，语义与下述 load 一致。发布 Store 根 Manifest 前，完成源完整性、原始顺序输入的 marker/trailer/EOF 和所请求输出文件的收尾检查。
+Store 同样接受 `--ref-location`、`--strip-tail`、`--extract-tail PATH` 和 `--append-tail PATH`，语义与下述 load 一致。发布 Store 根 Manifest 前，完成[传输身份与边界重建](#传输身份与边界重建)所述的适用源检查、原始顺序输入的 marker/trailer/EOF 和所请求输出文件的收尾检查。
 
 stdout 输出一行 64 字符 hex,即已上传 Manifest 的 content key。stderr 输出动态进度
 与最终人类可读摘要。**`--no-progress` 只关闭动态进度,最终摘要仍输出**。以下为示意:
@@ -202,11 +202,11 @@ Flags:
 
 REF 按参数顺序通过 `fetch.NewLayered` 组合，第一个为顶层。Data 和显式零值覆盖低层，Hole 向下透传。普通本地路径可直接输入；64 字符十六进制 key 保持 Manifest 语义。同名本地文件可用 `./<name>` 指定。文件身份 qualifier 会被验证，named location 共用 `manifest.RefLocations` 解析。
 
-固定顺序为：检查/提取原始 top tail；按需分别 strip 每个 source；分层读取；offset/length 窗口；append 新 tail。裸 source 可直接使用 `--append-tail`，原有 tail 时必须同时给出 `--strip-tail`；可识别的损坏 tail 报错。`--output-mode=none --extract-tail PATH` 仅提取有界原始元数据。tail 操作作用于逻辑内容而非外层 Bundle ZIP。保留的旧/新 tail 共用 64 MiB 预算，解码 ZIP 元数据另受限额约束。
+固定顺序为：检查/提取原始 top tail；按需分别 strip 每个 source；分层读取；offset/length 窗口；append 新 tail。非空内容的 `--offset` 必须严格小于 strip/分层后的大小；过大的 `--length` 截到剩余字节数，而不是报错。空内容允许 offset 为零。裸 source 可直接使用 `--append-tail`，原有 tail 时必须同时给出 `--strip-tail`；可识别的损坏 tail 报错。`--output-mode=none --extract-tail PATH` 仅提取有界原始元数据。tail 操作作用于逻辑内容而非外层 Bundle ZIP。保留的旧/新 tail 共用 64 MiB 预算，解码 ZIP 元数据另受限额约束。
 
 `--store` 写入最终变换后的 source，缺省文件输出模式为 `none`，并可与两种文件输出组合。Store+Bundle 取得一次 admission，通过同一 Chunk/Manifest 编码流和有界背压写入两端；同配置得到相同物理对象及根 key。`--extra-salt` 同时适用于 Bundle-only 和 Store。Store+tarstream 通过有界管道接入既有 ingest 协议，也支持 stdin 输入。
 
-使用命名输出文件时 Store key 输出到 stdout；二进制内容使用 stdout 时，标识和诊断输出到 stderr。Bundle root key 输出到 stderr。请求的文件以 exclusive create 直接写入；失败仅清理本次仍拥有的不完整文件。既有文件、输入输出 alias、输出路径冲突在写入前拒绝。成功结果包含源校验、文件关闭及 Store 根发布。后续目标失败可能留下已经独立完成的文件或已写入 Chunk，不影响旧源。
+使用命名输出文件时 Store key 输出到 stdout；二进制内容使用 stdout 时，标识和诊断输出到 stderr。Bundle root key 输出到 stderr。请求的文件以 exclusive create 直接写入；失败仅清理本次仍拥有的不完整文件。既有文件、输入输出 alias、输出路径冲突在写入前拒绝。成功结果包含源校验、文件关闭及 Store 根发布。后续目标失败可能留下已经独立完成的文件或已写入 Chunk，不影响旧源。打印最终 key/摘要失败时，Store 根可能已经发布；返回错误不保证原子回滚。
 
 Tarstream 输出保留稀疏元数据。`crypto.local=off` 输出 plaintext；`auto|required` 输出 encrypted v1。不可寻址 stdin 使用 tarstream，Bundle 随机读取通过文件/ref 提供。上述 transfer 路径不生成完整镜像缓存或 staging 文件。
 
@@ -234,14 +234,21 @@ cat source.tar | manifest-ctl load --store --output-mode=tarstream \
 
 #### 传输身份与边界重建
 
-显式 tarstream `@digest`/`@hmac` 身份和 Bundle `@manifest` selector 在关闭普通 `manifest.verify_content` 时仍然生效。内容转换完成载体校验后才报告成功。载体按字节格式或显式 selector 识别，与文件扩展名无关。载体声明 tail 时，提取和剥离要求该边界与合法 ZIP 后缀起点一致。
+显式 tarstream `@digest`/`@hmac` 身份和 Bundle `@manifest` selector 在关闭普通 `manifest.verify_content` 时仍然生效。载体按字节格式或显式 selector 识别，与文件扩展名无关。载体声明 tail 时，提取和剥离要求该边界与合法 ZIP 后缀起点一致。
+
+完成阶段的检查取决于来源和操作：
+
+- **本地 tarstream 或 Bundle 转为 tarstream/Bundle 或 Store 输出：** CLI 调用 `Opened.Verify`。普通验证开启（默认），或带有显式身份/selector 时，完整验证已固定文件描述符的 tarstream，或选定的 Bundle 根及其 chunk。两者皆无时，不执行最后这次完整扫描；打开和读取时的结构、codec 检查仍然适用。
+- **远端 Manifest：** 读取遵循 `manifest.verify_content`，`Opened.Verify` 不增加完整 Manifest 扫描。窗口或 overlay 不一定读取每个来源 chunk。需要强制完整远端校验时使用 `manifest-ctl verify`。
+- **随机访问文件仅提取元数据：** 不带 `--store` 的 `--output-mode=none --extract-tail PATH` 验证选定的 ZIP 元数据，但跳过最终完整载体扫描，即使指定了显式身份也是如此。打开时的身份/selector 检查仍然适用；仅提取不能证明完整 payload 已验证。
+- **Tarstream stdin：** 完成时读完原始顺序来源，包括输出窗口之外的字节，并检查 marker/trailer/EOF；仅提取元数据时也如此。关闭普通验证不会绕过该顺序协议。
 
 对未经修改的完整 Manifest/Bundle 根，tarstream 输出恢复合法相对偏移 ZIP 后缀的边界，使规范镜像信封身份在 Store 往返中保持一致；既有 tarstream 声明和显式窗口维持各自边界。Store 统计仅在最终 Put 实际创建 Manifest 时计入新增字节。tarstream-only load 报告逻辑进度，`--no-progress` 可关闭动态进度。
 
 ### `manifest-ctl get-manifest` — 取回 manifest 字节
 
 取得 Manifest 物理对象的原始字节,主要用于 debug 或离线 `info`/`diff`。
-实际取数经过配置的 cache/store 读路径。
+实际取数经过配置的 cache/store 读路径。与 transfer 输出文件不同，`get-manifest --output FILE` 使用普通文件创建，**会截断既有文件**；请选用新路径。它不提供 `load` 的 exclusive-create/失败清理保证。
 
 ```
 manifest-ctl get-manifest [--output -|FILE] <hex|manifest://hex>
@@ -381,7 +388,7 @@ crypto:
   `GetManifestBlob` 和 `CheckManifest` 都用同一策略：`true` 时在解析 Manifest
   前复验 `SHA256(physical Manifest) == requested key`，首次读取 Chunk 时复验
   `SHA256(physical Chunk) == CiphertextHash`；`false` 时 ContentKey 只作 locator，
-  不执行这两次完整对象扫描。关闭后进程只记录一次清晰 WARNING；Manifest
+  不执行这两次完整对象扫描。通过 Config 的普通远端读取在关闭验证后每进程记录一次 WARNING；纯本地 transfer 路径不能依赖该警告。Manifest
   envelope/geometry、key table GCM、Chunk format/长度、解密/解压等结构检查仍然
   执行。但 chunk AES-CTR 本身不是认证加密;关闭 physical hash 会去掉对应的 chunk
   内容完整性检查。`manifest-ctl verify`、Bundle full verify/upload/export 和对象修复始终
@@ -432,7 +439,7 @@ sandbox-ctl 投递配置,endpoint/crypto 不必落盘。调用方可单独设置
 
 ## 使用共享 Go 入口
 
-`pkg/manifest/transfer.Reader.Open` 返回持有来源资源的 `Opened` sparse source。报告成功前完成 `Opened.Verify(ctx)`，然后 Close 并传播关闭错误；Reader 自身另外关闭，释放远端 fetcher 并清理 key material。`transfer.Write` 对 sparse source 生成请求的载体/Store 输出，`BeforeCommit` 在 Store 根发布前完成调用方验证。`manifest.RefLocations` 与 CLI、sandboxer 共用位置映射校验。输入资源须保持稳定并存活到操作结束，终结验证与 Close 错误必须向上传播，失败输出不可发布。格式和读取完成规则见[数据契约](artifacts_zh.md)；精确 Go options 以 [`pkg/manifest/transfer`](../pkg/manifest/transfer/) 的公共 API 注释为准。
+`pkg/manifest/transfer.Reader.Open` 返回持有来源资源的 `Opened` sparse source。报告成功前完成 `Opened.Verify(ctx)`，然后 Close 并传播关闭错误；Reader 自身另外关闭，释放远端 fetcher 并清理 key material。`Opened.Verify` 遵循上述来源相关策略，其名称不表示强制完整远端审计。`transfer.Write` 对 sparse source 生成请求的载体/Store 输出，其可选 `BeforeCommit` 在**文件编码之后**、Store 根发布之前调用。调用方在此提供源验证与所拥有输出文件的关闭操作。它不是 tarstream writer 的 marker 写入前回调：拒绝操作时，部分字节可能已经输出到流。`manifest.RefLocations` 与 CLI、sandboxer 共用位置映射校验。输入资源须保持稳定并存活到操作结束，终结验证与 Close 错误必须向上传播，失败输出不可发布。格式和读取完成规则见[数据契约](artifacts_zh.md)；精确 Go options 以 [`pkg/manifest/transfer`](../pkg/manifest/transfer/) 的公共 API 注释为准。
 
 ## 相关契约
 
