@@ -171,14 +171,19 @@ test-e2e-scripts:
 
 VERSION ?= v0.1.0
 
+# Mixed release recipes run sub-makes with the jobserver on real builds. GNU
+# Make executes recipes that directly reference $(MAKE) even under --dry-run.
+release_make = $(MAKE)
+release_recursive = $(if $(findstring n,$(filter-out -% %=%,$(firstword $(MAKEFLAGS)))),,+)
+
 release:
-	@set -e; export GOWORK=off; \
+	$(release_recursive)@set -e; export GOWORK=off; \
 	if [[ "$(VERSION)" == *-preview.* ]]; then \
 	  work="$$(mktemp -d)"; trap 'rm -rf -- "$$work"' EXIT; \
 	  (cd "$$work" && $(GO) work init "$(CURDIR)"); \
 	  export GOWORK="$$work/go.work"; \
 	fi; \
-	$(MAKE) _release-bundle GOWORK="$$GOWORK"
+	$(release_make) _release-bundle GOWORK="$$GOWORK"
 
 .PHONY: _release-bundle
 _release-bundle: build
