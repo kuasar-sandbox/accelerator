@@ -230,6 +230,7 @@ def check_build_shell(steps):
         make = tools / "make"
         make.write_text(f"#!{sys.executable}\nimport os, sys\n"
                         "from pathlib import Path\n"
+                        "assert os.environ['GOWORK'] == '/selected/go.work'\n"
                         "with open(os.environ['MAKE_LOG'], 'a') as log:\n"
                         "    print(sys.argv[1:], os.getcwd(), file=log)\n"
                         "sys.exit(72 if sys.argv[1] == os.environ.get('FAIL_GOAL') else 0)\n")
@@ -249,6 +250,11 @@ def check_build_shell(steps):
             'if [ "$1" = "${FAIL_RELEASE:-}" ]; then\n'
             '  case "$1" in package) exit 74 ;; validate) exit 75 ;; esac\nfi\n')
         framework = root / "framework"
+        helper = framework / "ci/integration/go_workspace.py"
+        helper.parent.mkdir(parents=True)
+        helper.write_text("import sys\nassert sys.argv[1:] == "
+                          "['--root', '/src', '--owners', 'accelerator', '--bound-release', '--version', "
+                          "'v0.1.6-preview.20261009']\nprint('/selected/go.work')\n")
         recipe = framework / "ci/native-cache/native-cache.sh"
         recipe.parent.mkdir(parents=True)
         recipe.write_text('set -eu\ncase "$*" in\n'
