@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Release jobs consume the environment CLI without installing or selecting tools."""
+import json
 import os
 from pathlib import Path
 import shutil
@@ -58,6 +59,41 @@ class EnvironmentTools(unittest.TestCase):
                                      ":" if policy is None else "x:" + policy)
                     self.assertEqual(cli.read_bytes(), before)
                     self.assertFalse((root / "github-path").exists())
+
+    def test_local_release_selects_its_own_go_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recipe = (ROOT/'Makefile').read_text().split('\nrelease:\n', 1)[1].split('\n\n', 1)[0]
+            (root/'Makefile').write_text(
+                "SHELL := /bin/bash\nGO := go\nBUILD_DIR := build\nTARGET_ARCH := x86_64\n"
+                "release:\n" + recipe + "\n.PHONY: build\nbuild:\n"
+                "\t@go env GOWORK > build-env\n\t@go build -o checked .\n")
+            (root/'go.mod').write_text('module example.com/release-fixture\n\ngo 1.20\n')
+            (root/'main.go').write_text('package main\nfunc main() {}\n')
+            (root/'go.work').write_text('invalid workspace supplied by the caller\n')
+            (root/'scripts').mkdir()
+            (root/'scripts/release.sh').write_text(
+                'set -eu\n./checked\ngo env GOWORK > package-env\n'
+                'if [[ "$GOWORK" != off ]]; then go work edit -json "$GOWORK" > selected.json; fi\n')
+            for cmd in (['init', '-q'], ['add', '.'],
+                        ['-c','user.name=test','-c','user.email=test@example.invalid','commit','-qm','fixture']):
+                subprocess.run(['git', *cmd], cwd=root, check=True, capture_output=True)
+            for version in ('v0.1.1', 'v0.1.2-preview.20261112'):
+                with self.subTest(version=version):
+                    result = subprocess.run(['make', 'release', 'VERSION='+version,
+                                             'GOWORK='+str(root/'go.work')], cwd=root,
+                                            text=True, capture_output=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    selected = (root/'build-env').read_text().strip()
+                    self.assertEqual((root/'package-env').read_text().strip(), selected)
+                    if '-preview.' in version:
+                        work = Path(selected)
+                        self.assertFalse(work.exists())
+                        doc = json.loads((root/'selected.json').read_text())
+                        self.assertEqual([(work.parent / use['DiskPath']).resolve() for use in doc['Use']], [root])
+                        self.assertFalse(doc.get('Replace'))
+                    else:
+                        self.assertEqual(selected, 'off')
 
     def test_missing_cli_fails_without_installing(self):
         with tempfile.TemporaryDirectory() as directory:

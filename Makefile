@@ -171,8 +171,15 @@ test-e2e-scripts:
 
 VERSION ?= v0.1.0
 
-release: build
-	rm -rf build/release-bundle
+release:
+	@set -e; export GOWORK=off; \
+	if [[ "$(VERSION)" == *-preview.* ]]; then \
+	  work="$$(mktemp -d)"; trap 'rm -rf -- "$$work"' EXIT; \
+	  (cd "$$work" && $(GO) work init "$(CURDIR)"); \
+	  export GOWORK="$$work/go.work"; \
+	fi; \
+	$(MAKE) build GOWORK="$$GOWORK"; \
+	rm -rf build/release-bundle; \
 	SOURCE_DATE_EPOCH="$$(git show -s --format=%ct HEAD)" \
 		bash scripts/release.sh package "$(VERSION)" "$(TARGET_ARCH)" build/release-bundle
 
