@@ -55,6 +55,8 @@ type beforeCommitOption struct{ check func(context.Context) error }
 // consumed, before the carrier digest marker, archive trailer, and final
 // encrypted record are written. It also runs for empty and all-Hole/Zero sources;
 // no extra EOF read is required. An earlier read/write failure skips check.
+// Completed encrypted records are flushed before check; a partial record stays
+// buffered so the canonical suffix retains the same encrypted record layout.
 //
 // The caller retains ownership of the source and must keep it stable and open
 // until WriteTo returns. check must not modify it. A failed check leaves an
