@@ -69,7 +69,9 @@ class EnvironmentTools(unittest.TestCase):
             (root/'Makefile').write_text(
                 "SHELL := /bin/bash\nGO := go\nBUILD_DIR := build\nTARGET_ARCH := x86_64\n"
                 + recursive + "\nrelease:\n" + recipe + "\n.PHONY: build\nbuild:\n"
-                "\t@go env GOWORK > build-env\n\t@go build -o checked .\n")
+                "\t@go env GOWORK > build-env\n"
+                '\t@echo "$$GOTOOLCHAIN" > build-policy\n'
+                "\t@go build -o checked .\n")
             (root/'go.mod').write_text('module example.com/release-fixture\n\ngo 1.20\n')
             (root/'main.go').write_text('package main\nfunc main() {}\n')
             (root/'go.work').write_text('invalid workspace supplied by the caller\n')
@@ -96,16 +98,27 @@ class EnvironmentTools(unittest.TestCase):
                     self.assertFalse(record.exists())
                     self.assertEqual(marker.read_text(), 'previous release')
                     self.assertFalse((root/'package-env').exists())
+            # Model a previously selected compiler while using the real Go binary
+            # for the workspace and build. CI needs only one installed toolchain.
+            selected_bin = root/'selected-toolchain/bin'
+            selected_bin.mkdir(parents=True)
+            compiler = selected_bin/'go'
+            compiler.write_text('#!/bin/sh\n[ "$GOTOOLCHAIN" = local ] || exit 12\nexec go "$@"\n')
+            compiler.chmod(0o755)
             launcher = root/'go-from-owner'
-            launcher.write_text('#!/bin/sh\n[ "$PWD" = "$EXPECTED_OWNER" ] || exit 11\nexec go "$@"\n')
+            launcher.write_text('#!/bin/sh\n[ "$PWD" = "$EXPECTED_OWNER" ] || exit 11\n'
+                                '[ "$GOTOOLCHAIN" = auto ] || exit 13\n'
+                                '[ "$*" = "env GOROOT" ] || exit 14\n'
+                                'printf "%s\\n" "$EXPECTED_OWNER/selected-toolchain"\n')
             launcher.chmod(0o755)
             for version in ('v0.1.1', 'v0.1.2-preview.20261112'):
                 with self.subTest(version=version):
                     result = subprocess.run(['make', 'release', 'VERSION='+version, 'GO='+str(launcher),
                                              'GOWORK='+str(root/'go.work')], cwd=root,
-                                            env=dict(os.environ, EXPECTED_OWNER=str(root)),
+                                            env=dict(os.environ, EXPECTED_OWNER=str(root), GOTOOLCHAIN="auto"),
                                             text=True, capture_output=True)
                     self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual((root/'build-policy').read_text().strip(), 'auto')
                     selected = (root/'build-env').read_text().strip()
                     self.assertEqual((root/'package-env').read_text().strip(), selected)
                     if '-preview.' in version:
