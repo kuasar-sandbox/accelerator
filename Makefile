@@ -171,7 +171,23 @@ test-e2e-scripts:
 
 VERSION ?= v0.1.0
 
-release: build
+# Mixed release recipes run sub-makes with the jobserver on real builds. GNU
+# Make executes recipes that directly reference $(MAKE) even under --dry-run.
+release_make = $(MAKE)
+release_recursive = $(if $(findstring n,$(filter-out -% %=%,$(firstword $(MAKEFLAGS)))),,+)
+
+release:
+	$(release_recursive)@set -e; export GOWORK=off; \
+	if [[ "$(VERSION)" == *-preview.* ]]; then \
+	  work="$$(mktemp -d)"; trap 'rm -rf -- "$$work"' EXIT; \
+	  selected_go="$$( $(GO) env GOROOT)/bin/go"; \
+	  (cd "$$work" && GOTOOLCHAIN=local "$$selected_go" work init "$(CURDIR)"); \
+	  export GOWORK="$$work/go.work"; \
+	fi; \
+	$(release_make) _release-bundle GOWORK="$$GOWORK"
+
+.PHONY: _release-bundle
+_release-bundle: build
 	rm -rf build/release-bundle
 	SOURCE_DATE_EPOCH="$$(git show -s --format=%ct HEAD)" \
 		bash scripts/release.sh package "$(VERSION)" "$(TARGET_ARCH)" build/release-bundle
