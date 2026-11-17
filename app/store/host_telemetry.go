@@ -12,7 +12,7 @@ func storeTelemetryPoints(stats storeserver.StatsSnapshot, observed time.Time) [
 	points := make([]hostmetrics.Point, 0, 10)
 	add := func(name, unit string, v uint64) {
 		value := v
-		points = append(points, hostmetrics.Point{Name: name, Unit: unit, Time: observed, Uint: &value})
+		points = append(points, hostmetrics.Point{Name: name, Unit: unit, Time: observed, Counter: true, Uint: &value})
 	}
 	add("store.get.requests", "{request}", stats.GetN)
 	add("store.get.hits", "{request}", stats.GetHits)

@@ -15,13 +15,22 @@ func TestStoreHostTelemetryUsesActualCounters(t *testing.T) {
 	found := map[string]float64{}
 	for _, p := range got {
 		if p.Histogram != nil {
+			if p.Counter {
+				t.Fatalf("histogram marked as numeric counter: %s", p.Name)
+			}
 			if p.Unit != "ns" {
 				t.Fatalf("unexpected histogram unit %q", p.Unit)
 			}
 			histograms[p.Name] = p.Histogram.Count
 		} else if p.Uint != nil {
+			if !p.Counter {
+				t.Fatalf("cumulative total exported as gauge: %s", p.Name)
+			}
 			found[p.Name] = float64(*p.Uint)
 		} else {
+			if p.Counter {
+				t.Fatalf("instantaneous observation exported as counter: %s", p.Name)
+			}
 			found[p.Name] = p.Value
 		}
 	}

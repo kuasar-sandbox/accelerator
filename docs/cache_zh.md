@@ -1228,6 +1228,11 @@ Cache 单次读取与 client 恢复见[单次读取、连接池恢复与错误�
 Socket `/run/sandbox-telemetry/host.sock`（可用 `KS_HOST_OTLP_SOCKET` 覆盖）
 上报其原生节点级请求数、字节数、命中/错误计数和在途请求量。
 `cache.get.latency` 和 `cache.put.latency` 以纳秒为单位，上报进程启动以来的原生 OTLP 直方图，包含全部时延区间和超过 1 秒的样本。
+直方图 count 取本次上报桶计数之和。原生快照分别读取总时延与最大时延，
+因此 OTLP 省略这两个无法保证与桶一致的可选字段。
+请求数、字节数、命中数和错误数使用累计单调 OTLP Sum，并附带进程起始时间。
+在途请求和连接数使用 Gauge。每个 daemon 增加进程生命周期内稳定的
+`service.instance.id`，使同主机的多个实例拥有独立指标流。
 Host 指标采用固定 10 秒周期，不依赖 stderr 统计的 `stats_interval`；
 `0`/`off` 仅关闭原有 stderr 自适应统计行，不会关闭 Host OTLP 上报。
 来源为 `sandbox.telemetry.source=cache`。共享缓存、存储的用量不臆造

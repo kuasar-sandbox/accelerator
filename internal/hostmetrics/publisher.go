@@ -5,6 +5,7 @@ package hostmetrics
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,15 +23,21 @@ import (
 
 const DefaultSocket = "/run/sandbox-telemetry/host.sock"
 
-// The cache/store latency accumulators begin empty at process startup.
-var processStart = time.Now()
+// Cache/store cumulative accumulators begin empty at process startup. Keep
+// their start time and instance identity stable across publishers in this process.
+var (
+	processStart      = time.Now()
+	processInstanceID = rand.Text()
+)
 
 type Point struct {
-	Name       string
-	Unit       string
-	Time       time.Time
-	Value      float64
-	Uint       *uint64
+	Name  string
+	Unit  string
+	Time  time.Time
+	Value float64
+	Uint  *uint64
+	// Counter marks a nonnegative process-lifetime cumulative total.
+	Counter    bool
 	Histogram  *obstat.HistSnapshot
 	Attributes map[string]string
 }
@@ -49,13 +56,20 @@ type otlpAttribute struct {
 	Value otlpValue `json:"value"`
 }
 type otlpDP struct {
-	TimeUnixNano string          `json:"timeUnixNano"`
-	AsDouble     *float64        `json:"asDouble,omitempty"`
-	AsInt        string          `json:"asInt,omitempty"`
-	Attributes   []otlpAttribute `json:"attributes,omitempty"`
+	StartTimeUnixNano string          `json:"startTimeUnixNano,omitempty"`
+	TimeUnixNano      string          `json:"timeUnixNano"`
+	AsDouble          *float64        `json:"asDouble,omitempty"`
+	AsInt             string          `json:"asInt,omitempty"`
+	Attributes        []otlpAttribute `json:"attributes,omitempty"`
 }
 type otlpGauge struct {
 	DataPoints []otlpDP `json:"dataPoints"`
+}
+
+type otlpSum struct {
+	AggregationTemporality int      `json:"aggregationTemporality"`
+	IsMonotonic            bool     `json:"isMonotonic"`
+	DataPoints             []otlpDP `json:"dataPoints"`
 }
 
 type otlpHistogramPoint struct {
@@ -63,8 +77,6 @@ type otlpHistogramPoint struct {
 	TimeUnixNano      string          `json:"timeUnixNano"`
 	Attributes        []otlpAttribute `json:"attributes,omitempty"`
 	Count             string          `json:"count"`
-	Sum               *float64        `json:"sum,omitempty"`
-	Max               *float64        `json:"max,omitempty"`
 	ExplicitBounds    []float64       `json:"explicitBounds"`
 	BucketCounts      []string        `json:"bucketCounts"`
 }
@@ -78,11 +90,13 @@ type otlpMetric struct {
 	Name      string         `json:"name"`
 	Unit      string         `json:"unit,omitempty"`
 	Gauge     *otlpGauge     `json:"gauge,omitempty"`
+	Sum       *otlpSum       `json:"sum,omitempty"`
 	Histogram *otlpHistogram `json:"histogram,omitempty"`
 }
 
-// A native snapshot reads lock-free counters independently. Always derive the OTLP
-// count from the exact transmitted buckets. Omit summary fields on a skewed read.
+// Native buckets and summaries are read independently. Derive Count from the
+// transmitted buckets. Sum and Max are optional in OTLP and are omitted because
+// even a matching native Count cannot prove those summaries belong to these buckets.
 func latencyHistogramPoint(s *obstat.HistSnapshot, timestamp string, attrs []otlpAttribute) otlpHistogramPoint {
 	bounds := obstat.LatencyBoundsNs()
 	point := otlpHistogramPoint{
@@ -99,14 +113,7 @@ func latencyHistogramPoint(s *obstat.HistSnapshot, timestamp string, attrs []otl
 		count += n
 	}
 	point.Count = strconv.FormatUint(count, 10)
-	if count == s.Count {
-		sum := float64(s.SumNs)
-		point.Sum = &sum
-		if count > 0 {
-			max := float64(s.MaxNs)
-			point.Max = &max
-		}
-	}
+
 	return point
 }
 
@@ -159,6 +166,7 @@ func New(service, source string, resource map[string]string) *Publisher {
 			attrs["host.name"] = name
 		}
 	}
+	attrs["service.instance.id"] = processInstanceID
 	attrs["service.name"] = service
 	attrs["sandbox.telemetry.source"] = source
 	transport := &http.Transport{DisableKeepAlives: true, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -208,7 +216,7 @@ func (p *Publisher) Send(ctx context.Context, points []Point) error {
 		timestamp := strconv.FormatInt(point.Time.UnixNano(), 10)
 		attrs := attributes(point.Attributes)
 		if point.Histogram != nil {
-			if metric.Gauge != nil || point.Uint != nil {
+			if metric.Gauge != nil || metric.Sum != nil || point.Uint != nil || point.Counter {
 				return errors.New("mixed histogram and numeric host metric")
 			}
 			if metric.Histogram == nil {
@@ -220,9 +228,6 @@ func (p *Publisher) Send(ctx context.Context, points []Point) error {
 		}
 		if metric.Histogram != nil {
 			return errors.New("mixed histogram and numeric host metric")
-		}
-		if metric.Gauge == nil {
-			metric.Gauge = &otlpGauge{}
 		}
 		dp := otlpDP{TimeUnixNano: timestamp, Attributes: attrs}
 		if point.Uint != nil {
@@ -238,7 +243,24 @@ func (p *Publisher) Send(ctx context.Context, points []Point) error {
 			v := point.Value
 			dp.AsDouble = &v
 		}
-		metric.Gauge.DataPoints = append(metric.Gauge.DataPoints, dp)
+		if point.Counter {
+			if metric.Gauge != nil || point.Uint == nil && point.Value < 0 {
+				return errors.New("invalid cumulative host counter")
+			}
+			if metric.Sum == nil {
+				metric.Sum = &otlpSum{AggregationTemporality: 2, IsMonotonic: true}
+			}
+			dp.StartTimeUnixNano = strconv.FormatInt(processStart.UnixNano(), 10)
+			metric.Sum.DataPoints = append(metric.Sum.DataPoints, dp)
+		} else {
+			if metric.Sum != nil {
+				return errors.New("mixed gauge and cumulative host counter")
+			}
+			if metric.Gauge == nil {
+				metric.Gauge = &otlpGauge{}
+			}
+			metric.Gauge.DataPoints = append(metric.Gauge.DataPoints, dp)
+		}
 	}
 	rm.ScopeMetrics = []otlpScopeMetrics{scope}
 	body, err := json.Marshal(otlpExport{ResourceMetrics: []otlpResourceMetrics{rm}})

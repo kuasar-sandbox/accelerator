@@ -15,7 +15,7 @@ func cacheTelemetryPoints(mode string, stats server.WireStats, conns int, tier *
 	samples := make([]hostmetrics.Point, 0, 20)
 	add := func(name, unit string, v uint64, attrs map[string]string) {
 		val := v
-		samples = append(samples, hostmetrics.Point{Name: name, Unit: unit, Time: observed, Uint: &val, Attributes: attrs})
+		samples = append(samples, hostmetrics.Point{Name: name, Unit: unit, Time: observed, Counter: true, Uint: &val, Attributes: attrs})
 	}
 	add("cache.get.requests", "{request}", stats.GetN, group)
 	add("cache.put.requests", "{request}", stats.PutN, group)

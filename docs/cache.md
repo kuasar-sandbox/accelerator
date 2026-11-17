@@ -1120,6 +1120,12 @@ The active `cache-ctl serve` instance publishes its existing aggregate node-leve
 request, byte, hit/error and inflight counters through standard OTLP/HTTP on
 `/run/sandbox-telemetry/host.sock` (override `KS_HOST_OTLP_SOCKET`).
 `cache.get.latency` and `cache.put.latency` are cumulative OTLP histograms in nanoseconds with all native buckets, including the overflow above one second.
+The histogram count is derived from the transmitted buckets. Optional sum and
+maximum fields are omitted because the native snapshot reads them independently.
+Request, byte, hit and error totals use cumulative monotonic OTLP Sums with the
+process start time. Inflight requests and connections use Gauges. Each daemon
+adds a process-lifetime `service.instance.id`, so multiple daemons on one host
+produce distinct streams.
 Host metrics use a fixed 10-second observation interval independent of the
 adaptive stderr `stats_interval`. `0`/`off` disables only the existing stderr
 statistics, not Host OTLP delivery. No new tuning options are added.
