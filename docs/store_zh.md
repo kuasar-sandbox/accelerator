@@ -501,3 +501,17 @@ PutHandle 缓冲单个对象并以单次 PutObject 写入固定 key。`max_objec
 - 仓库根目录 `README.md` / `Makefile` — 构建和完整测试入口
 
 Store 单次读取与非重放边界见[单次读取与写入边界](#单次读取与写入边界).
+
+### Host OTLP 指标
+
+`store-ctl serve` 通过 Host 专用 Unix
+Socket `/run/sandbox-telemetry/host.sock`（可用 `KS_HOST_OTLP_SOCKET` 覆盖）
+上报其原生节点级请求数、字节数、命中/错误计数和在途请求量。
+`store.get.latency` 和 `store.put.latency` 以纳秒为单位，上报进程启动以来的原生 OTLP 直方图，包含全部时延区间和超过 1 秒的样本。
+Host 指标采用固定 10 秒周期，不依赖 stderr 统计的 `stats_interval`；
+`0`/`off` 仅关闭原有 stderr 自适应统计行，不会关闭 Host OTLP 上报。
+来源为 `sandbox.telemetry.source=store`。共享缓存、存储的用量不臆造
+SandboxID 或在沙箱之间分摊。上报失败不会影响业务请求与退出。独立部署的非 root systemd 服务
+可在启用 Telemetry 时安装 `deploy/systemd/node-telemetry.sysusers.conf` 与相应
+`cache-ctl.service.d` / `store-ctl.service.d` 下的 Host Telemetry drop-in；
+**基础服务 unit 不依赖该用户组**。

@@ -148,11 +148,15 @@ func Run(ctx context.Context, cfg Config, opts Options) (retErr error) {
 		n++
 	}
 	if !life.Active(func() {
-		observers.Add(2)
+		observers.Add(3)
 		go func() { defer observers.Done(); input.run(runCtx, opts.Reload, log) }()
 		go func() {
 			defer observers.Done()
 			obstat.RunAdaptive(runCtx, cfg.StatsIntervalDur(), sampler(srv), func(f string, a ...any) { log.Info(fmt.Sprintf(f, a...)) })
+		}()
+		go func() {
+			defer observers.Done()
+			runStoreHostMetrics(runCtx, srv)
 		}()
 		go func() { results <- result{"grpc", gs.Serve(gl)} }()
 		if ws != nil {

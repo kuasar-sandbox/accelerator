@@ -20,6 +20,9 @@ var bucketNs = [numBuckets]uint64{
 	128_000_000, 256_000_000, 512_000_000, 1_000_000_000,
 }
 
+// LatencyBoundsNs returns the inclusive upper bounds used by Hist.Record.
+func LatencyBoundsNs() [numBuckets]uint64 { return bucketNs }
+
 // Hist is a concurrent latency histogram. The zero value is ready to use;
 // Record is lock-free (per-bucket atomic add), so request handlers can call it
 // directly. Read a consistent view with Snapshot.

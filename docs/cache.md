@@ -1113,3 +1113,18 @@ On helper success, the caller owns the original Files starting at FD 3 and must 
 - [system architecture](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/architecture.md): the cache model in the platform.
 
 Cache read attempts and client recovery are specified in [Read attempts, pool recovery and error ownership](#read-attempts-pool-recovery-and-error-ownership).
+
+### Host OTLP metrics
+
+The active `cache-ctl serve` instance publishes its existing aggregate node-level
+request, byte, hit/error and inflight counters through standard OTLP/HTTP on
+`/run/sandbox-telemetry/host.sock` (override `KS_HOST_OTLP_SOCKET`).
+`cache.get.latency` and `cache.put.latency` are cumulative OTLP histograms in nanoseconds with all native buckets, including the overflow above one second.
+Host metrics use a fixed 10-second observation interval independent of the
+adaptive stderr `stats_interval`. `0`/`off` disables only the existing stderr
+statistics, not Host OTLP delivery. No new tuning options are added.
+The source identity is `sandbox.telemetry.source=cache`; shared cache/store
+activity is not fabricated as per-sandbox usage. Failed delivery does not affect request servicing or shutdown. For
+non-root systemd deployments, install `deploy/systemd/node-telemetry.sysusers.conf`
+and the optional `cache-ctl.service.d` / `store-ctl.service.d` Host Telemetry
+drop-in. The base daemon units remain usable without the telemetry group.

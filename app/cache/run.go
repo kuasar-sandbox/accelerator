@@ -312,12 +312,16 @@ func Run(ctx context.Context, cfg Config, opts Options) (retErr error) {
 		if tieredComps != nil {
 			statsRocks = tieredComps.EmbeddedStore
 		}
-		observers.Add(1)
+		observers.Add(2)
 		go func() {
 			defer observers.Done()
 			obstat.RunAdaptive(runCtx, cfg.StatsIntervalDur(), cacheSampler(cfg.Mode, ws, tieredCache, statsRocks, collectRedisGaugeSources(primaryRedis, tieredComps)), func(f string, a ...any) {
 				log.Info(fmt.Sprintf(f, a...))
 			})
+		}()
+		go func() {
+			defer observers.Done()
+			runCacheHostMetrics(runCtx, cfg.Mode, ws, tieredCache)
 		}()
 		if opts.Reload != nil {
 			observers.Add(1)
