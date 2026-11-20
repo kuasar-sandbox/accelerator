@@ -9,12 +9,7 @@ require_command redis-server
 if [ "$(id -u)" -ne 0 ]; then sudo -n true; fi
 scratch=$(mktemp -d /tmp/acc-activation-ports-XXXXXX)
 trap 'rm -rf "$scratch"' EXIT
-E2E_PORT_LEASE_FILE="$scratch/ports"
-source "$E2E_LIB/accelerator/port_lease.sh"
-ports=()
-for _ in $(seq 1 10); do ports+=("$(e2e_free_port)"); done
-
-python3 - "$BIN" "${ports[@]}" <<'PY'
+python3 - "$BIN" "$E2E_LIB/accelerator/port_lease.sh" "$scratch/ports" <<'PY'
 import contextlib
 import fcntl
 import hashlib
@@ -34,7 +29,7 @@ import tempfile
 import time
 
 binary_dir = Path(sys.argv[1]).resolve()
-ports = iter(sys.argv[2:])
+port_helper, port_lease_file = sys.argv[2:]
 privilege = [] if os.geteuid() == 0 else ['sudo', '-n']
 sleep_binary = shutil.which('sleep')
 assert sleep_binary, 'sleep executable is required'
@@ -42,8 +37,12 @@ payload = b'activation-response-' * (3 * 1024 * 1024 // 20)
 key = hashlib.sha256(payload).digest()
 
 def ctl(*args, check=True, timeout=20):
-    return subprocess.run(privilege + ['systemctl', *args], check=check,
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout).stdout
+    try:
+        return subprocess.run(privilege + ['systemctl', *args], check=check,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout).stdout
+    except subprocess.CalledProcessError as error:
+        sys.stderr.write(error.stdout or '')
+        raise
 
 def wait_for(check, label):
     end = time.monotonic() + 10
@@ -54,7 +53,16 @@ def wait_for(check, label):
     raise AssertionError(label)
 
 def endpoint(root, name, network):
-    return str(root / (name + '.sock')) if network == 'unix' else '127.0.0.1:' + next(ports)
+    if network == 'unix':
+        return str(root / (name + '.sock'))
+    # Earlier scenarios create TCP clients. Choose a currently free port only
+    # when this scenario starts, so their TIME_WAIT sockets cannot consume a
+    # port selected for a later scenario. The shared lease still prevents reuse.
+    port = subprocess.check_output([
+        'bash', '-c', 'E2E_PORT_LEASE_FILE="$2"; source "$1"; e2e_free_port',
+        'activation-port', port_helper, port_lease_file,
+    ], text=True).strip()
+    return '127.0.0.1:' + port
 
 class Wire:
     def __init__(self, address, budget=5):
@@ -548,8 +556,13 @@ StandardError=append:{log}
             except BaseException:
                 for path in root.glob('*.log'):
                     print(path.name + ':\n' + path.read_text(), file=sys.stderr)
-                if service_owned:
-                    print(ctl('show', service, '--property=MainPID,ControlPID,SubState,Result,ExecStartPre,ExecMainStatus,NRestarts', check=False), file=sys.stderr)
+                try:
+                    if service_owned:
+                        print(ctl('show', service, '--property=MainPID,ControlPID,SubState,Result,ExecStartPre,ExecMainStatus,NRestarts', check=False), file=sys.stderr)
+                    if socket_units:
+                        print(ctl('status', '--no-pager', '--full', *socket_units, check=False), file=sys.stderr)
+                except Exception as diagnostic_error:
+                    print(f'activation diagnostics failed: {diagnostic_error}', file=sys.stderr)
                 raise
             finally:
                 cleanup()
