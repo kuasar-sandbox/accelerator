@@ -16,6 +16,9 @@ const (
 	recordOverhead       = 17
 	canonicalSuffixSize  = 4 * 512
 	maxCoalesceBytes     = 1 << 20
+	// Batch ciphertext writes without changing the authenticated record geometry.
+	// This stays within the writer's existing 2 MiB fixed-buffer budget.
+	recordWriteBatchSize = 64 * (recordSize + recordOverhead)
 )
 
 var (
@@ -247,7 +250,7 @@ func newRecordWriter(w io.Writer, codec RecordCodec, prefix [envelopePrefixSize]
 	return &recordWriter{
 		w: w, codec: codec, geometry: geometry,
 		buffer: make([]byte, 0, recordSize),
-		sealed: make([]byte, 0, recordSize+recordOverhead),
+		sealed: make([]byte, 0, recordWriteBatchSize),
 		aad:    newRecordAAD(prefix, header),
 	}
 }
@@ -291,7 +294,7 @@ func (w *recordWriter) Close() error {
 	if w.recordIndex != w.geometry.recordCount {
 		return fmt.Errorf("%w: wrote %d of %d records", ErrInvalidCanonicalTarstream, w.recordIndex, w.geometry.recordCount)
 	}
-	return nil
+	return w.flushSealed()
 }
 
 func (w *recordWriter) flush() error {
@@ -303,19 +306,29 @@ func (w *recordWriter) flush() error {
 	if w.recordIndex == ^uint64(0) {
 		return fmt.Errorf("%w: record sequence overflow", ErrMalformedEnvelope)
 	}
+	if len(w.sealed)+wantSize > recordWriteBatchSize {
+		if err := w.flushSealed(); err != nil {
+			return err
+		}
+	}
 	setRecordAAD(w.aad, w.recordIndex, uint32(actual))
-	sealed, err := w.codec.Encrypt(w.sealed[:0], w.buffer, w.aad, w.recordIndex+1)
+	sealed, err := w.codec.Encrypt(w.sealed, w.buffer, w.aad, w.recordIndex+1)
 	if err != nil {
 		return err
 	}
-	if len(sealed) != wantSize {
+	if len(sealed) != len(w.sealed)+wantSize {
 		return fmt.Errorf("%w: codec returned invalid record size", ErrMalformedEnvelope)
 	}
-	if err := writeFull(w.w, sealed); err != nil {
-		return err
-	}
-	w.sealed = sealed[:0]
+	w.sealed = sealed
 	w.recordIndex++
 	w.buffer = w.buffer[:0]
+	return nil
+}
+
+func (w *recordWriter) flushSealed() error {
+	if err := writeFull(w.w, w.sealed); err != nil {
+		return err
+	}
+	w.sealed = w.sealed[:0]
 	return nil
 }
