@@ -51,6 +51,9 @@ func TestRuntimeAnnotationRejectsMalformed(t *testing.T) {
 	for _, suffix := range []string{
 		"@runtime", "@runtime:", "@runtime=runtime.bundle", "@runtime::digest:",
 		"@runtime:runtime.bundle", "@runtime:runtime.bundle:digest:", "@runtime::digest:" + digest,
+		"@runtime:runtime.tar:digest:" + digest, "@runtime:.bundle:digest:" + digest,
+		"@runtime:bad\n.bundle:digest:" + digest, "@runtime:bad\x7f.bundle:digest:" + digest,
+		"@runtime:bad\xff.bundle:digest:" + digest,
 		"@runtime:/runtime.bundle:digest:" + digest, "@runtime:dir/runtime.bundle:digest:" + digest,
 		"@runtime:dir\\runtime.bundle:digest:" + digest, "@runtime:..:digest:" + digest,
 		"@runtime:.:digest:" + digest, "@runtime:bad\x00.bundle:digest:" + digest,
@@ -74,7 +77,7 @@ func TestRuntimeAnnotationRejectsMalformed(t *testing.T) {
 
 func TestRuntimeAnnotationLengthBoundary(t *testing.T) {
 	base := "manifest://" + strings.Repeat("a", 64)
-	for _, name := range []string{strings.Repeat("x", MaxRuntimeBasenameBytes), strings.Repeat("界", 85)} {
+	for _, name := range []string{strings.Repeat("x", MaxRuntimeBasenameBytes-len(".bundle")) + ".bundle", strings.Repeat("界", 82) + "xx.bundle"} {
 		raw := base + "@runtime:" + name + ":digest:" + strings.Repeat("b", 64)
 		ref, err := ParseRef(raw)
 		if err != nil || ref.String() != raw || len(raw)-len(base) != MaxRuntimeAnnotationBytes {

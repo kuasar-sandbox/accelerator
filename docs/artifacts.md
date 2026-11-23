@@ -56,7 +56,8 @@ file://<path>[@manifest:<key>][@location:<name>]@runtime:<basename>:digest:<64-l
 ```
 
 The declaration also works with the existing tarstream identity qualifiers. It
-names the required guest runtime by basename (at most 255 bytes, no path) and
+names the required guest runtime by UTF-8 `.bundle` basename (at most 255 bytes,
+no path or control characters) and
 declared content digest. Ordinary colons in a basename are allowed; parsing uses
 the final `:digest:` separator. Reserved qualifier markers remain reserved.
 `@runtime` must be unique and terminal; malformed declarations are rejected.

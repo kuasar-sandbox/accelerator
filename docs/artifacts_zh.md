@@ -52,7 +52,8 @@ location 时 path 必须是 basename,location 匹配
 
 快照引用可追加唯一且位于末尾的
 `@runtime:<basename>:digest:<64 位小写十六进制摘要>`。Manifest、Bundle 和
-tarstream 引用均可携带该声明。basename 最长 255 字节且不能包含路径；允许普通
+tarstream 引用均可携带该声明。basename 是 UTF-8 `.bundle` 文件名，最长 255 字节，
+不能包含路径或控制字符；允许普通
 冒号，以最后一个 `:digest:` 分隔名称和摘要，已有 qualifier 标记仍是保留标记。
 格式错误或重复声明必须报错，不能降级为旧引用。
 

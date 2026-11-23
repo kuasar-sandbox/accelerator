@@ -3,6 +3,8 @@ package manifest
 import (
 	"fmt"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -28,8 +30,10 @@ func (r RuntimeIdentity) Validate() error {
 		return nil
 	}
 	if r.Basename == "" || r.Basename == "." || r.Basename == ".." ||
-		len(r.Basename) > MaxRuntimeBasenameBytes || strings.ContainsAny(r.Basename, "/\\\x00") {
-		return fmt.Errorf("runtime ref: runtime name must be a basename of at most %d bytes", MaxRuntimeBasenameBytes)
+		len(r.Basename) > MaxRuntimeBasenameBytes || strings.ContainsAny(r.Basename, "/\\") ||
+		!utf8.ValidString(r.Basename) || strings.IndexFunc(r.Basename, unicode.IsControl) >= 0 ||
+		!strings.HasSuffix(r.Basename, ".bundle") || r.Basename == ".bundle" {
+		return fmt.Errorf("runtime ref: runtime name must be a UTF-8 .bundle basename of at most %d bytes without control characters", MaxRuntimeBasenameBytes)
 	}
 	for _, marker := range []string{"@runtime", "@digest:", "@hmac:", "@manifest:", "@location:", "@sha256:"} {
 		if strings.Contains(r.Basename, marker) {
