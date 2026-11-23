@@ -50,6 +50,21 @@ location 时 path 必须是 basename,location 匹配
 `[A-Za-z0-9][A-Za-z0-9._-]*`,只保存逻辑名称,不携带宿主目录。允许数字开头以直接
 容纳 UUIDv7 sandbox/build ID。
 
+快照引用可追加唯一且位于末尾的
+`@runtime:<basename>:digest:<64 位小写十六进制摘要>`。Manifest、Bundle 和
+tarstream 引用均可携带该声明。basename 最长 255 字节且不能包含路径；允许普通
+冒号，以最后一个 `:digest:` 分隔名称和摘要，已有 qualifier 标记仍是保留标记。
+格式错误或重复声明必须报错，不能降级为旧引用。
+
+`Ref.Runtime` 保存声明，`Ref.Base()` 去掉声明以用于内容查询、不可变父层和物理
+载体引用。`ParseKeyRef` 校验完整声明后返回原内容 key。同一快照迁移位置时保留
+声明；改为选择其他 Bundle 成员时不继承。Bundle 依赖 `refs` 只引用物理载体，
+不能带 runtime 声明。此扩展不增加新的数据读取链路。
+
+没有声明的旧引用仍然合法，沿用原有调度及恢复校验，但不享有 runtime 预筛选。
+声明不替代 Node 实际恢复时的 runtime 校验。必须先交付支持新格式的实际消费者和
+SDK，再启用新输出；新读取器兼容旧输入不代表旧读取器能够解析新输出。
+
 ## Manifest 对象与稀疏访问
 
 ### chunking

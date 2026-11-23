@@ -91,6 +91,7 @@ func TestRefsCodecRejectsNonCanonicalInput(t *testing.T) {
 	}
 
 	invalidRefs := []string{
+		"file://root.bundle@runtime:runtime.bundle:digest:" + strings.Repeat("a", 64),
 		"manifest://" + digest,
 		"file:///absolute.bundle",
 		"file://dir/root.bundle",

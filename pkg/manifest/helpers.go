@@ -30,9 +30,17 @@ func ParseHexKey(s string) (store.ContentKey, error) {
 // ParseKeyRef decodes a manifest content key that may carry an optional
 // "manifest://" scheme prefix (the form printed in URIs / passed on
 // CLIs and env). "manifest://<hex>" and bare "<hex>" are equivalent;
-// validation is delegated to ParseHexKey.
+// A manifest reference may include a runtime declaration; it is validated but
+// does not participate in content lookup. Bare keys remain supported.
 func ParseKeyRef(s string) (store.ContentKey, error) {
-	return ParseHexKey(strings.TrimPrefix(s, "manifest://"))
+	if strings.HasPrefix(s, "manifest://") {
+		ref, err := ParseRef(s)
+		if err != nil {
+			return store.ContentKey{}, err
+		}
+		return ParseHexKey(ref.Path)
+	}
+	return ParseHexKey(s)
 }
 
 // HexKey is the inverse of ParseHexKey — formats a ContentKey as 64

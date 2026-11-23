@@ -148,6 +148,9 @@ func validateBundleRef(raw string) error {
 	if ref.DigestScheme != "" || ref.Digest != "" {
 		return readerr.Mark(fmt.Errorf("Bundle ref %q must not contain an identity selector", raw), false)
 	}
+	if !ref.Runtime.IsZero() {
+		return readerr.Mark(fmt.Errorf("Bundle carrier ref %q must not contain a snapshot runtime declaration", raw), false)
+	}
 	if ref.Path == "." || ref.Path == ".." || strings.ContainsAny(ref.Path, `/\\`) {
 		return readerr.Mark(fmt.Errorf("Bundle ref %q path must be a basename", raw), false)
 	}

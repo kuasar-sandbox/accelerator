@@ -18,19 +18,27 @@ const (
 // Manifest from a multi-Manifest Bundle.
 // Location is the logical name from an optional @location qualifier. Host
 // paths for locations are deliberately not part of Ref.
+// Runtime is an optional, terminal snapshot runtime declaration. It does not
+// change content identity; use Base when referring to a carrier or parent.
 type Ref struct {
 	Scheme       string
 	Path         string
 	DigestScheme string
 	Digest       string
 	Location     string
+	Runtime      RuntimeIdentity
 }
 
 // ParseRef parses one manifest or file reference. A manifest reference always
 // contains exactly one content key. File qualifiers, when present, have the
-// fixed order @digest|@hmac|@manifest then @location.
+// fixed order @digest|@hmac|@manifest then @location. Either reference may end
+// with one @runtime:<basename>:digest:<digest> declaration.
 func ParseRef(raw string) (Ref, error) {
 	var ref Ref
+	raw, runtime, err := parseRuntimeAnnotation(raw)
+	if err != nil {
+		return ref, err
+	}
 	switch {
 	case strings.HasPrefix(raw, RefSchemeManifest+"://"):
 		key, err := ParseHexKey(strings.TrimPrefix(raw, RefSchemeManifest+"://"))
@@ -88,6 +96,7 @@ func ParseRef(raw string) (Ref, error) {
 	default:
 		return ref, fmt.Errorf("ref: unsupported scheme in %q", raw)
 	}
+	ref.Runtime = runtime
 	if err := ref.Validate(); err != nil {
 		return Ref{}, err
 	}
@@ -97,6 +106,12 @@ func ParseRef(raw string) (Ref, error) {
 // Validate checks the canonical reference fields without consulting host
 // configuration or the filesystem.
 func (r Ref) Validate() error {
+	if err := r.Runtime.Validate(); err != nil {
+		return err
+	}
+	if strings.Contains(r.Path, "@runtime") {
+		return fmt.Errorf("ref: reserved runtime qualifier in path")
+	}
 	switch r.Scheme {
 	case RefSchemeManifest:
 		if r.DigestScheme != "" || r.Digest != "" || r.Location != "" {
@@ -147,7 +162,17 @@ func (r Ref) String() string {
 	if r.Location != "" {
 		value += "@location:" + r.Location
 	}
+	if !r.Runtime.IsZero() {
+		value += "@runtime:" + r.Runtime.Basename + ":digest:" + r.Runtime.Digest
+	}
 	return value
+}
+
+// Base returns the reference without its snapshot runtime declaration. Content
+// lookup, physical carriers and immutable parent graphs use this identity.
+func (r Ref) Base() Ref {
+	r.Runtime = RuntimeIdentity{}
+	return r
 }
 
 // Portable reports whether the reference contains no node-local file path.

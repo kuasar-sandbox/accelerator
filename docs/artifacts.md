@@ -48,6 +48,32 @@ file://<path>[@digest:<digest>|@hmac:<digest>|@manifest:<key>][@location:<name>]
 
 The three identity qualifiers are mutually exclusive. `@manifest` selects a root Manifest in a Manifest Bundle and must be rejected by a tarstream opener; a Bundle opener must reject `@digest` and `@hmac`. With a location, the path must be a basename. The location must match `[A-Za-z0-9][A-Za-z0-9._-]*` and carries a logical name, not a host directory. A leading digit is allowed so UUIDv7 sandbox/build IDs can be used directly.
 
+A snapshot reference may end with one runtime declaration:
+
+```text
+manifest://<key>@runtime:<basename>:digest:<64-lowercase-hex>
+file://<path>[@manifest:<key>][@location:<name>]@runtime:<basename>:digest:<64-lowercase-hex>
+```
+
+The declaration also works with the existing tarstream identity qualifiers. It
+names the required guest runtime by basename (at most 255 bytes, no path) and
+declared content digest. Ordinary colons in a basename are allowed; parsing uses
+the final `:digest:` separator. Reserved qualifier markers remain reserved.
+`@runtime` must be unique and terminal; malformed declarations are rejected.
+
+`Ref.Runtime` carries this metadata. `Ref.Base()` removes it for content lookup,
+immutable parents and physical carriers; `ParseKeyRef` validates an annotated
+manifest reference and returns its original content key. Relocating the same
+snapshot preserves the declaration, while selecting a different Bundle member
+does not inherit it. Bundle dependency `refs` contain physical carrier references
+and cannot contain a runtime declaration. No new data-reading path is introduced.
+
+References without a declaration remain valid. They retain prior scheduling and
+restore behavior, without runtime prefiltering. The declaration does not replace
+the Node's actual restore-time runtime checks. Deploy compatible consumers and
+SDKs before enabling annotated output: accepting old input does not make old
+readers compatible with new output.
+
 ## Read path in detail
 
 | Interface/stage | Responsibility |
