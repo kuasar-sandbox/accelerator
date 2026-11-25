@@ -140,6 +140,17 @@ func (p *ConnPool) releaseCapacity() {
 	p.wake()
 }
 
+// wakeWaiters relays a coalesced notification while idle connections or
+// connection capacity remain available.
+func (p *ConnPool) wakeWaiters() {
+	p.mu.Lock()
+	hasIdle := p.free.size > 0
+	p.mu.Unlock()
+	if hasIdle || int(p.current.Load()) < p.config.MaxSize {
+		p.wake()
+	}
+}
+
 func (p *ConnPool) dial(ctx context.Context) (*PoolConn, error) {
 	dialCtx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(p.ctx, cancel)
@@ -205,9 +216,7 @@ func (p *ConnPool) Acquire(ctx context.Context) (*PoolConn, error) {
 	for {
 		if err := ctx.Err(); err != nil {
 			// A cancelled waiter may have consumed the sole capacity wake.
-			if int(p.current.Load()) < p.config.MaxSize {
-				p.wake()
-			}
+			p.wakeWaiters()
 			return nil, err
 		}
 		if p.closed.Load() {
@@ -249,12 +258,7 @@ func (p *ConnPool) acquired(ctx context.Context, pc *PoolConn) (*PoolConn, error
 	// Relay notifications while idle connections remain. Unlike the old
 	// channel-backed queue, one notification no longer wakes a waiter per
 	// connection; each successful checkout passes the signal to the next.
-	p.mu.Lock()
-	hasIdle := p.free.size > 0
-	p.mu.Unlock()
-	if hasIdle || int(p.current.Load()) < p.config.MaxSize {
-		p.wake()
-	}
+	p.wakeWaiters()
 	return pc, nil
 }
 
