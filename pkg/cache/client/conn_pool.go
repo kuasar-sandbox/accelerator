@@ -246,9 +246,13 @@ func (p *ConnPool) acquired(ctx context.Context, pc *PoolConn) (*PoolConn, error
 		p.Release(pc, true)
 		return nil, err
 	}
-	// This waiter may have consumed a capacity notification before taking
-	// a returned healthy connection. Relay spare capacity to other waiters.
-	if int(p.current.Load()) < p.config.MaxSize {
+	// Relay notifications while idle connections remain. Unlike the old
+	// channel-backed queue, one notification no longer wakes a waiter per
+	// connection; each successful checkout passes the signal to the next.
+	p.mu.Lock()
+	hasIdle := p.free.size > 0
+	p.mu.Unlock()
+	if hasIdle || int(p.current.Load()) < p.config.MaxSize {
 		p.wake()
 	}
 	return pc, nil
