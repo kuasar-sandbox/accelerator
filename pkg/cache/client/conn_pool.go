@@ -32,7 +32,7 @@ type ConnPoolConfig struct {
 // conns are busy and current < MaxSize. Excess burst connections
 // are reaped after IdleMax of idleness.
 type ConnPool struct {
-	free    chan *PoolConn
+	free    connDeque // guarded by mu; newest connections are at the back
 	addr    string
 	network string
 	config  ConnPoolConfig
@@ -40,8 +40,8 @@ type ConnPool struct {
 	closed  atomic.Bool
 	done    chan struct{}
 
-	// Publication and Close share this lock. The idle Acquire path does not
-	// take it, and no network call or retry wait is made while holding it.
+	// The idle queue, publication and Close share this lock. Network calls and
+	// retry waits are never made while holding it.
 	mu           sync.Mutex
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -74,7 +74,7 @@ func DialConnPool(addr string, cfg ConnPoolConfig) (*ConnPool, error) {
 	network, dialAddr := parseAddr(addr)
 
 	p := &ConnPool{
-		free:    make(chan *PoolConn, cfg.MaxSize),
+		free:    newConnDeque(cfg.MaxSize),
 		addr:    dialAddr,
 		network: network,
 		config:  cfg,
@@ -166,10 +166,8 @@ func (p *ConnPool) healthLoop() {
 		case <-p.refillNeeded:
 			p.refill()
 		case <-ticker.C:
-			select {
-			case pc := <-p.free:
+			if pc := p.popOldest(); pc != nil {
 				p.Release(pc, pc.Ping(pingTimeout) == nil)
-			default:
 			}
 			p.refill()
 		}
@@ -187,13 +185,12 @@ func (p *ConnPool) reaperLoop() {
 		case <-ticker.C:
 		}
 		for int(p.current.Load()) > p.config.PoolSize {
-			select {
-			case pc := <-p.free:
-				pc.closeConn()
-				p.releaseCapacity()
-			default:
+			pc := p.popOldest()
+			if pc == nil {
 				goto done
 			}
+			pc.closeConn()
+			p.releaseCapacity()
 		}
 	done:
 	}
@@ -214,10 +211,8 @@ func (p *ConnPool) Acquire(ctx context.Context) (*PoolConn, error) {
 		if p.closed.Load() {
 			return nil, net.ErrClosed
 		}
-		select {
-		case pc := <-p.free:
+		if pc := p.popNewest(); pc != nil {
 			return p.acquired(ctx, pc)
-		default:
 		}
 		if p.reserve(p.config.MaxSize) {
 			if int(p.current.Load()) < p.config.MaxSize {
@@ -231,8 +226,6 @@ func (p *ConnPool) Acquire(ctx context.Context) (*PoolConn, error) {
 			return p.acquired(ctx, pc)
 		}
 		select {
-		case pc := <-p.free:
-			return p.acquired(ctx, pc)
 		case <-p.changed:
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -263,13 +256,10 @@ func (p *ConnPool) acquired(ctx context.Context, pc *PoolConn) (*PoolConn, error
 // one existing maintenance worker may refill, never one goroutine per error.
 func (p *ConnPool) Release(pc *PoolConn, healthy bool) {
 	p.mu.Lock()
-	if healthy && !p.closed.Load() {
-		select {
-		case p.free <- pc:
-			p.mu.Unlock()
-			return
-		default:
-		}
+	if healthy && !p.closed.Load() && p.free.pushBack(pc) {
+		p.mu.Unlock()
+		p.wake()
+		return
 	}
 	p.mu.Unlock()
 	pc.closeConn()
@@ -295,17 +285,16 @@ func (p *ConnPool) Close() error {
 	p.cancel()
 	var firstErr error
 	for {
-		select {
-		case pc := <-p.free:
-			if err := pc.closeConn(); err != nil && firstErr == nil {
-				firstErr = err
-			}
-			p.releaseCapacity()
-		default:
+		pc := p.free.popFront()
+		if pc == nil {
 			p.mu.Unlock()
 			p.maintenance.Wait()
 			return firstErr
 		}
+		if err := pc.closeConn(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		p.releaseCapacity()
 	}
 }
 
@@ -321,6 +310,21 @@ func (p *ConnPool) refill() {
 		}
 		p.Release(pc, true)
 	}
+}
+
+// popNewest transfers the most recently returned idle connection to its caller.
+func (p *ConnPool) popNewest() *PoolConn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.free.popBack()
+}
+
+// popOldest transfers the least recently returned idle connection to its caller.
+// Background maintenance and idle reaping use this order.
+func (p *ConnPool) popOldest() *PoolConn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.free.popFront()
 }
 
 // PoolConn methods
