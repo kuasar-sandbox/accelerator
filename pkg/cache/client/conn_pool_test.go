@@ -141,21 +141,24 @@ func TestSetOpDeadlineClearsStaleDeadlineWithoutBudget(t *testing.T) {
 	}
 }
 
-func TestAcquiredRelaysWakeupWhileIdleConnectionsRemain(t *testing.T) {
+func TestTakeNewestRelaysWakeupWhileIdleConnectionsRemain(t *testing.T) {
 	p := &ConnPool{
 		free:    newConnDeque(3),
-		config:  ConnPoolConfig{MaxSize: 3},
 		changed: make(chan struct{}, 1),
 	}
-	p.current.Store(3)
-	p.free.pushBack(&PoolConn{})
+	oldest, newest := &PoolConn{}, &PoolConn{}
+	p.free.pushBack(oldest)
+	p.free.pushBack(newest)
 
-	if _, err := p.acquired(context.Background(), &PoolConn{}); err != nil {
-		t.Fatal(err)
+	if got := p.takeNewest(); got != newest {
+		t.Fatalf("taken connection = %p, want newest %p", got, newest)
 	}
 	select {
 	case <-p.changed:
 	default:
 		t.Fatal("remaining idle connection did not wake another waiter")
+	}
+	if got := p.takeNewest(); got != oldest {
+		t.Fatalf("remaining connection = %p, want oldest %p", got, oldest)
 	}
 }
