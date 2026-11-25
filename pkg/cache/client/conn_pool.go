@@ -26,8 +26,10 @@ type ConnPoolConfig struct {
 	IdleMax  time.Duration // burst connections idle this long get reaped (0 = no reaping)
 }
 
-// ConnPool is a channel-based connection pool with elastic burst
-// capacity. Pre-established connections are dialled at creation;
+// ConnPool is a bounded connection pool with elastic burst capacity.
+// Idle connections are kept in a deque: Acquire takes the newest connection,
+// while background maintenance and idle reaping take the oldest. Pre-established
+// connections are dialled at creation;
 // burst connections are dialled on-demand when all pre-established
 // conns are busy and current < MaxSize. Excess burst connections
 // are reaped after IdleMax of idleness.
