@@ -222,7 +222,8 @@ func (p *ConnPool) Acquire(ctx context.Context) (*PoolConn, error) {
 		if p.closed.Load() {
 			return nil, net.ErrClosed
 		}
-		if pc := p.takeNewest(); pc != nil {}
+		pc := p.takeNewest()
+		if pc != nil {
 			return p.acquired(ctx, pc)
 		}
 		if p.reserve(p.config.MaxSize) {
@@ -322,7 +323,7 @@ func (p *ConnPool) refill() {
 	}
 }
 
-// popNewest transfers the most recently returned idle connection to its caller.
+// takeNewest transfers the newest idle connection and relays a wakeup if more remain.
 func (p *ConnPool) takeNewest() *PoolConn {
 	p.mu.Lock()
 	pc := p.free.popBack()
