@@ -222,7 +222,7 @@ func (p *ConnPool) Acquire(ctx context.Context) (*PoolConn, error) {
 		if p.closed.Load() {
 			return nil, net.ErrClosed
 		}
-		if pc := p.popNewest(); pc != nil {
+		if pc := p.takeNewest(); pc != nil {}
 			return p.acquired(ctx, pc)
 		}
 		if p.reserve(p.config.MaxSize) {
@@ -255,10 +255,10 @@ func (p *ConnPool) acquired(ctx context.Context, pc *PoolConn) (*PoolConn, error
 		p.Release(pc, true)
 		return nil, err
 	}
-	// Relay notifications while idle connections remain. Unlike the old
-	// channel-backed queue, one notification no longer wakes a waiter per
-	// connection; each successful checkout passes the signal to the next.
-	p.wakeWaiters()
+// Relay spare capacity to other waiters after a successful dial or checkout.
+	if int(p.current.Load()) < p.config.MaxSize {
+		p.wake()
+	}
 	return pc, nil
 }
 
@@ -323,10 +323,15 @@ func (p *ConnPool) refill() {
 }
 
 // popNewest transfers the most recently returned idle connection to its caller.
-func (p *ConnPool) popNewest() *PoolConn {
+func (p *ConnPool) takeNewest() *PoolConn {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.free.popBack()
+	pc := p.free.popBack()
+	hasIdle := p.free.size > 0
+	p.mu.Unlock()
+	if hasIdle {
+		p.wake()
+	}
+	return pc
 }
 
 // popOldest transfers the least recently returned idle connection to its caller.
