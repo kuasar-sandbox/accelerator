@@ -256,7 +256,7 @@ func (p *ConnPool) acquired(ctx context.Context, pc *PoolConn) (*PoolConn, error
 		p.Release(pc, true)
 		return nil, err
 	}
-// Relay spare capacity to other waiters after a successful dial or checkout.
+	// Relay spare capacity to other waiters after a successful dial or checkout.
 	if int(p.current.Load()) < p.config.MaxSize {
 		p.wake()
 	}
