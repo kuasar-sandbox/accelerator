@@ -140,3 +140,22 @@ func TestSetOpDeadlineClearsStaleDeadlineWithoutBudget(t *testing.T) {
 		t.Fatal("server did not observe the request in time")
 	}
 }
+
+func TestAcquiredRelaysWakeupWhileIdleConnectionsRemain(t *testing.T) {
+	p := &ConnPool{
+		free:    newConnDeque(3),
+		config:  ConnPoolConfig{MaxSize: 3},
+		changed: make(chan struct{}, 1),
+	}
+	p.current.Store(3)
+	p.free.pushBack(&PoolConn{})
+
+	if _, err := p.acquired(context.Background(), &PoolConn{}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-p.changed:
+	default:
+		t.Fatal("remaining idle connection did not wake another waiter")
+	}
+}
