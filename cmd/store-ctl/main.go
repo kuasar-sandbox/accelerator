@@ -21,9 +21,14 @@ package main
 import (
 	"fmt"
 	"os"
+
+	"github.com/kuasar-sandbox/accelerator/internal/version"
 )
 
 func main() {
+	if version.PrintIfRequested("store-ctl") {
+		return
+	}
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
@@ -64,7 +69,7 @@ func resolveConfigPath(flagValue string) string {
 }
 
 func printUsage() {
-	fmt.Fprintln(os.Stderr, "usage: store-ctl <command> [args]")
+	fmt.Fprintln(os.Stderr, "usage: store-ctl <command> [args]\n       store-ctl --version")
 	fmt.Fprintln(os.Stderr, "commands:")
 	fmt.Fprintln(os.Stderr, "  serve     Start the gRPC store daemon")
 	fmt.Fprintln(os.Stderr, "  init      Initialise an empty store with a starting generation")
