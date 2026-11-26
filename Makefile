@@ -37,6 +37,12 @@ endif
 # ---------------------------------------------------------------------------
 GO             := go
 GO_BUILD_FLAGS := -trimpath
+# Version is explicitly supplied by release builds; ordinary builds are dev.
+BUILD_VERSION ?= dev
+VERSION_TAG := $(shell git tag --points-at HEAD --list 'v[0-9]*' --sort=refname 2>/dev/null | \
+	grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8}(\.[1-9][0-9]*)?)?$$' | \
+	awk -v preferred="$(BUILD_VERSION)" 'NR == 1 { first = $$0 } $$0 == preferred { exact = $$0 } END { print (exact != "" ? exact : first) }')
+VERSION_LDFLAGS := -X github.com/kuasar-sandbox/accelerator/internal/version.releaseVersion=$(BUILD_VERSION) -X github.com/kuasar-sandbox/accelerator/internal/version.gitTag=$(VERSION_TAG)
 BINDIR         := bin/$(TARGET_ARCH)
 BUILD_DIR      := build/$(TARGET_ARCH)
 ROCKS_PREFIX   := $(abspath $(BUILD_DIR)/rocksdb)
@@ -68,14 +74,14 @@ CACHE_CTL_DEPS  :=
 CACHE_CTL_CGO   := 0
 CACHE_CTL_TAGS  := no_rocksdb
 CACHE_CTL_BUILD = GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=$(CACHE_CTL_CGO) \
-    $(GO) build $(GO_BUILD_FLAGS) -tags $(CACHE_CTL_TAGS) -o $(BINDIR)/cache-ctl ./cmd/cache-ctl
+    $(GO) build $(GO_BUILD_FLAGS) -ldflags '$(VERSION_LDFLAGS)' -tags $(CACHE_CTL_TAGS) -o $(BINDIR)/cache-ctl ./cmd/cache-ctl
 else
 CACHE_CTL_DEPS  := deps-rocksdb
 CACHE_CTL_CGO   := 1
 CACHE_CTL_BUILD = TMPDIR="$(abspath $(BUILD_DIR))" GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=$(CACHE_CTL_CGO) \
     CC="$(TARGET_CC)" CXX="$(TARGET_CXX)" \
     CGO_CPPFLAGS="$(CGO_CPPFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS_STATIC)" \
-    $(GO) build $(GO_BUILD_FLAGS) -ldflags '$(GOLDFLAGS_STATIC)' -o $(BINDIR)/cache-ctl ./cmd/cache-ctl
+    $(GO) build $(GO_BUILD_FLAGS) -ldflags '$(GOLDFLAGS_STATIC) $(VERSION_LDFLAGS)' -o $(BINDIR)/cache-ctl ./cmd/cache-ctl
 endif
 
 # Native-only symlink: bin/<name> -> $(TARGET_ARCH)/<name>. $(1) = basename.
@@ -94,12 +100,12 @@ build: manifest-ctl store-ctl cache-ctl
 
 manifest-ctl:
 	@mkdir -p $(BINDIR)
-	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o $(BINDIR)/manifest-ctl ./cmd/manifest-ctl
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -ldflags '$(VERSION_LDFLAGS)' -o $(BINDIR)/manifest-ctl ./cmd/manifest-ctl
 	$(call link_bin,manifest-ctl)
 
 store-ctl:
 	@mkdir -p $(BINDIR)
-	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o $(BINDIR)/store-ctl ./cmd/store-ctl
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -ldflags '$(VERSION_LDFLAGS)' -o $(BINDIR)/store-ctl ./cmd/store-ctl
 	$(call link_bin,store-ctl)
 
 # cache-ctl: the artifact target. NO_ROCKSDB=1 compiles RocksDB out.
@@ -185,7 +191,7 @@ release:
 	  (cd "$$work" && GOTOOLCHAIN=local "$$selected_go" work init "$(CURDIR)"); \
 	  export GOWORK="$$work/go.work"; \
 	fi; \
-	$(release_make) _release-bundle GOWORK="$$GOWORK"
+	$(release_make) _release-bundle GOWORK="$$GOWORK" BUILD_VERSION="$(VERSION)"
 
 .PHONY: _release-bundle
 _release-bundle: build
@@ -210,3 +216,18 @@ help:
 	@echo "  test-release  test component release packaging"
 	@echo "  clean         remove bin build"
 	@echo "  TARGET_ARCH   x86_64 (default) | aarch64"
+
+.PHONY: check-version
+# Verify the newly built clean release binaries on their native architecture.
+check-version:
+	@test "$(HOST_ARCH)" = "$(TARGET_ARCH)"
+	@set -e; source="$(VERSION_TAG)"; \
+	if [ -z "$$source" ]; then source="$$(git rev-parse HEAD | cut -c1-12)"; fi; \
+	for name in manifest-ctl store-ctl cache-ctl; do \
+	  binary="$(BINDIR)/$$name"; \
+	  actual="$$("$$binary" --version)"; \
+	  rc=0; "$$binary" --version unexpected >/dev/null 2>&1 || rc=$$?; \
+	  if [ "$$rc" -ne 2 ]; then echo "$$name accepted extra version arguments" >&2; exit 1; fi; \
+	  expected="$$name $(BUILD_VERSION) ($$source)"; \
+	  if [ "$$actual" != "$$expected" ]; then printf 'expected %s, got %s\n' "$$expected" "$$actual" >&2; exit 1; fi; \
+	done

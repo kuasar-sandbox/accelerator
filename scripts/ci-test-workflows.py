@@ -268,41 +268,58 @@ def check_build_shell(steps):
         command = steps["Build, test and package accelerator"]["with"]["run"].replace("/inputs/release", str(framework))
         command = command.replace("${{ needs.preflight.outputs.version }}", "v0.1.6-preview.20261009")
         command = command.replace("${{ needs.preflight.outputs.source_sha }}", "a" * 40)
+        version_marker = source / "internal/version/version.go"
+        version_marker.parent.mkdir(parents=True)
         for arch in ("x86_64", "aarch64"):
-            log = root / f"make-{arch}.log"
-            cache_log = root / f"cache-{arch}.log"
-            release_log = root / f"release-{arch}.log"
-            env = dict(os.environ, PATH=f"{tools}:{os.environ['PATH']}", MAKE_LOG=str(log),
-                       TARGET_ARCH=arch, CACHE_LOG=str(cache_log), RELEASE_LOG=str(release_log), GIT_SHA="a" * 40,
-                       MKFS_EROFS_PATH=str(stale_tool))
-            subprocess.run(["bash", "-e", "-o", "pipefail", "-c", command],
-                           cwd=source.parent, env=env, check=True)
-            goals = ("test", "vet", "build", "test-release") if arch == "x86_64" else ("build",)
-            assert log.read_text().splitlines() == [f"{[goal]} {source}" for goal in goals]
-            assert cache_log.read_text().splitlines() == [arch + " rocksdb"]
-            assert release_log.read_text().splitlines() == ["package", "validate"]
-            log.unlink()
-            release_log.unlink()
-            failed = subprocess.run(["bash", "-e", "-c", command], cwd=source.parent,
-                                    env=dict(env, CACHE_EXIT="71"))
-            assert failed.returncode == 71 and not log.exists() and not release_log.exists()
-            failed = subprocess.run(["bash", "-e", "-c", command], cwd=source.parent,
-                                    env=dict(env, FAIL_GOAL=goals[0]))
-            assert failed.returncode == 72
-            assert log.read_text().splitlines() == [f"{[goals[0]]} {source}"]
-            assert not release_log.exists()
-            for stage, code, expected in (("package", 74, ["package"]),
-                                          ("validate", 75, ["package", "validate"])):
+            for versioned in (False, True):
+                version_marker.unlink(missing_ok=True)
+                if versioned:
+                    version_marker.touch()
+                log = root / f"make-{arch}-{versioned}.log"
+                cache_log = root / f"cache-{arch}-{versioned}.log"
+                release_log = root / f"release-{arch}-{versioned}.log"
+                env = dict(os.environ, PATH=f"{tools}:{os.environ['PATH']}", MAKE_LOG=str(log),
+                           TARGET_ARCH=arch, CACHE_LOG=str(cache_log), RELEASE_LOG=str(release_log), GIT_SHA="a" * 40,
+                           MKFS_EROFS_PATH=str(stale_tool))
+                subprocess.run(["bash", "-e", "-o", "pipefail", "-c", command],
+                               cwd=source.parent, env=env, check=True)
+                goals = (["test", "vet"] if arch == "x86_64" else []) + ["build"]
+                if versioned:
+                    goals.append("check-version")
+                if arch == "x86_64":
+                    goals.append("test-release")
+                arguments = [[goal] + (["BUILD_VERSION=v0.1.6-preview.20261009"]
+                             if goal in ("build", "check-version") else []) for goal in goals]
+                assert log.read_text().splitlines() == [f"{args} {source}" for args in arguments]
+                assert cache_log.read_text().splitlines() == [arch + " rocksdb"]
+                assert release_log.read_text().splitlines() == ["package", "validate"]
                 log.unlink()
-                failed = subprocess.run(["bash", "-e", "-c", command], cwd=source.parent,
-                                        env=dict(env, FAIL_RELEASE=stage))
-                assert failed.returncode == code
-                assert log.read_text().splitlines() == [f"{[goal]} {source}" for goal in goals]
-                assert release_log.read_text().splitlines() == expected
                 release_log.unlink()
-            failed = subprocess.run(["bash", "-e", "-c", command], cwd=source.parent,
-                                    env=dict(env, GIT_SHA="b" * 40))
-            assert failed.returncode == 1 and not release_log.exists()
+                failed = subprocess.run(["bash", "-e", "-c", command], cwd=source.parent,
+                                        env=dict(env, CACHE_EXIT="71"))
+                assert failed.returncode == 71 and not log.exists() and not release_log.exists()
+                failed = subprocess.run(["bash", "-e", "-c", command], cwd=source.parent,
+                                        env=dict(env, FAIL_GOAL=goals[0]))
+                assert failed.returncode == 72
+                assert log.read_text().splitlines() == [f"{arguments[0]} {source}"]
+                assert not release_log.exists()
+                if versioned:
+                    log.unlink()
+                    failed = subprocess.run(["bash", "-e", "-c", command], cwd=source.parent,
+                                            env=dict(env, FAIL_GOAL="check-version"))
+                    assert failed.returncode == 72 and not release_log.exists()
+                for stage, code, expected in (("package", 74, ["package"]),
+                                              ("validate", 75, ["package", "validate"])):
+                    log.unlink()
+                    failed = subprocess.run(["bash", "-e", "-c", command], cwd=source.parent,
+                                            env=dict(env, FAIL_RELEASE=stage))
+                    assert failed.returncode == code
+                    assert log.read_text().splitlines() == [f"{args} {source}" for args in arguments]
+                    assert release_log.read_text().splitlines() == expected
+                    release_log.unlink()
+                failed = subprocess.run(["bash", "-e", "-c", command], cwd=source.parent,
+                                        env=dict(env, GIT_SHA="b" * 40))
+                assert failed.returncode == 1 and not release_log.exists()
 
 
 def check_source_workspace():

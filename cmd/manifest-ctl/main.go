@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/internal/version"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
@@ -25,6 +26,9 @@ import (
 const manifestConfigEnv = "MANIFEST_CONFIG"
 
 func main() {
+	if version.PrintIfRequested("manifest-ctl") {
+		return
+	}
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
@@ -52,6 +56,7 @@ func main() {
 
 func printUsage() {
 	fmt.Fprintf(os.Stderr, `Usage: manifest-ctl <command> [flags]
+       manifest-ctl --version
 
 Commands:
   store          Ingest one logical source (tarstream, file ref, selected Bundle

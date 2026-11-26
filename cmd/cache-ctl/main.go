@@ -26,6 +26,7 @@ import (
 	"time"
 
 	appcache "github.com/kuasar-sandbox/accelerator/app/cache"
+	"github.com/kuasar-sandbox/accelerator/internal/version"
 	"github.com/kuasar-sandbox/accelerator/pkg/activation"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/client"
@@ -36,6 +37,9 @@ import (
 )
 
 func main() {
+	if version.PrintIfRequested("cache-ctl") {
+		return
+	}
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
@@ -87,7 +91,7 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Fprintln(os.Stderr, "usage: cache-ctl <command> [args]")
+	fmt.Fprintln(os.Stderr, "usage: cache-ctl <command> [args]\n       cache-ctl --version")
 	fmt.Fprintln(os.Stderr, "commands:")
 	fmt.Fprintln(os.Stderr, "  serve       Start cache daemon")
 	fmt.Fprintln(os.Stderr, "  object get  Read a complete object")
