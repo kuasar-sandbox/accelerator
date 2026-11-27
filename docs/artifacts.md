@@ -8,6 +8,10 @@ This specification owns generic immutable-file encryption, tarstream and multi-M
 
 ## Logical data and responsibilities
 
+The Manifest customer key may be supplied as hex or an `@plugin/key` reference.
+See [Secret plugins](secret-plugins.md) for broker configuration and key lifetime.
+Content IDs and artifact references retain the formats documented below.
+
 ### Role
 
 ```mermaid

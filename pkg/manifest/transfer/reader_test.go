@@ -6,12 +6,30 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 )
+
+func TestRemoteReaderUsesAlreadyBoundCustomerKey(t *testing.T) {
+	// A changed or unavailable reference must not be re-resolved when a transfer
+	// first opens its remote Getter after constructing its local reader.
+	t.Setenv(manifest.CustomerKeyEnv, "@unconfigured/changed")
+	cfg := &manifest.Config{Crypto: crypto.Config{Chunk: "aes", Manifest: "aes"}}
+	r, err := NewReader(cfg, [32]byte{7}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	_, err = r.remoteFetcher()
+	if err == nil || !strings.Contains(err.Error(), "cache.endpoint or store.endpoint required") {
+		t.Fatalf("remote reader did not retain the supplied key: %v", err)
+	}
+}
 
 func TestOpenTarstreamPinsCarrierAndVerifiesWithReadPolicy(t *testing.T) {
 	ctx := context.Background()

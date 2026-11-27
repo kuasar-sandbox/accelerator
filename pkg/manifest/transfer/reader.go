@@ -53,7 +53,7 @@ func (r *Reader) Close() error {
 func (r *Reader) remoteFetcher() (manifest.FetcherCloser, error) {
 	if r.remote == nil {
 		var err error
-		r.remote, err = r.cfg.NewFetcher()
+		r.remote, err = r.cfg.NewFetcherWithKey(r.key)
 		if err != nil {
 			return nil, err
 		}

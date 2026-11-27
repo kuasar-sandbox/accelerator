@@ -88,6 +88,10 @@ s3:
 静态 AK/SK 必须成对出现；两者都为空时使用 AWS SDK 默认凭据链。字符串字段支持
 `${VAR}` 展开。`region` 缺省为 `us-east-1`，`path_style` 缺省为 `true`。
 
+静态 AK/SK 也支持带引号的 `@plugin/key` 引用，在 S3 client 构造时解析一次；
+应用显式注入的 CredentialsProvider 优先。该规则同样适用于 S3 generation source。
+配置和协议见 [Secret plugin](secret-plugins_zh.md)。
+
 `tls.ca_cert` 指向 PEM CA bundle 路径（可含多张证书），追加进系统信任库——用于
 信任 CA 不在系统库中的 endpoint（或拦截代理）。`tls.insecure_skip_verify: true`
 完全跳过 TLS 证书校验；不安全——流量（含凭据）可能被截获——仅供测试，勿用于

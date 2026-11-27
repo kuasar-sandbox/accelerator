@@ -8,6 +8,9 @@
 
 ## 逻辑数据与职责
 
+Manifest customer key 支持 hex 或 `@plugin/key` 引用。broker 配置和密钥生命周期见
+[Secret plugin](secret-plugins_zh.md)。内容 ID 与制品引用仍采用下文规定的格式。
+
 ### 模块定位
 
 ```mermaid
