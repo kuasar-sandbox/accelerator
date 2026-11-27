@@ -385,5 +385,38 @@ sys.exit("unexpected Docker operation (pull/tag/rm are forbidden)")
         self.assertFalse((self.case / "flatten.json").exists())
 
 
+class ManifestDiffAssertionTest(unittest.TestCase):
+    def check(self, output, default=True):
+        source = (E2E / "cases/image.manifest.sh").read_text()
+        function = 'assert_diff_summary() {' + source.split('assert_diff_summary() {', 1)[1].split('\n}\n', 1)[0] + '\n}\n'
+        return subprocess.run(['bash', '-c', 'set -euo pipefail\n' + function +
+                               'assert_diff_summary "$DIFF_OUTPUT" "$DEFAULT_FIXTURES"'],
+                              env=dict(os.environ, DIFF_OUTPUT=output, DEFAULT_FIXTURES='1' if default else '0'),
+                              capture_output=True, text=True, timeout=5)
+
+    def summary(self, shared=2, only_a=2, only_b=3):
+        return ("manifest A:  1.0 MiB, 7 chunks (4 unique)\n"
+                "manifest B:  1.0 MiB, 9 chunks (5 unique)\n"
+                f"shared:      {shared} chunks (8.0 KiB)\n"
+                f"only in A:   {only_a} chunks (8.0 KiB)\n"
+                f"only in B:   {only_b} chunks (12.0 KiB)\n")
+
+    def test_valid_partition_passes(self):
+        result = self.check(self.summary())
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_missing_or_inconsistent_counts_fail(self):
+        for output in ('shared chunks', self.summary(shared=3),
+                       self.summary() + 'shared: 2 chunks (8.0 KiB)\n'):
+            with self.subTest(output=output):
+                self.assertNotEqual(self.check(output).returncode, 0)
+
+    def test_default_fixtures_require_shared_and_distinct_content(self):
+        self.assertNotEqual(self.check(self.summary(shared=0, only_a=4, only_b=5)).returncode, 0)
+        # Explicit cached IMAGE_A/IMAGE_B overrides may legitimately be unrelated.
+        result = self.check(self.summary(shared=0, only_a=4, only_b=5), default=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
