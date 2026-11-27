@@ -91,13 +91,13 @@ exec(compile(setup, "fixture-setup", "exec"), namespace)
 outer = next(node for node in tree.body if isinstance(node, ast.For) and isinstance(node.target, ast.Name) and node.target.id == "backend")
 scenario = outer.body[0].body[0]
 boundary = next(i for i, node in enumerate(scenario.body) if isinstance(node, ast.FunctionDef) and node.name == "spawn")
-scenario.body = scenario.body[:boundary] + ast.parse("scenario_probe(backend, network, entrances)").body
+scenario.body = scenario.body[:boundary] + ast.parse("scenario_probe(backend, network, scenario, entrances)").body
 index = 0
-def probe(backend, network, entrances):
+def probe(backend, network, scenario, entrances):
     global index
     number = index
     index += 1
-    record = {{"backend": backend, "network": network, "leases": leases(), "tcp": [v for v in entrances.values() if not v.startswith("/")]}}
+    record = {{"backend": backend, "network": network, "scenario": scenario, "leases": leases(), "tcp": [v for v in entrances.values() if not v.startswith("/")]}}
     (trace / f"step-{{number}}.json").write_text(json.dumps(record))
     deadline = time.monotonic() + 10
     while not (trace / f"release-{{number}}").exists():
@@ -115,12 +115,13 @@ exec(compile(ast.fix_missing_locations(ast.Module(body=[outer], type_ignores=[])
             self.assertEqual(json.loads((self.root / "entered.json").read_text()), [],
                              "ports were selected before any scenario started")
             allocated = []
-            for index, expected in enumerate((backend, network) for backend in ("embedded", "redis", "store")
-                                             for network in ("tcp", "unix")):
+            for index, expected in enumerate((backend, network, scenario) for backend in ("embedded", "redis", "store")
+                                             for network in ("tcp", "unix")
+                                             for scenario in ("lifecycle", "initialization-failure")):
                 path = self.root / f"step-{index}.json"
                 self.wait_file(path, proc)
                 record = json.loads(path.read_text())
-                self.assertEqual((record["backend"], record["network"]), expected)
+                self.assertEqual((record["backend"], record["network"], record["scenario"]), expected)
                 allocated.extend(address.rsplit(":", 1)[1] for address in record["tcp"])
                 self.assertEqual(record["leases"], allocated)
                 self.assertEqual(len(set(allocated)), len(allocated))
@@ -133,7 +134,7 @@ exec(compile(ast.fix_missing_locations(ast.Module(body=[outer], type_ignores=[])
                 (self.root / f"release-{index}").touch()
             output, _ = proc.communicate(timeout=5)
             self.assertEqual(proc.returncode, 0, output)
-            self.assertEqual(len(allocated), 10)
+            self.assertEqual(len(allocated), 20)
             self.assertFalse(lease_path.exists(), "real shell EXIT trap did not remove its lease")
         finally:
             if proc.poll() is None:

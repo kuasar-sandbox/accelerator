@@ -206,9 +206,13 @@ with tempfile.TemporaryDirectory(prefix='acc-activation-invalid-') as raw:
                             accepted.close()
                 print(f'PASS {product}/{network}: 10 invalid FD configurations rejected by real CLI before backend creation; caller sockets preserved', flush=True)
 
+# Lifecycle and temporary-initialization recovery each own their manager units.
+# They must not consume one another's StartLimitBurst budget.
 for backend in ('embedded', 'redis', 'store'):
-    for network in ('tcp', 'unix'):
+    for network, scenario in ((network, scenario) for network in ('tcp', 'unix')
+                              for scenario in ('lifecycle', 'initialization-failure')):
         with owned_directory() as (root, directory_state), contextlib.ExitStack() as streams:
+            scenario_started = time.monotonic()
             unit = root.name
             service = unit + '.service'
             run_directory = Path('/run') / unit
@@ -388,6 +392,8 @@ TriggerLimitBurst=20
 ''')
                     socket_units.append(sock_unit)
                 sockets = ' '.join(socket_units)
+                startup_barrier = (f'ExecStartPre={json.dumps(sleep_binary)} 0.5\n'
+                                   if scenario == 'lifecycle' else '')
                 install(service, f'''[Unit]
 Description=Owned accelerator activation test service
 Requires={sockets}
@@ -401,8 +407,7 @@ Group={os.getgid()}
 Sockets={sockets}
 RuntimeDirectory={unit}
 RuntimeDirectoryMode=0700
-ExecStartPre={json.dumps(sleep_binary)} 0.5
-ExecStart={json.dumps(str(executable))} serve --config {json.dumps(str(cfg_path))} --drain-timeout 2s
+{startup_barrier}ExecStart={json.dumps(str(executable))} serve --config {json.dumps(str(cfg_path))} --drain-timeout 2s
 Restart=on-failure
 RestartSec=1s
 TimeoutStartSec=90s
@@ -417,17 +422,20 @@ StandardError=append:{log}
                 for address in entrances.values():
                     if address.startswith('/'):
                         assert stat.S_ISSOCK(os.stat(address).st_mode), 'manager UDS missing without service'
-                # A real manager listener connects before the Go service starts.
-                # The fixture's ExecStartPre holds startup for this single probe.
-                with contextlib.closing(Wire(data_endpoint, .15)) as c:
-                    c.request(5)
-                    try:
-                        c.response()
-                    except TimeoutError:
-                        pass
-                    else:
-                        raise AssertionError('listener-only endpoint passed protocol Ping')
-                    assert int(show()['MainPID']) == 0
+                if scenario == 'lifecycle':
+                    # A real manager listener connects before the Go service starts.
+                    # The fixture's ExecStartPre holds startup for this single probe.
+                    with contextlib.closing(Wire(data_endpoint, .15)) as c:
+                        c.request(5)
+                        try:
+                            c.response()
+                        except TimeoutError:
+                            pass
+                        else:
+                            raise AssertionError('listener-only endpoint passed protocol Ping')
+                        assert int(show()['MainPID']) == 0
+                else:
+                    ctl('start', service)
                 pid = wait_started(0)
                 if backend != 'store':
                     with contextlib.closing(Wire(data_endpoint)) as c:
@@ -449,110 +457,110 @@ StandardError=append:{log}
                             '--output', target, manifest_key)
                     manifest_bytes = target.read_bytes()
                 check_requests()
-                print(f'PASS {backend}/{network}: manager-only listener rejects Ping; actual binary serves all configured entrances', flush=True)
+                if scenario == 'lifecycle':
+                    print(f'PASS {backend}/{network}/{scenario}: manager-only listener rejects Ping; actual binary serves all configured entrances', flush=True)
 
-                # Prove admission has stopped by observing closure of each App
-                # listener copy. The CLI retains exactly one original per socket.
-                old, previous = pid, starts()
-                originals = {os.readlink(f'/proc/{old}/fd/{3+i}') for i in range(len(entrances))}
-                with contextlib.closing(Wire(data_endpoint)) as active:
-                    active.request(1)
-                    header = active.receive(8)
-                    ctl('restart', '--no-block', service)
-                    def copies_closed():
-                        assert int(show()['MainPID']) == old, 'old process exited before admitted response finished'
-                        targets = []
-                        for fd in Path(f'/proc/{old}/fd').iterdir():
-                            try:
-                                targets.append(os.readlink(fd))
-                            except FileNotFoundError:
-                                pass
-                        return all(targets.count(original) == 1 for original in originals)
-                    wait_for(copies_closed, 'App listening copies remained during drain')
-                    with contextlib.closing(Wire(data_endpoint)) as queued:
-                        queued.request(1)
-                        assert active.response(header, slow=True) == payload, 'planned restart truncated admitted response'
-                        pid = wait_started(previous)
-                        assert pid != old and not Path(f'/proc/{old}').exists(), 'instances overlapped'
-                        assert queued.response() == payload, 'manager lost unaccepted queued request'
-                check_requests()
-                print(f'PASS {backend}/{network}: planned restart drains old response and serves queued single-attempt request in next process', flush=True)
+                    # Prove admission has stopped by observing closure of each App
+                    # listener copy. The CLI retains exactly one original per socket.
+                    old, previous = pid, starts()
+                    originals = {os.readlink(f'/proc/{old}/fd/{3+i}') for i in range(len(entrances))}
+                    with contextlib.closing(Wire(data_endpoint)) as active:
+                        active.request(1)
+                        header = active.receive(8)
+                        ctl('restart', '--no-block', service)
+                        def copies_closed():
+                            assert int(show()['MainPID']) == old, 'old process exited before admitted response finished'
+                            targets = []
+                            for fd in Path(f'/proc/{old}/fd').iterdir():
+                                try:
+                                    targets.append(os.readlink(fd))
+                                except FileNotFoundError:
+                                    pass
+                            return all(targets.count(original) == 1 for original in originals)
+                        wait_for(copies_closed, 'App listening copies remained during drain')
+                        with contextlib.closing(Wire(data_endpoint)) as queued:
+                            queued.request(1)
+                            assert active.response(header, slow=True) == payload, 'planned restart truncated admitted response'
+                            pid = wait_started(previous)
+                            assert pid != old and not Path(f'/proc/{old}').exists(), 'instances overlapped'
+                            assert queued.response() == payload, 'manager lost unaccepted queued request'
+                    check_requests()
+                    print(f'PASS {backend}/{network}/{scenario}: planned restart drains old response and serves queued single-attempt request in next process', flush=True)
 
-                previous, old = starts(), pid
-                ctl('kill', '--kill-who=main', '--signal=SIGKILL', service)
-                pid = wait_started(previous)
-                assert pid != old and not Path(f'/proc/{old}').exists()
-                check_requests()
-                for _ in range(2):
                     previous, old = starts(), pid
-                    ctl('restart', service)
+                    ctl('kill', '--kill-who=main', '--signal=SIGKILL', service)
                     pid = wait_started(previous)
                     assert pid != old and not Path(f'/proc/{old}').exists()
                     check_requests()
-                print(f'PASS {backend}/{network}: SIGKILL and repeated restarts recover actual requests with one complete process', flush=True)
+                    for _ in range(2):
+                        previous, old = starts(), pid
+                        ctl('restart', service)
+                        pid = wait_started(previous)
+                        assert pid != old and not Path(f'/proc/{old}').exists()
+                        check_requests()
+                    print(f'PASS {backend}/{network}/{scenario}: SIGKILL and repeated restarts recover actual requests with one complete process', flush=True)
 
-                # Let the configured start-limit window from the preceding
-                # independent scenarios expire. Do not reset limits or retry a
-                # business request to disguise the initialization-failure case.
-                time.sleep(10.05)
-                ctl('stop', service)
-                assert not run_directory.exists(), 'service runtime directory was not cleaned'
-                for address in entrances.values():
-                    if address.startswith('/'):
-                        assert stat.S_ISSOCK(os.stat(address).st_mode), 'service directory cleanup deleted manager pathname'
-                previous, log_offset = starts(), len(text())
-                if backend == 'embedded':
-                    database = root / 'db'
-                    saved = root / 'db-saved'
-                    database.rename(saved)
-                    database.write_text('temporary initialization failure')
-                    expected = 'open rocks'
-                elif backend == 'redis':
-                    cfg['redis']['endpoint'] = str(root / 'missing-redis.sock')
+                    # Release manager ownership before ordinary bind uses the same
+                    # endpoints. The process owns only its own bind-created UDS now.
+                    ctl('stop', *socket_units, service)
+                    assert int(show()['MainPID']) == 0
+                    for sock_unit in socket_units:
+                        assert ctl('show', sock_unit, '--property=ActiveState', '--value').strip() == 'inactive'
+                    if backend == 'store':
+                        cfg['listen'], cfg['cache_listen'] = entrances['store'], data_endpoint
+                    else:
+                        cfg['listen'], cfg['health_listen'], cfg['pprof_listen'] = data_endpoint, entrances['health'], entrances['pprof']
                     cfg_path.write_text(json.dumps(cfg))
-                    expected = 'open redis'
+                    ordinary_log = root / 'ordinary.log'
+                    ordinary = spawn('ordinary', [str(executable), 'serve', '--config', str(cfg_path), '--drain-timeout', '2s'])
+                    def ordinary_started():
+                        assert ordinary.poll() is None, 'ordinary bind restart failed'
+                        return ' started"' in ordinary_log.read_text()
+                    wait_for(ordinary_started, 'ordinary bind never initialized')
+                    check_requests()
+                    ordinary.terminate()
+                    assert ordinary.wait(timeout=10) == 0
+                    print(f'PASS {backend}/{network}/{scenario}: socket units released before rollback; ordinary bind serves unchanged endpoints', flush=True)
                 else:
-                    generation_file.rename(root / 'generations-saved')
-                    expected = 'initial generations'
-                ctl('start', service)
-                wait_for(lambda: expected in text()[log_offset:] and show()['SubState'] == 'auto-restart',
-                         'temporary initialization failure did not schedule recovery')
-                if backend == 'embedded':
-                    database.unlink()
-                    saved.rename(database)
-                elif backend == 'redis':
-                    cfg['redis']['endpoint'] = str(root / 'redis.sock')
-                    cfg_path.write_text(json.dumps(cfg))
-                else:
-                    (root / 'generations-saved').rename(generation_file)
-                # No systemctl start/reset-failed here: the existing Restart
-                # policy must recover this instance itself.
-                pid = wait_started(previous)
-                check_requests()
-                assert int(show()['NRestarts']) >= 1
-                print(f'PASS {backend}/{network}: first initialization failure recovers through existing Restart budget; UDS survives runtime cleanup', flush=True)
+                    # This unit starts with a fresh limit budget. Its recovery
+                    # must come from Restart=on-failure, without reset-failed.
+                    ctl('stop', service)
+                    assert not run_directory.exists(), 'service runtime directory was not cleaned'
+                    for address in entrances.values():
+                        if address.startswith('/'):
+                            assert stat.S_ISSOCK(os.stat(address).st_mode), 'service directory cleanup deleted manager pathname'
+                    previous, log_offset = starts(), len(text())
+                    if backend == 'embedded':
+                        database = root / 'db'
+                        saved = root / 'db-saved'
+                        database.rename(saved)
+                        database.write_text('temporary initialization failure')
+                        expected = 'open rocks'
+                    elif backend == 'redis':
+                        cfg['redis']['endpoint'] = str(root / 'missing-redis.sock')
+                        cfg_path.write_text(json.dumps(cfg))
+                        expected = 'open redis'
+                    else:
+                        generation_file.rename(root / 'generations-saved')
+                        expected = 'initial generations'
+                    ctl('start', service)
+                    wait_for(lambda: expected in text()[log_offset:] and show()['SubState'] == 'auto-restart',
+                             'temporary initialization failure did not schedule recovery')
+                    if backend == 'embedded':
+                        database.unlink()
+                        saved.rename(database)
+                    elif backend == 'redis':
+                        cfg['redis']['endpoint'] = str(root / 'redis.sock')
+                        cfg_path.write_text(json.dumps(cfg))
+                    else:
+                        (root / 'generations-saved').rename(generation_file)
+                    # No systemctl start/reset-failed here: the existing Restart
+                    # policy must recover this instance itself.
+                    pid = wait_started(previous)
+                    check_requests()
+                    assert int(show()['NRestarts']) >= 1
+                    print(f'PASS {backend}/{network}/{scenario}: first initialization failure recovers through existing Restart budget; UDS survives runtime cleanup', flush=True)
 
-                # Release manager ownership before ordinary bind uses the same
-                # endpoints. The process owns only its own bind-created UDS now.
-                ctl('stop', *socket_units, service)
-                assert int(show()['MainPID']) == 0
-                for sock_unit in socket_units:
-                    assert ctl('show', sock_unit, '--property=ActiveState', '--value').strip() == 'inactive'
-                if backend == 'store':
-                    cfg['listen'], cfg['cache_listen'] = entrances['store'], data_endpoint
-                else:
-                    cfg['listen'], cfg['health_listen'], cfg['pprof_listen'] = data_endpoint, entrances['health'], entrances['pprof']
-                cfg_path.write_text(json.dumps(cfg))
-                ordinary_log = root / 'ordinary.log'
-                ordinary = spawn('ordinary', [str(executable), 'serve', '--config', str(cfg_path), '--drain-timeout', '2s'])
-                def ordinary_started():
-                    assert ordinary.poll() is None, 'ordinary bind restart failed'
-                    return ' started"' in ordinary_log.read_text()
-                wait_for(ordinary_started, 'ordinary bind never initialized')
-                check_requests()
-                ordinary.terminate()
-                assert ordinary.wait(timeout=10) == 0
-                print(f'PASS {backend}/{network}: socket units released before rollback; ordinary bind serves unchanged endpoints', flush=True)
             except BaseException:
                 for path in root.glob('*.log'):
                     print(path.name + ':\n' + path.read_text(), file=sys.stderr)
@@ -565,5 +573,8 @@ StandardError=append:{log}
                     print(f'activation diagnostics failed: {diagnostic_error}', file=sys.stderr)
                 raise
             finally:
-                cleanup()
+                try:
+                    cleanup()
+                finally:
+                    print(f'TIMING {backend}/{network}/{scenario}: {time.monotonic() - scenario_started:.3f}s', flush=True)
 PY
