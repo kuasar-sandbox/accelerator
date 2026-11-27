@@ -88,10 +88,11 @@ class CacheAssertionTests(unittest.TestCase):
 
 
 class MembershipLoadTests(unittest.TestCase):
-    def exercise(self, mode, calls=1, existing_prefix=False):
-        source = (CASES / "storage.cache-membership.sh").read_text()
+    def exercise(self, mode, calls=1, existing_prefix=False, filename="storage.cache-membership.sh"):
+        source = (CASES / filename).read_text()
+        helper = "load_hash_via_tiered" if filename == "storage.cache-membership.sh" else "wait_manifest_load"
         functions = "\n".join(name + "() {" + section(source, name + "() {", "\n}\n") + "\n}"
-                              for name in ("payload_hash", "load_hash_via_tiered"))
+                              for name in ("payload_hash", helper))
         with tempfile.TemporaryDirectory(prefix="membership-load-") as directory:
             root = Path(directory)
             binary = root / "manifest-ctl"
@@ -115,13 +116,14 @@ with stream:
         stream.write(b'partial')
         print('partial load failed', file=sys.stderr)
         sys.exit(23)
-    if mode == 'corrupt':
+    if mode == 'corrupt' or (mode == 'corrupt-first' and first):
         stream.write(b'not a tar archive')
     else:
         with tarfile.open(fileobj=stream, mode='w') as archive:
             info = tarfile.TarInfo('image')
-            info.size = len(b'payload')
-            archive.addfile(info, io.BytesIO(b'payload'))
+            payload = b'wrong' if mode == 'wrong-first' and first else b'payload'
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
 """)
             binary.chmod(0o755)
             prefix = root / "output"
@@ -129,10 +131,12 @@ with stream:
                 prefix.write_bytes(b'previous unrelated data')
             environment = dict(os.environ, BIN=directory, TIERED_PORT="1",
                                LOAD_CALLS=str(root / "calls"), LOAD_MODE=mode,
-                               LOAD_PREFIX=str(prefix))
+                               LOAD_PREFIX=str(prefix), EXPECTED_HASH=hashlib.sha256(b"payload").hexdigest())
+            invocation = ('load_hash_via_tiered key \"$LOAD_PREFIX\" fixture\n' if helper == 'load_hash_via_tiered' else
+                          'wait_manifest_load fixture \"$LOAD_PREFIX\" key \"$EXPECTED_HASH\"\n')
             program = ('set -euo pipefail\nsleep() { :; }\n'
                        'accel_cfg_for_cache() { echo fixture; }\n' + functions + '\n' +
-                       'load_hash_via_tiered key "$LOAD_PREFIX" fixture\n' * calls)
+                       invocation * calls)
             result = subprocess.run(['bash', '-c', program], env=environment,
                                     capture_output=True, text=True, timeout=10)
             outputs = [Path(json.loads(line)) for line in (root / 'calls').read_text().splitlines()]
@@ -153,22 +157,122 @@ with stream:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(count, 1)
 
-    def test_partial_failure_does_not_poison_the_next_attempt(self):
+    def test_partial_business_read_is_not_retried_green(self):
         result, count = self.exercise('partial-first')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(count, 2)
-        self.assertEqual(result.stdout.strip(), hashlib.sha256(b'payload').hexdigest())
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(count, 1)
+        self.assertEqual(result.stdout, '')
+        self.assertIn('partial load failed', result.stderr)
 
     def test_failed_or_corrupt_loads_cannot_pass(self):
         for mode in ('fail', 'corrupt'):
             with self.subTest(mode=mode):
                 result, count = self.exercise(mode)
                 self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertEqual(count, 10)
+                self.assertEqual(count, 1)
                 self.assertEqual(result.stdout, '')
-                self.assertIn('did not load/decode through tiered cache', result.stderr)
-                self.assertIn('attempt-1.', result.stderr)
-                self.assertIn('attempt-10.', result.stderr)
+                self.assertIn('did not load/decode through tiered cache on its single attempt', result.stderr)
+                self.assertIn('read.', result.stderr)
+
+
+class MembershipCommitTests(unittest.TestCase):
+    def exercise(self, log, peers, *, epoch=2, alive=True, info_status=0):
+        source = (CASES / "storage.cache-membership.sh").read_text()
+        function = "wait_membership() {" + section(source, "wait_membership() {", "\n}\n") + "\n}\n"
+        with tempfile.TemporaryDirectory(prefix="membership-commit-") as directory:
+            root = Path(directory)
+            (root / "tiered.log").write_text(log)
+            binary = root / "cache-ctl"
+            binary.write_text('#!/bin/bash\n'
+                              'printf "%s\\n" "$*" >> "$INFO_CALLS"\n'
+                              'printf "%s\\n" "$INFO_JSON"\n'
+                              'exit "$INFO_STATUS"\n')
+            binary.chmod(0o755)
+            environment = dict(os.environ, BIN=directory, TMPDIR=directory,
+                               TIERED_HEALTH_PORT="1234", INFO_CALLS=str(root / "calls"),
+                               INFO_JSON=json.dumps({"tiered": {"tiers": [{"peers": [{"id": peer} for peer in peers]}]}}),
+                               INFO_STATUS=str(info_status), DAEMON_ALIVE="1" if alive else "0")
+            # Check actual Bash process liveness. The exited child belongs to
+            # this test, while the live case uses the current shell itself.
+            program = ('set -euo pipefail\nsleep() { :; }\n'
+                       'if [ "$DAEMON_ALIVE" = 1 ]; then TIERED_PID=$$; '
+                       'else (exit 0) & TIERED_PID=$!; wait "$TIERED_PID"; fi\n' +
+                       function + f'wait_membership {epoch} "s2,s3,s4,s5,s6"\n')
+            result = subprocess.run(['bash', '-c', program], env=environment,
+                                    capture_output=True, text=True, timeout=10)
+            calls = (root / "calls").read_text().splitlines() if (root / "calls").exists() else []
+            self.assertTrue(all(call == 'info --endpoint 127.0.0.1:1234 --json' for call in calls))
+            return result, calls
+
+    def test_committed_epoch_and_exact_peers_are_required_together(self):
+        for epoch in (2, 3):
+            with self.subTest(epoch=epoch):
+                result, calls = self.exercise(f'ec: membership epoch {epoch - 1} → {epoch} committed\n',
+                                             ['s6', 's2', 's5', 's3', 's4'], epoch=epoch)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(calls), 1)
+
+    def test_missing_or_wrong_epoch_cannot_use_a_ready_peer_list(self):
+        for log in ('', 'ec: membership epoch 0 → 1 committed\n', 'ec: membership epoch 2 → 3 committed\n'):
+            with self.subTest(log=log):
+                result, calls = self.exercise(log, ['s2', 's3', 's4', 's5', 's6'])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(calls, [])
+
+    def test_committed_log_cannot_accept_old_peers(self):
+        result, calls = self.exercise('ec: membership epoch 1 → 2 committed\n', ['s1', 's2', 's3', 's4', 's5'])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(calls), 100)
+        self.assertIn('s1', result.stderr)
+
+    def test_dead_daemon_cannot_reuse_committed_state(self):
+        result, calls = self.exercise('ec: membership epoch 1 → 2 committed\n', ['s2', 's3', 's4', 's5', 's6'], alive=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(calls, [])
+
+    def test_failed_info_command_cannot_pass_with_expected_json(self):
+        result, calls = self.exercise('ec: membership epoch 1 → 2 committed\n', ['s2', 's3', 's4', 's5', 's6'], info_status=1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(calls), 100)
+
+
+class FillReadinessTests(unittest.TestCase):
+    # Exercise the real helper bodies with a CLI that implements exclusive
+    # creation and controlled partial/corrupt output, without claiming E2E.
+    exercise = MembershipLoadTests.exercise
+
+    def test_partial_fill_uses_a_fresh_probe_and_preserves_existing_output(self):
+        for filename in ("storage.cache.sh", "storage.tiered-cache.sh"):
+            with self.subTest(case=filename):
+                result, count = self.exercise('partial-first', existing_prefix=True, filename=filename)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(count, 2)
+
+    def test_repeated_observations_have_distinct_outputs(self):
+        for filename in ("storage.cache.sh", "storage.tiered-cache.sh"):
+            with self.subTest(case=filename):
+                result, count = self.exercise('success', calls=2, filename=filename)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(count, 2)
+
+    def test_completed_corrupt_or_wrong_payload_fails_without_retry(self):
+        for filename in ("storage.cache.sh", "storage.tiered-cache.sh"):
+            for mode in ('corrupt-first', 'wrong-first'):
+                with self.subTest(case=filename, mode=mode):
+                    result, count = self.exercise(mode, filename=filename)
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(count, 1)
+                    self.assertIn('completed fill probe returned invalid or mismatched payload', result.stderr)
+
+    def test_exhausted_observation_retains_first_and_last_failure(self):
+        for filename in ("storage.cache.sh", "storage.tiered-cache.sh"):
+            with self.subTest(case=filename):
+                result, count = self.exercise('fail', filename=filename)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(count, 100)
+                self.assertIn('attempt-1.stderr', result.stderr)
+                self.assertIn('attempt-100.stderr', result.stderr)
+                self.assertIn('partial load failed', result.stderr)
 
 
 if __name__ == "__main__":
