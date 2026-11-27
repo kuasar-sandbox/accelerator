@@ -330,7 +330,7 @@ Distinct native inputs cannot overwrite a shared material name. RPM collection
 requires complete same-source sibling listings. These materials support release
 review, not legal certification, and do not change the RocksDB backend or durability.
 
-This repository publishes independent component versions named `vX.Y.Z`. Each published native-architecture component archive contains the three service binaries and the documented operational/performance helper scripts selected by the release contract. The aggregate platform archive carries selected user guides and canonical E2E runtime inputs from its explicit documentation/test selections. Internal design documents and source-only tests remain in the source repositories.
+This repository publishes independent component versions named `vX.Y.Z`. Each published native-architecture component archive contains the three command-line binaries and the documented operational/performance helper scripts selected by the release contract. The aggregate platform archive carries selected user guides and canonical E2E runtime inputs from its explicit documentation/test selections. Internal design documents and source-only tests remain in the source repositories.
 
 The project repository publishes aggregate versions named `release-vX.Y.Z`, selecting exact versions of `accelerator` and the other release units, validating their assets, and running cross-component tests. Aggregate and component version numbers are independent.
 

@@ -4,6 +4,12 @@
 
 Accelerator owns the shared OCI/directory/archive preparation libraries in `pkg/flatten`, `pkg/image` and `pkg/remote`. This guide defines their source lifetime, image payload, conversion policy, Plan and completion contracts. [flatten-ctl usage](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten-cli.md) belongs to guest-runtime, which publishes that CLI. Generic sparse data, encryption and carriers are defined in [artifacts](artifacts.md).
 
+## Choose the user-facing entry point
+
+For an application template, use the platform [Build workflow](https://github.com/kuasar-sandbox/orchestrator/blob/main/docs/node-build.md#client-workflow), which owns task execution and publication. To prepare a reusable image file independently, use the published [flatten-ctl CLI](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten-cli.md), choose the Guest architecture explicitly, and verify the completed output before [upload or distribution](transfer.md#publish-and-reuse-an-artifact). `flatten-ctl` is delivered by guest-runtime, not the Accelerator component archive.
+
+The linked Go EROFS generator handles OCI, directory and archive preparation. Image generation uses neither a host mkfs.erofs installation nor a loop-mounted filesystem. Registry reachability, selected image platform, input ownership and filesystem capacity remain real prerequisites. The contracts below are for library integrators and for diagnosing incomplete or incompatible output; a successful intermediate payload write is not completed publication.
+
 ## Library entry points and consumer responsibilities
 
 `PrepareImage`, `PrepareArchive` and `PrepareDir` select and prepare immutable logical content. Their `PreparedImage` retains the prepared rootfs (or borrows the selected directory), layout, Plan and descriptors until `Close` joins any active output and releases owned resources. Original archive and layer bodies are consumed and closed during preparation, not retained until `PreparedImage.Close`. Callers own execution-resource limits, stable input, the requested writer and publication of the final result. The sections below define the exact boundaries; successful payload writes alone are not successful artifact publication.

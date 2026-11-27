@@ -4,6 +4,12 @@
 
 Accelerator 维护 `pkg/flatten`、`pkg/image`、`pkg/remote` 中共享的 OCI/目录/归档制备库。本篇定义来源生命周期、镜像 payload、转换政策、Plan 和完成契约。[flatten-ctl 用法](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten-cli_zh.md)归发布该 CLI 的 guest-runtime；通用稀疏数据、加密和载体由[数据契约](artifacts_zh.md)定义。
 
+## 选择面向用户的入口
+
+应用模板使用平台 [Build 流程](https://github.com/kuasar-sandbox/orchestrator/blob/main/docs/node-build_zh.md)，由其管理任务执行和发布。独立制备可复用镜像文件时，使用已发布的 [flatten-ctl CLI](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten-cli_zh.md)，明确选择 Guest 架构，验证完整输出后再[上传或分发](transfer_zh.md#发布并复用工件)。`flatten-ctl` 由 guest-runtime 交付，不在 Accelerator 组件归档中。
+
+链接的 Go EROFS 生成器处理 OCI、目录和归档制备；不需要先安装 host mkfs.erofs 或挂载 loop 文件系统。Registry 可达性、所选镜像平台、输入所有权和文件系统容量仍是实际前置条件。下文面向库集成及不完整/不兼容输出的诊断，中间 payload 写入成功不等于发布完成。
+
 ## 库入口与消费者责任
 
 `PrepareImage`、`PrepareArchive`、`PrepareDir` 选择并制备不可变逻辑内容，返回的 `PreparedImage` 持有制备出的私有 rootfs（或借用选定目录）、layout、Plan 和 FD，直到 `Close` 等待活动输出结束并释放自有资源。原始归档和层 body 在制备期间消费并关闭，不会保留到 `PreparedImage.Close`。调用者负责执行资源、输入稳定性、目标 writer 和结果发布。以下章节定义精确边界；只写完 payload 不等于工件发布成功。

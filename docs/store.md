@@ -6,6 +6,30 @@ Use this guide to deploy an independent FS or S3-compatible Store, configure and
 
 `store-ctl` provides a unified persistent-storage data plane for `manifest-ctl` and cache origins. Object data may reside on a local/shared filesystem or in S3-compatible object storage. The generation list can independently come from the main configuration, a regular file or a separate S3 object.
 
+## Deploy a first persistent Store
+
+For platform deployment, use the Store service and persistent mounts selected by [node-infra](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra.md). Do not start a competing Store against its data directory or listener. For an independent service, begin with one filesystem backend and a direct client path; S3 and cache can be introduced separately.
+
+1. Install `store-ctl` and `manifest-ctl` from the same selected release combination. Create the persistent root directory and make it writable by the service account before starting; the FS backend requires that directory to exist. Choose an endpoint reachable by the intended consumers. A loopback listener serves only the local network namespace; cluster consumers need a protected reachable address or a deliberately shared service.
+2. Save a complete configuration, for example `/etc/accelerator/store.yaml`:
+
+   ```yaml
+   listen: 127.0.0.1:7100
+   backend: fs
+   fs:
+     root: /var/lib/kuasar-accelerator-store
+     verify_content_key: true
+   generations:
+     config: [G1]
+   ```
+
+   This inline generation list is ready to use and needs no `store-ctl init`. To let the administration commands manage the list, instead select one file or S3 generation source and run `init` once before first startup. Do not reinitialize a retained source on each restart. Data backend and generation source are independent choices.
+3. Run `store-ctl serve --config /etc/accelerator/store.yaml` under your service manager, or in a dedicated foreground terminal. The ordinary listener is sufficient for a first service. [Socket activation](#named-listeners-and-socket-activation) is optional when the deployment needs a manager to retain listeners across process restarts.
+4. Point Manifest configuration at this `store.endpoint`, leave `cache.endpoint` empty, supply the retained customer key, and [upload, verify and read an artifact](transfer.md#publish-and-reuse-an-artifact). A bound socket or active process is not a successful data roundtrip. `store-ctl info --config /etc/accelerator/store.yaml` inspects the configured backend/list and reports counts; it does not probe the running RPC listener.
+5. Back up the object directory, generation list, complete artifact references and customer keys according to their owners. When changing the current write generation, retain every older generation still needed by an image, template, snapshot or parent chain. See [Administrative commands](#administrative-commands) before rollout or purge.
+
+For S3, replace the data backend with the [S3 configuration](#s3-data-backend), verify endpoint/credentials/TLS access from the Store host, and keep remote backend credentials with the service. Clients only need the Store endpoint and their content-protection key. A local cache is optional in both deployments.
+
 ## Core model
 
 There is one representation of generations:

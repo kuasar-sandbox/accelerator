@@ -19,7 +19,9 @@ tiers:
       bloom_bits: 15
 
 origin:
-  backend: fs
-  fs:
-    root: /var/store
+  type: store
+  store:
+    endpoint: 127.0.0.1:7100
+    pool: 4
+    timeout: 2s
   max_inflight: 16

@@ -8,6 +8,30 @@
 位于本地/共享文件系统或 S3-compatible object storage；generation 列表则可独立
 来自主配置、普通文件或单独的 S3 object。
 
+## 部署首个持久 Store
+
+平台部署使用 [node-infra](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra_zh.md)选定的 Store 服务和持久挂载，不要对其数据目录或监听地址再启动竞争服务。独立部署先使用一个文件系统后端和直接客户端路径，S3 与 cache 可分别引入。
+
+1. 从同一选定发行组合安装 `store-ctl` 和 `manifest-ctl`，启动前创建持久根目录并让服务账号可写；FS 后端要求该目录已存在。选择消费者可达的 endpoint。loopback 监听只服务本地 network namespace；集群消费者需要受保护的可达地址或明确共享的服务。
+2. 保存完整配置，例如 `/etc/accelerator/store.yaml`：
+
+   ```yaml
+   listen: 127.0.0.1:7100
+   backend: fs
+   fs:
+     root: /var/lib/kuasar-accelerator-store
+     verify_content_key: true
+   generations:
+     config: [G1]
+   ```
+
+   内联 generation 列表可直接使用，无需 `store-ctl init`。需要用管理命令维护列表时，改选一个 file 或 S3 generation source，首次启动前执行一次 `init`，不要在每次重启时重新初始化保留的 source。数据后端与 generation source 是独立选择。
+3. 由服务管理器运行 `store-ctl serve --config /etc/accelerator/store.yaml`，或在独立终端以前台方式运行。首次部署用普通 listener 即可；需要由管理器跨进程重启保留监听时，再选用 [socket activation](#命名监听与-socket-activation)。
+4. 将 Manifest 配置的 `store.endpoint` 指向该服务，保持 `cache.endpoint` 为空，提供保留的客户密钥，执行[工件上传、验证和读取](transfer_zh.md#发布并复用工件)。socket 已绑定或进程 active 不构成数据往返成功。`store-ctl info --config /etc/accelerator/store.yaml` 直接检查配置的后端/列表并报告数量，不探测运行中的 RPC listener。
+5. 按各自所有者备份对象目录、generation 列表、完整工件引用及客户密钥。切换当前写入 generation 时，保留镜像、模板、快照或父链仍需要的旧代。执行 rollout/purge 前阅读 [Admin 命令](#admin-命令)。
+
+使用 S3 时，将数据后端替换为 [S3 配置](#s3-数据后端)，从 Store 主机核验 endpoint、凭据和 TLS 访问，远端后端凭据由服务持有。客户端只需要 Store endpoint 与内容保护密钥；两种部署都可按需增加本地 cache。
+
 ## 核心模型
 
 generation 只有一种表示：

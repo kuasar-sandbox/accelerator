@@ -4,6 +4,27 @@
 
 `manifest-ctl` and the shared transfer API move selected logical content between tarstream files, Manifest Bundles and Store. Start with the complete local roundtrip, then use the command and configuration reference. The [data contract](artifacts.md) defines references, sparse data, formats and encryption; this guide owns invocation, transformations, output and caller responsibilities.
 
+## Publish and reuse an artifact
+
+Choose the destination before converting data. A platform Build may already have published a complete usable template reference; use that reference directly instead of re-uploading its payload. `manifest-ctl` is useful for importing existing artifacts, moving them between supported carriers, and verifying stored content.
+
+| Situation | Recommended path | Retain for later reads |
+|---|---|---|
+| Artifact stays on one node | A complete local tarstream or Bundle with a `file://` reference | File and its identity qualifier, key if protected, and all referenced parents/dependencies. |
+| Multiple nodes share a consistently mounted filesystem | Publish the complete file/dependency set and use the consumer's named location mapping | Shared bytes, location mapping and complete refs; a pathname alone does not establish cross-node availability. |
+| Artifact must be read through object storage | `manifest-ctl store` to Store, then consume `manifest://<returned-key>` | Store objects/generations, complete reference and the customer key that seals its key table. |
+| Export or import a portable offline package | Bundle output and the documented Bundle transfer/verification path | Bundle dependencies and selected root reference; upload completion must precede publishing the new Store reference. |
+
+For a persistent Store workflow:
+
+1. Deploy [Store](store.md#deploy-a-first-persistent-store) and create a [Manifest config](#manifest-configyaml) with `store.endpoint`, verification enabled and no cache endpoint initially. Deliver the existing 32-byte customer key as a 64-character hexadecimal `MANIFEST_KEY`, or use the documented protected configuration mechanism. Generate a new key only when intentionally creating a new content-protection domain; retain it to read the resulting artifacts later.
+2. Use `flatten-ctl` from the matching guest-runtime release to prepare an image if needed. Current preparation uses the linked Go EROFS generator; host mkfs.erofs installation or privileged loop mounting is not a preparation step. Ownership-preserving export may still require privileges as described in the CLI guide.
+3. Run `manifest-ctl store --manifest-config /etc/accelerator/manifest.yaml --no-progress /path/to/artifact.img`. For upload-only output, stdout is the Manifest key. Record `manifest://` plus that complete key only after successful completion. Do not use a digest prefix or a temporary source pathname as the published reference.
+4. Run `manifest-ctl verify --manifest-config /etc/accelerator/manifest.yaml --no-progress manifest://<returned-key>`, then load or consume it from the intended node. Verify with the same customer key and the intended Store/generation visibility. Add cache only after this path works.
+5. Publish the reference through the platform's template/instance workflow and retain the key, Runtime declaration, parent/dependency refs and durable bytes. Exporting one layer does not necessarily make a parent-dependent snapshot self-contained. Use the exact transfer options below when relocation, merging or repacking is intended; these operations can change identity.
+
+The disposable roundtrip below creates and deletes its own test key and storage. It is a diagnostic exercise, not a persistent key-provisioning recipe. Generic tar files and raw payload files do not carry the same sparse/identity contract as the platform tarstream envelope.
+
 ## Independent Store roundtrip
 
 Use this before adding a VM or cache. Prerequisites: Linux, Bash, Python 3,
@@ -15,7 +36,7 @@ Use matching selected versions, not unrelated latest component downloads.
 
 The following disposable FS Store uses a private UDS and a generated test-only
 customer key. No L2, MicroVM, registry, public listener or external data is involved.
-[Store generation initialization](store.md#administrative-commands) and
+Its inline generation list needs no initialization; [Store generation administration](store.md#administrative-commands) and
 [Configuration](#configuration) remain authoritative. Run in a new shell. Exit cleanup always stops this
 child; only success removes its temporary directory. Failure retains the private
 directory and prints its path for diagnosis.
@@ -38,6 +59,7 @@ cleanup() {
   exit "$result"
 }
 trap cleanup EXIT
+mkdir "$LAB/objects"
 cat > "$LAB/store.yaml" <<EOF
 listen: unix://$LAB/store.sock
 backend: fs
@@ -45,10 +67,8 @@ fs:
   root: $LAB/objects
   verify_content_key: true
 generations:
-  file:
-    path: $LAB/generations
+  config: [G1]
 EOF
-store-ctl init --config "$LAB/store.yaml" --generation G1
 store-ctl serve --config "$LAB/store.yaml" >"$LAB/store.log" 2>&1 &
 STORE_PID=$!
 for i in $(seq 1 50); do
@@ -57,7 +77,8 @@ for i in $(seq 1 50); do
   sleep 0.1
 done
 test -S "$LAB/store.sock"
-export MANIFEST_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+MANIFEST_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+export MANIFEST_KEY
 cat > "$LAB/manifest.yaml" <<EOF
 store:
   endpoint: unix://$LAB/store.sock
@@ -87,7 +108,7 @@ Expect a complete Manifest key, zero failed chunks from verify, and the final
 PASS line. Compare extracted logical bytes: tar wrappers/names can differ after
 load. A normal file or a generic tar is not a substitute for the platform
 sparse/digest envelope. On failure inspect `store.log` in the retained directory
-reported on stderr; check generation initialization, socket readiness and key availability;
+reported on stderr; check generation configuration, socket readiness and key availability;
 do not retry an uncertain write as though it were a failed read. This validates
 only a local byte roundtrip, not sparse VM state, cache tiers, S3 or recovery.
 After diagnosis, explicitly remove only the reported private test directory.

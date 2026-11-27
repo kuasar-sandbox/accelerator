@@ -6,6 +6,12 @@ This is the common data contract for Accelerator readers, writers and consumers.
 
 This specification owns generic immutable-file encryption, tarstream and multi-Manifest Bundle contracts, together with the [logical Manifest/Chunk objects and keys](#manifest-objects-and-sparse-access). [Data transfer](transfer.md) owns commands and workflows; [Store](store.md) owns persistence and admission. Sandbox E/S contents belong to the [sandbox artifact contract](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/artifacts.md#artifact-model), while OCI/EROFS payload semantics belong to [Image preparation](image-preparation.md#image-payload-and-runtime-configuration).
 
+## What to retain and pass to another node
+
+A usable artifact is more than its visible filename or content digest. Retain the complete canonical reference, the bytes it selects, any parent/dependency references, the content-protection key required by that carrier, and a declared guest Runtime when present. A named file location also needs the destination consumer's location mapping; a Manifest needs access to its Store generations or a complete alternative carrier.
+
+Copy a complete published reference unchanged when moving the same logical artifact. Do not strip `@manifest`, `@location` or `@runtime` qualifiers to shorten it. A customer key protects the Manifest key table or local carrier; the hexadecimal Manifest content key in a reference is a locator, not that secret. For commands that prepare, publish and verify these pieces, start with [Publish and reuse an artifact](transfer.md#publish-and-reuse-an-artifact). The remainder of this page defines their exact representation for integrators.
+
 ## Logical data and responsibilities
 
 ### Role

@@ -6,6 +6,12 @@
 
 本篇定义通用不可变文件加密、tarstream、多 Manifest Bundle 契约及下文的[逻辑 Manifest/Chunk 对象与密钥](#manifest-对象与稀疏访问)。[数据传输](transfer_zh.md) 定义命令与流程，[Store](store_zh.md) 定义持久化和准入。Sandbox E/S 内容由 [Sandbox 工件契约](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/artifacts_zh.md#artifact-model) 定义，OCI/EROFS payload 语义由[镜像制备](image-preparation_zh.md#镜像-payload-与运行配置)定义。
 
+## 需要保留和传递到其他节点的内容
+
+可用工件不只有可见文件名或内容摘要，还需保留完整规范引用、引用选中的字节、父层/依赖引用、该载体所需的内容保护密钥，以及存在时声明的 guest Runtime。命名文件位置还需要目标消费者的 location 映射；Manifest 需要访问其 Store generation 或完整替代载体。
+
+搬运同一逻辑工件时保留完整发布引用，不要为缩短字符串而删除 `@manifest`、`@location` 或 `@runtime` 限定符。客户密钥保护 Manifest key table 或本地载体；引用中的十六进制 Manifest content key 是定位符，不是这个秘密。制备、发布和验证这些内容的命令见[发布并复用工件](transfer_zh.md#发布并复用工件)，本文后续内容为集成者定义精确表示。
+
 ## 逻辑数据与职责
 
 ### 模块定位
@@ -42,8 +48,13 @@ flowchart TD
 
 `pkg/manifest` 同时提供 canonical ref parser。`manifest://` 只允许一个 64 位
 小写十六进制 content key;多层组合必须由调用方传入显式 ref 数组并使用
-`fetch.NewLayered`,不再使用 `manifest://k1:k2`。文件引用为
-`file://<path>[@digest:<digest>|@hmac:<digest>|@manifest:<key>][@location:<name>]`;
+`fetch.NewLayered`,不再使用 `manifest://k1:k2`。文件引用为：
+
+```text
+file://<path>[@digest:<digest>|@hmac:<digest>|@manifest:<key>][@location:<name>]
+```
+
+
 三个 identity qualifier 互斥。`@manifest` 选择 Manifest Bundle 中的根 Manifest，
 tarstream opener 必须拒绝它；反之 Bundle opener 必须拒绝 `@digest/@hmac`。带
 location 时 path 必须是 basename,location 匹配
@@ -51,8 +62,14 @@ location 时 path 必须是 basename,location 匹配
 容纳 UUIDv7 sandbox/build ID。
 
 快照引用可追加唯一且位于末尾的
-`@runtime:<basename>:digest:<64 位小写十六进制摘要>`。Manifest、Bundle 和
-tarstream 引用均可携带该声明。basename 是 UTF-8 `.bundle` 文件名，最长 255 字节，
+`@runtime:<basename>:digest:<64 位小写十六进制摘要>`：
+
+```text
+manifest://<key>@runtime:<basename>:digest:<64-lowercase-hex>
+file://<path>[@manifest:<key>][@location:<name>]@runtime:<basename>:digest:<64-lowercase-hex>
+```
+
+Manifest、Bundle 和 tarstream 引用均可携带该声明。basename 是 UTF-8 `.bundle` 文件名，最长 255 字节，
 不能包含路径或控制字符；允许普通
 冒号，以最后一个 `:digest:` 分隔名称和摘要，已有 qualifier 标记仍是保留标记。
 格式错误或重复声明必须报错，不能降级为旧引用。
