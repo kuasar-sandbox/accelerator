@@ -335,7 +335,7 @@ KillSignal=SIGTERM
 
 也可直接用 Go 构造 `storeapp.Config`。动态 generation/credential provider 通过 Go API 的 `Options` 显式绑定，不写回 YAML。需要 reload 的定制调用方自行拥有 reload 触发和 provider callback；官方 `store-ctl` 只是把 SIGHUP 适配为这些输入。
 
-`Options` 新增零值兼容的 `Drain <-chan struct{}` 和 `DrainTimeout time.Duration`。Drain 为 nil 保留上例的旧 SDK 取消用法;关闭 Drain 发起不可逆软停。ctx 取消始终取消在途工作,drain 中取消立即升级,同时发生时取消优先。初始化期间收到 drain 后不再发布 started 或开始 serving。宿主可传 `Options{Drain: drain, DrainTimeout: 30*time.Second}`,将第一次退出请求适配为 `close(drain)`,后续请求调用自己的 cancel;SDK 不注册信号。预算与资源顺序见 [`cache_listen` 与运维](#cache_listen-与运维)。
+`Options` 提供 `Drain <-chan struct{}` 和 `DrainTimeout time.Duration`。Drain 为 nil 时，SDK 使用上例的 context 取消方式；关闭 Drain 发起不可逆软停。ctx 取消始终取消在途工作,drain 中取消立即升级,同时发生时取消优先。初始化期间收到 drain 后不再发布 started 或开始 serving。宿主可传 `Options{Drain: drain, DrainTimeout: 30*time.Second}`,将第一次退出请求适配为 `close(drain)`,后续请求调用自己的 cancel;SDK 不注册信号。预算与资源顺序见 [`cache_listen` 与运维](#cache_listen-与运维)。
 
 可复用入口的验收应独立编译定制 module，并在服务 `PATH` 中没有官方二进制时执行真实 Store 协议请求。
 
@@ -363,11 +363,11 @@ rpc Get(GetRequest) returns (stream GetResponse);
 rpc Put(stream PutRequest) returns (PutResponse);
 ```
 
-`AdmitWriteRequest.generation` 为空时保持选择最新可写 generation 的原语义；非空时
+`AdmitWriteRequest.generation` 为空时选择最新可写 generation；非空时
 名称非法时返回 `InvalidArgument`;名称有效但不在本请求读取的当前列表中时返回
 `FailedPrecondition`。服务端 generation 列表为空时返回 `Unavailable`。成功响应始终返回该 generation 的 canonical
-`WriteAdmission`。官方 Go client 保留 `AdmitWrite(ctx)`，并新增
-`AdmitWriteFor(ctx, generation)`；Put wire 与 Backend 接口不变。
+`WriteAdmission`。官方 Go client 用 `AdmitWrite(ctx)` 自动选择 generation，
+用 `AdmitWriteFor(ctx, generation)` 指定 generation；两者都返回供 Put 使用的 admission。
 
 `PutHeader` 包含 partition、32-byte key、generation 和真正有 presence 的
 `optional uint64 size`。零表示已知的空对象；字段缺席才表示大小未知。官方 Go

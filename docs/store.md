@@ -301,7 +301,7 @@ KillSignal=SIGTERM
 
 Direct Go construction of `storeapp.Config` is equally supported. Dynamic generation or credential providers are explicit `Options` bindings documented by the Go API; they are process-local bindings and are not written back into YAML. A custom caller that wants reload must own its reload trigger and provider callback just as `store-ctl` owns SIGHUP adaptation.
 
-`Options` adds zero-value-compatible `Drain <-chan struct{}` and `DrainTimeout time.Duration`. A nil Drain preserves the old SDK cancellation usage shown above; closing Drain starts irreversible soft shutdown. Context cancellation always cancels in-flight work, immediately escalates drain, and takes precedence when simultaneous. Drain during initialization prevents subsequent started publication or serving. A host can pass `Options{Drain: drain, DrainTimeout: 30*time.Second}`, adapt its first exit request to `close(drain)` and later requests to its own cancel function; the SDK does not register signals. See [`cache_listen` and operations](#cache_listen-and-operations) for the budget and resource ordering.
+`Options` exposes `Drain <-chan struct{}` and `DrainTimeout time.Duration`. With a nil Drain, the SDK uses context cancellation as shown above; closing Drain starts irreversible soft shutdown. Context cancellation always cancels in-flight work, immediately escalates drain, and takes precedence when simultaneous. Drain during initialization prevents subsequent started publication or serving. A host can pass `Options{Drain: drain, DrainTimeout: 30*time.Second}`, adapt its first exit request to `close(drain)` and later requests to its own cancel function; the SDK does not register signals. See [`cache_listen` and operations](#cache_listen-and-operations) for the budget and resource ordering.
 
 Validation of the reusable entry point should compile the custom module independently and exercise real Store protocol requests with the official service binary absent from `PATH`.
 
@@ -329,7 +329,7 @@ rpc Get(GetRequest) returns (stream GetResponse);
 rpc Put(stream PutRequest) returns (PutResponse);
 ```
 
-An empty `AdmitWriteRequest.generation` keeps the existing behavior of choosing the newest writable generation. A nonempty invalid name returns `InvalidArgument`; a valid name absent from the current list observed by this request returns `FailedPrecondition`. An empty server generation list returns `Unavailable`. A successful response always returns the canonical `WriteAdmission` for that generation. The official Go client retains `AdmitWrite(ctx)` and additionally provides `AdmitWriteFor(ctx, generation)`. Put wire format and the Backend interface are unchanged.
+An empty `AdmitWriteRequest.generation` selects the newest writable generation. A nonempty invalid name returns `InvalidArgument`; a valid name absent from the current list observed by this request returns `FailedPrecondition`. An empty server generation list returns `Unavailable`. A successful response always returns the canonical `WriteAdmission` for that generation. The official Go client provides `AdmitWrite(ctx)` for automatic selection and `AdmitWriteFor(ctx, generation)` for an explicit generation. Both return the admission used by Put.
 
 `PutHeader` contains the partition, 32-byte key, generation and a presence-aware `optional uint64 size`. Zero means a known empty object; only absence means unknown size. The official Go client receives a complete `[]byte`, so it always sends `uint64(len(data))`. The server checks overflow before converting to `int64`.
 

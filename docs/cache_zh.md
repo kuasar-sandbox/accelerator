@@ -110,7 +110,7 @@ cache-ctl config generate
 
 `show` 读取 `--config`（或 `CACHE_CONFIG`）并重新序列化解析后的 YAML，不执行 `serve` 的语义 `Validate` 检查。成功输出不证明 daemon 能启动。
 
-`validate` 是当前源码及包含本修改的发行版新增命令，已发布的 `v0.2.0-preview.20261127` 二进制尚不包含。它采用与 `show` 相同的 `--config` / `CACHE_CONFIG` 优先级，再运行 `serve` 使用的静态 `Config.Validate`。成功输出 `{"valid":true}`；加载/校验失败非零退出且不输出成功结果。它检查所选模式、必需的 backend/tier/origin 字段及受支持的组合，不打开目录、不导入 activation FD、不连接 Store/Redis/EC peer，也不绑定 listener。后端初始化、二进制构建选项、资源容量和可达性仍需实际启动所选服务并访问验证。命令沿用现有 YAML 加载/校验规则，不引入新的未知字段严格拒绝策略。
+`validate` 采用与 `show` 相同的 `--config` / `CACHE_CONFIG` 优先级，再运行 `serve` 使用的静态 `Config.Validate` 检查。成功输出 `{"valid":true}`；加载/校验失败非零退出且不输出成功结果。它检查所选模式、必需的 backend/tier/origin 字段及受支持的组合，不打开目录、不导入 activation FD、不连接 Store/Redis/EC peer，也不绑定 listener。后端初始化、二进制构建选项、资源容量和可达性需要实际启动所选服务并访问验证。共用的 YAML 加载器会忽略未知字段；即使校验成功，也应使用文档规定的字段名。
 
 `generate` 输出带注释模板(默认 tiered:rocksdb L1 + store origin)。
 

@@ -2,9 +2,9 @@
 
 # accelerator
 
-首次启动沙箱，请从项目[快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)使用已发布的 node-infra 镜像及配套聚合版本。部署持久节点或集群时，继续阅读平台部署指南并提供明确的站点配置。quickstart profile 用于首次体验，不应通过任意挂载生产配置来扩展。
+首次启动沙箱，请按项目[快速开始](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart_zh.md)，用 `docker pull` 拉取 node-infra 镜像、`docker run` 启动节点，再在 Guest 中执行命令。部署持久节点或集群时，继续阅读平台部署指南并提供明确的站点配置。quickstart profile 使用专用数据卷；自定义工作负载使用已完成站点配置的实例。
 
-独立部署组件或接入其他 runtime 时，再使用本仓指南。架构与能力以所选发布版的实际资产为准；当前源码文档可能包含旧 Stable 归档尚未提供的功能。[Workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README_zh.md)用于源码开发、演示和集成验证。
+独立部署组件或接入其他 runtime 时，再使用本仓指南。使用所选版本及架构配套的二进制、配置示例和指南。[Workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README_zh.md)用于源码开发、演示和集成验证。
 
 `accelerator` 是 [Kuasar Sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) 中面向镜像、快照和稀疏工件的数据访问、存储、加密与缓存基础组件。
 
@@ -50,7 +50,7 @@
 | --- | --- | --- |
 | `manifest-ctl` | ingest、检查、fetch 和转换 Manifest 工件 | 纯 Go |
 | `store-ctl` | 文件系统或 S3-compatible 内容存储服务及管理 | 纯 Go |
-| `cache-ctl` | 本地、分片、分层和纠删码缓存服务 | 使用当前源码选择的后端依赖 |
+| `cache-ctl` | 本地、分片、分层和纠删码缓存服务 | 官方程序包含 RocksDB；使用其他后端的部署可选纯 Go 构建 |
 
 `flatten-ctl` 随 `guest-runtime` 的 Runtime 发行单元发布,共享镜像展平实现仍在本仓维护。
 
@@ -101,7 +101,7 @@ make test
 
 ## 选择已发行产品
 
-本组件发布 `vX.Y.Z`，聚合 `release-vX.Y.Z` 精确选择独立组件 Tag。通过[平台安装](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/installation_zh.md)选择匹配聚合版本。[Stable 聚合渠道](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest)可能落后于当前源码功能，应以发行清单和所选程序的 help 核验所需能力。精确工件清单、Native 材料收集与打包检查见[组件发行准备](CONTRIBUTING_zh.md#构建与打包组件发行版)。共享 Preview 保留/清理、Latest 对齐和发行线规则由[项目发行契约](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release_zh.md)统一定义。
+本组件发布 `vX.Y.Z`，聚合 `release-vX.Y.Z` 精确选择独立组件 Tag。通过[平台安装](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/installation_zh.md)选择发行渠道及匹配聚合版本；[Stable 聚合渠道](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest)指向稳定版本。部署时使用所选版本的发行清单及配套指南。精确工件清单、Native 材料收集与打包检查见[组件发行准备](CONTRIBUTING_zh.md#构建与打包组件发行版)。共享 Preview 保留/清理、Latest 对齐和发行线规则由[项目发行契约](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release_zh.md)统一定义。
 
 ## 项目边界
 

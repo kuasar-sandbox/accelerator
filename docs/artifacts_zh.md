@@ -132,10 +132,10 @@ IV=0)` 加密两个不同的编码 payload。下述相同/不同 key 与 hash �
 同 salt 域内同 plaintext 必然产出同 physical object;同 object → 同
 ContentKey(= `SHA256(object)`)→ store 上同一份字节。
 
-此不变量要求 Go Snappy 版本、`snappy.Encode`、收益门槛和格式规则固定。当前 reader
-拒绝旧开发布局;不能在同一 salt/key 域混用不兼容 writer。未来修改 encoder 输出或门槛
-需要域分离与明确评审的迁移方案,仅换 format byte 不够。核验所选版本的 reader/writer
-兼容性,保留既有资产与回滚数据,不能把过时的“尚未发布”备注当作删除在线 salt 域的依据。
+此不变量要求 Go Snappy 版本、`snappy.Encode`、收益门槛和格式规则固定。Reader
+只接受下文定义的 [Chunk 加密格式](#加密模式--chunk)。不能在同一 salt/key 域混用
+不兼容 writer。修改 encoder 输出或门槛需要域分离与明确评审的迁移方案，
+仅换 format byte 不够。升级前核验 reader/writer 兼容性，迁移期间保留既有资产与回滚数据。
 
 canonical encoder 固定为 `github.com/golang/snappy` v1.0.0 的 block API。相同
 输入的 encoded bytes 由 amd64、amd64 `noasm` 与 arm64 golden 共同约束；这项

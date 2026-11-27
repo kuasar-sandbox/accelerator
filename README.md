@@ -2,9 +2,9 @@
 
 # accelerator
 
-For a first sandbox, follow the project's [Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md) using a published node-infra image and its matching aggregate release. For a persistent node or cluster, continue with the platform deployment guides and explicit site configuration. The quickstart profile is a first-run environment, not a base to extend by mounting arbitrary production configuration.
+For a first sandbox, follow the project's [Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md): pull the node-infra image with `docker pull`, start it with `docker run`, and execute a command in a Guest. For a persistent node or cluster, continue with the platform deployment guides and explicit site configuration. Use the quickstart profile with its dedicated data volume; use a site-configured instance for custom workloads.
 
-Use this repository's guides when deploying this component independently or integrating it with another runtime. Select the architecture and capabilities actually present in the chosen release; current source documentation can describe features absent from an older stable archive. [Workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README.md) is for source development, demonstrations and integration validation.
+Use this repository's guides when deploying this component independently or integrating it with another runtime. Use the binaries, configuration examples and guides from the same selected release and architecture. [Workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README.md) is for source development, demonstrations and integration validation.
 
 `accelerator` is the **data access, storage, encryption, and cache infrastructure** for images, snapshots, and sparse artifacts in [Kuasar Sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox).
 
@@ -50,7 +50,7 @@ These paths expose common logical data and reference semantics to downstream com
 | --- | --- | --- |
 | `manifest-ctl` | Ingest, inspect, fetch, and transform Manifest-backed artifacts | Pure Go |
 | `store-ctl` | Filesystem or S3-compatible content-store service and administration | Pure Go |
-| `cache-ctl` | Local, sharded, tiered, and erasure-coded cache service | Uses the backend dependencies selected by the current source tree |
+| `cache-ctl` | Local, sharded, tiered, and erasure-coded cache service | Includes RocksDB in the official binary; a pure-Go build supports deployments using other backends |
 
 `flatten-ctl` is published with the `guest-runtime` Runtime release unit, while its shared image-flattening implementation is maintained here.
 
@@ -104,7 +104,7 @@ Use [Contributing](CONTRIBUTING.md#build-and-test) for toolchain prerequisites, 
 
 ## Select a released product
 
-This component publishes `vX.Y.Z`; aggregate `release-vX.Y.Z` versions select exact independent component tags. Choose a matching aggregate through [platform installation](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/installation.md). The [Stable aggregate channel](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest) can lag current source features; use the release inventory and selected binaries' help to verify required capabilities. Exact artifact inventories, native material collection and packaging checks are in [component release preparation](CONTRIBUTING.md#build-and-package-a-component-release). Shared Preview retention, cleanup, Latest reconciliation and release-line rules have one authority in the [project release contract](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release.md).
+This component publishes `vX.Y.Z`; aggregate `release-vX.Y.Z` versions select exact independent component tags. Choose the release channel and a matching aggregate through [platform installation](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/installation.md); the [Stable aggregate channel](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest) identifies the stable selection. Use that release's inventory and matching guides for deployment. Exact artifact inventories, native material collection and packaging checks are in [component release preparation](CONTRIBUTING.md#build-and-package-a-component-release). Shared Preview retention, cleanup, Latest reconciliation and release-line rules have one authority in the [project release contract](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release.md).
 
 ## Project boundaries
 
