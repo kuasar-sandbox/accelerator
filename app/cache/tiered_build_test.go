@@ -4,16 +4,13 @@ import (
 	"errors"
 	"io"
 	"net"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	pkgcache "github.com/kuasar-sandbox/accelerator/pkg/cache"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/client"
-	"github.com/kuasar-sandbox/accelerator/pkg/cache/rocks"
 	"github.com/kuasar-sandbox/accelerator/pkg/cache/runtime"
 )
 
@@ -92,50 +89,6 @@ func passiveRedisSocket(t *testing.T) string {
 		acceptWg.Wait()
 	})
 	return socket
-}
-
-func TestBuildTieredChain_EmbeddedOnly(t *testing.T) {
-	cfg := &runtime.Config{
-		Mode:  "tiered",
-		Tiers: []runtime.TierConfig{embeddedTier(t)},
-	}
-	comps, err := buildTieredChain(cfg, nil)
-	if err != nil {
-		t.Fatalf("buildTieredChain: %v", err)
-	}
-	defer comps.Close()
-
-	if got := len(comps.Tiers); got != 1 {
-		t.Fatalf("Tiers length: got %d, want 1", got)
-	}
-	if comps.Tiers[0] == nil {
-		t.Fatal("Tiers[0] should be non-nil")
-	}
-	if comps.EmbeddedStore == nil {
-		t.Fatal("EmbeddedStore should be non-nil for embedded tier")
-	}
-	if _, ok := comps.Tiers[0].(pkgcache.Semaphore); ok {
-		t.Fatal("unlimited embedded tier should remain unwrapped")
-	}
-	// Sketch-construction invariant is covered by rocks package tests;
-	// this test only verifies tier-chain assembly.
-}
-
-func TestBuildTieredChain_AppliesTierMaxInflight(t *testing.T) {
-	tier := embeddedTier(t)
-	tier.MaxInflight = 1
-	cfg := &runtime.Config{Mode: "tiered", Tiers: []runtime.TierConfig{tier}}
-	comps, err := buildTieredChain(cfg, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer comps.Close()
-	if _, ok := comps.Tiers[0].(pkgcache.Semaphore); !ok {
-		t.Fatalf("limited tier type %T does not implement pkgcache.Semaphore", comps.Tiers[0])
-	}
-	if comps.TierSpecs[0].EmbeddedStore == nil {
-		t.Fatal("limiting the tier discarded its concrete Info reference")
-	}
 }
 
 func TestBuildTieredChain_RejectsRedisMaxInflightWithoutValidation(t *testing.T) {
@@ -220,6 +173,16 @@ func TestBuildTieredChain_ECThenRedisPreservesOrder(t *testing.T) {
 }
 
 func TestBuildTieredChain_RedisRollsBackOnLaterFailure(t *testing.T) {
+	err := requireRedisRollbackAfter(t, runtime.TierConfig{Type: "unknown"})
+	if !strings.Contains(err.Error(), "tiers[1]: unknown type") {
+		t.Fatalf("wrong failure stage: %v", err)
+	}
+}
+
+// requireRedisRollbackAfter proves both real workers opened by the first tier
+// are closed after the supplied second tier fails. It applies to both builds.
+func requireRedisRollbackAfter(t *testing.T, failingTier runtime.TierConfig) error {
+	t.Helper()
 	socket := filepath.Join(t.TempDir(), "redis.sock")
 	lis, err := net.Listen("unix", socket)
 	if err != nil {
@@ -252,12 +215,12 @@ func TestBuildTieredChain_RedisRollsBackOnLaterFailure(t *testing.T) {
 					Timeout:  "1s",
 				},
 			},
-			{Type: "unknown"},
+			failingTier,
 		},
 	}
-	comps, err := buildTieredChain(cfg, nil)
-	if err == nil {
-		t.Fatal("buildTieredChain should reject the later unknown tier")
+	comps, buildErr := buildTieredChain(cfg, nil)
+	if buildErr == nil {
+		t.Fatal("buildTieredChain should reject the later tier")
 	}
 	if comps != nil {
 		t.Fatal("comps should be nil on partial failure")
@@ -280,50 +243,7 @@ func TestBuildTieredChain_RedisRollsBackOnLaterFailure(t *testing.T) {
 			t.Fatalf("Redis worker %d was not closed by rollback: %v", i, err)
 		}
 	}
-}
-
-func TestBuildTieredChain_EmbeddedThenEC(t *testing.T) {
-	cfg := &runtime.Config{
-		Mode:  "tiered",
-		Tiers: []runtime.TierConfig{embeddedTier(t), ecTier()},
-	}
-	comps, err := buildTieredChain(cfg, nil)
-	if err != nil {
-		t.Fatalf("buildTieredChain: %v", err)
-	}
-	defer comps.Close()
-
-	if got := len(comps.Tiers); got != 2 {
-		t.Fatalf("Tiers length: got %d, want 2", got)
-	}
-	if comps.TierSpecs[0].Type != "embedded" || comps.TierSpecs[1].Type != "ec" {
-		t.Fatalf("tier order: got [%s, %s], want [embedded, ec]",
-			comps.TierSpecs[0].Type, comps.TierSpecs[1].Type)
-	}
-}
-
-// TestBuildTieredChain_ECThenEmbedded is the regression guard for the
-// original bug: pre-refactor main.go unconditionally prepended the embedded
-// store, collapsing `[ec, embedded]` and `[embedded, ec]` to the same chain.
-// The new builder must honour YAML order verbatim.
-func TestBuildTieredChain_ECThenEmbedded(t *testing.T) {
-	cfg := &runtime.Config{
-		Mode:  "tiered",
-		Tiers: []runtime.TierConfig{ecTier(), embeddedTier(t)},
-	}
-	comps, err := buildTieredChain(cfg, nil)
-	if err != nil {
-		t.Fatalf("buildTieredChain: %v", err)
-	}
-	defer comps.Close()
-
-	if got := len(comps.Tiers); got != 2 {
-		t.Fatalf("Tiers length: got %d, want 2", got)
-	}
-	if comps.TierSpecs[0].Type != "ec" || comps.TierSpecs[1].Type != "embedded" {
-		t.Fatalf("tier order: got [%s, %s], want [ec, embedded] (YAML-order regression)",
-			comps.TierSpecs[0].Type, comps.TierSpecs[1].Type)
-	}
+	return buildErr
 }
 
 func TestBuildTieredChain_ECOnly(t *testing.T) {
@@ -447,66 +367,4 @@ func TestBuildTieredChain_UpstreamDialFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "dial") {
 		t.Fatalf("error should mention 'dial', got: %v", err)
 	}
-}
-
-// TestBuildTieredChain_DoubleEmbedded exercises the defensive duplicate-embedded
-// guard in buildTieredChain (Validate normally catches this earlier, but the
-// builder must be safe on its own).
-func TestBuildTieredChain_DoubleEmbedded(t *testing.T) {
-	cfg := &runtime.Config{
-		Mode:  "tiered",
-		Tiers: []runtime.TierConfig{embeddedTier(t), embeddedTier(t)},
-	}
-	comps, err := buildTieredChain(cfg, nil)
-	if err == nil {
-		t.Fatal("buildTieredChain should reject two embedded tiers")
-	}
-	if comps != nil {
-		t.Fatal("comps should be nil on error")
-	}
-	if !strings.Contains(err.Error(), "more than one embedded") {
-		t.Fatalf("error should mention duplicate embedded, got: %v", err)
-	}
-}
-
-// TestBuildTieredChain_PartialFailureRollsBack asserts that when a later
-// tier fails to construct, the earlier successfully-constructed tiers are
-// Close()d (released). We check this by observing that the embedded tier's
-// RocksDB LOCK file is gone — a live rocks.Store holds LOCK; rocks.Close
-// releases it.
-func TestBuildTieredChain_PartialFailureRollsBack(t *testing.T) {
-	embedded := embeddedTier(t)
-	cfg := &runtime.Config{
-		Mode:  "tiered",
-		Tiers: []runtime.TierConfig{embedded, badEcTier()},
-	}
-	comps, err := buildTieredChain(cfg, nil)
-	if err == nil {
-		t.Fatal("buildTieredChain should fail when ec tier is invalid")
-	}
-	if comps != nil {
-		t.Fatal("comps should be nil on partial failure")
-	}
-
-	// The embedded tier was constructed then rolled back: rocks LOCK must
-	// not exist (a dangling *Store holds an exclusive LOCK file).
-	lockPath := filepath.Join(embedded.Rocks.Path, "LOCK")
-	data, err := os.ReadFile(lockPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return // ok — rocks fully released
-		}
-		t.Fatalf("read LOCK: %v", err)
-	}
-	// LOCK file exists, but a closed rocks.Store leaves it as an empty
-	// file (RocksDB recreates and unlocks). The real proof of release
-	// is that a fresh Open() succeeds on the same path.
-	if len(data) > 0 {
-		t.Logf("LOCK exists with %d bytes, verifying rocks is reopenable", len(data))
-	}
-	reopened, err := rocks.Open(*embedded.Rocks, runtime.FreqConfig{})
-	if err != nil {
-		t.Fatalf("rocks still locked after rollback: %v", err)
-	}
-	reopened.Close()
 }

@@ -9,6 +9,8 @@ ACCELERATOR_LIB="$E2E_LIB/accelerator"
 
 IMAGE_A="${IMAGE_A:-}"
 IMAGE_B="${IMAGE_B:-}"
+DEFAULT_FIXTURES=0
+if [ -z "$IMAGE_A" ] && [ -z "$IMAGE_B" ]; then DEFAULT_FIXTURES=1; fi
 
 BIN="${BIN:?BIN is required}"
 
@@ -90,6 +92,32 @@ assert_eq() {
     else
         fail "$3 (expected '$1', got '$2')"
     fi
+}
+
+# Diff must report a consistent content-key partition. The prepared fixtures
+# contain 4 MiB shared content and a different 1 MiB file in each image. Custom
+# IMAGE_A/IMAGE_B may be unrelated or identical, so they only require consistency.
+assert_diff_summary() {
+    python3 - "$1" "$2" <<'DIFF_PY'
+import re
+import sys
+
+output, default_fixtures = sys.argv[1:]
+def fields(pattern):
+    matches = re.findall(pattern, output, re.MULTILINE)
+    assert len(matches) == 1, f'missing or ambiguous diff field: {pattern}\n{output}'
+    value = matches[0]
+    return tuple(map(int, value)) if isinstance(value, tuple) else int(value)
+count_a, unique_a = fields(r'^manifest A:\s+.+, (\d+) chunks \((\d+) unique\)$')
+count_b, unique_b = fields(r'^manifest B:\s+.+, (\d+) chunks \((\d+) unique\)$')
+shared = fields(r'^shared:\s+(\d+) chunks \(.+\)$')
+only_a = fields(r'^only in A:\s+(\d+) chunks \(.+\)$')
+only_b = fields(r'^only in B:\s+(\d+) chunks \(.+\)$')
+assert unique_a <= count_a and unique_b <= count_b, output
+assert shared + only_a == unique_a and shared + only_b == unique_b, output
+if default_fixtures == '1':
+    assert shared > 0 and only_a > 0 and only_b > 0, output
+DIFF_PY
 }
 
 # Explicit overrides use only the local daemon's cached images. A clean
@@ -357,20 +385,24 @@ MKEY_B=$("$BIN/manifest-ctl" store "${COMMON[@]}" --no-progress "$TMPDIR/image-b
 "$BIN/manifest-ctl" get-manifest "${COMMON[@]}" --output "$TMPDIR/image-b.manifest" "$MKEY_B"
 OUTPUT=$("$BIN/manifest-ctl" diff "$TMPDIR/image-a.manifest" "$TMPDIR/image-b.manifest" 2>&1)
 echo "  $OUTPUT" | head -5
-if echo "$OUTPUT" | grep -q "shared"; then
-    ok "diff shows shared chunks"
+if assert_diff_summary "$OUTPUT" "$DEFAULT_FIXTURES"; then
+    ok "diff reports a consistent shared/unique content-key partition"
 else
-    fail "diff missing shared info"
+    fail "diff reported an invalid shared/unique content-key partition"
 fi
 
 # ============================================================
 echo ""
-echo "=== Test 9: Fixed chunking vs CDC ==="
+echo "=== Test 9: Fixed chunking preserves the original artifact ==="
 MKEY_FIXED=$("$BIN/manifest-ctl" store --manifest-config "$TMPDIR/accelerator-fixed.yaml" --no-progress "$TMPDIR/image-a.erofs")
 "$BIN/manifest-ctl" get-manifest "${COMMON[@]}" --output "$TMPDIR/image-a-fixed.manifest" "$MKEY_FIXED"
-OUTPUT=$("$BIN/manifest-ctl" diff "$TMPDIR/image-a.manifest" "$TMPDIR/image-a-fixed.manifest" 2>&1)
-echo "  $OUTPUT" | head -5
-ok "CDC vs fixed diff completed"
+"$BIN/manifest-ctl" info "$TMPDIR/image-a-fixed.manifest" > "$TMPDIR/fixed-info.txt"
+FIXED_MODE=$(sed -nE 's/^chunk mode:[[:space:]]+(.+)$/\1/p' "$TMPDIR/fixed-info.txt")
+assert_eq "fixed" "$FIXED_MODE" "fixed chunking configuration reached the stored manifest"
+"$BIN/manifest-ctl" load --manifest-config "$TMPDIR/accelerator-fixed.yaml" \
+    --output "$TMPDIR/image-a-fixed-restored.erofs" --no-progress "$MKEY_FIXED"
+FIXED_HASH=$(sha256sum "$TMPDIR/image-a-fixed-restored.erofs" | awk '{print $1}')
+assert_eq "$H1" "$FIXED_HASH" "fixed chunking load preserves the same artifact as CDC"
 
 # ============================================================
 echo ""
@@ -412,11 +444,8 @@ SUMMARY=$(grep -E '^chunks:' "$TMPDIR/sparse-store.stderr" | head -1)
 ZERO_W=$(echo "$SUMMARY" | sed -E 's/.*zero=([0-9]+).*/\1/')
 STORED_S=$(echo "$SUMMARY" | sed -E 's/.*stored=([0-9]+).*/\1/')
 echo "  sparse store summary: $SUMMARY"
-if [ -z "$ZERO_W" ] || [ "$ZERO_W" -lt 100 ]; then
-    fail "expected ≥100 zero chunks for 7/8 MiB sparse file (got: '$ZERO_W')"
-else
-    ok "sparse ingest: $ZERO_W zero chunks detected, $STORED_S stored"
-fi
+assert_eq "112" "$ZERO_W" "sparse ingest marks all 112 zero chunks"
+assert_eq "16" "$STORED_S" "sparse ingest stores only the 16 nonzero chunks"
 
 # Materialize the manifest blob; info must report the same zero count.
 "$BIN/manifest-ctl" get-manifest "${COMMON[@]}" --output "$TMPDIR/sparse.manifest" "$MKEY_SPARSE"
@@ -431,19 +460,12 @@ assert_eq "$ZERO_W" "$INFO_ZERO" "info reports same zero count as store summary"
 RT_HASH=$(sha256sum "$TMPDIR/sparse.rt" | awk '{print $1}')
 assert_eq "$SPARSE_HASH" "$RT_HASH" "sparse file payload roundtrip matches"
 
-# Manifest size sanity: with 128 chunks total but only ~16 non-zero
-# (1 MiB / 64 KiB), the sealed key table holds ~16*32 bytes of key
-# material instead of 128*32 — manifest is significantly smaller.
-MANIFEST_SIZE=$(stat -c %s "$TMPDIR/sparse.manifest" 2>/dev/null || stat -f %z "$TMPDIR/sparse.manifest")
-echo "  sparse manifest size: $MANIFEST_SIZE bytes (with key-table compression)"
-# 128 * 56 (entry) + 64 (header) + 16 * 32 (compressed keys) + AEAD overhead ≈ 7800
-# Without compression would be 128 * 32 = 4096 instead of 512 in keys,
-# so ~3.5 KiB delta. We assert manifest < 12 KiB as a loose bound.
-if [ "$MANIFEST_SIZE" -gt 12288 ]; then
-    fail "sparse manifest unexpectedly large: $MANIFEST_SIZE bytes"
-else
-    ok "sparse manifest size within bound (≤12 KiB)"
-fi
+# Check the serialized key table itself, not a loose whole-manifest bound.
+# AES-GCM seals 16 nonzero keys: 1 flag + 12 nonce + 16*32 keys + 16 tag.
+INFO_CHUNKS=$(sed -nE 's/^chunk count:[[:space:]]+([0-9]+)$/\1/p' "$TMPDIR/sparse-info.txt")
+KEY_TABLE_BYTES=$(sed -nE 's/^key table:[[:space:]]+([0-9]+) bytes \(sealed\)$/\1/p' "$TMPDIR/sparse-info.txt")
+assert_eq "128" "$INFO_CHUNKS" "fixed 64 KiB sparse payload contains 128 chunks"
+assert_eq "541" "$KEY_TABLE_BYTES" "sealed key table contains exactly 16 nonzero keys"
 
 # ============================================================
 echo ""

@@ -35,7 +35,15 @@ origin:
   max_inflight: 16
 ```
 
-Make the cache directory writable by its service account, then run `cache-ctl serve --config /etc/accelerator/cache.yaml` in a service or dedicated terminal. For node-infra, use its existing managed Cache service and persistent cache mount instead of starting a competing instance. The example endpoint is loopback; adapt the listener to the consumer's actual namespace/reachability.
+Make the cache directory writable by its service account and validate the configuration before starting the service:
+
+```bash
+cache-ctl config validate --config /etc/accelerator/cache.yaml
+```
+
+Require `{"valid":true}`, then run `cache-ctl serve --config /etc/accelerator/cache.yaml` in a service or dedicated terminal. Validation checks the configuration without opening the cache or testing Store connectivity; the running-service checks below complete that path.
+
+For node-infra, the deployment owner runs Cache as an external service and sets `cache.endpoint` in the node's `/etc/node-infra/manifest.yaml` to its reachable data listener. The Cache service owner manages its process and backend storage; node-infra does not start it. Reuse an existing service without starting a competing instance against its backend directory or listener. For a Unix socket, mount the provider-owned parent directory into the node container so socket replacement remains visible. The example TCP endpoint is loopback and serves only consumers in the same network namespace; choose a protected reachable address when the service and consumer use different namespaces.
 
 The `10GiB` value illustrates an initial sizing input, not a disk quota. At `mem_ratio: 0.01`, it selects about 102.4 MiB of BlockCache, above the 64 MiB minimum. CMS generations, write buffers, native metadata, in-flight requests and OS memory are additional. Measure the complete process and filesystem; [memory budgeting](#memory-budgeting) and [RocksDB tuning](#rocksdb-tuning) explain the other allowances. The larger examples later in this guide describe topology, not a universal host size.
 

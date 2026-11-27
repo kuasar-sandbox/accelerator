@@ -10,7 +10,9 @@
 
 ## 部署首个持久 Store
 
-平台部署使用 [node-infra](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra_zh.md)选定的 Store 服务和持久挂载，不要对其数据目录或监听地址再启动竞争服务。独立部署先使用一个文件系统后端和直接客户端路径，S3 与 cache 可分别引入。
+[node-infra 部署](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra_zh.md)需要使用 Store 时，准备外部 Store 服务或复用已有服务，并将节点 `/etc/node-infra/manifest.yaml` 中的 `store.endpoint` 指向其可达地址。Store 服务所有者管理进程、后端存储和 generation source；node-infra 消费该 endpoint，不启动此服务。使用 Unix socket 时，将服务提供方持有的父目录挂载到节点容器，使替换后的 socket 仍然可见。后端数据目录由服务提供方保管，不要对已有服务的数据目录或监听地址再启动竞争 Store。
+
+部署新的 Store 时，先使用一个文件系统后端和直接客户端路径，S3 与 cache 可分别引入。
 
 1. 从同一选定发行组合安装 `store-ctl` 和 `manifest-ctl`，启动前创建持久根目录并让服务账号可写；FS 后端要求该目录已存在。选择消费者可达的 endpoint。loopback 监听只服务本地 network namespace；集群消费者需要受保护的可达地址或明确共享的服务。
 2. 保存完整配置，例如 `/etc/accelerator/store.yaml`：

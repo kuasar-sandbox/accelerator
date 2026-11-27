@@ -40,7 +40,15 @@ origin:
   max_inflight: 16
 ```
 
-让服务账号可写缓存目录，再由服务或独立终端运行 `cache-ctl serve --config /etc/accelerator/cache.yaml`。node-infra 使用既有受管 Cache 服务和持久缓存挂载，不另启竞争实例。示例使用 loopback，须按消费者所在 namespace 和实际可达性调整 listener。
+让服务账号可写缓存目录，并在启动服务前验证配置：
+
+```bash
+cache-ctl config validate --config /etc/accelerator/cache.yaml
+```
+
+要求输出 `{"valid":true}`，再由服务或独立终端运行 `cache-ctl serve --config /etc/accelerator/cache.yaml`。验证仅检查配置，不打开缓存或测试 Store 连通性；下文的运行服务检查用于完成这条路径的验证。
+
+对 node-infra，由部署方在外部运行 Cache 服务，并将节点 `/etc/node-infra/manifest.yaml` 中的 `cache.endpoint` 指向其可达的数据 listener。Cache 服务所有者管理进程和后端存储；node-infra 不启动此服务。已有服务应直接复用，不对其后端目录或监听地址再启动竞争实例。使用 Unix socket 时，将服务提供方持有的父目录挂载到节点容器，使替换后的 socket 仍然可见。示例 TCP endpoint 使用 loopback，只服务同一 network namespace 内的消费者；服务与消费者位于不同 namespace 时，应选择受保护的可达地址。
 
 `10GiB` 是初始定容输入示例，不是磁盘 quota。`mem_ratio: 0.01` 对应约 102.4 MiB BlockCache，高于 64 MiB 最小值；CMS 各代、写缓冲、原生元数据、在途请求和 OS 内存另计。应测量完整进程和文件系统，[内存预算](#内存预算)及 [RocksDB 调优](#rocksdb-调优)解释其他用量。后文的大容量示例用于说明拓扑，不是通用主机规格。
 

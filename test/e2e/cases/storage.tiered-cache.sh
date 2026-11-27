@@ -86,14 +86,33 @@ origin_hits() {
 }
 
 wait_manifest_load() {
-    local config=$1 output=$2 key=$3 expected_hash=$4
-    for _ in $(seq 1 100); do
+    local config=$1 prefix=$2 key=$3 expected_hash=$4
+    local owned attempt output actual_hash diagnostic
+    # This is an asynchronous fill observation. Each probe owns an exclusive
+    # output path; a partial file must not poison all later readiness probes.
+    # The caller still performs its separate single-attempt business read.
+    owned=$(mktemp -d "${prefix}.probe.XXXXXX") || return 1
+    for attempt in $(seq 1 100); do
+        output="$owned/attempt-$attempt"
         if "$BIN/manifest-ctl" load --manifest-config "$config" \
-            --output "$output" --no-progress "$key" >/dev/null 2>&1 &&
-            [ "$(payload_hash "$output" 2>/dev/null)" = "$expected_hash" ]; then
-            return 0
+            --output "$output" --no-progress "$key" >"$output.stdout" 2>"$output.stderr"; then
+            if actual_hash="$(payload_hash "$output" 2>"$output.tar.stderr")" &&
+                [ "$actual_hash" = "$expected_hash" ]; then
+                return 0
+            fi
+            # A completed load with malformed or wrong content is a product
+            # failure, not pending fill. Do not turn it green with another read.
+            echo "  ERROR: completed fill probe returned invalid or mismatched payload" >&2
+            break
         fi
-        sleep 0.05
+        if [ "$attempt" -lt 100 ]; then sleep 0.05; fi
+    done
+    echo "  ERROR: manifest fill did not become readable for $key" >&2
+    for diagnostic in "$owned"/*.stdout "$owned"/*.stderr; do
+        if [ -s "$diagnostic" ]; then
+            echo "---- $diagnostic ----" >&2
+            cat "$diagnostic" >&2
+        fi
     done
     return 1
 }

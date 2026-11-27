@@ -8,7 +8,9 @@ Use this guide to deploy an independent FS or S3-compatible Store, configure and
 
 ## Deploy a first persistent Store
 
-For platform deployment, use the Store service and persistent mounts selected by [node-infra](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra.md). Do not start a competing Store against its data directory or listener. For an independent service, begin with one filesystem backend and a direct client path; S3 and cache can be introduced separately.
+For a [node-infra deployment](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra.md) using Store, provision an external Store service or reuse an existing one, and set `store.endpoint` in the node's `/etc/node-infra/manifest.yaml` to its reachable address. The Store service owner manages its process, backend storage and generation source; node-infra consumes the endpoint and does not start the service. For a Unix socket, mount the provider-owned parent directory into the node container so socket replacement remains visible. The service's backend data directory stays with the provider. Do not start a competing Store against an existing service's data directory or listener.
+
+When provisioning a new Store, begin with one filesystem backend and a direct client path; S3 and cache can be introduced separately.
 
 1. Install `store-ctl` and `manifest-ctl` from the same selected release combination. Create the persistent root directory and make it writable by the service account before starting; the FS backend requires that directory to exist. Choose an endpoint reachable by the intended consumers. A loopback listener serves only the local network namespace; cluster consumers need a protected reachable address or a deliberately shared service.
 2. Save a complete configuration, for example `/etc/accelerator/store.yaml`:

@@ -174,6 +174,7 @@ test-e2e-scripts:
 	PYTHONDONTWRITEBYTECODE=1 python3 test/scripts/test_activation_fixture.py
 	PYTHONDONTWRITEBYTECODE=1 python3 test/scripts/test_e2e_manifest.py
 	PYTHONDONTWRITEBYTECODE=1 python3 test/scripts/test_e2e_cache.py
+	PYTHONDONTWRITEBYTECODE=1 python3 test/scripts/test_e2e_obs.py
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/scripts -p 'test_bench_*.py'
 
 VERSION ?= v0.1.0
