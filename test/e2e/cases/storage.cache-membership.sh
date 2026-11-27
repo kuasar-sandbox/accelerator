@@ -78,31 +78,50 @@ payload_hash() {
 }
 
 load_hash_via_tiered() {
-    local key="$1" prefix="$2" label="$3" attempt hash out owned diagnostic
+    local key="$1" prefix="$2" label="$3" hash out owned diagnostic
     local cfg
     cfg="$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")"
-    # load creates its output exclusively. Repeated repair probes and retries
-    # after a partial write must each own a fresh path, without deleting data.
+    # Each business read must succeed once. Repeated successful repair triggers
+    # may use this helper, but a failed/partial read must never be retried green.
     owned=$(mktemp -d "${prefix}.load.XXXXXX") || return 1
-    for attempt in $(seq 1 10); do
-        out="$owned/attempt-$attempt"
-        if "$BIN/manifest-ctl" load --manifest-config "$cfg" \
-            --output "$out" \
-            --no-progress "$key" >"$out.stdout" 2>"$out.stderr"; then
-            if hash="$(payload_hash "$out" 2>"$out.tar.stderr")"; then
-                printf '%s\n' "$hash"
-                return 0
-            fi
+    out="$owned/read"
+    if "$BIN/manifest-ctl" load --manifest-config "$cfg" \
+        --output "$out" \
+        --no-progress "$key" >"$out.stdout" 2>"$out.stderr"; then
+        if hash="$(payload_hash "$out" 2>"$out.tar.stderr")"; then
+            printf '%s\n' "$hash"
+            return 0
         fi
-        sleep 0.3
-    done
-    echo "  FAIL: $label did not load/decode through tiered cache" >&2
-    # Preserve every attempt's diagnostics in the case log before TMPDIR cleanup.
+    fi
+    echo "  FAIL: $label did not load/decode through tiered cache on its single attempt" >&2
     for diagnostic in "$owned"/*.stdout "$owned"/*.stderr; do
         if [ -s "$diagnostic" ]; then
             echo "---- $diagnostic ----" >&2
             cat "$diagnostic" >&2
         fi
+    done
+    return 1
+}
+
+
+# The EC layer logs its committed epoch after applying the router and pool.
+# Pair that completion signal with the public Info peer set before any read.
+wait_membership() {
+    local epoch=$1 expected_peers=$2
+    for _ in $(seq 1 100); do
+        kill -0 "$TIERED_PID" 2>/dev/null || break
+        if grep -Fq "ec: membership epoch $((epoch-1)) → $epoch " "$TMPDIR/tiered.log" &&
+            "$BIN/cache-ctl" info --endpoint "127.0.0.1:$TIERED_HEALTH_PORT" --json \
+                >"$TMPDIR/membership-info.json" 2>"$TMPDIR/membership-info.stderr" &&
+            python3 -c 'import json,sys; peers=json.load(sys.stdin)["tiered"]["tiers"][0]["peers"]; assert sorted(p["id"] for p in peers)==sys.argv[1].split(","), peers' \
+                "$expected_peers" <"$TMPDIR/membership-info.json" 2>"$TMPDIR/membership-check.stderr"; then
+            return 0
+        fi
+        sleep 0.05
+    done
+    echo "  FAIL: membership did not reach epoch $epoch with peers $expected_peers" >&2
+    for diagnostic in "$TMPDIR/tiered.log" "$TMPDIR"/membership-*; do
+        if [ -f "$diagnostic" ]; then cat "$diagnostic" >&2; fi
     done
     return 1
 }
@@ -256,7 +275,7 @@ EOF
 }
 
 render_tiered_yaml "1 2 3 4 5"
-"$BIN/cache-ctl" serve --config "$TMPDIR/tiered.yaml" &
+"$BIN/cache-ctl" serve --config "$TMPDIR/tiered.yaml" >"$TMPDIR/tiered.log" 2>&1 &
 TIERED_PID=$!
 PIDS+=($TIERED_PID)
 wait_ready "127.0.0.1:$TIERED_HEALTH_PORT"
@@ -311,8 +330,8 @@ ok "$N keys prewarmed through EC tier"
 echo "=== SIGHUP: rotate membership {s1..s5} → {s2..s6} ==="
 render_tiered_yaml "2 3 4 5 6"
 kill -HUP "$TIERED_PID"
-# Give the daemon a moment to reload + probe s6.
-sleep 1
+wait_membership 2 "s2,s3,s4,s5,s6"
+ok "first SIGHUP committed epoch 2 with the replacement peer set"
 
 # ============================================================
 # Read all N keys again. Because 4/5 shards for every key remain on
@@ -360,7 +379,8 @@ ok "$N keys repaired onto the replacement shard"
 # ============================================================
 echo "=== Second SIGHUP (idempotent-ish: membership {s2..s6} again) ==="
 kill -HUP "$TIERED_PID"
-sleep 0.5
+wait_membership 3 "s2,s3,s4,s5,s6"
+ok "second SIGHUP advanced epoch to 3 without changing the peer set"
 # Reads should still work.
 h="$(load_hash_via_tiered "${MKEYS[0]}" "$TMPDIR/val-1.idem" "second SIGHUP key 1")" || exit 1
 assert_eq "${ORIG_HASHES[0]}" "$h" "second SIGHUP leaves reads working"
