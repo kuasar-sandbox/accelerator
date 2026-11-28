@@ -32,3 +32,25 @@ type Backend interface {
 	// semantics. Storage errors are never converted into misses.
 	Exists(ctx context.Context, generation store.Generation, partition store.Partition, key store.ContentKey, expectedSize *int64) (bool, error)
 }
+
+// AliasBackend is the optional capability behind Resolve and
+// PutHeader.represents. fs.Store and s3.Store implement it; a Backend that does
+// not makes Resolve answer UNIMPLEMENTED and makes represents a no-op, which a
+// client reads as "this store does not do cross-node delta compression".
+//
+// An alias is a write-once record in the generation, named by the independent
+// address H_ind of a chunk and naming the delta object that represents it.
+type AliasBackend interface {
+	// GetAlias returns the delta key H_ind names, or (zero, false, nil).
+	GetAlias(ctx context.Context, generation store.Generation, hInd store.ContentKey) (store.ContentKey, bool, error)
+
+	// CreateAlias makes hInd name delta unless it already names something. It
+	// returns the key hInd names afterwards and whether this call created it.
+	CreateAlias(ctx context.Context, generation store.Generation, hInd, delta store.ContentKey) (current store.ContentKey, created bool, err error)
+
+	// Delete removes one object. A missing object is not an error. The server
+	// uses it for exactly one thing: removing a delta object that this very
+	// Put created and that then lost the alias race, so that losing patches do
+	// not accumulate as unreferenced bytes.
+	Delete(ctx context.Context, generation store.Generation, partition store.Partition, key store.ContentKey) error
+}

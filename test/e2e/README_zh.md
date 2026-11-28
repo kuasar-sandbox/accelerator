@@ -22,6 +22,7 @@ Accelerator 产品 E2E 统一由平台提供的 prepared-workspace runner 执行
 | `storage.service-drain.sh` | 真实 Store/Cache CLI 的 TCP/UDS 慢 reader、首信号排空、第二信号取消、预算到期和普通 bind 重启;分别验证 RocksDB、Redis 与 Store FS。 |
 | `storage.store-cache.sh` | Store 内嵌只读 cache 协议、generation 切换、旧 manifest 读取、blob 命名空间及拒绝写入。 |
 | `image.manifest.sh` | 真实 flatten/EROFS，以及 Manifest store/load、去重、校验、稀疏/零块与镜像差异契约。 |
+| `image.manifest-delta.sh` | 基于相似度的差分压缩：两个 Store 边车分别承载开启/关闭差分的写入端，Version 2 清单及其差分表，`info`/`deps`/`verify` 的差分感知，关闭差分的读取端读取差分编码镜像，密封快照重载，`store-ctl delta-gc` 孤儿审计，以及报告（不断言）的开启/关闭差分整镜像加载启动时延。 |
 | `storage.obs.sh` | 显式选择、需要凭据的 OBS/S3 兼容对象存储往返；不属于普通离线执行。 |
 
 用例文件有意保持普通 `100644` 模式。公共 runner 使用 `bash` 执行选中的用例，不把 executable bit 变成第二套用例契约。
@@ -45,6 +46,7 @@ WORK=/tmp/kuasar-e2e
   --include storage.service-drain.sh \
   --include storage.store-cache.sh \
   --include image.manifest.sh
+  --include image.manifest-delta.sh
 ```
 
 上述普通命令有意不选择 `storage.obs.sh`。只有在明确具备所需 OBS/S3 兼容 endpoint 与凭据时才单独选择它，例如使用 `--include storage.obs.sh`。

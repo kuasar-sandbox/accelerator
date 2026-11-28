@@ -22,6 +22,7 @@ A case ID is its filename. The suite is the first filename segment. Accelerator 
 | `storage.service-drain.sh` | Real Store/Cache CLI over TCP/UDS: slow readers, first-signal drain, second-signal cancellation, budget expiry and ordinary bind restart, with RocksDB, Redis and Store FS. |
 | `storage.store-cache.sh` | Store's embedded read-only cache protocol, generation rollout, old-manifest reads, blob namespace and rejected writes. |
 | `image.manifest.sh` | Real flatten/EROFS plus Manifest store/load, dedup, verification, sparse/zero-block and image-diff contracts. |
+| `image.manifest-delta.sh` | Similarity-based delta compression: delta-on and delta-off writers over two Store sidecars, Version 2 manifests with a delta table, `info`/`deps`/`verify` awareness, delta-off readers of delta-encoded images, sealed-snapshot reload, `store-ctl delta-gc` orphan audit, and reported (not asserted) full-load start-up latency on versus off. |
 | `storage.obs.sh` | Explicit credentialed OBS/S3-compatible round trip. This case is not part of ordinary offline execution. |
 
 The case files are intentionally regular `100644` files. The common runner invokes selected cases with `bash`; executable mode is not a second case contract.
@@ -45,6 +46,7 @@ WORK=/tmp/kuasar-e2e
   --include storage.service-drain.sh \
   --include storage.store-cache.sh \
   --include image.manifest.sh
+  --include image.manifest-delta.sh
 ```
 
 `storage.obs.sh` is deliberately omitted from that ordinary command. Run it only when the required OBS/S3-compatible credentials and endpoint are explicitly available, for example with `--include storage.obs.sh`.

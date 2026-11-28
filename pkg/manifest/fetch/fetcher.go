@@ -26,10 +26,20 @@ type ManifestValidator interface {
 	ValidateManifest(key store.ContentKey, manifest *codec.Manifest) error
 }
 
-// Options controls ordinary content-address verification. Explicit verify,
-// import, export, and repair paths must always pass VerifyContent=true.
+// Options controls ordinary content-address verification and the delta read
+// path. Explicit verify, import, export, and repair paths must always pass
+// VerifyContent=true. Zero delta budgets use the defaults (64 MiB base cache,
+// 128 MiB scratch).
 type Options struct {
 	VerifyContent bool
+	// DeltaBaseCacheBytes bounds the plaintext cache of decoded delta bases
+	// shared by streams this fetcher opens. Zero selects the default.
+	DeltaBaseCacheBytes int64
+	// DeltaScratchBytes bounds concurrent delta-apply memory. Zero selects the default.
+	DeltaScratchBytes int64
+
+	bases   *baseCache
+	scratch *deltaScratch
 }
 
 // NewFetcher returns a Fetcher bound to the given cache.Getter (which
@@ -42,12 +52,22 @@ func NewFetcher(customerKey [32]byte, cg cache.Getter, dec crypto.Decryptor) Fet
 // NewFetcherWithOptions returns a Fetcher with an explicit ordinary-read
 // verification policy. NewFetcher remains strict for compatibility.
 func NewFetcherWithOptions(customerKey [32]byte, cg cache.Getter, dec crypto.Decryptor, opts Options) Fetcher {
+	baseBytes := opts.DeltaBaseCacheBytes
+	if baseBytes <= 0 {
+		baseBytes = defaultBaseCacheBytes
+	}
+	scratchBytes := opts.DeltaScratchBytes
+	if scratchBytes <= 0 {
+		scratchBytes = defaultScratchBytes
+	}
 	return &fetcher{
 		customerKey:   customerKey,
 		cache:         newScheduledCacheClient(cg),
 		dec:           dec,
 		verifyContent: opts.VerifyContent,
 		validator:     manifestValidator(cg),
+		bases:         newBaseCache(baseBytes),
+		scratch:       newDeltaScratch(scratchBytes),
 	}
 }
 
@@ -62,6 +82,17 @@ type fetcher struct {
 	dec           crypto.Decryptor
 	verifyContent bool
 	validator     ManifestValidator
+	bases         *baseCache
+	scratch       *deltaScratch
+}
+
+// Close zeroes cached base plaintext. Streams opened from this fetcher must
+// not be used afterwards.
+func (f *fetcher) Close() error {
+	if f.bases != nil {
+		f.bases.close()
+	}
+	return nil
 }
 
 // OpenManifest loads, parses, and key-table-unseals one manifest, then returns
@@ -109,6 +140,6 @@ func (f *fetcher) OpenManifest(ctx context.Context, manifestKey store.ContentKey
 		f.cache.OnDemandGetter(),
 		f.cache.PrefetchGetter(),
 		f.dec,
-		Options{VerifyContent: f.verifyContent},
+		Options{VerifyContent: f.verifyContent, bases: f.bases, scratch: f.scratch},
 	), nil
 }

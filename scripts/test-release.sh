@@ -148,6 +148,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/test-release-publisher.py"
 
 expected_cases=(
   test/e2e/cases/basic.accelerator-activation.sh
+  test/e2e/cases/image.manifest-delta.sh
   test/e2e/cases/image.manifest.sh
   test/e2e/cases/storage.cache-membership.sh
   test/e2e/cases/storage.cache-probe.sh

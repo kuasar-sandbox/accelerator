@@ -74,6 +74,9 @@ func (s *Store) GenerationStats(ctx context.Context, generation store.Generation
 	return out, nil
 }
 
+// allPartitions lists every directory purge, wipe and stats must cover. The
+// alias partition is internal but its objects belong to a generation and must
+// disappear with it.
 func allPartitions() []store.Partition {
-	return []store.Partition{store.PartitionChunk, store.PartitionManifest, store.PartitionBlob}
+	return []store.Partition{store.PartitionChunk, store.PartitionManifest, store.PartitionBlob, store.PartitionAlias}
 }

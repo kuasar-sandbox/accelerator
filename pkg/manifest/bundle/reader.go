@@ -609,6 +609,14 @@ func (r *Reader) validateManifestClosure(key store.ContentKey, manifest *codec.M
 			return fmt.Errorf("%w: Manifest %s Chunk %d (%s) is absent", ErrIncomplete, hex.EncodeToString(key[:]), index, hex.EncodeToString(chunkKey[:]))
 		}
 	}
+	// A delta entry also needs its base, which may be no entry of this (or
+	// any local) manifest: the delta table is what makes it part of the closure.
+	for _, ref := range manifest.Deltas {
+		baseKey := store.ContentKey(ref.Base)
+		if _, ok := r.chunks[baseKey]; !ok {
+			return fmt.Errorf("%w: Manifest %s Chunk %d is a delta whose base (%s) is absent", ErrIncomplete, hex.EncodeToString(key[:]), ref.Entry, hex.EncodeToString(baseKey[:]))
+		}
+	}
 	return nil
 }
 

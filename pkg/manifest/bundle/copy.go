@@ -26,8 +26,9 @@ func (w *Writer) CopyManifestFromBundle(ctx context.Context, key store.ContentKe
 
 // CopyManifest copies exact physical bytes from a caller-owned Bundle-only or
 // Store Getter. It force-checks each physical ContentKey and complete Chunk
-// closure. Source/target write-admission compatibility is established by the
-// caller (or by CopyManifestFromBundle).
+// closure, which for a Version2 manifest includes the bases its delta chunks
+// depend on. Source/target write-admission compatibility is established by
+// the caller (or by CopyManifestFromBundle).
 func (w *Writer) CopyManifest(ctx context.Context, key store.ContentKey, source cache.Getter) error {
 	if source == nil {
 		return fmt.Errorf("manifest bundle: copy source Getter is required")
@@ -42,16 +43,7 @@ func (w *Writer) CopyManifest(ctx context.Context, key store.ContentKey, source 
 		manifestBlob.Release()
 		return fmt.Errorf("manifest bundle: copied Manifest %s parse: %w", hex.EncodeToString(key[:]), err)
 	}
-	seen := make(map[store.ContentKey]struct{})
-	for _, entry := range manifest.Entries {
-		if entry.IsZero {
-			continue
-		}
-		chunkKey := store.ContentKey(entry.CiphertextHash)
-		if _, ok := seen[chunkKey]; ok {
-			continue
-		}
-		seen[chunkKey] = struct{}{}
+	for _, chunkKey := range manifestClosureKeys(manifest) {
 		chunkBlob, err := getVerified(ctx, source, store.PartitionChunk, chunkKey)
 		if err != nil {
 			manifestBlob.Release()

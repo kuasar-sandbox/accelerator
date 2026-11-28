@@ -10,8 +10,8 @@ import (
 
 // cmdInfo opens the store described by the config in read-only mode
 // and prints a short report: backend, location, current write generation,
-// the full generations list, and per-generation chunk/manifest object
-// counts.
+// the full generations list, and per-generation chunk/manifest/blob object
+// counts plus the number of delta aliases.
 //
 // Works on both backends — the per-partition walk happens through
 // the admin GenerationStats method, which fs implements with
@@ -60,7 +60,7 @@ func cmdInfo(args []string) {
 			fmt.Printf("  %s: error: %v\n", generation, err)
 			continue
 		}
-		fmt.Printf("  %s: chunk=%d manifest=%d blob=%d\n",
-			generation, stats[store.PartitionChunk], stats[store.PartitionManifest], stats[store.PartitionBlob])
+		fmt.Printf("  %s: chunk=%d manifest=%d blob=%d alias=%d\n",
+			generation, stats[store.PartitionChunk], stats[store.PartitionManifest], stats[store.PartitionBlob], stats[store.PartitionAlias])
 	}
 }

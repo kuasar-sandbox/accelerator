@@ -29,6 +29,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/chunker"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/delta"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/internal/objectformat"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
@@ -106,6 +107,37 @@ type Result struct {
 	EncodedChunkBytes     uint64
 	CompressionSavedBytes uint64 // LogicalChunkBytes - EncodedChunkBytes
 
+	// Delta compression (all zero unless delta is enabled). A chunk stored as a
+	// delta is still counted under RawChunks/CompressedChunks by the independent
+	// encoding it would otherwise have had, so Raw+Compressed still equals the
+	// number of non-zero chunks; DeltaChunks says how many of those were stored
+	// as deltas instead. StoredChunks/DedupChunks/StoredBytes describe the
+	// object actually written, delta or not.
+	DeltaChunks       uint32 // chunks stored as delta objects, newly written or already present
+	DeltaLogicalBytes uint64 // plaintext bytes of those chunks
+	DeltaSavedBytes   uint64 // independent object bytes minus delta object bytes, summed
+	DeltaRepHits      uint32 // of DeltaChunks, resolved from the representation index
+	DeltaAttempts     uint32 // chunks for which at least one candidate base was delta-encoded
+	DeltaRejected     uint32 // attempts where no delta met the acceptance rule
+	DeltaNoCandidate  uint32 // eligible chunks with no similar base available
+	DeltaNotResident  uint32 // similar bases found but whose plaintext was not in the pool
+	DeltaKnownSkips   uint32 // chunks skipped because already stored independently
+	DeltaTimeouts     uint32 // attempts cut short by the per-chunk deadline
+	DeltaErrors       uint32 // unexpected failures that fell back to independent objects
+	DeltaReadbacks    uint32 // bases fetched from the store because they were not in the pool
+
+	// Cross-node coordination (see store.PartitionAlias). The store keeps one
+	// write-once alias per delta'd chunk so replicas that never exchange state
+	// still record the same representation.
+	DeltaResolves         uint32 // Resolve calls made
+	DeltaAdopted          uint32 // chunks that took another writer's verified delta object
+	DeltaAdoptFailed      uint32 // aliases that could not be adopted (unusable, or could not be checked)
+	DeltaAliasWon         uint32 // delta objects uploaded that became the chunk's representation
+	DeltaAliasLost        uint32 // delta objects uploaded that lost to another writer's
+	DeltaAliasIndependent uint32 // delta objects uploaded for a chunk that turned out to exist whole (older servers only)
+	DeltaOrphanBytes      uint64 // bytes of uploaded delta objects that nothing references and that remain in the store
+	DeltaDiscardedBytes   uint64 // bytes of uploaded delta objects that lost the alias race and the store deleted again
+
 	ManifestLogicalBytes uint64 // decoded logical manifest, including magic
 	ManifestStoredBytes  uint64 // physical envelope size, including magic + encoding
 	ManifestCompressed   bool
@@ -141,6 +173,7 @@ type ingester struct {
 	store       StoreWriter
 	chunker     chunker.Chunker
 	enc         crypto.Encryptor
+	delta       *deltaRuntime // nil = delta compression off
 }
 
 // Ingest consumes src in one forward pass: Hole runs are recorded as
@@ -199,6 +232,16 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 		encLen uint64
 		format byte
 		isNew  bool
+
+		// Delta: isDelta marks a chunk whose stored object is a delta object;
+		// repHit that it was already stored (no Put); deltaSaved is independent
+		// object size minus delta object size; baseKey/baseSize name the base
+		// for the manifest's delta table.
+		isDelta    bool
+		repHit     bool
+		deltaSaved uint64
+		baseKey    [32]byte
+		baseSize   uint32
 	}
 	var (
 		outcomes []*chunkOutcome
@@ -218,6 +261,14 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	var (
+		dom      *delta.Domain
+		counters deltaCounters
+	)
+	if i.delta != nil {
+		dom = i.delta.eng.Domain(salt)
+	}
 
 	type job struct {
 		oc      *chunkOutcome
@@ -262,24 +313,78 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 					fail(fmt.Errorf("ingest: encrypt chunk: %w", err))
 					continue
 				}
-				ck := store.ContentKey(hash)
-				var isNew bool
-				if ordered, ok := i.store.(OrderedChunkStoreWriter); ok {
-					isNew, err = ordered.PutChunkOrdered(wctx, admission, ck, ciphertext, j.ordinal)
-				} else {
-					isNew, err = i.store.Put(wctx, admission, store.PartitionChunk, ck, ciphertext)
+				// ciphertext/hash/key describe the independent object. When delta
+				// applies, a different object is stored and recorded instead.
+				stored, storedHash, storedKey := ciphertext, hash, key
+				var dout deltaOutcome
+				if dom != nil {
+					dout = i.delta.tryDelta(wctx, dom, admission.Generation, salt, j.data, ciphertext, hash, &counters)
+					if wctx.Err() != nil {
+						fail(wctx.Err())
+						continue
+					}
 				}
-				if err != nil {
-					fail(fmt.Errorf("ingest: store put chunk: %w", err))
-					continue
+
+				var (
+					isNew bool
+					dp    deltaPut
+				)
+				// putIndependent stores the independent object through whichever
+				// path this writer wants; the delta fallback uses it too.
+				putIndependent := func(ctx context.Context) (bool, error) {
+					ck := store.ContentKey(hash)
+					if ordered, ok := i.store.(OrderedChunkStoreWriter); ok {
+						return ordered.PutChunkOrdered(ctx, admission, ck, ciphertext, j.ordinal)
+					}
+					return i.store.Put(ctx, admission, store.PartitionChunk, ck, ciphertext)
 				}
-				j.oc.key = key
-				j.oc.ck = ck
-				j.oc.ctLen = uint64(len(ciphertext))
-				j.oc.encLen = uint64(len(ciphertext) - 1)
+				switch {
+				case dout.repHit:
+					// Already stored as a delta: nothing to write.
+					storedHash, storedKey = dout.rep.DeltaObjectKey, dout.key
+					j.oc.ctLen = uint64(dout.rep.ObjectSize)
+					j.oc.isDelta, j.oc.repHit = true, true
+					j.oc.deltaSaved = savedBytes(len(ciphertext), uint64(dout.rep.ObjectSize))
+					j.oc.baseKey, j.oc.baseSize = dout.rep.BaseObjectKey, dout.rep.BaseSize
+				case dout.object != nil:
+					// A new delta object. The store decides whether it becomes the
+					// chunk's representation; the manifest records what it decided.
+					dp, err = i.delta.putDelta(wctx, dom, admission, salt, &dout, j.data, ciphertext, hash, key, putIndependent, &counters)
+					if err != nil {
+						fail(fmt.Errorf("ingest: store put chunk: %w", err))
+						continue
+					}
+					storedHash, storedKey = dp.hash, dp.key
+					j.oc.isDelta = dp.isDelta
+					if dp.isDelta {
+						j.oc.deltaSaved = savedBytes(len(ciphertext), uint64(dp.objectSize))
+						j.oc.baseKey, j.oc.baseSize = dp.rep.BaseObjectKey, dp.rep.BaseSize
+					}
+					isNew = dp.isNew
+					j.oc.ctLen = dp.written
+				default:
+					isNew, err = putIndependent(wctx)
+					if err != nil {
+						fail(fmt.Errorf("ingest: store put chunk: %w", err))
+						continue
+					}
+					j.oc.ctLen = uint64(len(stored))
+				}
+				j.oc.key = storedKey
+				j.oc.ck = store.ContentKey(storedHash)
+				j.oc.encLen = uint64(len(ciphertext) - 1) // independent payload, so compression stats keep their meaning
 				j.oc.format = ciphertext[0]
 				j.oc.isNew = isNew
 				emitProgress(j.oc.size)
+
+				// Only after the object is safely stored, feed the soft state.
+				// Registering a base hands j.data to the pool, so it comes last.
+				if dom != nil && !dout.repHit {
+					if dout.object == nil || dp.independent {
+						i.delta.afterIndependentPut(dom, dout, hash, key, j.data)
+					}
+					// A stored delta object's representation was recorded by putDelta.
+				}
 			}
 		}()
 	}
@@ -384,6 +489,21 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 			case crypto.ChunkFormatAESSnappy:
 				res.CompressedChunks++
 			}
+			if oc.isDelta {
+				res.DeltaChunks++
+				res.DeltaLogicalBytes += uint64(oc.size)
+				res.DeltaSavedBytes += oc.deltaSaved
+				// A delta entry makes this a Version2 manifest: the entry is
+				// flagged and the delta table names its base, so prefetch and
+				// dependency tooling need not open the object to learn it.
+				entry.IsDelta = true
+				m.Version = codec.Version2
+				m.Deltas = append(m.Deltas, codec.DeltaRef{
+					Entry:    uint32(len(m.Entries)),
+					BaseSize: oc.baseSize,
+					Base:     oc.baseKey,
+				})
+			}
 			if oc.isNew {
 				res.StoredChunks++
 				res.StoredBytes += oc.ctLen
@@ -421,7 +541,7 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 	if err != nil {
 		return nil, fmt.Errorf("ingest: marshal manifest: %w", err)
 	}
-	res.ManifestLogicalBytes = uint64(codec.HeaderSize) + uint64(len(m.Entries))*codec.EntrySize + uint64(len(m.Holes))*codec.HoleSize + uint64(len(sealed))
+	res.ManifestLogicalBytes = uint64(codec.HeaderSize) + uint64(len(m.Entries))*codec.EntrySize + uint64(len(m.Holes))*codec.HoleSize + uint64(len(m.Deltas))*codec.DeltaRefSize + uint64(len(sealed))
 	res.ManifestStoredBytes = uint64(len(blob))
 	res.ManifestCompressed = len(blob) >= 5 && blob[4] == codec.ManifestEncodingSnappy
 	res.CompressionSavedBytes = res.LogicalChunkBytes - res.EncodedChunkBytes
@@ -436,6 +556,27 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 	}
 
 	res.ManifestKey = manifestKey
+
+	if i.delta != nil {
+		res.DeltaRepHits = counters.repHits.Load()
+		res.DeltaAttempts = counters.attempts.Load()
+		res.DeltaRejected = counters.rejected.Load()
+		res.DeltaNoCandidate = counters.noCandidate.Load()
+		res.DeltaNotResident = counters.notResident.Load()
+		res.DeltaKnownSkips = counters.knownSkips.Load()
+		res.DeltaTimeouts = counters.timeouts.Load()
+		res.DeltaErrors = counters.encodeErrors.Load() + counters.repStale.Load()
+		res.DeltaReadbacks = counters.readbacks.Load()
+		res.DeltaResolves = counters.resolves.Load()
+		res.DeltaAdopted = counters.adopted.Load()
+		res.DeltaAdoptFailed = counters.adoptFailed.Load()
+		res.DeltaAliasWon = counters.aliasWon.Load()
+		res.DeltaAliasLost = counters.aliasLost.Load()
+		res.DeltaAliasIndependent = counters.aliasIndep.Load()
+		res.DeltaOrphanBytes = counters.orphanBytes.Load()
+		res.DeltaDiscardedBytes = counters.discardedBytes.Load()
+		i.delta.flush()
+	}
 	return &res, nil
 }
 
@@ -453,10 +594,20 @@ func validateEncryptedChunkObject(object []byte, plaintextSize uint32) error {
 		if !objectformat.CompressionBeneficial(uint64(plaintextSize), encodedSize) {
 			return fmt.Errorf("Snappy payload size %d does not satisfy canonical benefit rule for %d plaintext bytes", encodedSize, plaintextSize)
 		}
+	case crypto.ChunkFormatAESDelta:
+		return validateDeltaObject(object, plaintextSize)
 	default:
 		return fmt.Errorf("unknown physical format 0x%02x", object[0])
 	}
 	return nil
+}
+
+// savedBytes is independent minus delta object size, floored at zero.
+func savedBytes(independent int, deltaObject uint64) uint64 {
+	if uint64(independent) <= deltaObject {
+		return 0
+	}
+	return uint64(independent) - deltaObject
 }
 
 // segReader feeds one hole-bounded segment [cur, end) of a

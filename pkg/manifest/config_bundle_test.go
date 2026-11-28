@@ -29,6 +29,7 @@ type bundleTestStore struct {
 	mu        sync.Mutex
 	admission store.WriteAdmission
 	objects   map[bundleTestObject][]byte
+	aliases   map[store.ContentKey]store.ContentKey
 }
 
 func (s *bundleTestStore) AdmitWrite(ctx context.Context) (store.WriteAdmission, error) {
@@ -56,6 +57,57 @@ func (s *bundleTestStore) Put(ctx context.Context, a store.WriteAdmission, p sto
 	}
 	s.objects[id] = bytes.Clone(data)
 	return true, nil
+}
+
+// Get, Resolve and PutRepresenting give the store what delta compression needs
+// from a real one: reading objects back and the write-once alias per chunk.
+func (s *bundleTestStore) Get(ctx context.Context, p store.Partition, k store.ContentKey) (bool, []byte, error) {
+	if err := ctx.Err(); err != nil {
+		return false, nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, ok := s.objects[bundleTestObject{p, k}]
+	return ok, bytes.Clone(data), nil
+}
+
+func (s *bundleTestStore) Resolve(ctx context.Context, _ store.Generation, h store.ContentKey) (store.Resolved, error) {
+	if err := ctx.Err(); err != nil {
+		return store.Resolved{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.objects[bundleTestObject{store.PartitionChunk, h}]; ok {
+		return store.Resolved{Resolution: store.ResolutionIndependent}, nil
+	}
+	if d, ok := s.aliases[h]; ok {
+		return store.Resolved{Resolution: store.ResolutionDelta, DeltaKey: d}, nil
+	}
+	return store.Resolved{}, nil
+}
+
+func (s *bundleTestStore) PutRepresenting(ctx context.Context, a store.WriteAdmission, k store.ContentKey, data []byte, represents store.ContentKey) (store.PutResult, error) {
+	isNew, err := s.Put(ctx, a, store.PartitionChunk, k, data)
+	if err != nil {
+		return store.PutResult{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := store.PutResult{IsNew: isNew}
+	if _, ok := s.objects[bundleTestObject{store.PartitionChunk, represents}]; ok {
+		out.Represented = store.RepresentedIndependent
+		return out, nil
+	}
+	if s.aliases == nil {
+		s.aliases = map[store.ContentKey]store.ContentKey{}
+	}
+	if cur, ok := s.aliases[represents]; ok && cur != k {
+		out.Represented, out.Key = store.RepresentedLost, cur
+		return out, nil
+	}
+	s.aliases[represents] = k
+	out.Represented = store.RepresentedWon
+	return out, nil
 }
 
 func bundleTestConfig(t *testing.T) *manifest.Config {

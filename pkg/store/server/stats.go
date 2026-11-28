@@ -18,8 +18,19 @@ type Stats struct {
 	putBytes atomic.Uint64 // bytes received + stored on Put (excludes dedup hits)
 	putDedup atomic.Uint64 // Put that short-circuited on an existing key (no store)
 	admitN   atomic.Uint64 // AdmitWrite calls
-	errN     atomic.Uint64 // requests that returned a gRPC error
-	inflight atomic.Int64  // gauge: Get+Put currently executing
+	resolveN atomic.Uint64 // Resolve calls
+
+	// Alias outcomes of Puts that asked for representation (cross-node delta).
+	aliasWon   atomic.Uint64 // this Put's object became the chunk's representation
+	aliasLost  atomic.Uint64 // another delta object already represented the chunk
+	aliasIndep atomic.Uint64 // an independent object already existed (no longer produced; kept for the stats line)
+	aliasErr   atomic.Uint64 // the alias step failed or is unsupported; Put still succeeded
+	// Losing objects this server created in the same Put and deleted again.
+	discarded      atomic.Uint64
+	discardedBytes atomic.Uint64
+	discardErr     atomic.Uint64 // a losing object could not be deleted and stays as an orphan
+	errN           atomic.Uint64 // requests that returned a gRPC error
+	inflight       atomic.Int64  // gauge: Get+Put currently executing
 
 	getHist obstat.Hist // Get wall-clock latency
 	putHist obstat.Hist // Put wall-clock latency
@@ -30,6 +41,11 @@ type StatsSnapshot struct {
 	GetN, GetHits, GetBytes  uint64
 	PutN, PutBytes, PutDedup uint64
 	AdmitN, ErrN             uint64
+	ResolveN                 uint64
+	AliasWon, AliasLost      uint64
+	AliasIndep, AliasErr     uint64
+	Discarded, DiscardErr    uint64
+	DiscardedBytes           uint64
 	Inflight                 int64
 	GetHist, PutHist         obstat.HistSnapshot
 }
@@ -40,9 +56,14 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		GetN: s.getN.Load(), GetHits: s.getHits.Load(), GetBytes: s.getBytes.Load(),
 		PutN: s.putN.Load(), PutBytes: s.putBytes.Load(), PutDedup: s.putDedup.Load(),
 		AdmitN: s.admitN.Load(), ErrN: s.errN.Load(),
-		Inflight: s.inflight.Load(),
-		GetHist:  s.getHist.Snapshot(),
-		PutHist:  s.putHist.Snapshot(),
+		ResolveN: s.resolveN.Load(),
+		AliasWon: s.aliasWon.Load(), AliasLost: s.aliasLost.Load(),
+		AliasIndep: s.aliasIndep.Load(), AliasErr: s.aliasErr.Load(),
+		Discarded: s.discarded.Load(), DiscardErr: s.discardErr.Load(),
+		DiscardedBytes: s.discardedBytes.Load(),
+		Inflight:       s.inflight.Load(),
+		GetHist:        s.getHist.Snapshot(),
+		PutHist:        s.putHist.Snapshot(),
 	}
 }
 

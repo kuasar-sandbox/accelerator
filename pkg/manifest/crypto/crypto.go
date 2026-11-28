@@ -17,6 +17,27 @@ type Encryptor interface {
 	SealKeyTable(customerKey [32]byte, keys, aad []byte) ([]byte, error)
 }
 
+// DeltaEncryptor is implemented by encryptors that can also produce
+// ChunkFormatAESDelta objects. It is a separate, optional interface so that
+// existing Encryptor implementations (and test doubles) are unaffected; callers
+// type-assert for it and treat its absence as "delta unsupported".
+type DeltaEncryptor interface {
+	// EncryptDeltaChunk stores target as a delta against base. stream is the
+	// VCDIFF encoding of target relative to base's plaintext. It returns the
+	// complete physical object, its hash, and the key to record in the key table
+	// (the delta key K_d, which is NOT the convergent key of target).
+	EncryptDeltaChunk(ctx context.Context, salt [32]byte, base DeltaBase, target, stream []byte) (object []byte, hash [32]byte, key [32]byte, err error)
+}
+
+// DeltaDecryptor is the read-side counterpart of DeltaEncryptor.
+type DeltaDecryptor interface {
+	// OpenDeltaChunk parses and decrypts a ChunkFormatAESDelta object with its
+	// key-table key, returning the base reference and the VCDIFF stream. The
+	// caller fetches the base, decrypts it with the returned BaseKey, and applies
+	// the stream.
+	OpenDeltaChunk(ctx context.Context, key [32]byte, object []byte) (DeltaOpened, error)
+}
+
 // Decryptor is the read-side narrow interface. Symmetric counterpart
 // to Encryptor — same algorithms, opposite direction.
 type Decryptor interface {
@@ -61,6 +82,14 @@ type codec struct {
 
 func (c *codec) EncryptChunk(ctx context.Context, salt [32]byte, plaintext []byte) ([]byte, [32]byte, [32]byte, error) {
 	return c.chunk.EncryptChunk(ctx, salt, plaintext)
+}
+
+func (c *codec) EncryptDeltaChunk(ctx context.Context, salt [32]byte, base DeltaBase, target, stream []byte) ([]byte, [32]byte, [32]byte, error) {
+	return c.chunk.EncryptDeltaChunk(ctx, salt, base, target, stream)
+}
+
+func (c *codec) OpenDeltaChunk(ctx context.Context, key [32]byte, object []byte) (DeltaOpened, error) {
+	return c.chunk.OpenDeltaChunk(ctx, key, object)
 }
 
 func (c *codec) DecryptChunkTo(ctx context.Context, key [32]byte, ciphertext, dst []byte) error {

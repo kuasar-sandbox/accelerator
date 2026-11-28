@@ -42,6 +42,8 @@ func main() {
 		cmdGetManifest(os.Args[2:])
 	case "info":
 		cmdInfo(os.Args[2:])
+	case "deps":
+		cmdDeps(os.Args[2:])
 	case "verify":
 		cmdVerify(os.Args[2:])
 	case "diff":
@@ -65,6 +67,8 @@ Commands:
                  tarstream, Bundle and/or Store outputs, preserving sparse ranges.
   get-manifest   Fetch a manifest blob by hex content key.
   info           Print manifest metadata.
+  deps           List every store object an image depends on: its chunk
+                 objects and, for delta chunks, the base objects they need.
   verify         Verify chunk integrity against a manifest.
   diff           Compare two manifests' shared / unique chunks.
   config         Inspect or generate the manifest config file.
@@ -72,8 +76,9 @@ Commands:
 Configuration:
   Commands using remote data or configuration read YAML through
   --manifest-config <path> or MANIFEST_CONFIG. Flag wins; no auto-discovery.
-  'config generate', local/stdin 'info', and local-file 'diff' need no config.
-  For remote 'info', use manifest://<hex>; bare hex is a local filename.
+  'config generate', local/stdin 'info'/'deps', and local-file 'diff' need no
+  config. For remote 'info'/'deps', use manifest://<hex>; bare hex is a local
+  filename.
   The sensitive manifest.key may be omitted from the file and supplied
   via nonempty MANIFEST_KEY instead (a nonempty value overrides the file).
   'config show' does not echo the environment key, but can print a key
@@ -266,20 +271,12 @@ func cmdGetManifest(args []string) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// info command
-// ---------------------------------------------------------------------------
-
-func cmdInfo(args []string) {
-	fs := flag.NewFlagSet("info", flag.ExitOnError)
-	gf := addGlobalFlags(fs)
-	fs.Parse(args)
-	src := fs.Arg(0)
+// loadManifestArg reads a manifest from a manifest://<hex> reference (through
+// the configured store), a file path, or "-"/empty for stdin.
+func loadManifestArg(src, configPath string) (data []byte, m *codec.Manifest, sealedKT []byte) {
 	if src == "" {
 		src = "-" // default: manifest bytes on stdin
 	}
-
-	var data []byte
 	var err error
 	if strings.HasPrefix(src, "manifest://") {
 		// manifest://<hex>: fetch the raw manifest blob from store
@@ -288,7 +285,7 @@ func cmdInfo(args []string) {
 		if perr != nil {
 			fatal("%v", perr)
 		}
-		data, err = loadCfg(*gf.configPath).GetManifestBlob(context.Background(), key)
+		data, err = loadCfg(configPath).GetManifestBlob(context.Background(), key)
 		if err != nil {
 			fatal("get manifest: %v", err)
 		}
@@ -299,10 +296,62 @@ func cmdInfo(args []string) {
 			fatal("read manifest: %v", err)
 		}
 	}
-	m, sealedKT, err := codec.Unmarshal(data)
+	m, sealedKT, err = codec.Unmarshal(data)
 	if err != nil {
 		fatal("unmarshal manifest: %v", err)
 	}
+	return data, m, sealedKT
+}
+
+// deltaSummary is what a manifest's delta table says about the image's
+// dependencies, without touching the store.
+type deltaSummary struct {
+	entries       uint32 // entries stored as deltas
+	logicalBytes  uint64 // their plaintext bytes
+	bases         int    // distinct base objects
+	externalBases int    // of those, not addressed by any entry of this manifest
+	baseBytes     uint64 // plaintext bytes of the distinct bases
+}
+
+func summarizeDeltas(m *codec.Manifest) deltaSummary {
+	var s deltaSummary
+	if len(m.Deltas) == 0 {
+		return s
+	}
+	own := make(map[[32]byte]struct{}, len(m.Entries))
+	for _, e := range m.Entries {
+		if !e.IsZero {
+			own[e.CiphertextHash] = struct{}{}
+		}
+	}
+	bases := make(map[[32]byte]uint32, len(m.Deltas))
+	for _, d := range m.Deltas {
+		s.entries++
+		if int(d.Entry) < len(m.Entries) {
+			s.logicalBytes += uint64(m.Entries[d.Entry].Size)
+		}
+		if _, seen := bases[d.Base]; seen {
+			continue
+		}
+		bases[d.Base] = d.BaseSize
+		s.bases++
+		s.baseBytes += uint64(d.BaseSize)
+		if _, ok := own[d.Base]; !ok {
+			s.externalBases++
+		}
+	}
+	return s
+}
+
+// ---------------------------------------------------------------------------
+// info command
+// ---------------------------------------------------------------------------
+
+func cmdInfo(args []string) {
+	fs := flag.NewFlagSet("info", flag.ExitOnError)
+	gf := addGlobalFlags(fs)
+	fs.Parse(args)
+	data, m, sealedKT := loadManifestArg(fs.Arg(0), *gf.configPath)
 
 	count := m.ChunkCount()
 	var (
@@ -332,6 +381,11 @@ func cmdInfo(args []string) {
 	fmt.Printf("chunk count:   %d\n", count)
 	fmt.Printf("zero chunks:   %d (%s)\n", zeroChunks, formatSize(zeroBytes))
 	fmt.Printf("holes:         %d (%s)\n", len(m.Holes), formatSize(holeBytes))
+	if m.Version >= codec.Version2 {
+		ds := summarizeDeltas(m)
+		fmt.Printf("delta chunks:  %d (%s)\n", ds.entries, formatSize(ds.logicalBytes))
+		fmt.Printf("delta bases:   %d distinct (%s), %d outside this manifest\n", ds.bases, formatSize(ds.baseBytes), ds.externalBases)
+	}
 	fmt.Printf("min chunk:     %s    (configured)\n", formatSize(uint64(m.MinChunkSize)))
 	fmt.Printf("max chunk:     %s    (configured)\n", formatSize(uint64(m.MaxChunkSize)))
 	fmt.Printf("avg chunk:     %s\n", formatSize(avgSize))
@@ -418,6 +472,77 @@ func shortSize(n uint64) string {
 }
 
 // ---------------------------------------------------------------------------
+// deps command
+// ---------------------------------------------------------------------------
+
+// cmdDeps prints the image's object closure: one line per distinct chunk-
+// partition object the image needs, in the form "<role> <hex> <bytes>", where
+// role is "chunk" (an independent object an entry addresses), "delta" (a delta
+// object an entry addresses) or "base" (an object a delta needs and no entry
+// addresses). A garbage collector that keeps exactly this set for every live
+// manifest never deletes a base out from under a delta. With -bases-only, only
+// base lines are printed; with -quiet, the summary is suppressed.
+//
+// Sizes are logical (plaintext) for chunk and base lines because that is what
+// the manifest knows; a delta object's stored size is not recorded in the
+// manifest, so its line reports the entry's plaintext size as well.
+func cmdDeps(args []string) {
+	fs := flag.NewFlagSet("deps", flag.ExitOnError)
+	basesOnly := fs.Bool("bases-only", false, "print only base objects that no entry addresses")
+	quiet := fs.Bool("quiet", false, "suppress the summary on stderr")
+	gf := addGlobalFlags(fs)
+	fs.Parse(args)
+	_, m, _ := loadManifestArg(fs.Arg(0), *gf.configPath)
+
+	type obj struct {
+		role string
+		size uint64
+	}
+	objs := make(map[[32]byte]obj, len(m.Entries)+len(m.Deltas))
+	order := make([][32]byte, 0, len(m.Entries)+len(m.Deltas))
+	add := func(k [32]byte, o obj) {
+		if _, ok := objs[k]; ok {
+			return
+		}
+		objs[k] = o
+		order = append(order, k)
+	}
+	for _, e := range m.Entries {
+		if e.IsZero {
+			continue
+		}
+		role := "chunk"
+		if e.IsDelta {
+			role = "delta"
+		}
+		add(e.CiphertextHash, obj{role: role, size: uint64(e.Size)})
+	}
+	for _, d := range m.Deltas {
+		add(d.Base, obj{role: "base", size: uint64(d.BaseSize)})
+	}
+	var chunks, deltas, bases int
+	for _, k := range order {
+		o := objs[k]
+		switch o.role {
+		case "chunk":
+			chunks++
+		case "delta":
+			deltas++
+		case "base":
+			bases++
+		}
+		if *basesOnly && o.role != "base" {
+			continue
+		}
+		fmt.Printf("%-5s %x %d\n", o.role, k, o.size)
+	}
+	if !*quiet {
+		fmt.Fprintf(os.Stderr, "objects: %d  chunk: %d  delta: %d  base (outside this manifest): %d  manifest version: %d\n",
+			len(order), chunks, deltas, bases, m.Version)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // verify command
 // ---------------------------------------------------------------------------
 
@@ -463,7 +588,7 @@ func cmdVerify(args []string) {
 	defer stream.Close()
 
 	count := int(m.ChunkCount())
-	verified, skipped, failed := 0, 0, 0
+	verified, skipped, failed, deltas := 0, 0, 0, 0
 	buf := make([]byte, m.MaxChunkSize)
 	for i, entry := range m.Entries {
 		if entry.IsZero {
@@ -477,12 +602,17 @@ func cmdVerify(args []string) {
 			buf = make([]byte, entry.Size)
 		}
 		buf = buf[:entry.Size]
+		// A delta entry is verified end to end: the delta object, its base
+		// (fetched, hash-checked, decrypted) and the apply all have to succeed.
 		if _, rerr := stream.ReadAt(ctx, buf, entry.Offset); rerr != nil {
 			fmt.Fprintf(os.Stderr, "\nchunk %d: read failed: %v\n", i, rerr)
 			failed++
 			continue
 		}
 		verified++
+		if entry.IsDelta {
+			deltas++
+		}
 		if !*noProgress {
 			fmt.Fprintf(os.Stderr, "\rverify: %d/%d", i+1, count)
 		}
@@ -490,8 +620,8 @@ func cmdVerify(args []string) {
 	if !*noProgress {
 		fmt.Fprintln(os.Stderr)
 	}
-	fmt.Fprintf(os.Stderr, "verified: %d  skipped(zero): %d  holes: %d  failed: %d  total chunks: %d\n",
-		verified, skipped, len(m.Holes), failed, count)
+	fmt.Fprintf(os.Stderr, "verified: %d (delta: %d)  skipped(zero): %d  holes: %d  failed: %d  total chunks: %d\n",
+		verified, deltas, skipped, len(m.Holes), failed, count)
 	totalFailed += failed
 	if totalFailed > 0 {
 		os.Exit(1)

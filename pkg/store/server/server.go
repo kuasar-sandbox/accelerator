@@ -206,6 +206,24 @@ func (s *Server) Put(stream pb.Store_PutServer) error {
 		s.stats.errN.Add(1)
 		return status.Errorf(codes.FailedPrecondition, "put: generation %q is not current", generation)
 	}
+	var represents *store.ContentKey
+	if r := header.GetRepresents(); len(r) != 0 {
+		if partition != store.PartitionChunk {
+			s.stats.errN.Add(1)
+			return status.Error(codes.InvalidArgument, "put: represents is only valid for the chunk partition")
+		}
+		var h store.ContentKey
+		if len(r) != len(h) {
+			s.stats.errN.Add(1)
+			return status.Errorf(codes.InvalidArgument, "put: represents must be %d bytes, got %d", len(h), len(r))
+		}
+		copy(h[:], r)
+		if h == key {
+			s.stats.errN.Add(1)
+			return status.Error(codes.InvalidArgument, "put: an object cannot represent itself")
+		}
+		represents = &h
+	}
 	var expectedSize *int64
 	if header.Size != nil {
 		if *header.Size > math.MaxInt64 {
@@ -228,7 +246,7 @@ func (s *Server) Put(stream pb.Store_PutServer) error {
 	}
 	if exists {
 		s.stats.putDedup.Add(1)
-		return stream.SendAndClose(&pb.PutResponse{IsNew: false})
+		return stream.SendAndClose(s.putResponse(stream.Context(), generation, partition, false, 0, key, represents))
 	}
 
 	// 3. Open a streaming-Put handle; bytes land directly on disk.
@@ -315,7 +333,111 @@ func (s *Server) Put(stream pb.Store_PutServer) error {
 	} else {
 		s.stats.putDedup.Add(1)
 	}
-	return stream.SendAndClose(&pb.PutResponse{IsNew: isNew})
+	return stream.SendAndClose(s.putResponse(stream.Context(), generation, partition, isNew, uint64(nbytes), key, represents))
+}
+
+// putResponse builds the Put reply. When the client asked for the object to be
+// recorded as the representation of another chunk, it attempts that after the
+// object is durably stored (new or already present) and reports the outcome.
+//
+// The alias is the only serialisation point between writers, so it is created
+// first and decides everything: whoever's object it names has WON; everyone
+// else has LOST. No separate "does the independent object exist" check is
+// made here. Such a check could only produce an outcome the client cannot act
+// on safely (an object nobody is allowed to reference but nobody may delete,
+// because another writer may have just been told it WON with that very
+// object). If an independent object has landed in the meantime, Resolve
+// prefers it, later writers converge on it, and the delta the winner recorded
+// stays referenced by the winner's manifest: not an orphan.
+//
+// A LOST object that this Put itself created is deleted again. That is safe
+// precisely because the alias is write-once: within this generation the alias
+// will never name this object, a client records a delta object only when the
+// alias names it, so no manifest can ever point at it. A LOST object that
+// already existed (dedup hit) is left to the request that created it: that
+// request sees the same alias, so it also LOST, and it deletes its own object.
+//
+// Failing to record the alias is not failing the Put: the object is stored and
+// valid, and the client treats REPRESENTED_NONE as "store the chunk
+// independently"; the object stays as the only kind of orphan this design
+// still produces, and only on an error path.
+func (s *Server) putResponse(ctx context.Context, generation store.Generation, partition store.Partition, isNew bool, nbytes uint64, key store.ContentKey, represents *store.ContentKey) *pb.PutResponse {
+	resp := &pb.PutResponse{IsNew: isNew}
+	if represents == nil {
+		return resp
+	}
+	ab, ok := s.backend.(AliasBackend)
+	if !ok {
+		s.stats.aliasErr.Add(1)
+		return resp
+	}
+	current, created, err := ab.CreateAlias(ctx, generation, *represents, key)
+	switch {
+	case err != nil:
+		s.stats.aliasErr.Add(1)
+	case created || current == key:
+		s.stats.aliasWon.Add(1)
+		resp.Represented = pb.Represented_REPRESENTED_WON
+	default:
+		s.stats.aliasLost.Add(1)
+		resp.Represented = pb.Represented_REPRESENTED_LOST
+		resp.RepresentedKey = current[:]
+		if isNew {
+			if err := ab.Delete(ctx, generation, partition, key); err != nil {
+				s.stats.discardErr.Add(1)
+			} else {
+				s.stats.discarded.Add(1)
+				s.stats.discardedBytes.Add(nbytes)
+				resp.Discarded = true
+			}
+		}
+	}
+	return resp
+}
+
+// Resolve reports how one generation stores the chunk whose independent
+// address is the request key. It looks only at the named generation: aliases
+// are scoped to the dedup domain they were created in, and an object in an
+// older generation was encrypted under a different salt.
+func (s *Server) Resolve(ctx context.Context, req *pb.ResolveRequest) (*pb.ResolveResponse, error) {
+	s.stats.resolveN.Add(1)
+	ab, ok := s.backend.(AliasBackend)
+	if !ok {
+		return nil, status.Error(codes.Unimplemented, "resolve: backend does not support aliases")
+	}
+	generation := store.Generation(req.GetGeneration())
+	if err := store.ValidateGeneration(generation); err != nil {
+		s.stats.errN.Add(1)
+		return nil, status.Errorf(codes.InvalidArgument, "resolve: generation: %v", err)
+	}
+	if !containsGeneration(s.generations(), generation) {
+		s.stats.errN.Add(1)
+		return nil, status.Errorf(codes.FailedPrecondition, "resolve: generation %q is not current", generation)
+	}
+	var key store.ContentKey
+	if len(req.GetKey()) != len(key) {
+		s.stats.errN.Add(1)
+		return nil, status.Errorf(codes.InvalidArgument, "resolve: key must be %d bytes, got %d", len(key), len(req.GetKey()))
+	}
+	copy(key[:], req.GetKey())
+
+	indep, err := s.backend.Exists(ctx, generation, store.PartitionChunk, key, nil)
+	if err != nil {
+		s.stats.errN.Add(1)
+		return nil, status.Errorf(codes.Internal, "resolve: exists: %v", err)
+	}
+	if indep {
+		return &pb.ResolveResponse{Resolution: pb.Resolution_RESOLUTION_INDEPENDENT}, nil
+	}
+	delta, found, err := ab.GetAlias(ctx, generation, key)
+	if err != nil {
+		s.stats.errN.Add(1)
+		return nil, status.Errorf(codes.Internal, "resolve: alias: %v", err)
+	}
+	if !found {
+		return &pb.ResolveResponse{Resolution: pb.Resolution_RESOLUTION_ABSENT}, nil
+	}
+	return &pb.ResolveResponse{Resolution: pb.Resolution_RESOLUTION_DELTA, DeltaKey: delta[:]}, nil
 }
 
 func containsGeneration(generations []store.Generation, generation store.Generation) bool {

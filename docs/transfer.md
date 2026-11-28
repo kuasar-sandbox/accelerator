@@ -123,6 +123,7 @@ Commands that use configuration require either `--manifest-config` or `MANIFEST_
 | `load` | Read and transform logical sources into tarstream, Bundle and/or Store outputs. |
 | `get-manifest` | Fetch raw Manifest bytes by hex key, chiefly for inspection. |
 | `info` | Print Manifest metadata without unsealing its key table. |
+| `deps` | Print the Manifest's object closure (chunks, delta objects and the bases deltas need) without unsealing its key table. |
 | `verify` | Verify the stored Manifest and all nonzero chunks through the fetch path. |
 | `diff` | Compare chunk overlap between two local Manifest files. |
 | `config show` | Print parsed configuration as YAML. |
@@ -293,6 +294,21 @@ The minimum/maximum marked `(configured)` are the bounds stored in the Manifest 
 
 `manifest-ctl info manifest://<hex>` is the direct equivalent of `get-manifest … | info -` for remote inspection.
 
+A Version 2 Manifest (one written with [delta compression](delta.md) enabled and containing at least one delta chunk) adds two lines after `holes:`:
+
+```text
+delta chunks:  1280 (612.5 MiB)
+delta bases:   1104 distinct (540.0 MiB), 1104 outside this manifest
+```
+
+### `manifest-ctl deps`
+
+Print one line per distinct chunk-partition object the image needs, from the same sources as `info`: `<role> <hex> <bytes>`, where the role is `chunk` (an independent object an entry addresses), `delta` (a delta object an entry addresses) or `base` (an object a delta needs that no entry addresses). Sizes are logical plaintext sizes. A collector that retains this set for every live Manifest never removes a base from under a delta. `-bases-only` prints only `base` lines; `-quiet` suppresses the summary on stderr.
+
+```text
+manifest-ctl deps [-bases-only] [-quiet] [--manifest-config <path>] <file|-|manifest://hex>
+```
+
 ### `manifest-ctl verify`
 
 Fetch and decrypt every nonzero chunk to verify the entire Manifest's availability and content. This command forces physical SHA-256 checking even if ordinary reads disable it.
@@ -302,8 +318,10 @@ manifest-ctl verify [--no-progress] a1b2c3d4...        # or manifest://a1b2c3d4.
 ```
 
 ```text
-verified: 20480  skipped(zero): 0  holes: 0  failed: 0  total chunks: 20480
+verified: 20480 (delta: 1280)  skipped(zero): 0  holes: 0  failed: 0  total chunks: 20480
 ```
+
+`delta:` counts chunks that were stored as patches; each one was opened, its base fetched and verified, and the patch applied and compared.
 
 ### `manifest-ctl diff` — deduplication analysis
 
@@ -366,6 +384,8 @@ crypto:
   manifest: aes                  # Only supported value
   local: off                     # off | auto | required; default off
   ref: auto                      # off | auto | required, independent of local
+delta:
+  enabled: false                 # Similarity-based delta compression; see docs/delta.md for the full block
 ```
 
 Fields:
@@ -381,6 +401,8 @@ Fields:
 - `crypto.ref` controls tarstreams in sandboxer named ref locations. Its independent default, `auto`, accepts plaintext or correctly keyed encrypted inputs and encrypts new output with the same customer key. Existing plaintext dependencies can remain in a published graph. `off` accepts and writes plaintext only. `required` accepts and writes encrypted tarstreams only. Manifest and Bundle keep their existing encoding.
 
 Enable this policy with a sandboxer version that implements ref-location reads, reuse and publication. Older loaders can ignore an unknown field. With a supporting sandboxer, upgrading an existing `local: off` configuration makes new ref writes require a key. To preserve the former publication behavior, set `ref` to the previous `local` value. In particular, set `ref: required` to keep rejecting plaintext ref inputs after upgrading from `local: required`.
+
+`delta` is the strictly decoded block of [delta compression](delta.md#configuration): an unknown key inside it is an error, unlike the rest of this file. `enabled` defaults to `false`, and with it off the pipeline is unchanged. Readers honour `delta.fetch.*` regardless of `enabled`, because an image another writer stored with deltas must stay readable.
 
 ### Loading order
 

@@ -12,6 +12,7 @@
 //	store-ctl purge   --config FILE --generation G   delete one older generation
 //	store-ctl purge   --config FILE --all            wipe the entire store
 //	store-ctl info    --config FILE                  show generations + object counts
+//	store-ctl delta-gc --config FILE --generation G  audit delta objects; --delete removes orphans
 //
 // `init` creates a writable generation source. Serve and the remaining admin
 // commands require an already initialised source; config sources are managed
@@ -44,6 +45,8 @@ func main() {
 		cmdPurge(os.Args[2:])
 	case "info":
 		cmdInfo(os.Args[2:])
+	case "delta-gc":
+		cmdDeltaGC(os.Args[2:])
 	case "config":
 		cmdConfig(os.Args[2:])
 	case "-h", "--help", "help":
@@ -76,6 +79,7 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  rollout   Append a new write generation")
 	fmt.Fprintln(os.Stderr, "  purge     Delete an older generation, or --all to wipe the store")
 	fmt.Fprintln(os.Stderr, "  info      Show generations and per-partition object counts")
+	fmt.Fprintln(os.Stderr, "  delta-gc  Audit a generation's delta objects; --delete removes orphans")
 	fmt.Fprintln(os.Stderr, "  config    Inspect or generate the store-ctl config")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "Environment:")

@@ -14,6 +14,14 @@
 //
 // Get is server-streaming: one GetRequest produces one or more
 // GetResponse messages with byte chunks, or a NOT_FOUND status on miss.
+//
+// Resolve and PutHeader.represents support cross-node delta compression. A
+// delta object is addressed by the hash of its patch, so two nodes that encode
+// the same chunk against different bases write different objects. The store
+// keeps one write-once "alias" per delta'd chunk, named by the hash the chunk
+// would have had as an independent object (H_ind); the first writer wins and
+// later writers adopt it. Aliases live in an internal partition that Get and
+// Put cannot address, are scoped to a generation, and are removed with it.
 syntax = "proto3";
 
 package cac.store.v1;
@@ -38,6 +46,13 @@ service Store {
     // exists. Otherwise the server streams data into the backend's
     // generation-bound handle and optionally re-hashes it.
     rpc Put(stream PutRequest) returns (PutResponse);
+
+    // Resolve reports how the chunk whose independent object address is `key`
+    // is stored in one generation: as that independent object, as a delta
+    // object named by an alias, or not at all. It answers only for the
+    // generation in the request, which must be current. A server whose backend
+    // cannot hold aliases returns UNIMPLEMENTED.
+    rpc Resolve(ResolveRequest) returns (ResolveResponse);
 }
 
 message AdmitWriteRequest {
@@ -94,6 +109,37 @@ message PutHeader {
     // Presence matters: zero is a known empty payload, while absence means
     // the sender did not provide an expected size.
     optional uint64 size = 4;
+    // Optional, chunk partition only (anything else is INVALID_ARGUMENT). When
+    // set it is the 32-byte independent address H_ind of the chunk this object
+    // is a delta of. After the object is stored (or found already stored), the
+    // server tries to create the write-once alias H_ind -> key in this
+    // generation and reports the outcome in PutResponse.represented. A server
+    // that predates the field ignores it and answers REPRESENTED_NONE.
+    //
+    // A client must record a delta object in a manifest only when the alias
+    // names it (WON here, or learned through Resolve). On any other outcome it
+    // adopts the alias's object or stores the chunk independently. That rule is
+    // what lets the server delete a losing object (see PutResponse.discarded)
+    // without ever breaking a manifest.
+    bytes represents = 5;
+}
+
+// Represented is the outcome of PutHeader.represents.
+enum Represented {
+    // No alias was requested, the backend cannot hold aliases, or creating the
+    // alias failed. The object itself was stored normally.
+    REPRESENTED_NONE = 0;
+    // The alias was created: this object is the chunk's representation.
+    REPRESENTED_WON = 1;
+    // An alias already named a different delta object (represented_key). An
+    // alias that already names this very object (a retried Put) is WON.
+    REPRESENTED_LOST = 2;
+    // Servers before the discard rule answered this when an independent object
+    // already existed at H_ind: no alias was created and the stored delta object
+    // was left unreferenced. Current servers create the alias first and never
+    // answer it; Resolve prefers the independent object regardless. Clients keep
+    // handling it for older servers.
+    REPRESENTED_INDEPENDENT = 3;
 }
 
 message PutResponse {
@@ -101,4 +147,36 @@ message PutResponse {
     // and no new file was written. true means a new file was
     // created.
     bool is_new = 1;
+    Represented represented = 2;
+    // 32 bytes, set only when represented == REPRESENTED_LOST.
+    bytes represented_key = 3;
+    // True when the object this Put stored (is_new) was deleted again because
+    // it lost the alias race (represented == REPRESENTED_LOST): nothing can
+    // reference an object the alias does not name, so keeping it would only
+    // waste space. The client must not record the key it sent.
+    bool discarded = 4;
+}
+
+message ResolveRequest {
+    // Must be a generation in the server's current list.
+    string generation = 1;
+    // 32-byte H_ind: the address the chunk would have as an independent object.
+    bytes key = 2;
+}
+
+enum Resolution {
+    // Neither an independent object nor an alias exists.
+    RESOLUTION_ABSENT = 0;
+    // The independent object exists at key.
+    RESOLUTION_INDEPENDENT = 1;
+    // An alias exists; delta_key names the delta object it points at. The
+    // server does not check that the delta object exists or is correct: the
+    // caller holds the plaintext and must verify before relying on it.
+    RESOLUTION_DELTA = 2;
+}
+
+message ResolveResponse {
+    Resolution resolution = 1;
+    // 32 bytes, set only when resolution == RESOLUTION_DELTA.
+    bytes delta_key = 2;
 }

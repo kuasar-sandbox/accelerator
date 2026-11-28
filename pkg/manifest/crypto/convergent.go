@@ -30,6 +30,9 @@ type KeyTableEncryptor interface {
 const (
 	ChunkFormatAESRaw    byte = 0x01
 	ChunkFormatAESSnappy byte = 0x02
+	// ChunkFormatAESDelta is a chunk stored as a VCDIFF delta against another
+	// stored chunk. See delta.go for the layout.
+	ChunkFormatAESDelta byte = 0x03
 
 	KeyTableFormatAESGCM byte = 0x01
 

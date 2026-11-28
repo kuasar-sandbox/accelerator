@@ -1,17 +1,28 @@
 // Package manifest implements the binary manifest format for the container accelerator.
 //
-// A manifest describes a chunked image or snapshot. Its physical Version1
-// envelope is ["MANI"][encoding][payload], where payload is the logical bytes
-// after magic either RAW or canonical Go Snappy block encoded. The logical layout is:
+// A manifest describes a chunked image or snapshot. Its physical envelope is
+// ["MANI"][encoding][payload], where payload is the logical bytes after magic
+// either RAW or canonical Go Snappy block encoded. The logical layout is:
 //
 //	[Header 64B]
 //	[ChunkEntry × N, 56B each]
 //	[hole extent × M, 16B each]   -- entries describe data, holes describe absence
+//	[DeltaRef × D, 40B each]      -- Version2 only: which entries are deltas, and of what
 //	[SealedKeyTable variable]
 //
 // Entries cover the data ranges of the original image; holes cover the
 // "no data here" ranges (filesystem holes, qcow2 unallocated, TRIM, ...).
 // Together they tile [0, ImageSize) with no overlap and no gap.
+//
+// Version1 has no delta table and no EntryFlagDelta. Version2 adds both: an
+// entry whose stored object is a delta object (crypto.ChunkFormatAESDelta)
+// carries the flag and has exactly one DeltaRef naming the base object it
+// depends on. The reader does not need the table to read the chunk (the delta
+// object names its own base); it exists so that prefetch can warm the base
+// alongside the delta, and so that tooling can compute an image's complete
+// object closure, bases included, without fetching a single chunk. A writer
+// emits Version2 only when at least one entry is a delta, so images without
+// deltas keep their Version1 bytes and keys.
 package codec
 
 import (
@@ -31,11 +42,13 @@ import (
 const (
 	// Magic is retained byte-for-byte in BuildAAD. The physical envelope uses
 	// manifestMagic explicitly so its on-wire bytes are the required "MANI".
-	Magic      uint32 = 0x4D414E49
-	Version1   uint8  = 1
-	HeaderSize        = 64
-	EntrySize         = 56
-	HoleSize          = 16 // 8 B Offset + 8 B Size; no flags, no reserved
+	Magic        uint32 = 0x4D414E49
+	Version1     uint8  = 1
+	Version2     uint8  = 2 // adds EntryFlagDelta and the DeltaRef table
+	HeaderSize          = 64
+	EntrySize           = 56
+	HoleSize            = 16 // 8 B Offset + 8 B Size; no flags, no reserved
+	DeltaRefSize        = 40 // 4 B Entry + 4 B BaseSize + 32 B Base
 
 	ManifestEncodingRaw    byte = 0x00
 	ManifestEncodingSnappy byte = 0x01
@@ -55,6 +68,14 @@ const (
 	// and not present in the sealed key table — load synthesises the
 	// zero bytes locally. CiphertextHash is unused for zero entries.
 	EntryFlagZero uint32 = 1 << 0
+	// EntryFlagDelta (Version2) marks a chunk whose stored object is a delta
+	// object: CiphertextHash addresses a crypto.ChunkFormatAESDelta object and
+	// the key table holds its K_d. Exactly one DeltaRef in Manifest.Deltas
+	// names this entry. Exclusive with EntryFlagZero.
+	EntryFlagDelta uint32 = 1 << 1
+
+	// knownFlagsV2 are the flag bits a Version2 manifest may set.
+	knownFlagsV2 = EntryFlagZero | EntryFlagDelta
 )
 
 // ChunkMode identifies the chunking algorithm used to produce the manifest.
@@ -81,7 +102,12 @@ type Manifest struct {
 	// caller-defined: the fetch layer zero-fills holes, or falls
 	// through to a lower layer when overlaid.
 	Holes []sparse.Extent
-	Keys  [][32]byte // per-chunk convergent keys (plaintext, before sealing)
+	// Deltas (Version2) lists, in ascending Entry order, every entry whose
+	// object is a delta object and the base object each depends on. It is
+	// derived information for prefetch and dependency tooling: the delta
+	// object itself names the same base. Empty in Version1.
+	Deltas []DeltaRef
+	Keys   [][32]byte // per-chunk convergent keys (plaintext, before sealing)
 }
 
 // ChunkEntry describes one chunk in the original image.
@@ -89,7 +115,75 @@ type ChunkEntry struct {
 	Offset         uint64
 	Size           uint32
 	IsZero         bool
+	IsDelta        bool // Version2: the stored object is a delta; see Manifest.Deltas
 	CiphertextHash [32]byte
+}
+
+// DeltaRef records that entry Entry is stored as a delta of the chunk object
+// Base, whose plaintext is BaseSize bytes. Base is an ordinary (independent)
+// chunk-partition object; it is not necessarily referenced by any entry of
+// this manifest, which is exactly why the table exists: an image's object
+// closure is its entries' objects plus its DeltaRefs' bases.
+type DeltaRef struct {
+	Entry    uint32
+	BaseSize uint32
+	Base     [32]byte
+}
+
+// DeltaFor returns the DeltaRef of entry index i, if the entry is a delta.
+func (m *Manifest) DeltaFor(i int) (DeltaRef, bool) {
+	n := sort.Search(len(m.Deltas), func(k int) bool { return m.Deltas[k].Entry >= uint32(i) })
+	if n < len(m.Deltas) && m.Deltas[n].Entry == uint32(i) {
+		return m.Deltas[n], true
+	}
+	return DeltaRef{}, false
+}
+
+// validateDeltas checks that Deltas and the IsDelta flags describe each other
+// exactly: ascending entries, each in range, flagged, non-zero, and no flagged
+// entry without a ref. A Version1 manifest may have neither.
+func (m *Manifest) validateDeltas() error {
+	if m.Version == Version1 {
+		if len(m.Deltas) != 0 {
+			return fmt.Errorf("%w: Version1 cannot carry a delta table", ErrBadDeltas)
+		}
+		for i, e := range m.Entries {
+			if e.IsDelta {
+				return fmt.Errorf("%w: Version1 entry %d is flagged delta", ErrBadDeltas, i)
+			}
+		}
+		return nil
+	}
+	flagged := 0
+	for i, e := range m.Entries {
+		if e.IsDelta {
+			flagged++
+			if e.IsZero {
+				return fmt.Errorf("%w: entry %d is both zero and delta", ErrBadDeltas, i)
+			}
+		}
+	}
+	if flagged != len(m.Deltas) {
+		return fmt.Errorf("%w: %d entries are flagged delta, table has %d refs", ErrBadDeltas, flagged, len(m.Deltas))
+	}
+	for k, d := range m.Deltas {
+		if k > 0 && d.Entry <= m.Deltas[k-1].Entry {
+			return fmt.Errorf("%w: refs not in ascending entry order at %d", ErrBadDeltas, k)
+		}
+		if uint64(d.Entry) >= uint64(len(m.Entries)) {
+			return fmt.Errorf("%w: ref %d names entry %d of %d", ErrBadDeltas, k, d.Entry, len(m.Entries))
+		}
+		if !m.Entries[d.Entry].IsDelta {
+			return fmt.Errorf("%w: ref %d names entry %d, which is not flagged delta", ErrBadDeltas, k, d.Entry)
+		}
+		if d.BaseSize == 0 || d.BaseSize > MaxChunkDecodedSize {
+			return fmt.Errorf("%w: ref %d base size %d", ErrBadDeltas, k, d.BaseSize)
+		}
+		if d.Base == m.Entries[d.Entry].CiphertextHash {
+			return fmt.Errorf("%w: ref %d names its own object as base", ErrBadDeltas, k)
+		}
+	}
+	return nil
 }
 
 // ChunkCount returns the number of chunk entries.
@@ -108,6 +202,7 @@ var (
 	ErrBadEncoding      = errors.New("manifest: unsupported physical encoding")
 	ErrBadChunkSize     = errors.New("manifest: chunk size exceeds declared or implementation limit")
 	ErrManifestTooLarge = errors.New("manifest: decoded size exceeds hard limit")
+	ErrBadDeltas        = errors.New("manifest: delta table and entry flags disagree")
 )
 
 // Marshal serializes a Manifest and its sealed key table into the binary format.
@@ -118,10 +213,10 @@ func Marshal(m *Manifest, sealedKeyTable []byte) ([]byte, error) {
 	if m == nil {
 		return nil, ErrNilManifest
 	}
-	if m.Version != Version1 {
+	if m.Version != Version1 && m.Version != Version2 {
 		return nil, fmt.Errorf("%w: got %d", ErrBadVersion, m.Version)
 	}
-	if uint64(len(m.Entries)) > math.MaxUint32 || uint64(len(m.Holes)) > math.MaxUint32 {
+	if uint64(len(m.Entries)) > math.MaxUint32 || uint64(len(m.Holes)) > math.MaxUint32 || uint64(len(m.Deltas)) > math.MaxUint32 {
 		return nil, ErrManifestTooLarge
 	}
 	if err := m.ValidateGeometry(); err != nil {
@@ -130,14 +225,22 @@ func Marshal(m *Manifest, sealedKeyTable []byte) ([]byte, error) {
 	if err := validateChunkSizes(m); err != nil {
 		return nil, err
 	}
+	if err := m.validateDeltas(); err != nil {
+		return nil, err
+	}
 
 	count := uint32(len(m.Entries))
 	holeCount := uint32(len(m.Holes))
+	deltaCount := uint32(len(m.Deltas))
 	holesOffset, ok := checkedAdd(uint64(HeaderSize), uint64(count)*uint64(EntrySize))
 	if !ok {
 		return nil, ErrManifestTooLarge
 	}
-	keyTableOffset, ok := checkedAdd(holesOffset, uint64(holeCount)*uint64(HoleSize))
+	deltasOffset, ok := checkedAdd(holesOffset, uint64(holeCount)*uint64(HoleSize))
+	if !ok {
+		return nil, ErrManifestTooLarge
+	}
+	keyTableOffset, ok := checkedAdd(deltasOffset, uint64(deltaCount)*uint64(DeltaRefSize))
 	if !ok {
 		return nil, ErrManifestTooLarge
 	}
@@ -164,18 +267,18 @@ func Marshal(m *Manifest, sealedKeyTable []byte) ([]byte, error) {
 	le.PutUint64(payload[32:40], uint64(len(sealedKeyTable)))
 	le.PutUint32(payload[40:44], holeCount)
 	le.PutUint64(payload[44:52], holesOffset)
-	// payload[52:60] reserved, zero
+	// payload[52:56] (Version2) delta ref count; payload[56:60] reserved, zero.
+	// Version1 leaves all of [52:60] zero, as it always has.
+	if m.Version >= Version2 {
+		le.PutUint32(payload[52:56], deltaCount)
+	}
 
 	// --- Chunk Entries (56 bytes each) ---
 	for i, e := range m.Entries {
 		base := HeaderSize - len(manifestMagic) + i*EntrySize
 		le.PutUint64(payload[base:base+8], e.Offset)
 		le.PutUint32(payload[base+8:base+12], e.Size)
-		var flags uint32
-		if e.IsZero {
-			flags |= EntryFlagZero
-		}
-		le.PutUint32(payload[base+12:base+16], flags)
+		le.PutUint32(payload[base+12:base+16], entryFlags(e))
 		copy(payload[base+16:base+48], e.CiphertextHash[:])
 		// payload[base+48:base+56] reserved, zero
 	}
@@ -185,6 +288,12 @@ func Marshal(m *Manifest, sealedKeyTable []byte) ([]byte, error) {
 		base := int(holesOffset) - len(manifestMagic) + i*HoleSize
 		le.PutUint64(payload[base:base+8], h.Offset)
 		le.PutUint64(payload[base+8:base+16], h.Size)
+	}
+
+	// --- Delta Refs (40 bytes each; Version2) ---
+	for i, d := range m.Deltas {
+		base := int(deltasOffset) - len(manifestMagic) + i*DeltaRefSize
+		putDeltaRef(payload[base:base+DeltaRefSize], d)
 	}
 
 	// --- Sealed Key Table ---
@@ -270,7 +379,7 @@ func unmarshalLogicalPayload(payload []byte) (*Manifest, []byte, error) {
 	}
 	le := binary.LittleEndian
 	version := payload[0]
-	if version != Version1 {
+	if version != Version1 && version != Version2 {
 		return nil, nil, fmt.Errorf("%w: got %d", ErrBadVersion, version)
 	}
 
@@ -283,6 +392,10 @@ func unmarshalLogicalPayload(payload []byte) (*Manifest, []byte, error) {
 	keyTableSize := le.Uint64(payload[32:40])
 	holeCount := le.Uint32(payload[40:44])
 	holesOffset := le.Uint64(payload[44:52])
+	var deltaCount uint32
+	if version >= Version2 {
+		deltaCount = le.Uint32(payload[52:56])
+	}
 	logicalSize := uint64(len(payload) + len(manifestMagic))
 
 	entriesEnd, ok := checkedAdd(uint64(HeaderSize), uint64(chunkCount)*uint64(EntrySize))
@@ -296,8 +409,12 @@ func unmarshalLogicalPayload(payload []byte) (*Manifest, []byte, error) {
 	if !ok || holesEnd > logicalSize {
 		return nil, nil, fmt.Errorf("%w: need %d bytes for holes, have %d", ErrTooShort, holesEnd, logicalSize)
 	}
-	if keyTableOffset != holesEnd {
-		return nil, nil, fmt.Errorf("manifest: non-canonical key-table offset %d, want %d", keyTableOffset, holesEnd)
+	deltasEnd, ok := checkedAdd(holesEnd, uint64(deltaCount)*uint64(DeltaRefSize))
+	if !ok || deltasEnd > logicalSize {
+		return nil, nil, fmt.Errorf("%w: need %d bytes for delta refs, have %d", ErrTooShort, deltasEnd, logicalSize)
+	}
+	if keyTableOffset != deltasEnd {
+		return nil, nil, fmt.Errorf("manifest: non-canonical key-table offset %d, want %d", keyTableOffset, deltasEnd)
 	}
 	keyTableEnd, ok := checkedAdd(keyTableOffset, keyTableSize)
 	if !ok || keyTableEnd > logicalSize {
@@ -315,6 +432,10 @@ func unmarshalLogicalPayload(payload []byte) (*Manifest, []byte, error) {
 		entries[i].Size = le.Uint32(payload[base+8 : base+12])
 		flags := le.Uint32(payload[base+12 : base+16])
 		entries[i].IsZero = (flags & EntryFlagZero) != 0
+		entries[i].IsDelta = (flags & EntryFlagDelta) != 0
+		if version >= Version2 && flags&^knownFlagsV2 != 0 {
+			return nil, nil, fmt.Errorf("manifest: entry %d has unknown flags %#x", i, flags&^knownFlagsV2)
+		}
 		copy(entries[i].CiphertextHash[:], payload[base+16:base+48])
 	}
 
@@ -326,6 +447,16 @@ func unmarshalLogicalPayload(payload []byte) (*Manifest, []byte, error) {
 			base := holesOffset - uint64(len(manifestMagic)) + uint64(i)*uint64(HoleSize)
 			holes[i].Offset = le.Uint64(payload[base : base+8])
 			holes[i].Size = le.Uint64(payload[base+8 : base+16])
+		}
+	}
+
+	// --- Delta Refs ---
+	var deltas []DeltaRef
+	if deltaCount > 0 {
+		deltas = make([]DeltaRef, deltaCount)
+		for i := range deltas {
+			base := holesEnd - uint64(len(manifestMagic)) + uint64(i)*uint64(DeltaRefSize)
+			deltas[i] = getDeltaRef(payload[base : base+DeltaRefSize])
 		}
 	}
 
@@ -342,6 +473,7 @@ func unmarshalLogicalPayload(payload []byte) (*Manifest, []byte, error) {
 		MaxChunkSize: maxChunkSize,
 		Entries:      entries,
 		Holes:        holes,
+		Deltas:       deltas,
 	}
 
 	if err := validateChunkSizes(m); err != nil {
@@ -350,8 +482,40 @@ func unmarshalLogicalPayload(payload []byte) (*Manifest, []byte, error) {
 	if err := m.ValidateGeometry(); err != nil {
 		return nil, nil, err
 	}
+	if err := m.validateDeltas(); err != nil {
+		return nil, nil, err
+	}
 
 	return m, sealedKeyTable, nil
+}
+
+// entryFlags is the on-disk flag word of an entry; shared by Marshal and
+// BuildAAD so the two can never disagree.
+func entryFlags(e ChunkEntry) uint32 {
+	var flags uint32
+	if e.IsZero {
+		flags |= EntryFlagZero
+	}
+	if e.IsDelta {
+		flags |= EntryFlagDelta
+	}
+	return flags
+}
+
+func putDeltaRef(b []byte, d DeltaRef) {
+	le := binary.LittleEndian
+	le.PutUint32(b[0:4], d.Entry)
+	le.PutUint32(b[4:8], d.BaseSize)
+	copy(b[8:40], d.Base[:])
+}
+
+func getDeltaRef(b []byte) DeltaRef {
+	le := binary.LittleEndian
+	var d DeltaRef
+	d.Entry = le.Uint32(b[0:4])
+	d.BaseSize = le.Uint32(b[4:8])
+	copy(d.Base[:], b[8:40])
+	return d
 }
 
 func encodeManifestPayload(payload []byte) (encoded []byte, err error) {

@@ -70,6 +70,7 @@ Do not interpret content encryption as a claim that every threat model leaks no 
 | Deploy or embed authoritative persistence | [Store](docs/store.md): FS/S3, generations, visibility, administration and App lifecycle |
 | Deploy or embed acceleration and diagnose misses/recovery | [Cache](docs/cache.md): tiers, sharding/EC, RocksDB/Redis backends and App lifecycle |
 | Prepare an OCI, archive or directory image through the shared library | [Image preparation](docs/image-preparation.md): lifetime, image payload, layout and publication |
+| Store similar chunks as patches | [Delta compression](docs/delta.md): object format, Version 2 manifests, aliases, `delta-gc` |
 
 [flatten-ctl operations](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten-cli.md) belong to guest-runtime, which publishes the executable. Each guide has a complete Chinese edition via its language selector.
 

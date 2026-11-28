@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/transfer"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tailzip"
@@ -387,6 +388,10 @@ func runTransfer(ctx context.Context, args []string, storeCommand bool, streams 
 	if err != nil {
 		return err
 	}
+	// Delta state is soft: failing to persist it never fails the command.
+	if derr := cfg.CloseDelta(); derr != nil {
+		fmt.Fprintf(streams.Stderr, "warning: delta state not persisted: %v\n", derr)
+	}
 	if storeOut {
 		target := streams.Stdout
 		if mode != "none" && (output == "-" || output == "") {
@@ -414,10 +419,24 @@ func runTransfer(ctx context.Context, args []string, storeCommand bool, streams 
 		}
 		_, err = fmt.Fprintf(streams.Stderr, "image size:   %s\nstored bytes: %s\nchunks:       stored=%d dedup=%d zero=%d\ncompression:  raw=%d snappy=%d logical=%s encoded=%s saved=%s\nmanifest:     encoding=%s logical=%s stored=%s\nmanifest key: %s\n",
 			formatSize(src.Size()), formatSize(stats.StoredBytes), stats.StoredChunks, stats.DedupChunks, stats.ZeroChunks, stats.RawChunks, stats.CompressedChunks, formatSize(stats.LogicalChunkBytes), formatSize(stats.EncodedChunkBytes), formatSize(stats.CompressionSavedBytes), encoding, formatSize(stats.ManifestLogicalBytes), formatSize(stats.ManifestStoredBytes), manifest.HexKey(result.StoreKey))
+		if err == nil && deltaRan(stats) {
+			_, err = fmt.Fprintf(streams.Stderr, "delta:        chunks=%d logical=%s saved=%s repHits=%d attempts=%d rejected=%d noCandidate=%d notResident=%d readbacks=%d known=%d timeouts=%d errors=%d\n",
+				stats.DeltaChunks, formatSize(stats.DeltaLogicalBytes), formatSize(stats.DeltaSavedBytes), stats.DeltaRepHits, stats.DeltaAttempts, stats.DeltaRejected, stats.DeltaNoCandidate, stats.DeltaNotResident, stats.DeltaReadbacks, stats.DeltaKnownSkips, stats.DeltaTimeouts, stats.DeltaErrors)
+			if err == nil && stats.DeltaResolves > 0 {
+				_, err = fmt.Fprintf(streams.Stderr, "aliases:      resolves=%d won=%d lost=%d independent=%d adopted=%d adoptFailed=%d discarded=%s orphan=%s\n",
+					stats.DeltaResolves, stats.DeltaAliasWon, stats.DeltaAliasLost, stats.DeltaAliasIndependent, stats.DeltaAdopted, stats.DeltaAdoptFailed, formatSize(stats.DeltaDiscardedBytes), formatSize(stats.DeltaOrphanBytes))
+			}
+		}
 	} else {
 		_, err = fmt.Fprintf(streams.Stderr, "%s: %s logical bytes\n", command, formatSize(src.Size()))
 	}
 	return err
+}
+
+// deltaRan reports whether delta compression did any work, so the extra stats
+// line appears only when the feature is on and was exercised.
+func deltaRan(s ingest.Result) bool {
+	return s.DeltaChunks+s.DeltaAttempts+s.DeltaNoCandidate+s.DeltaKnownSkips+s.DeltaRepHits+s.DeltaNotResident+s.DeltaReadbacks+s.DeltaResolves > 0
 }
 
 func readBoundedTail(path string, limit int) (body []byte, retErr error) {

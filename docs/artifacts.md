@@ -182,6 +182,9 @@ The implementation evaluates this rule without overflowing adversarial integer l
 |---|---|---|
 | `0x01` (`AESRaw`) | Original plaintext. | `[0x01] || AES-256-CTR(key, IV=0, plaintext)` |
 | `0x02` (`AESSnappy`) | `snappy.Encode(plaintext)`. | `[0x02] || AES-256-CTR(key, IV=0, snappy_block)` |
+| `0x03` (`AESDelta`) | 45-byte cleartext header (base object key, base plaintext size, target size, VCDIFF stream size, payload encoding RAW/Snappy), then the base's convergent key and a VCDIFF patch against that base, encrypted. | `[0x03] || header[45] || AES-256-CTR(K_d, IV=0, K_base[32] || patch)` with `K_d = SHA256(salt || "accelerator-delta-chunk/v1" || base_object_key || plaintext)` |
+
+Format `0x03` exists only when [delta compression](delta.md) is enabled on the writer; every reader accepts it. Its key is not `SHA256(salt || plaintext)`, because the same plaintext encoded against two different bases must not share a CTR keystream, so the base object key is bound into the derivation. The base object key is in the clear so a reader can fetch the base before decrypting anything; the base's own key travels inside the ciphertext, so the manifest key table stays one 32-byte key per chunk. A manifest entry records the delta object's physical hash exactly as for any chunk, plus a flag and a side-table row naming the base (below).
 
 The encryption layer derives `SHA256(salt || plaintext)` internally; its caller passes salt, not a chunk key. Distinct plaintexts receive distinct keys under the hash assumptions, avoiding intentional CTR keystream reuse within the canonical contract. The format byte is cleartext but included in the physical ContentKey.
 
@@ -215,7 +218,7 @@ final_salt = SHA256("accelerator-extra-salt-v1" || server_salt || extra_salt) # 
 
 ### Manifest binary format
 
-The current Version1 **physical envelope** is:
+The **physical envelope** (Version 1 and Version 2 share it) is:
 
 ```text
 [4 bytes "MANI"][1 byte encoding][payload]
@@ -232,10 +235,13 @@ The logical layout uses little-endian integers; magic itself is the byte string 
 
 | Region | Layout |
 |---|---|
-| Header, 64 B | `magic[4]`, `version u8`, `chunk_mode u8`, reserved padding; `image_size u64`, `chunk_count u32`, configured `chunk_min/max u32 × 2`; key-table offset/length, hole count and hole-table offset; reserved bytes to 64 B. Chunk mode 1 = CDC, 2 = fixed. |
-| Chunk index, 56 B per entry | `image_offset u64`, `plain_len u32`, `flags u32` (bit 0 = zero chunk), `cipher_hash[32]`, **8 reserved zero bytes**. Entries are sorted by image offset. |
+| Header, 64 B | `magic[4]`, `version u8` (1 or 2), `chunk_mode u8`, reserved padding; `image_size u64`, `chunk_count u32`, configured `chunk_min/max u32 × 2`; key-table offset/length, hole count and hole-table offset; `delta_count u32` at logical offset 56 (Version 2 only; reserved zero in Version 1); reserved bytes to 64 B. Chunk mode 1 = CDC, 2 = fixed. |
+| Chunk index, 56 B per entry | `image_offset u64`, `plain_len u32`, `flags u32` (bit 0 = zero chunk, bit 1 = delta chunk, Version 2 only), `cipher_hash[32]`, **8 reserved zero bytes**. Entries are sorted by image offset. |
 | Holes, 16 B per extent | `offset u64`, `size u64`. Data entries and holes exactly tile `[0, image_size)`. |
+| Delta table, 40 B per row (Version 2 only) | `entry u32` (index of a flagged entry, ascending), `base_size u32`, `base[32]` (object key of the base chunk). Exactly one row per entry with flag bit 1. |
 | Key table | Customer-key-sealed AES-GCM table of nonzero chunk keys: `key_0[32], key_1[32], ...`. |
+
+A writer emits Version 2 only when at least one entry is a delta; a manifest without deltas is byte-identical to what a Version 1 writer produces, and Version 1 bytes and AAD are unchanged. In Version 2 the AAD additionally covers the delta table, so a base reference cannot be swapped without failing to unseal the key table. The table lets a reader prefetch bases in parallel with deltas and lets tooling (`manifest-ctl deps`) list an image's full object closure without opening any object. When a delta object is opened, its header must name the same base and base size as the table row, and an entry's delta flag must match the object's format byte; otherwise the read fails. This holds even with content verification off, because the flag and table are authenticated and the header is not. A Version 2 manifest with an inconsistent table (unflagged or out-of-range entry, zero or oversized base size, a base equal to the entry's own key, or a Version 1 header carrying a table or flag bit 1) is rejected.
 
 All-zero chunks (flag bit 0) are neither encrypted nor stored and have no key-table entry; reads synthesize zero bytes locally. A Hole is an externally declared absence of data, distinct from an all-zero data chunk. Data chunks and holes cover the image without overlaps or gaps.
 

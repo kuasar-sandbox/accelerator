@@ -149,12 +149,14 @@ store-ctl rollout --config FILE --generation G2
 store-ctl info    --config FILE
 store-ctl purge   --config FILE --generation G1
 store-ctl purge   --config FILE --all --confirm
+store-ctl delta-gc --config FILE --generation G1 [--list] [--delete] [--older-than 1h]
 store-ctl serve   --config FILE
 ```
 
-- `info` reads the oldest-to-newest list, shows its last entry as the current write generation, and scans each generation for chunk/manifest/blob object counts. A per-generation statistics failure is printed and processing continues; a zero command exit is not proof that every generation was counted successfully.
+- `info` reads the oldest-to-newest list, shows its last entry as the current write generation, and scans each generation for chunk/manifest/blob/alias object counts (`alias=N`; zero unless delta compression has stored aliases). A per-generation statistics failure is printed and processing continues; a zero command exit is not proof that every generation was counted successfully.
 - `init` creates a file or S3 source and refuses to overwrite an existing one; `rollout` appends a new generation. A config source is explicitly read-only and must be updated by the configuration system.
-- `purge --generation` rejects the last entry, removes the generation from a writable source, then deletes FS/S3 data. S3 source updates use ETag `If-Match` CAS, rereading and retrying within a bound on conflicts. This mode has no additional confirmation prompt. List removal and data deletion are not atomic: cleanup failure can leave the generation unlisted with some or all objects still present.
+- `purge --generation` rejects the last entry, removes the generation from a writable source, then deletes FS/S3 data, including that generation's aliases. S3 source updates use ETag `If-Match` CAS, rereading and retrying within a bound on conflicts. This mode has no additional confirmation prompt. List removal and data deletion are not atomic: cleanup failure can leave the generation unlisted with some or all objects still present.
+- `delta-gc` reports, per generation, chunk objects, delta objects, aliases (and how many distinct delta objects they name, and how many are dangling) and orphans: delta objects no alias names, which no manifest can reference ([Delta aliases and Resolve](#delta-aliases-and-resolve)). Without `--delete` it only reports; with it, orphans at least `--older-than` old are removed. Orphans of unknown age (a backend without modification times) are never deleted. Running it against a live generation is safe; the age bound is the only thing protecting a writer between its `Put` and its alias, so do not lower it below the longest plausible ingest stall.
 - `purge --all` is offline maintenance and still requires `--confirm`: stop every `store-ctl serve` process and quiesce all writers first. File/S3 sources are removed. For a config source, only object data is removed, not the main YAML. A running server treats a missing source as refresh failure and deliberately retains its last valid list; therefore this command is not an online write-revocation mechanism.
 
 A write-generation rollout does not retire existing data:
@@ -303,9 +305,10 @@ Store gRPC provides:
 rpc AdmitWrite(AdmitWriteRequest) returns (AdmitWriteResponse);
 rpc Get(GetRequest) returns (stream GetResponse);
 rpc Put(stream PutRequest) returns (PutResponse);
+rpc Resolve(ResolveRequest) returns (ResolveResponse);
 ```
 
-An empty `AdmitWriteRequest.generation` keeps the existing behavior of choosing the newest writable generation. A nonempty invalid name returns `InvalidArgument`; a valid name absent from the current list observed by this request returns `FailedPrecondition`. An empty server generation list returns `Unavailable`. A successful response always returns the canonical `WriteAdmission` for that generation. The official Go client retains `AdmitWrite(ctx)` and additionally provides `AdmitWriteFor(ctx, generation)`. Put wire format and the Backend interface are unchanged.
+`Resolve` and `PutHeader.represents` exist only for delta-compression aliases; see [Delta aliases](#delta-aliases-and-resolve). An empty `AdmitWriteRequest.generation` keeps the existing behavior of choosing the newest writable generation. A nonempty invalid name returns `InvalidArgument`; a valid name absent from the current list observed by this request returns `FailedPrecondition`. An empty server generation list returns `Unavailable`. A successful response always returns the canonical `WriteAdmission` for that generation. The official Go client retains `AdmitWrite(ctx)` and additionally provides `AdmitWriteFor(ctx, generation)`. The `Backend` interface is unchanged; backends that can also store aliases additionally implement `AliasBackend` (below).
 
 `PutHeader` contains the partition, 32-byte key, generation and a presence-aware `optional uint64 size`. Zero means a known empty object; only absence means unknown size. The official Go client receives a complete `[]byte`, so it always sends `uint64(len(data))`. The server checks overflow before converting to `int64`.
 
@@ -354,6 +357,56 @@ for i := len(generations) - 1; i >= 0; i-- {
 Store `Get` performs one business read attempt. Failed streams are canceled/released, and a later call starts a complete new object read; confirmed absence remains different from transport/access failure. The existing endpoint and operation timeout bound that attempt, while caller context owns any later retry/backoff.
 
 This read contract never authorizes replay of `Put`, Fill, ingestion, publication or snapshot capture. A lost response does not prove that a write was not applied. Direct CLI reads return their single-attempt error to the command owner. `pkg/readerr` markers are applied only where Store knows a semantic boundary such as confirmed absence or integrity/format failure; opaque access, network EOF/partial stream and backend-local cancellation keep their original causes.
+
+## Delta aliases and Resolve
+
+Delta compression ([delta.md](delta.md)) needs every node to agree which stored object represents a chunk that was stored as a delta. The store keeps that agreement as a **write-once alias** per chunk.
+
+An alias is an object in the internal partition `alias`, scoped to a generation like every other object and named by the chunk's independent content key (`H_ind`):
+
+```text
+<root>/alias/<generation>/<aa>/<bb>/<H_ind>
+body: [0x01][32-byte key of the delta object]
+```
+
+The partition is not in the protobuf `Partition` enum, so `Get` and `Put` cannot address it. It is created and read only through the two operations below, is never rewritten, and is removed by `purge --generation` with the rest of its generation (`wipe`, `drop` and `info` include it). Reads of data never consult aliases.
+
+`AliasBackend`, implemented by the FS and S3 backends, has three methods:
+
+```go
+GetAlias(ctx, generation, key) (delta ContentKey, found bool, err error)
+CreateAlias(ctx, generation, key, delta) (current ContentKey, created bool, err error)
+Delete(ctx, generation, partition, key) error
+```
+
+`CreateAlias` is create-only. FS writes the body to a temp file under `<root>/alias/.tmp/`, fsyncs it and publishes it with `os.Link`, so a partial alias is never visible, and a winner that vanishes between a failed link and the read causes a bounded retry. S3 issues PutObject with `If-None-Match: *` and reads the existing alias on conflict. `Delete` removes one object (a missing object is not an error); the server uses it only for the discard described below, and `store-ctl delta-gc` for orphan collection. A backend without `AliasBackend` makes `Resolve` return `Unimplemented`, and the delta writer then stores independently.
+
+**`Put` with `PutHeader.represents`.** The field is optional, 32 bytes, valid only for the chunk partition and never equal to the object's own key (`InvalidArgument` otherwise). Absence changes nothing. When present, the object is stored exactly as before (dedup or commit) and the server then tries to create the alias. The alias is the only serialisation point between writers, so it alone decides the outcome in `PutResponse.represented`:
+
+| Condition | `represented` |
+| --- | --- |
+| the alias was created | `WON` |
+| the alias already names this object (a retried Put) | `WON` |
+| the alias names another object | `LOST`, with `represented_key` = the winner |
+| the backend errored or has no aliases | `NONE` |
+
+The server does not check for an independent object at `represents` (the `INDEPENDENT` value remains in the enum but is no longer produced): such a check could only yield an outcome the client cannot act on safely. If an independent object has landed in the meantime, `Resolve` prefers it and later writers converge on it, while the winner's delta stays referenced by the winner's manifest.
+
+**Discard.** A `LOST` object that this very `Put` created is deleted again before the response is sent, and `PutResponse.discarded` reports it. This is safe because the alias is write-once: within this generation the alias will never name that object, and a client records a delta object only when the alias names it, so no manifest can point at it. A `LOST` object that already existed (a dedup hit) belongs to the request that created it, which saw the same alias and discarded it itself. Failing to record the alias never fails the `Put`: the object is stored and valid, and the client then stores the chunk independently; that object, and any whose discard failed, is an **orphan** no alias names and no manifest references.
+
+**`store-ctl delta-gc`** audits one generation offline for such orphans (every `0x03` chunk object no alias names) and, with `--delete`, removes those older than `--older-than` (default one hour, so a writer between its `Put` and its alias is never raced). Aliases are never deleted individually; they leave with their generation. The statistics line of `store-ctl serve` reports `discarded N (rate)` and `discardErr N` next to the alias counters.
+
+**`Resolve(generation, key)`** reports how one admitted generation stores the chunk whose independent address is `key`. It checks the independent object first, then the alias:
+
+| Answer | Meaning |
+| --- | --- |
+| `INDEPENDENT` | an ordinary object exists at `key` |
+| `DELTA` + `delta_key` | no independent object; the alias names `delta_key` |
+| `ABSENT` | neither |
+
+An invalid generation or key is `InvalidArgument`; a generation absent from the current list is `FailedPrecondition`; a backend without aliases is `Unimplemented`. Preferring the independent object lets a later independent `Put` supersede a bad alias without mutating it.
+
+The server cannot parse delta objects (it holds no keys or plaintext), so a `DELTA` answer is a claim, not a proof; the client must verify the object before using it. The statistics line of `store-ctl serve` reports `resolve N/s` and `alias won/lost/indep/err`.
 
 ## FS direct-final-write
 

@@ -36,6 +36,11 @@ type VerifyOptions struct {
 type chunkReference struct {
 	decryptKey [32]byte
 	plainSize  uint32
+	kind       refKind
+	// For refDelta: the base the manifest's delta table names, which the
+	// delta object itself must agree with.
+	base     store.ContentKey
+	baseSize uint32
 }
 
 // FullVerify force-checks physical ContentKeys, every Manifest closure and key
@@ -145,20 +150,21 @@ func (r *Reader) verifyAndUpload(ctx context.Context, root store.ContentKey, cus
 			clear(keys)
 			return err
 		}
-		for index, entry := range manifest.Entries {
-			if entry.IsZero {
-				continue
-			}
-			chunkKey := store.ContentKey(entry.CiphertextHash)
-			reference := chunkReference{decryptKey: keys[index], plainSize: entry.Size}
-			if previous, ok := chunkRefs[chunkKey]; ok && previous != reference {
-				clear(keys)
-				clear(reference.decryptKey[:])
-				return fmt.Errorf("manifest bundle: Chunk %s has inconsistent key or plaintext size across Manifests", hex.EncodeToString(chunkKey[:]))
+		err = manifestChunkRefs(manifest, keys, func(chunkKey store.ContentKey, reference chunkReference) error {
+			if previous, ok := chunkRefs[chunkKey]; ok {
+				merged, err := mergeChunkReference(chunkKey, previous, reference)
+				if err != nil {
+					return err
+				}
+				reference = merged
 			}
 			chunkRefs[chunkKey] = reference
-		}
+			return nil
+		})
 		clear(keys)
+		if err != nil {
+			return err
+		}
 	}
 	if len(chunkRefs) != len(r.chunks) {
 		for key := range r.chunks {
@@ -168,6 +174,9 @@ func (r *Reader) verifyAndUpload(ctx context.Context, root store.ContentKey, cus
 		}
 	}
 
+	if err := checkDeltaUpload(target, decryptor, hasDeltaRef(chunkRefs)); err != nil {
+		return err
+	}
 	chunkKeys := sortedKeys(r.chunks)
 	if err := r.verifyChunks(ctx, chunkKeys, chunkRefs, decryptor, target, opts); err != nil {
 		return err
@@ -244,17 +253,17 @@ func (r *Reader) verifyChunks(ctx context.Context, keys []store.ContentKey, refs
 					fail(fmt.Errorf("manifest bundle: Chunk %s physical ContentKey mismatch", hex.EncodeToString(key[:])))
 					continue
 				}
-				if err := decryptor.DecryptChunkTo(workCtx, reference.decryptKey, physical, plain); err != nil {
+				if err := verifyChunkPlaintext(workCtx, decryptor, key, reference, physical, plain, r.verifiedBase); err != nil {
 					blob.Release()
 					clear(plain)
-					fail(fmt.Errorf("manifest bundle: Chunk %s decrypt/decompress: %w", hex.EncodeToString(key[:]), err))
+					fail(err)
 					continue
 				}
 				if target != nil {
-					if _, err := target.Put(workCtx, r.admission, store.PartitionChunk, key, physical); err != nil {
+					if err := uploadChunk(workCtx, target, decryptor, r.admission, key, reference, physical, plain); err != nil {
 						blob.Release()
 						clear(plain)
-						fail(fmt.Errorf("manifest bundle: upload Chunk %s: %w", hex.EncodeToString(key[:]), err))
+						fail(err)
 						continue
 					}
 				}
@@ -281,6 +290,28 @@ func (r *Reader) verifyChunks(ctx context.Context, keys []store.ContentKey, refs
 	return ctx.Err()
 }
 
+// verifiedBase reads one chunk object from this Bundle and checks its bytes
+// against its key; it is how a delta's base is read during verification.
+func (r *Reader) verifiedBase(ctx context.Context, key store.ContentKey) ([]byte, func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	entry, ok := r.chunks[key]
+	if !ok {
+		return nil, nil, fmt.Errorf("%w: absent", ErrIncomplete)
+	}
+	blob, err := r.entryBlob(store.PartitionChunk, key, entry)
+	if err != nil {
+		return nil, nil, err
+	}
+	physical := blob.Bytes()
+	if sha256.Sum256(physical) != key {
+		blob.Release()
+		return nil, nil, fmt.Errorf("physical ContentKey mismatch")
+	}
+	return physical, blob.Release, nil
+}
+
 func (r *Reader) uploadManifest(ctx context.Context, target ExactStore, key store.ContentKey) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -298,6 +329,15 @@ func (r *Reader) uploadManifest(ctx context.Context, target ExactStore, key stor
 		return fmt.Errorf("manifest bundle: upload Manifest %s: %w", hex.EncodeToString(key[:]), err)
 	}
 	return nil
+}
+
+func hasDeltaRef[K comparable](refs map[K]chunkReference) bool {
+	for _, reference := range refs {
+		if reference.kind == refDelta {
+			return true
+		}
+	}
+	return false
 }
 
 func sortedKeys[T any](objects map[store.ContentKey]T) []store.ContentKey {

@@ -97,5 +97,5 @@ func (s *Store) deleteBounded(parent context.Context, key string) error {
 }
 
 func s3Partitions() []store.Partition {
-	return []store.Partition{store.PartitionChunk, store.PartitionManifest, store.PartitionBlob}
+	return []store.Partition{store.PartitionChunk, store.PartitionManifest, store.PartitionBlob, store.PartitionAlias}
 }

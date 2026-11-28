@@ -209,31 +209,70 @@ func classifyGetError(err error) error {
 // client handles the resulting io.EOF on its next Send by breaking
 // out of the loop; CloseAndRecv still returns the response.
 func (c *Client) Put(ctx context.Context, admission store.WriteAdmission, partition store.Partition, key store.ContentKey, data []byte) (bool, error) {
+	resp, err := c.put(ctx, admission, partition, key, data, nil)
+	if err != nil {
+		return false, err
+	}
+	return resp.GetIsNew(), nil
+}
+
+// PutRepresenting stores a chunk-partition delta object and, in the same RPC,
+// asks the store to record it as the representation of the chunk whose
+// independent address is represents (see store.PartitionAlias). The result says
+// whether this object won that role or lost it to another delta object; a
+// losing object this call stored may have been deleted again (Discarded). A
+// store that cannot hold aliases answers RepresentedNone. See store.PutResult
+// for what the caller may record.
+func (c *Client) PutRepresenting(ctx context.Context, admission store.WriteAdmission, key store.ContentKey, data []byte, represents store.ContentKey) (store.PutResult, error) {
+	resp, err := c.put(ctx, admission, store.PartitionChunk, key, data, &represents)
+	if err != nil {
+		return store.PutResult{}, err
+	}
+	out := store.PutResult{IsNew: resp.GetIsNew(), Discarded: resp.GetDiscarded()}
+	switch resp.GetRepresented() {
+	case pb.Represented_REPRESENTED_WON:
+		out.Represented = store.RepresentedWon
+	case pb.Represented_REPRESENTED_INDEPENDENT:
+		out.Represented = store.RepresentedIndependent
+	case pb.Represented_REPRESENTED_LOST:
+		if len(resp.GetRepresentedKey()) != len(out.Key) {
+			return store.PutResult{}, fmt.Errorf("store: Put: represented key is %d bytes, want %d", len(resp.GetRepresentedKey()), len(out.Key))
+		}
+		out.Represented = store.RepresentedLost
+		copy(out.Key[:], resp.GetRepresentedKey())
+	default:
+		// NONE, or a value from a newer server: nothing was recorded that we
+		// understand, so the caller keeps its own object.
+	}
+	return out, nil
+}
+
+func (c *Client) put(ctx context.Context, admission store.WriteAdmission, partition store.Partition, key store.ContentKey, data []byte, represents *store.ContentKey) (*pb.PutResponse, error) {
 	ctx, cancel := c.withTimeout(ctx)
 	defer cancel()
 
 	pp, err := storePartitionToProto(partition)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	stream, err := c.pickStub().Put(ctx)
 	if err != nil {
-		return false, fmt.Errorf("store: Put open: %w", err)
+		return nil, fmt.Errorf("store: Put open: %w", err)
 	}
 
 	// 1. Header.
 	size := uint64(len(data))
-	if err := stream.Send(&pb.PutRequest{
-		Body: &pb.PutRequest_Header{
-			Header: &pb.PutHeader{
-				Partition:  pp,
-				Key:        key[:],
-				Generation: string(admission.Generation),
-				Size:       &size,
-			},
-		},
-	}); err != nil {
-		return false, fmt.Errorf("store: Put send header: %w", err)
+	header := &pb.PutHeader{
+		Partition:  pp,
+		Key:        key[:],
+		Generation: string(admission.Generation),
+		Size:       &size,
+	}
+	if represents != nil {
+		header.Represents = represents[:]
+	}
+	if err := stream.Send(&pb.PutRequest{Body: &pb.PutRequest_Header{Header: header}}); err != nil {
+		return nil, fmt.Errorf("store: Put send header: %w", err)
 	}
 
 	// 2. Data frames.
@@ -250,16 +289,50 @@ func (c *Client) Put(ctx context.Context, admission store.WriteAdmission, partit
 				// response; do NOT return here.
 				break
 			}
-			return false, fmt.Errorf("store: Put send data: %w", err)
+			return nil, fmt.Errorf("store: Put send data: %w", err)
 		}
 	}
 
 	// 3. Close + recv.
 	resp, err := stream.CloseAndRecv()
 	if err != nil {
-		return false, fmt.Errorf("store: Put close: %w", err)
+		return nil, fmt.Errorf("store: Put close: %w", err)
 	}
-	return resp.GetIsNew(), nil
+	return resp, nil
+}
+
+// Resolve asks how generation stores the chunk whose independent object address
+// is hInd: as that object, as a delta object an alias names, or not at all. A
+// DELTA answer is a claim to verify, not a fact: the store does not check the
+// delta object, and the caller holds the plaintext.
+//
+// A server that predates the RPC, or whose backend cannot hold aliases, yields
+// store.ErrUnsupported, which callers treat as "no cross-node delta here".
+func (c *Client) Resolve(ctx context.Context, generation store.Generation, hInd store.ContentKey) (store.Resolved, error) {
+	ctx, cancel := c.withTimeout(ctx)
+	defer cancel()
+	resp, err := c.pickStub().Resolve(ctx, &pb.ResolveRequest{Generation: string(generation), Key: hInd[:]})
+	if err != nil {
+		if status.Code(err) == codes.Unimplemented {
+			return store.Resolved{}, fmt.Errorf("store: Resolve: %w", store.ErrUnsupported)
+		}
+		return store.Resolved{}, fmt.Errorf("store: Resolve: %w", err)
+	}
+	switch resp.GetResolution() {
+	case pb.Resolution_RESOLUTION_ABSENT:
+		return store.Resolved{Resolution: store.ResolutionAbsent}, nil
+	case pb.Resolution_RESOLUTION_INDEPENDENT:
+		return store.Resolved{Resolution: store.ResolutionIndependent}, nil
+	case pb.Resolution_RESOLUTION_DELTA:
+		out := store.Resolved{Resolution: store.ResolutionDelta}
+		if len(resp.GetDeltaKey()) != len(out.DeltaKey) {
+			return store.Resolved{}, fmt.Errorf("store: Resolve: delta key is %d bytes, want %d", len(resp.GetDeltaKey()), len(out.DeltaKey))
+		}
+		copy(out.DeltaKey[:], resp.GetDeltaKey())
+		return out, nil
+	default:
+		return store.Resolved{}, fmt.Errorf("store: Resolve: unknown resolution %d", resp.GetResolution())
+	}
 }
 
 // normalizeTarget rewrites a Unix-socket endpoint into gRPC's canonical

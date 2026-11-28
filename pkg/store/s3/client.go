@@ -22,6 +22,7 @@ package s3
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // Sentinel errors. The s3Client implementations normalise SDK-
@@ -45,6 +46,18 @@ var (
 type ObjectMeta struct {
 	Size int64
 	ETag string // includes the surrounding quotes per S3 convention
+	// LastModified is the object's modification time when the response
+	// carried one; zero otherwise. Only the delta audit consults it.
+	LastModified time.Time
+}
+
+// objectPrefixReader is an optional capability of an s3Client: read the
+// first n bytes of an object with a ranged GET, returning the whole object's
+// metadata (size, modification time). The delta audit uses it to learn each
+// chunk object's format byte without downloading the object; a client without
+// it makes the audit fall back to full GETs.
+type objectPrefixReader interface {
+	GetPrefix(ctx context.Context, key string, n int64) ([]byte, *ObjectMeta, error)
 }
 
 // PutOptions carries optional conditional-put headers and the few

@@ -358,8 +358,51 @@ func (c *Client) Head(ctx context.Context, key string) (*s3.ObjectMeta, error) {
 		return nil, normaliseErr("head", key, err)
 	}
 	return &s3.ObjectMeta{
-		Size: aws.ToInt64(out.ContentLength),
-		ETag: aws.ToString(out.ETag),
+		Size:         aws.ToInt64(out.ContentLength),
+		ETag:         aws.ToString(out.ETag),
+		LastModified: aws.ToTime(out.LastModified),
+	}, nil
+}
+
+// GetPrefix reads the first n bytes of an object with a ranged GET. The
+// returned metadata describes the whole object: Size is parsed from the
+// Content-Range total (falling back to Content-Length when the object is
+// shorter than n and the server answered without a range), LastModified from
+// the response. It implements the parent package's optional prefix reader.
+func (c *Client) GetPrefix(ctx context.Context, key string, n int64) ([]byte, *s3.ObjectMeta, error) {
+	if n <= 0 {
+		return nil, nil, fmt.Errorf("s3 sdkclient: non-positive prefix length %d", n)
+	}
+	out, err := c.api.GetObject(ctx, &awss3.GetObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+		Range:  aws.String(fmt.Sprintf("bytes=0-%d", n-1)),
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return nil, nil, s3.ErrNotFound
+		}
+		return nil, nil, normaliseErr("get", key, err)
+	}
+	defer out.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(out.Body, n))
+	if err != nil {
+		return nil, nil, fmt.Errorf("s3 sdkclient: read body %s: %w", key, err)
+	}
+	total := aws.ToInt64(out.ContentLength)
+	if cr := aws.ToString(out.ContentRange); cr != "" {
+		// "bytes 0-0/12345"
+		if slash := strings.LastIndexByte(cr, '/'); slash >= 0 && slash+1 < len(cr) && cr[slash+1:] != "*" {
+			var parsed int64
+			if _, err := fmt.Sscanf(cr[slash+1:], "%d", &parsed); err == nil {
+				total = parsed
+			}
+		}
+	}
+	return body, &s3.ObjectMeta{
+		Size:         total,
+		ETag:         aws.ToString(out.ETag),
+		LastModified: aws.ToTime(out.LastModified),
 	}, nil
 }
 
@@ -420,8 +463,9 @@ func (c *Client) get(ctx context.Context, key string, maxBytes *int64) ([]byte, 
 			size, len(body))
 	}
 	return body, &s3.ObjectMeta{
-		Size: int64(len(body)),
-		ETag: aws.ToString(out.ETag),
+		Size:         int64(len(body)),
+		ETag:         aws.ToString(out.ETag),
+		LastModified: aws.ToTime(out.LastModified),
 	}, nil
 }
 

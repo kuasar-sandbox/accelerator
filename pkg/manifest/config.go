@@ -30,6 +30,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/chunker"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/delta"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
@@ -65,6 +66,14 @@ type Config struct {
 	Cache    CacheConfig       `yaml:"cache"`
 	Chunker  chunker.Config    `yaml:"chunker"`
 	Crypto   crypto.Config     `yaml:"crypto"`
+	// Delta configures delta compression of unique chunks. Absent or
+	// enabled:false leaves the pipeline exactly as it was.
+	Delta delta.Config `yaml:"delta"`
+
+	// deltaEng is the process-wide delta engine, created lazily by the first
+	// ingester that can use it and shared by every later one (a base can only be
+	// found by an ingest that shares the engine that registered it).
+	deltaEng *delta.Engine
 }
 
 // ManifestSubConfig carries the per-config customer-key material. Kept
@@ -99,7 +108,16 @@ func (c *Config) fetchOptions() fetch.Options {
 			log.Printf("WARNING: manifest.verify_content=false; ordinary Manifest/Chunk SHA-256 verification is disabled")
 		})
 	}
-	return fetch.Options{VerifyContent: verify}
+	var baseCache, scratch int64
+	if p, err := c.Delta.Resolve(); err == nil {
+		baseCache = p.FetchBaseCache
+		scratch = p.FetchScratch
+	}
+	return fetch.Options{
+		VerifyContent:       verify,
+		DeltaBaseCacheBytes: baseCache,
+		DeltaScratchBytes:   scratch,
+	}
 }
 
 // StoreConfig is the wire-level connection schema for the store-ctl
@@ -202,6 +220,20 @@ func (w *generationStoreWriter) Put(ctx context.Context, admission store.WriteAd
 
 func (w *generationStoreWriter) PoolSize() int { return w.client.PoolSize() }
 
+func (w *generationStoreWriter) Get(ctx context.Context, p store.Partition, key store.ContentKey) (bool, []byte, error) {
+	return w.client.Get(ctx, p, key)
+}
+
+// Resolve and PutRepresenting let delta compression coordinate with other
+// writers through the store's aliases (see ingest.Resolver).
+func (w *generationStoreWriter) Resolve(ctx context.Context, generation store.Generation, hInd store.ContentKey) (store.Resolved, error) {
+	return w.client.Resolve(ctx, generation, hInd)
+}
+
+func (w *generationStoreWriter) PutRepresenting(ctx context.Context, admission store.WriteAdmission, key store.ContentKey, data []byte, represents store.ContentKey) (store.PutResult, error) {
+	return w.client.PutRepresenting(ctx, admission, key, data, represents)
+}
+
 // NewIngesterWithWriter wires Chunker + Crypto to a caller-owned writer. It is
 // used by local containers such as Manifest Bundles; writer lifetime and
 // admission acquisition remain the caller's responsibility.
@@ -224,7 +256,67 @@ func (c *Config) NewIngesterWithWriter(keyFn ingest.CustomerKeyFunc, extraSaltFn
 	if err != nil {
 		return nil, err
 	}
-	return ingest.NewIngester(keyFn, extraSaltFn, writer, chk, enc), nil
+	eng, err := c.deltaEngineFor(writer, enc)
+	if err != nil {
+		return nil, err
+	}
+	return ingest.NewIngesterWithDelta(keyFn, extraSaltFn, writer, chk, enc, eng), nil
+}
+
+var (
+	deltaInitMu sync.Mutex
+	deltaWarned sync.Map // reason -> struct{}: say why delta is inactive once, not per image
+)
+
+// deltaEngineFor returns the shared delta engine, or nil when delta compression
+// is off or cannot be used with this writer. The configuration is validated
+// even when disabled, so a typo fails at startup rather than the day the switch
+// is flipped.
+func (c *Config) deltaEngineFor(writer ingest.StoreWriter, enc crypto.Encryptor) (*delta.Engine, error) {
+	p, err := c.Delta.Resolve()
+	if err != nil {
+		return nil, err
+	}
+	if !p.Enabled {
+		return nil, nil
+	}
+	if reason := ingest.DeltaSupport(writer, enc); reason != nil {
+		if _, seen := deltaWarned.LoadOrStore(reason.Error(), struct{}{}); !seen {
+			log.Printf("delta.enabled=true but delta compression is inactive for this writer: %v", reason)
+		}
+		return nil, nil
+	}
+	deltaInitMu.Lock()
+	defer deltaInitMu.Unlock()
+	if c.deltaEng != nil {
+		return c.deltaEng, nil
+	}
+	// The snapshot is sealed under a key derived from the customer key, so a
+	// node that persists its index needs that key at start-up (it needs it to
+	// ingest anyway).
+	eng, err := delta.NewEngine(p, c.CustomerKey)
+	if err != nil {
+		return nil, fmt.Errorf("manifest: delta: %w", err)
+	}
+	if lerr := eng.LoadErr(); lerr != nil {
+		log.Printf("delta: persisted index not restored, starting empty (it is soft state): %v", lerr)
+	}
+	c.deltaEng = eng
+	return eng, nil
+}
+
+// CloseDelta persists the delta engine's state if it changed. Long-running
+// callers snapshot on an interval anyway; a short-lived process should call
+// this before exiting so its last changes survive. It is a no-op when delta is
+// off or was never used.
+func (c *Config) CloseDelta() error {
+	deltaInitMu.Lock()
+	eng := c.deltaEng
+	deltaInitMu.Unlock()
+	if eng == nil {
+		return nil
+	}
+	return eng.Close()
 }
 
 // NewBundleIngester wires a caller-owned multi-Manifest writer with the
@@ -287,6 +379,9 @@ func (c *Config) NewFetcher() (FetcherCloser, error) {
 // NewFetcherWithOptions wires the configured remote Getter with an explicit
 // verification policy. Explicit verification commands use this to force true.
 func (c *Config) NewFetcherWithOptions(opts fetch.Options) (FetcherCloser, error) {
+	if _, err := c.Delta.Resolve(); err != nil {
+		return nil, err
+	}
 	customerKey, err := c.CustomerKey()
 	if err != nil {
 		return nil, err
@@ -309,7 +404,11 @@ func (c *Config) NewFetcherWithOptions(opts fetch.Options) (FetcherCloser, error
 			return nil, fmt.Errorf("manifest: dial cache: %w", err)
 		}
 		f := fetch.NewFetcherWithOptions(customerKey, cc, dec, opts)
-		return &fetcherCloser{Fetcher: f, closers: []io.Closer{cc}}, nil
+		closers := []io.Closer{cc}
+		if c, ok := f.(io.Closer); ok {
+			closers = append([]io.Closer{c}, closers...)
+		}
+		return &fetcherCloser{Fetcher: f, closers: closers}, nil
 	}
 
 	if c.Store.Endpoint == "" {
@@ -325,7 +424,11 @@ func (c *Config) NewFetcherWithOptions(opts fetch.Options) (FetcherCloser, error
 	}
 	getter := cache.NewStoreOrigin(sc)
 	f := fetch.NewFetcherWithOptions(customerKey, getter, dec, opts)
-	return &fetcherCloser{Fetcher: f, closers: []io.Closer{sc}}, nil
+	closers := []io.Closer{sc}
+	if c, ok := f.(io.Closer); ok {
+		closers = append([]io.Closer{c}, closers...)
+	}
+	return &fetcherCloser{Fetcher: f, closers: closers}, nil
 }
 
 // NewFetcherWithGetter wires a caller-owned Getter using the configured
@@ -338,6 +441,9 @@ func (c *Config) NewFetcherWithGetter(getter cache.Getter) (fetch.Fetcher, error
 // NewFetcherWithGetterOptions is the explicit-policy form used by local
 // containers and mandatory verification operations.
 func (c *Config) NewFetcherWithGetterOptions(getter cache.Getter, opts fetch.Options) (fetch.Fetcher, error) {
+	if _, err := c.Delta.Resolve(); err != nil {
+		return nil, err
+	}
 	if getter == nil {
 		return nil, fmt.Errorf("manifest: cache getter is required")
 	}

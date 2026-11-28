@@ -16,6 +16,10 @@ type adminStore interface {
 	DropGeneration(ctx context.Context, generation store.Generation) error
 	Wipe(ctx context.Context) error
 	GenerationStats(ctx context.Context, generation store.Generation) (map[store.Partition]int, error)
+	// AuditDeltas and Delete serve delta-gc: find delta objects no alias
+	// names, and remove them.
+	AuditDeltas(ctx context.Context, generation store.Generation) (store.DeltaAudit, error)
+	Delete(ctx context.Context, generation store.Generation, partition store.Partition, key store.ContentKey) error
 }
 
 // openFSStore opens an existing filesystem object-data root.

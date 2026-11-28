@@ -32,6 +32,67 @@ type transferWriter struct {
 	workers   int
 	root      store.ContentKey
 	manifest  []byte
+	// bundle marks a transfer that also writes a self-contained Bundle. It is
+	// set at construction, not derived from local: the ingester decides whether
+	// delta is allowed when it is built, which is before local is assigned.
+	bundle bool
+}
+
+// SupportsDelta implements ingest.DeltaWriter. A transfer is an ordered writer
+// (it forwards PutChunkOrdered) but only sometimes a bundle; a Bundle must be
+// complete in itself, and a delta object's base may live outside it, so delta
+// is refused exactly when a Bundle is being written.
+//
+// Bundles can still carry delta objects: CopyManifest and the exact upload
+// path copy and verify a Version2 manifest's bases along with its entries. What
+// stays off is producing new deltas while writing a Bundle, because the base a
+// delta would save against is another image's chunk; a self-contained Bundle
+// would have to carry that base in full as well, making the Bundle larger than
+// the independent chunk it replaced.
+func (w *transferWriter) SupportsDelta() bool { return !w.bundle }
+
+// Get forwards to the store so delta compression can read a base back after it
+// has left the in-memory pool. A bundle writer has no store to read.
+func (w *transferWriter) Get(ctx context.Context, p store.Partition, key store.ContentKey) (bool, []byte, error) {
+	if w.bundle || w.target == nil {
+		return false, nil, errors.New("transfer: no store to read bases back from")
+	}
+	rd, ok := w.target.(ingest.ObjectReader)
+	if !ok {
+		return false, nil, errors.New("transfer: store writer cannot be read")
+	}
+	return rd.Get(ctx, p, key)
+}
+
+// Resolve and PutRepresenting forward to the store for delta compression's
+// cross-node coordination. There is nothing to coordinate with when no store is
+// being written, and delta is refused for a bundle anyway.
+func (w *transferWriter) Resolve(ctx context.Context, generation store.Generation, hInd store.ContentKey) (store.Resolved, error) {
+	if w.bundle || w.target == nil {
+		return store.Resolved{}, fmt.Errorf("transfer: no store to resolve against: %w", store.ErrUnsupported)
+	}
+	r, ok := w.target.(ingest.Resolver)
+	if !ok {
+		return store.Resolved{}, fmt.Errorf("transfer: store writer cannot resolve: %w", store.ErrUnsupported)
+	}
+	return r.Resolve(ctx, generation, hInd)
+}
+
+func (w *transferWriter) PutRepresenting(ctx context.Context, a store.WriteAdmission, key store.ContentKey, data []byte, represents store.ContentKey) (store.PutResult, error) {
+	if err := ctx.Err(); err != nil {
+		return store.PutResult{}, err
+	}
+	if a != w.admission {
+		return store.PutResult{}, errors.New("write admission changed")
+	}
+	if w.bundle || w.target == nil {
+		return store.PutResult{}, errors.New("transfer: no store to write a delta object to")
+	}
+	rw, ok := w.target.(ingest.RepresentingWriter)
+	if !ok {
+		return store.PutResult{}, errors.New("transfer: store writer cannot record representations")
+	}
+	return rw.PutRepresenting(ctx, a, key, data, represents)
 }
 
 func (w *transferWriter) AdmitWrite(ctx context.Context) (store.WriteAdmission, error) {
@@ -142,7 +203,7 @@ func writeTransfer(ctx context.Context, cfg *manifest.Config, key [32]byte, src 
 		if err != nil {
 			return result, err
 		}
-		writer = &transferWriter{admission: admission, workers: workers}
+		writer = &transferWriter{admission: admission, workers: workers, bundle: mode == "bundle"}
 		if client != nil {
 			writer.target = client
 		}

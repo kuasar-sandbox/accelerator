@@ -284,6 +284,13 @@ func openBackend(ctx context.Context, cfg Config, credentials CredentialsProvide
 }
 func nopClose() error { return nil }
 
+// Both backends must hold delta aliases: a Backend that does not makes Resolve
+// answer UNIMPLEMENTED, which silently turns cross-node delta compression off.
+var (
+	_ storeserver.AliasBackend = (*storefs.Store)(nil)
+	_ storeserver.AliasBackend = (*stores3.Store)(nil)
+)
+
 type storeGetter struct{ s *storeserver.Server }
 
 func (g storeGetter) Get(ctx context.Context, p pkgstore.Partition, k pkgstore.ContentKey) (bool, []byte, error) {
@@ -302,7 +309,8 @@ func sampler(s *storeserver.Server) func(float64) (string, bool) {
 	return func(elapsed float64) (string, bool) {
 		cur := s.Stats()
 		gets, puts, admits := cur.GetN-prev.GetN, cur.PutN-prev.PutN, cur.AdmitN-prev.AdmitN
-		if gets+puts+admits == 0 && cur.Inflight == 0 {
+		resolves := cur.ResolveN - prev.ResolveN
+		if gets+puts+admits+resolves == 0 && cur.Inflight == 0 {
 			prev = cur
 			return "", false
 		}
@@ -318,6 +326,21 @@ func sampler(s *storeserver.Server) func(float64) (string, bool) {
 		}
 		if admits > 0 {
 			fmt.Fprintf(&b, " · admit %s/s", obstat.FmtCount(float64(admits)/elapsed))
+		}
+		if resolves > 0 {
+			fmt.Fprintf(&b, " · resolve %s/s", obstat.FmtCount(float64(resolves)/elapsed))
+		}
+		if w, l, e := cur.AliasWon-prev.AliasWon, cur.AliasLost-prev.AliasLost, cur.AliasErr-prev.AliasErr; w+l+e > 0 {
+			fmt.Fprintf(&b, " · alias won %d lost %d", w, l)
+			if d := cur.Discarded - prev.Discarded; d > 0 {
+				fmt.Fprintf(&b, " discarded %d (%s)", d, obstat.FmtBytesPerSec(float64(cur.DiscardedBytes-prev.DiscardedBytes)/elapsed))
+			}
+			if de := cur.DiscardErr - prev.DiscardErr; de > 0 {
+				fmt.Fprintf(&b, " discardErr %d", de)
+			}
+			if e > 0 {
+				fmt.Fprintf(&b, " err %d", e)
+			}
 		}
 		fmt.Fprintf(&b, " | inflight %d", cur.Inflight)
 		if e := cur.ErrN - prev.ErrN; e > 0 {
