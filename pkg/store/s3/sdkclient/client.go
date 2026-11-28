@@ -31,6 +31,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/secret"
 	"github.com/kuasar-sandbox/accelerator/pkg/store/s3"
 )
 
@@ -55,7 +56,8 @@ type Config struct {
 	// pass the already resolved user-facing configuration value.
 	PathStyle bool
 
-	// AccessKey / SecretKey: static AK/SK. Empty → default chain.
+	// AccessKey / SecretKey: static AK/SK or @plugin/key references.
+	// Empty → default chain. References are resolved once at client creation.
 	AccessKey string
 	SecretKey string
 
@@ -197,9 +199,23 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		region = "us-east-1"
 	}
 	loadOpts := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(region)}
-	if cfg.AccessKey != "" {
+	if cfg.Credentials == nil && cfg.AccessKey != "" {
+		accessKey, err := secret.Resolve(ctx, cfg.AccessKey, secret.Literal)
+		if err != nil {
+			return nil, fmt.Errorf("s3 sdkclient: resolve access key: %w", err)
+		}
+		defer clear(accessKey)
+		secretKey, err := secret.Resolve(ctx, cfg.SecretKey, secret.Literal)
+		if err != nil {
+			return nil, fmt.Errorf("s3 sdkclient: resolve secret key: %w", err)
+		}
+		defer clear(secretKey)
+		if (secret.IsReference(cfg.AccessKey) && len(accessKey) == 0) ||
+			(secret.IsReference(cfg.SecretKey) && len(secretKey) == 0) {
+			return nil, errors.New("s3 sdkclient: plugin credentials must be nonempty")
+		}
 		loadOpts = append(loadOpts, awsconfig.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")))
+			credentials.NewStaticCredentialsProvider(string(accessKey), string(secretKey), "")))
 	}
 	var lifetime *providerLifetime
 	if cfg.Credentials != nil {

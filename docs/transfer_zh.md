@@ -17,7 +17,7 @@
 
 持久 Store 的使用流程：
 
-1. 部署 [Store](store_zh.md#部署首个持久-store)，创建 [Manifest 配置](#manifest-configyaml)，填写 `store.endpoint`，启用校验，初始不配置 cache endpoint。将既有 32 字节客户密钥以 64 字符十六进制 `MANIFEST_KEY` 交付，或使用文档规定的受保护配置方式。只有明确建立新内容保护域时才生成新密钥，并保留它供后续读取。
+1. 部署 [Store](store_zh.md#部署首个持久-store)，创建 [Manifest 配置](#manifest-configyaml)，填写 `store.endpoint`，启用校验，初始不配置 cache endpoint。通过 `MANIFEST_KEY` 或受保护的 `manifest.key` 配置，提供既有 32 字节客户密钥的 64 字符十六进制文本，或已配置的 [`@plugin/key` 引用](secret-plugins_zh.md)。只有明确建立新内容保护域时才生成新密钥，并保留它供后续读取。
 2. 如需制备镜像，使用匹配 guest-runtime 发行版的 `flatten-ctl`。当前制备使用链接的 Go EROFS 生成器，无需先在 host 安装 mkfs.erofs 或进行特权 loop mount；保留所有权的导出仍可能需要 CLI 指南规定的权限。
 3. 执行 `manifest-ctl store --manifest-config /etc/accelerator/manifest.yaml --no-progress /path/to/artifact.img`。仅上传时 stdout 为 Manifest key，成功完成后保存 `manifest://` 加完整 key。不要将摘要前缀或临时源路径作为发布引用。
 4. 执行 `manifest-ctl verify --manifest-config /etc/accelerator/manifest.yaml --no-progress manifest://<返回key>`，随后从预期节点 load 或消费。使用相同客户密钥并核验目标 Store/generation 可见性，路径验证成功后再增加 cache。
@@ -397,6 +397,8 @@ crypto:
   local: off                      # off | auto | required;缺省 off
   ref: auto                       # off | auto | required，独立于 local
 ```
+
+`manifest.key` 和 `MANIFEST_KEY` 均接受十六进制密钥文本或 `@plugin/key` 引用。YAML 中的引用需要加引号，解析后的值必须为 32 字节。broker 配置和密钥生命周期见 [Secret plugin](secret-plugins_zh.md)。
 
 字段说明:
 

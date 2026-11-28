@@ -17,7 +17,7 @@ Choose the destination before converting data. A platform Build may already have
 
 For a persistent Store workflow:
 
-1. Deploy [Store](store.md#deploy-a-first-persistent-store) and create a [Manifest config](#manifest-configyaml) with `store.endpoint`, verification enabled and no cache endpoint initially. Deliver the existing 32-byte customer key as a 64-character hexadecimal `MANIFEST_KEY`, or use the documented protected configuration mechanism. Generate a new key only when intentionally creating a new content-protection domain; retain it to read the resulting artifacts later.
+1. Deploy [Store](store.md#deploy-a-first-persistent-store) and create a [Manifest config](#manifest-configyaml) with `store.endpoint`, verification enabled and no cache endpoint initially. Provide the existing 32-byte customer key as 64-character hexadecimal text or a configured [`@plugin/key` reference](secret-plugins.md), using `MANIFEST_KEY` or a protected `manifest.key` setting. Generate a new key only when intentionally creating a new content-protection domain; retain it to read the resulting artifacts later.
 2. Use `flatten-ctl` from the matching guest-runtime release to prepare an image if needed. Current preparation uses the linked Go EROFS generator; host mkfs.erofs installation or privileged loop mounting is not a preparation step. Ownership-preserving export may still require privileges as described in the CLI guide.
 3. Run `manifest-ctl store --manifest-config /etc/accelerator/manifest.yaml --no-progress /path/to/artifact.img`. For upload-only output, stdout is the Manifest key. Record `manifest://` plus that complete key only after successful completion. Do not use a digest prefix or a temporary source pathname as the published reference.
 4. Run `manifest-ctl verify --manifest-config /etc/accelerator/manifest.yaml --no-progress manifest://<returned-key>`, then load or consume it from the intended node. Verify with the same customer key and the intended Store/generation visibility. Add cache only after this path works.
@@ -388,6 +388,8 @@ crypto:
   local: off                     # off | auto | required; default off
   ref: auto                      # off | auto | required, independent of local
 ```
+
+Both `manifest.key` and `MANIFEST_KEY` accept hexadecimal key text or an `@plugin/key` reference. Quote references in YAML; the resolved value must be 32 bytes. [Secret plugins](secret-plugins.md) describes broker configuration and key lifetime.
 
 Fields:
 

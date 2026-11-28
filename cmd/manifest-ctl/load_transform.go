@@ -161,7 +161,7 @@ func runTransfer(ctx context.Context, args []string, storeCommand bool, streams 
 	if err != nil {
 		return err
 	}
-	customer, err := cfg.CustomerKey()
+	customer, err := cfg.CustomerKeyContext(ctx)
 	if err != nil {
 		return err
 	}

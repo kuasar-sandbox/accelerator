@@ -50,7 +50,7 @@ const (
 // fully-wired ingest or fetch pipeline. The YAML form mirrors the
 // subpackages 1:1:
 //
-//	manifest: {key}                # 32-byte hex customer key
+//	manifest: {key}                # hex customer key or @plugin/key reference
 //	store:    {endpoint, ...}
 //	cache:    {endpoint, ...}      # optional; absent → store-as-origin
 //	chunker:  {mode, cdc:{...}}
@@ -71,7 +71,7 @@ type Config struct {
 // in a sub-struct so the YAML node name remains `manifest:` and the
 // field is grouped with future manifest-wide knobs.
 type ManifestSubConfig struct {
-	// Key is the 32-byte customer key, hex-encoded (64 chars). Required
+	// Key is the 32-byte customer key as hex (64 chars) or @plugin/key. Required
 	// for any ingest or fetch, but may be left empty here and supplied via
 	// the $MANIFEST_KEY environment variable instead — which also overrides
 	// a non-empty value here (see CustomerKeyEnv), so the secret can stay
@@ -291,6 +291,17 @@ func (c *Config) NewFetcherWithOptions(opts fetch.Options) (FetcherCloser, error
 	if err != nil {
 		return nil, err
 	}
+	return c.newFetcher(customerKey, opts)
+}
+
+// NewFetcherWithKey binds a configured remote Getter to already resolved key
+// material. A transfer that also reads local containers uses this to keep both
+// paths on the same key without resolving again after a cache expiry.
+func (c *Config) NewFetcherWithKey(customerKey [32]byte) (FetcherCloser, error) {
+	return c.newFetcher(customerKey, c.fetchOptions())
+}
+
+func (c *Config) newFetcher(customerKey [32]byte, opts fetch.Options) (FetcherCloser, error) {
 	_, dec, err := crypto.New(c.Crypto)
 	if err != nil {
 		return nil, err
@@ -482,7 +493,7 @@ func (c *Config) CheckManifest(ctx context.Context, key store.ContentKey) error 
 	if err != nil {
 		return fmt.Errorf("manifest %s: parse: %w", HexKey(key), err)
 	}
-	ck, err := c.CustomerKey()
+	ck, err := c.CustomerKeyContext(ctx)
 	if err != nil {
 		return err
 	}
