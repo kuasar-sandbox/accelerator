@@ -57,6 +57,13 @@ fs:
   verify_content_key: true
 EOF
 "$BIN/store-ctl" init --config "$TMPDIR/store-ctl.yaml" --generation G1
+# The administrative CLI has no blob Put command. Seed one immutable object
+# in this owned FS backend to test the positive blob read path through cache wire.
+BLOB_DATA='store-cache positive blob fixture'
+BLOB_KEY=$(printf '%s' "$BLOB_DATA" | sha256sum | awk '{print $1}')
+BLOB_PATH="$STORE_ROOT/blob/G1/${BLOB_KEY:0:2}/${BLOB_KEY:2:2}/$BLOB_KEY"
+mkdir -p "$(dirname "$BLOB_PATH")"
+printf '%s' "$BLOB_DATA" > "$BLOB_PATH"
 "$BIN/store-ctl" serve --config "$TMPDIR/store-ctl.yaml" &
 STORE_PID=$!
 PIDS+=("$STORE_PID")
@@ -129,10 +136,26 @@ H_GRPC=$(sha256sum "$TMPDIR/m-grpc.bin" | awk '{print $1}')
 H_WIRE=$("$BIN/cache-ctl" object get --endpoint "$STORE_CACHE_EP" --namespace manifest --hash "$MKEY" | sha256sum | awk '{print $1}')
 assert_eq "$H_GRPC" "$H_WIRE" "cache_listen manifest bytes match the store gRPC"
 
+# Compare a real encrypted chunk produced by manifest ingest with its wire read.
+# This also checks that chunk lookup can still find G1 while G2 admits new writes.
+CHUNK_FILE=$(find "$STORE_ROOT/chunk/G1" -type f -print -quit)
+if [ -z "$CHUNK_FILE" ]; then
+    fail "ingest did not produce a G1 chunk for the positive wire read"
+    exit 1
+fi
+CHUNK_KEY=$(basename "$CHUNK_FILE")
+CHUNK_EXPECTED=$(sha256sum "$CHUNK_FILE" | awk '{print $1}')
+CHUNK_WIRE=$("$BIN/cache-ctl" object get --endpoint "$STORE_CACHE_EP" \
+    --namespace chunk --hash "$CHUNK_KEY" | sha256sum | awk '{print $1}')
+assert_eq "$CHUNK_EXPECTED" "$CHUNK_WIRE" "cache_listen chunk bytes match the ingested G1 object"
+
 # ============================================================
 echo ""
 echo "=== Test 2: blob namespace (0x03) is wired end-to-end ==="
-# No blob has been written. cache-ctl defines a cache MISS as exit status 1
+BLOB_WIRE=$("$BIN/cache-ctl" object get --endpoint "$STORE_CACHE_EP" \
+    --namespace blob --hash "$BLOB_KEY" | sha256sum | awk '{print $1}')
+assert_eq "$BLOB_KEY" "$BLOB_WIRE" "cache_listen returns the exact G1 blob bytes"
+# A different blob key is absent. cache-ctl defines a cache MISS as exit status 1
 # plus the exact MISS diagnostic. Any transport/backend/protocol error is a
 # different result and must fail this selected product case.
 ABSENT="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
