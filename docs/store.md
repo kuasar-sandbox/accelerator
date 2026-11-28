@@ -76,6 +76,10 @@ s3:
 
 Static AK/SK values must be supplied together. When both are empty, the AWS SDK default credential chain is used. String fields support `${VAR}` expansion. `region` defaults to `us-east-1`; `path_style` defaults to `true`.
 
+Static AK/SK also accept quoted `@plugin/key` references. The S3 client resolves
+them once during construction; existing application credentials providers take
+precedence. This also applies to S3 generation sources. See [Secret plugins](secret-plugins.md).
+
 `tls.ca_cert` is a path to a PEM CA bundle (may hold several certificates) appended to the system trust store — the way to trust an endpoint (or intercepting proxy) whose CA is not in the system store. `tls.insecure_skip_verify: true` skips TLS certificate verification entirely; it is insecure — traffic, including credentials, can be intercepted — and is meant for testing only, not production. The two are mutually exclusive. Both apply to object traffic for the configured endpoint only; the SDK credential chain's identity requests (instance role, web identity, SSO) always use the system trust store, so on a fully intercepted network they need the CA in the system store or static AK/SK.
 
 ### Generation source
