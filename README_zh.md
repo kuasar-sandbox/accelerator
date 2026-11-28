@@ -39,7 +39,7 @@
 | 导入、取回、检查、变换或比较工件 | [传输](docs/transfer_zh.md)：完整本地 Store 往返与精确 manifest-ctl 参数 |
 | 实现稀疏 reader/writer，或解释引用与载体 | [数据契约](docs/artifacts_zh.md)：稀疏模型、身份、Chunk/Manifest、加密、tarstream 与 Bundle |
 | 部署或嵌入权威持久服务 | [Store](docs/store_zh.md)：FS/S3、generation、可见性、管理与 App 生命周期 |
-| 通过 broker 提供 Manifest 客户密钥或静态 S3 凭据 | [Secret plugin](docs/secret-plugins_zh.md)：引用、broker 配置、缓存与密钥生命周期 |
+| 通过 broker 提供密钥，或开发 Secret plugin | [Secret plugin](docs/secret-plugins_zh.md)：引用、配置、缓存、密钥生命周期与插件开发 |
 | 部署/嵌入加速层，诊断 miss 与恢复 | [Cache](docs/cache_zh.md)：tier、sharding/EC、RocksDB/Redis 后端与 App 生命周期 |
 | 通过共享库制备 OCI、归档或目录镜像 | [镜像制备](docs/image-preparation_zh.md)：生命周期、镜像 payload、布局与发布 |
 
@@ -82,6 +82,7 @@
 | `pkg/manifest` 及子包 | 内容组织、分块、加密、ingest、fetch 和 prefetch |
 | `pkg/store` 与 `pkg/store/client` | 内容存储协议和客户端 |
 | `pkg/secret` | 通过本地 broker 解析密钥引用，并支持原生文件和字面值解码 |
+| `pkg/secret/plugin` | 将自定义 Secret plugin 后端适配为 HTTP Resolve handler |
 | `pkg/cache` 与 `pkg/cache/client` | 缓存协议、本地/分片/分层组合与客户端 |
 | `app/store` 与 `app/cache` | 供官方及定制二进制复用的完整 Store/Cache 服务生命周期 |
 | `pkg/tarstream` | 携带身份及完整性元数据的本地稀疏传输工件 |

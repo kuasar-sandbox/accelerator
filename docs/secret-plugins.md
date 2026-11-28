@@ -141,3 +141,55 @@ use `secret.New(config)` and `client.Resolve` with the same arguments.
 the existing `CustomerKey()` method uses a background context. A transfer that
 already holds a key can use `NewFetcherWithKey` to keep local and remote reads
 bound to the same bytes. Neither path writes resolved material into configuration.
+
+## Develop a plugin
+
+A Secret plugin is an external service implementing the broker protocol above.
+Go implementations can import
+`github.com/kuasar-sandbox/accelerator/pkg/secret/plugin` and provide one callback:
+
+```go
+type ResolveFunc func(context.Context, string) ([]byte, error)
+
+func NewHandler(resolve ResolveFunc) http.Handler
+```
+
+`NewHandler` serves `POST /v1/secrets/resolve`. It accepts an `application/json`
+body of at most 1 MiB containing only one `key` field; query parameters are not
+supported. It checks the request, passes the
+opaque key and request context to the callback, and encodes the returned bytes
+with the required key echo and `base64:` representation. It bounds request bodies
+and checks the complete encoded response against the client's 1 MiB limit before
+writing a successful response. Secret length and material format remain the
+consumer's responsibility.
+
+The callback receives the key without the `@plugin/` prefix. Preserve that key as
+an identifier; do not implicitly turn it into an arbitrary filesystem path. The
+callback may run concurrently, so its backend must support concurrent calls and
+observe the request context. Returned bytes must remain stable while the handler
+encodes them. Return the actual material, such as a raw symmetric key or PEM
+content, rather than another reference or the hex text of a symmetric key.
+
+Backend errors are returned as fixed, sanitized HTTP errors. Errors matching
+`fs.ErrNotExist`, `fs.ErrPermission` and `context.DeadlineExceeded` produce 404,
+403 and 504 respectively; other backend errors produce 500. Backend error text
+and secret values are not included in error responses. The client treats all
+non-success statuses as resolution failures.
+
+The plugin program owns its Unix listener, socket access permissions, backend
+authentication and shutdown. Configure server timeouts and propagate the callback
+context to backend calls. The handler supplies no cache; the consuming SDK's
+per-plugin TTL/LRU cache and object-lifetime rules above still apply. Deploy the
+socket in a controlled directory and grant access only to the intended consuming
+processes. The protocol itself does not establish a separate caller identity.
+
+The [runnable Go example](../examples/secret-plugin/README.md) demonstrates a
+private Unix socket, a callback using fixed demonstration material, SDK
+interoperation and normal process shutdown. Replace its callback with the lookup
+for your secret system. Other languages can implement the same HTTP/JSON protocol
+without using the Go handler.
+
+The helper package is distributed through the Accelerator Go module, and the
+example is available in the corresponding source revision. Component binary
+archives contain the documented Accelerator services and operational helpers;
+the example is a source-level development aid.

@@ -119,3 +119,41 @@ credential, err := secret.Resolve(ctx, configuredCredential, secret.Literal)
 `manifest.Config.CustomerKeyContext(ctx)` 获取并校验 customer key，已有 `CustomerKey()`
 方法使用 background context。已经持有密钥的 transfer 可使用 `NewFetcherWithKey`，
 让本地和远端读取绑定相同字节。解析结果均不回写配置。
+
+## 开发插件
+
+Secret plugin 是实现上述 broker 协议的外部服务。Go 实现可以导入
+`github.com/kuasar-sandbox/accelerator/pkg/secret/plugin`，提供一个回调函数：
+
+```go
+type ResolveFunc func(context.Context, string) ([]byte, error)
+
+func NewHandler(resolve ResolveFunc) http.Handler
+```
+
+`NewHandler` 处理 `POST /v1/secrets/resolve`，接受最多 1 MiB、仅包含一个 `key`
+字段的 `application/json` 请求体，不接受 query 参数。它校验请求，将不透明 key 和请求 context
+传给回调，并按规定回显 key、以 `base64:` 编码返回字节。它限制请求体大小，并在写入
+成功响应前检查完整编码后的响应符合客户端的 1 MiB 上限。密钥长度和材料格式仍由
+消费端校验。
+
+回调接收的 key 不含 `@plugin/` 前缀。将 key 作为标识保留，不要隐式转换成任意
+文件系统路径。回调可能并发执行，因此后端应支持并发调用并响应请求 context。
+返回的字节在 handler 编码期间必须保持稳定。返回原始对称密钥、PEM 内容等实际
+材料，而不是另一条引用或对称密钥的 hex 文本。
+
+后端错误转换为固定、脱敏的 HTTP 错误。匹配 `fs.ErrNotExist`、`fs.ErrPermission`
+和 `context.DeadlineExceeded` 的错误分别返回 404、403 和 504，其他后端错误返回
+500。错误响应不包含后端原始错误文本或密钥值。客户端将所有非成功状态视为解析失败。
+
+插件程序负责 Unix listener、socket 访问权限、后端认证和退出流程。配置服务端超时，
+并将回调 context 传给后端调用。handler 不提供缓存；上述消费端 SDK 的每插件 TTL/LRU
+缓存及对象生命周期规则继续生效。将 socket 部署在受控目录中，仅允许预期的消费
+进程访问。协议本身不建立额外的调用方身份。
+
+[可运行的 Go 样例](../examples/secret-plugin/README_zh.md)演示私有 Unix socket、
+使用固定演示材料的回调、SDK 联调与正常退出。将其回调替换为自己的密钥系统查询即可。
+其他语言可以直接实现相同的 HTTP/JSON 协议，无需使用 Go handler。
+
+工具包随 Accelerator Go 模块提供，样例可在相应源码版本中获取。组件二进制归档
+包含文档列明的 Accelerator 服务和运维工具；样例作为源码形式的开发辅助材料提供。
