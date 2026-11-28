@@ -24,6 +24,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"log"
 	"sync"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/chunker"
@@ -69,6 +70,20 @@ type StoreWriter interface {
 type OrderedChunkStoreWriter interface {
 	StoreWriter
 	PutChunkOrdered(ctx context.Context, admission store.WriteAdmission, key store.ContentKey, data []byte, ordinal uint64) (isNew bool, err error)
+}
+
+// OrderedChunkRequirement is an optional capability for writers that implement
+// OrderedChunkStoreWriter but do not always require ordinal sequencing.
+// Returning false lets ingest use StoreWriter.Put and coalesce more aggressively.
+type OrderedChunkRequirement interface {
+	RequiresOrderedChunks() bool
+}
+
+// DedupIndexValidator optionally confirms that a persistent dedup index marker
+// still names a live store object. Used to discard an index after a store wipe
+// or reinitialization.
+type DedupIndexValidator interface {
+	ValidateDedupIndexMarker(ctx context.Context, marker store.ContentKey) (bool, error)
 }
 
 // IngestOption holds the per-call knobs for Ingest. Zero value is
@@ -126,12 +141,21 @@ type Ingester interface {
 // caller controls its lifetime. extraSaltFn may be nil — that is the
 // "no extra salt" case (platform-wide dedup domain).
 func NewIngester(keyFn CustomerKeyFunc, extraSaltFn ExtraSaltFunc, sw StoreWriter, chk chunker.Chunker, enc crypto.Encryptor) Ingester {
+	return NewIngesterWithCacheLimit(keyFn, extraSaltFn, sw, chk, enc, defaultChunkDedupCacheLimit)
+}
+
+// NewIngesterWithCacheLimit wires collaborators into an Ingester with an explicit
+// bounded chunk deduplication index limit.
+func NewIngesterWithCacheLimit(keyFn CustomerKeyFunc, extraSaltFn ExtraSaltFunc, sw StoreWriter, chk chunker.Chunker, enc crypto.Encryptor, cacheLimit int) Ingester {
 	return &ingester{
-		keyFn:       keyFn,
-		extraSaltFn: extraSaltFn,
-		store:       sw,
-		chunker:     chk,
-		enc:         enc,
+		keyFn:        keyFn,
+		extraSaltFn:  extraSaltFn,
+		store:        sw,
+		chunker:      chk,
+		enc:          enc,
+		dedupCache:   newChunkDedupCache(cacheLimit),
+		dedupFlights: make(map[[32]byte]*chunkFlight),
+		dedupPath:    persistentDedupPathForWriter(sw),
 	}
 }
 
@@ -141,6 +165,11 @@ type ingester struct {
 	store       StoreWriter
 	chunker     chunker.Chunker
 	enc         crypto.Encryptor
+
+	dedupMu      sync.Mutex
+	dedupCache   *chunkDedupCache
+	dedupFlights map[[32]byte]*chunkFlight
+	dedupPath    string
 }
 
 // Ingest consumes src in one forward pass: Hole runs are recorded as
@@ -245,6 +274,62 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 		opt.OnProgress(progDone, size)
 		progMu.Unlock()
 	}
+	_, implementsOrderedWriter := i.store.(OrderedChunkStoreWriter)
+	isOrderedWriter := implementsOrderedWriter
+	if ordering, ok := i.store.(OrderedChunkRequirement); ok && !ordering.RequiresOrderedChunks() {
+		isOrderedWriter = false
+	}
+	orderedSkipper, canSkipOrdered := i.store.(OrderedChunkSkipper)
+
+	var persistent *persistentChunkIndex
+	persistReset := false
+	if i.dedupPath != "" {
+		var err error
+		persistent, err = openPersistentChunkIndexRead(i.dedupPath)
+		if err != nil {
+			log.Printf("ingest: persistent dedup index unavailable: %v", err)
+			persistReset = true
+		}
+		if persistent != nil {
+			marker, found, err := persistent.marker()
+			if err != nil {
+				log.Printf("ingest: persistent dedup index marker unavailable: %v", err)
+				_ = persistent.Close()
+				persistent = nil
+				persistReset = true
+			} else if !found {
+				_ = persistent.Close()
+				persistent = nil
+				persistReset = true
+			} else if validator, ok := i.store.(DedupIndexValidator); ok {
+				valid, err := validator.ValidateDedupIndexMarker(ctx, store.ContentKey(marker))
+				if err != nil || !valid {
+					if err != nil {
+						log.Printf("ingest: persistent dedup index marker validation failed: %v", err)
+					}
+					_ = persistent.Close()
+					persistent = nil
+					persistReset = true
+				}
+			}
+		}
+	}
+	var pending map[[32]byte]chunkMeta
+	if i.dedupPath != "" {
+		pending = make(map[[32]byte]chunkMeta)
+	}
+	var pendingMu sync.Mutex
+	pendingLimit := i.dedupCache.limit // bound metadata retained for index persistence
+	if pendingLimit <= 0 || pendingLimit > defaultChunkDedupCacheLimit {
+		pendingLimit = defaultChunkDedupCacheLimit
+	}
+	var persistentLog sync.Once
+	logPersistentErr := func(err error) {
+		persistentLog.Do(func() {
+			log.Printf("ingest: persistent dedup index lookup unavailable: %v", err)
+		})
+	}
+
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
@@ -253,31 +338,182 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 				if wctx.Err() != nil {
 					continue // drain fast; error already recorded
 				}
-				ciphertext, hash, key, err := i.enc.EncryptChunk(wctx, salt, j.data)
+
+				fp := crypto.DeriveKey(salt, j.data)
+
+				var (
+					cachedMeta chunkMeta
+					hit        bool
+					flight     *chunkFlight
+					isLeader   bool
+				)
+				releaseFlight := func() {
+					if !isLeader {
+						return
+					}
+					i.dedupMu.Lock()
+					if i.dedupFlights[fp] == flight {
+						delete(i.dedupFlights, fp)
+					}
+					close(flight.done)
+					i.dedupMu.Unlock()
+					isLeader = false
+				}
+
+				for {
+					if wctx.Err() != nil {
+						break
+					}
+					i.dedupMu.Lock()
+					if meta, ok := i.dedupCache.get(fp); ok {
+						i.dedupMu.Unlock()
+						cachedMeta = meta
+						hit = true
+						break
+					}
+					f, active := i.dedupFlights[fp]
+					if !active {
+						flight = &chunkFlight{
+							done:    make(chan struct{}),
+							ordinal: j.ordinal,
+						}
+						i.dedupFlights[fp] = flight
+						isLeader = true
+						i.dedupMu.Unlock()
+						break
+					}
+					// A flight is already active for this chunk fingerprint.
+					// If this store enforces ordered Chunk ordinal sequencing,
+					// a lower ordinal cannot wait on a higher ordinal.
+					if isOrderedWriter && f.ordinal >= j.ordinal {
+						i.dedupMu.Unlock()
+						break // proceed independently
+					}
+					done := f.done
+					i.dedupMu.Unlock()
+					select {
+					case <-done:
+						continue
+					case <-wctx.Done():
+						break
+					}
+				}
+
+				if wctx.Err() != nil {
+					releaseFlight()
+					continue
+				}
+
+				if !hit && isLeader && persistent != nil {
+					meta, found, err := persistent.lookup(fp)
+					if err != nil {
+						logPersistentErr(err)
+					}
+					if found {
+						i.dedupMu.Lock()
+						i.dedupCache.put(fp, meta)
+						i.dedupMu.Unlock()
+						releaseFlight()
+						cachedMeta = meta
+						hit = true
+					}
+				}
+				if wctx.Err() != nil {
+					releaseFlight()
+					continue
+				}
+
+				if hit {
+					// Duplicate chunk found in dedup index.
+					if isOrderedWriter {
+						if canSkipOrdered {
+							skipped, err := orderedSkipper.SkipChunkOrdered(wctx, admission, cachedMeta.ck, cachedMeta.ctLen, j.ordinal)
+							if err != nil {
+								fail(fmt.Errorf("ingest: skip chunk ordered: %w", err))
+								continue
+							}
+							if !skipped {
+								// Underlying ordered writer does not have the chunk yet (e.g. fresh bundle).
+								goto performEncryptAndStore
+							}
+						} else {
+							goto performEncryptAndStore
+						}
+					}
+
+					// Successfully deduplicated! Completely skip EncryptChunk and store Put.
+					j.oc.key = cachedMeta.key
+					j.oc.ck = cachedMeta.ck
+					j.oc.ctLen = cachedMeta.ctLen
+					j.oc.encLen = cachedMeta.encLen
+					j.oc.format = cachedMeta.format
+					j.oc.isNew = false
+					emitProgress(j.oc.size)
+					continue
+				}
+
+			performEncryptAndStore:
+				var (
+					ciphertext []byte
+					hash       [32]byte
+					key        [32]byte
+					err        error
+				)
+				if keyed, ok := i.enc.(crypto.KeyedEncryptor); ok {
+					ciphertext, hash, err = keyed.EncryptChunkWithKey(wctx, fp, j.data)
+					key = fp
+				} else {
+					ciphertext, hash, key, err = i.enc.EncryptChunk(wctx, salt, j.data)
+				}
 				if err != nil {
 					fail(fmt.Errorf("ingest: encrypt chunk: %w", err))
+					releaseFlight()
 					continue
 				}
 				if err := validateEncryptedChunkObject(ciphertext, j.oc.size); err != nil {
 					fail(fmt.Errorf("ingest: encrypt chunk: %w", err))
+					releaseFlight()
 					continue
 				}
 				ck := store.ContentKey(hash)
 				var isNew bool
-				if ordered, ok := i.store.(OrderedChunkStoreWriter); ok {
+				if isOrderedWriter {
+					ordered := i.store.(OrderedChunkStoreWriter)
 					isNew, err = ordered.PutChunkOrdered(wctx, admission, ck, ciphertext, j.ordinal)
 				} else {
 					isNew, err = i.store.Put(wctx, admission, store.PartitionChunk, ck, ciphertext)
 				}
 				if err != nil {
 					fail(fmt.Errorf("ingest: store put chunk: %w", err))
+					releaseFlight()
 					continue
 				}
+
+				meta := chunkMeta{
+					key:    key,
+					ck:     ck,
+					ctLen:  uint64(len(ciphertext)),
+					encLen: uint64(len(ciphertext) - 1),
+					format: ciphertext[0],
+				}
+
+				i.dedupMu.Lock()
+				i.dedupCache.put(fp, meta)
+				i.dedupMu.Unlock()
+				releaseFlight()
+				if pending != nil {
+					pendingMu.Lock()
+					if len(pending) < pendingLimit {
+						pending[fp] = meta
+					}
+					pendingMu.Unlock()
+				}
+
 				j.oc.key = key
 				j.oc.ck = ck
-				j.oc.ctLen = uint64(len(ciphertext))
-				j.oc.encLen = uint64(len(ciphertext) - 1)
-				j.oc.format = ciphertext[0]
+				j.oc.ctLen = meta.ctLen
+				j.oc.encLen = meta.encLen
+				j.oc.format = meta.format
 				j.oc.isNew = isNew
 				emitProgress(j.oc.size)
 			}
@@ -355,6 +591,11 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 	}
 	close(jobs)
 	wg.Wait()
+	if persistent != nil {
+		if err := persistent.Close(); err != nil {
+			log.Printf("ingest: close persistent dedup index: %v", err)
+		}
+	}
 	if putErr != nil {
 		return nil, putErr
 	}
@@ -436,6 +677,11 @@ func (i *ingester) Ingest(ctx context.Context, src sparse.Source, opt IngestOpti
 	}
 
 	res.ManifestKey = manifestKey
+	if i.dedupPath != "" && (len(pending) > 0 || persistReset) {
+		if err := persistChunkMetas(i.dedupPath, pending, manifestKey, persistReset); err != nil {
+			log.Printf("ingest: persist chunk dedup index: %v", err)
+		}
+	}
 	return &res, nil
 }
 

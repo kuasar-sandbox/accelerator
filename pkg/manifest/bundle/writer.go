@@ -177,6 +177,56 @@ func (w *Writer) PutChunkOrdered(ctx context.Context, admission store.WriteAdmis
 	}
 }
 
+// SkipChunkOrdered advances logical ordinal sequencing for a chunk that already
+// exists in the bundle, skipping redundant physical object writing.
+func (w *Writer) SkipChunkOrdered(ctx context.Context, admission store.WriteAdmission, key store.ContentKey, size uint64, ordinal uint64) (bool, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		w.mu.Lock()
+		if err := w.stateErrorLocked(); err != nil {
+			w.mu.Unlock()
+			return false, err
+		}
+		if admission != w.admission {
+			w.mu.Unlock()
+			return false, fmt.Errorf("manifest bundle: object admission does not match recorded admission")
+		}
+		name, err := objectName(store.PartitionChunk, key)
+		if err != nil {
+			w.mu.Unlock()
+			return false, err
+		}
+		previous, ok := w.objects[name]
+		if !ok {
+			w.mu.Unlock()
+			return false, nil
+		}
+		if previous.size != size {
+			w.mu.Unlock()
+			return false, fmt.Errorf("manifest bundle: repeated object %s changed size from %d to %d", name, previous.size, size)
+		}
+		if ordinal < w.nextOrdinal {
+			w.mu.Unlock()
+			return false, fmt.Errorf("manifest bundle: Chunk ordinal %d already passed %d", ordinal, w.nextOrdinal)
+		}
+		if ordinal == w.nextOrdinal {
+			w.nextOrdinal++
+			w.signalLocked()
+			w.mu.Unlock()
+			return true, nil
+		}
+		turn := w.turn
+		w.mu.Unlock()
+		select {
+		case <-turn:
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+}
+
 func (w *Writer) putLocked(admission store.WriteAdmission, partition store.Partition, key store.ContentKey, data []byte) (bool, error) {
 	if err := w.stateErrorLocked(); err != nil {
 		return false, err
