@@ -12,6 +12,8 @@ docs/store.md
 docs/store_zh.md
 docs/cache.md
 docs/cache_zh.md
+docs/secret-plugins.md
+docs/secret-plugins_zh.md
 docs/image-preparation.md
 docs/image-preparation_zh.md
 test/e2e/README.md

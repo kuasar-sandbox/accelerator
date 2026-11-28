@@ -39,7 +39,7 @@ These paths expose common logical data and reference semantics to downstream com
 | Ingest, fetch, inspect, transform or compare an artifact | [Transfer](docs/transfer.md), including a complete local Store roundtrip and exact manifest-ctl options |
 | Implement sparse readers/writers or interpret a reference/carrier | [Artifacts](docs/artifacts.md): sparse model, identity, Chunk/Manifest, encryption, tarstream and Bundle |
 | Deploy or embed authoritative persistence | [Store](docs/store.md): FS/S3, generations, visibility, administration and App lifecycle |
-| Supply Manifest customer keys or static S3 credentials through a broker | [Secret plugins](docs/secret-plugins.md): references, broker configuration, caching and key lifetime |
+| Supply secrets through a broker or implement a Secret plugin | [Secret plugins](docs/secret-plugins.md): references, configuration, caching, key lifetime and plugin development |
 | Deploy or embed acceleration and diagnose misses/recovery | [Cache](docs/cache.md): tiers, sharding/EC, RocksDB/Redis backends and App lifecycle |
 | Prepare an OCI, archive or directory image through the shared library | [Image preparation](docs/image-preparation.md): lifetime, image payload, layout and publication |
 
@@ -82,6 +82,7 @@ The downstream import surface is kept small and mostly pure Go, so consumers suc
 | `pkg/manifest` and subpackages | Content organization, chunking, encryption, ingest, fetch, and prefetch |
 | `pkg/store` and `pkg/store/client` | Content-store protocol and client |
 | `pkg/secret` | Secret reference resolution through a local broker, with native file and literal decoders |
+| `pkg/secret/plugin` | HTTP Resolve handler for custom Secret plugin backends |
 | `pkg/cache` and `pkg/cache/client` | Cache protocol, local/sharded/tiered composition, and clients |
 | `app/store` and `app/cache` | Complete reusable Store/Cache service lifecycles for official and custom executables |
 | `pkg/tarstream` | Sparse local transport artifact with identity and integrity metadata |
