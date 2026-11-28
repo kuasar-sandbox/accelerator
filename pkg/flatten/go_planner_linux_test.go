@@ -3,11 +3,13 @@
 package flatten
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -17,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/image"
 	erofs "github.com/kuasar-sandbox/go-erofs"
 	"golang.org/x/sys/unix"
 )
@@ -439,5 +442,86 @@ func TestGoPlannerCrossArchitectureGolden(t *testing.T) {
 	const want = "6978a0c147d368c148c453b16d90b1dcff5026b7cd682b66379d6a6eff74b1ca"
 	if got := fmt.Sprintf("%x", sha256.Sum256(artifact.Bytes())); got != want {
 		t.Fatalf("fixed Go EROFS artifact changed on %s: got %s, want %s", runtime.GOARCH, got, want)
+	}
+}
+
+func TestVirtualTreeCrossArchitectureGoldenRootless(t *testing.T) {
+	payload := make([]byte, planReadBatch+73)
+	for i := range payload {
+		payload[i] = byte((i*17 + i/4096) % 251)
+	}
+	layerBytes := testLayerTar(t,
+		layerEntry{name: ".", kind: tar.TypeDir, mode: 0751, uid: 12345, gid: 23456, hasOwner: true},
+		layerEntry{name: "data", body: string(payload), mode: 0640, uid: 12345, gid: 23456, hasOwner: true},
+		layerEntry{name: "duplicate", body: string(payload), mode: 0640, uid: 12345, gid: 23456, hasOwner: true},
+		layerEntry{name: "short", body: "fixed tail\n", mode: 0640, uid: 12345, gid: 23456, hasOwner: true},
+		layerEntry{name: "empty-file", body: "", mode: 0640, uid: 12345, gid: 23456, hasOwner: true},
+		layerEntry{name: "hardlink", kind: tar.TypeLink, link: "data", mode: 0640, uid: 12345, gid: 23456, hasOwner: true},
+		layerEntry{name: "symlink", kind: tar.TypeSymlink, link: "data", mode: 0777, uid: 12345, gid: 23456, hasOwner: true},
+		layerEntry{name: "empty-directory", kind: tar.TypeDir, mode: 0751, uid: 12345, gid: 23456, hasOwner: true},
+		layerEntry{name: "fifo", kind: tar.TypeFifo, mode: 0640, uid: 12345, gid: 23456, hasOwner: true},
+	)
+	diffID := fmt.Sprintf("sha256:%x", sha256.Sum256(layerBytes))
+	cfg := []byte(fmt.Sprintf(`{"rootfs":{"type":"layers","diff_ids":[%q]}}`, diffID))
+	in, err := NewImageInput(cfg, []LayerInput{{
+		MediaType: "application/vnd.oci.image.layer.v1.tar",
+		Digest:    diffID,
+		DiffID:    diffID,
+		Size:      int64(len(layerBytes)),
+		Open: func(context.Context) (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(layerBytes)), nil
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := PrepareImage(context.Background(), in, Options{TmpDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := p.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	var artifact bytes.Buffer
+	if _, _, err := p.WriteArtifact(context.Background(), &artifact, "image"); err != nil {
+		t.Fatal(err)
+	}
+	const want = "fb79c297ad06232814719064bcbe2460ea0c959621d79a35ace097be41c7b750"
+	if got := fmt.Sprintf("%x", sha256.Sum256(artifact.Bytes())); got != want {
+		t.Fatalf("rootless golden artifact digest = %s, want %s", got, want)
+	}
+	// When root metadata matches TestGoPlannerCrossArchitectureGolden's directory
+	// root (0751, 12345:23456), the virtual tree produces the exact same digest.
+	limits, err := (PlanLimits{}).defaults()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirWork := t.TempDir()
+	dirTree := newVirtualTree(dirWork)
+	if err := unpackLayer(context.Background(), bytes.NewReader(layerBytes), dirTree, 0); err != nil {
+		t.Fatal(err)
+	}
+	dirSel, err := selectVirtualSource(context.Background(), dirWork, dirTree, limits.IndexMemoryBytes/4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rtCfg, err := image.ExtractRuntimeConfigFromJSON([]byte("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirStyle, err := prepareSelected(context.Background(), dirWork, dirSel, rtCfg, Options{}, limits, &erofs.Node{Mode: os.ModeDir | 0751, UID: 12345, GID: 23456})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dirStyle.Close()
+	var dirArtifact bytes.Buffer
+	if _, _, err := dirStyle.WriteArtifact(context.Background(), &dirArtifact, "image"); err != nil {
+		t.Fatal(err)
+	}
+	const wantDirGolden = "6978a0c147d368c148c453b16d90b1dcff5026b7cd682b66379d6a6eff74b1ca"
+	if got := fmt.Sprintf("%x", sha256.Sum256(dirArtifact.Bytes())); got != wantDirGolden {
+		t.Fatalf("rootless dir-metadata golden digest = %s, want %s", got, wantDirGolden)
 	}
 }
