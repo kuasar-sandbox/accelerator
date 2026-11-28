@@ -2,19 +2,25 @@
 
 # accelerator
 
-For the first cross-component sandbox or Demo, follow the project
-[Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md)
-with the matching aggregate release and
-[workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README.md).
-This component can still be built/deployed independently; workbench is not a
-production runtime dependency. Published architectures are specific to the
-selected release; source support does not imply all historical assets exist.
+For a first sandbox, follow the project's [Quick Start](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/quickstart.md): pull the node-infra image with `docker pull`, start it with `docker run`, and execute a command in a Guest. For a persistent node or cluster, continue with the platform deployment guides and explicit site configuration. Use the quickstart profile with its dedicated data volume; use a site-configured instance for custom workloads.
+
+Use this repository's guides when deploying this component independently or integrating it with another runtime. Use the binaries, configuration examples and guides from the same selected release and architecture. [Workbench](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/workbench/README.md) is for source development, demonstrations and integration validation.
 
 `accelerator` is the **data access, storage, encryption, and cache infrastructure** for images, snapshots, and sparse artifacts in [Kuasar Sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox).
 
 It provides reusable sparse-data and artifact abstractions, local and shared-file access, Manifest-backed content organization, filesystem and S3-compatible stores, layered caches, integrity and encryption, OCI retrieval, deterministic EROFS image flattening, on-demand fetch, and prefetch.
 
 Content addressing and deduplication are available capabilities, not the component's only purpose. Their sharing scope is controlled by deployment security domains and key material. A deployment can use direct files for snapshots, Manifest/object storage for large-scale distribution, or a combination of both.
+
+## Recommended workflow
+
+1. **Choose durable storage and a portable reference.** Use local files for node-local work, a consistently mounted shared filesystem for shared file artifacts, or [Store](docs/store.md) for Manifest objects. A file path available on one node is not automatically available on another.
+2. **Prepare or import the artifact once.** Use the published `flatten-ctl` for OCI/directory images and [manifest-ctl transfer](docs/transfer.md) for upload, export, inspection and verification. Keep the complete returned reference, any parent/dependency references, the required Runtime identity, and the customer key for as long as the artifact is retained.
+3. **Verify reads from the intended consumer location.** Start with direct file or Store reads. Check a complete roundtrip before adding cache or moving a template to another node.
+4. **Add acceleration when origin reads justify it.** Start with a node-local `tiered` cache and Store origin. Add shared EC peers when capacity and observed reuse warrant them; five shard servers are not a prerequisite for one node or a cluster. Embedded RocksDB and separately managed Redis-compatible storage are both supported.
+5. **Operate persistence and cache separately.** Back up the authoritative bytes, generation list, references and keys. Observe actual cache hit/miss, origin latency, memory and disk usage. Cache eviction or cache restart is not artifact retirement; a Store generation rollout is not garbage collection.
+
+The [first Store roundtrip](docs/transfer.md#independent-store-roundtrip) runs without a VM, cache, KVM or an external mkfs.erofs tool. Platform template publication and cross-node placement remain in the [main project guides](https://github.com/kuasar-sandbox/kuasar-sandbox/tree/main/docs).
 
 ## Data paths
 
@@ -26,24 +32,18 @@ Content addressing and deduplication are available capabilities, not the compone
 
 These paths expose common logical data and reference semantics to downstream components. `sandboxer` can therefore consume an image or snapshot without making the lifecycle API specific to one physical backend.
 
-## Public Go surface
+## Choose a complete task or contract
 
-The downstream import surface is kept small and mostly pure Go, so consumers such as `sandboxer` do not pull storage-server, object-storage SDK, erasure-coding, or database implementations into their binaries.
-
-| Package | Purpose |
+| Need | Authoritative guide |
 | --- | --- |
-| `pkg/sparse` | Authoritative Hole/Zero/Data representation and sparse random/sequential reads |
-| `pkg/manifest` and subpackages | Content organization, chunking, encryption, ingest, fetch, and prefetch |
-| `pkg/store` and `pkg/store/client` | Content-store protocol and client |
-| `pkg/cache` and `pkg/cache/client` | Cache protocol, local/sharded/tiered composition, and clients |
-| `app/store` and `app/cache` | Complete reusable Store/Cache service lifecycles for official and custom executables |
-| `pkg/tarstream` | Sparse local transport artifact with identity and integrity metadata |
-| `pkg/flatten`, `pkg/image`, `pkg/remote`, `pkg/tar` | OCI/directory retrieval, image configuration, and EROFS flattening primitives |
+| Ingest, fetch, inspect, transform or compare an artifact | [Transfer](docs/transfer.md), including a complete local Store roundtrip and exact manifest-ctl options |
+| Implement sparse readers/writers or interpret a reference/carrier | [Artifacts](docs/artifacts.md): sparse model, identity, Chunk/Manifest, encryption, tarstream and Bundle |
+| Deploy or embed authoritative persistence | [Store](docs/store.md): FS/S3, generations, visibility, administration and App lifecycle |
+| Supply Manifest customer keys or static S3 credentials through a broker | [Secret plugins](docs/secret-plugins.md): references, broker configuration, caching and key lifetime |
+| Deploy or embed acceleration and diagnose misses/recovery | [Cache](docs/cache.md): tiers, sharding/EC, RocksDB/Redis backends and App lifecycle |
+| Prepare an OCI, archive or directory image through the shared library | [Image preparation](docs/image-preparation.md): lifetime, image payload, layout and publication |
 
-Heavy server backends remain behind component binaries and server packages.
-The detailed sparse Run/Stream, chunk-window and local tarstream contracts belong
-to [Manifest sparse read path](docs/artifacts.md#read-path-in-detail) and
-[file artifacts](docs/artifacts.md), not a separate README protocol.
+[flatten-ctl operations](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten-cli.md) belong to guest-runtime, which publishes the executable. Each guide has a complete Chinese edition via its language selector.
 
 ## Binaries
 
@@ -51,7 +51,7 @@ to [Manifest sparse read path](docs/artifacts.md#read-path-in-detail) and
 | --- | --- | --- |
 | `manifest-ctl` | Ingest, inspect, fetch, and transform Manifest-backed artifacts | Pure Go |
 | `store-ctl` | Filesystem or S3-compatible content-store service and administration | Pure Go |
-| `cache-ctl` | Local, sharded, tiered, and erasure-coded cache service | Uses the backend dependencies selected by the current source tree |
+| `cache-ctl` | Local, sharded, tiered, and erasure-coded cache service | Includes RocksDB in the official binary; a pure-Go build supports deployments using other backends |
 
 `flatten-ctl` is published with the `guest-runtime` Runtime release unit, while its shared image-flattening implementation is maintained here.
 
@@ -61,21 +61,9 @@ The component supports integrity verification and encryption for data that enter
 
 Do not interpret content encryption as a claim that every threat model leaks no metadata, or that all tenant-private data should be globally deduplicated. Deployments must choose a sharing domain appropriate for the data classification and trust boundary. Direct local or shared-file paths can also apply the project's documented local artifact protection policy.
 
-## Choose a complete task or contract
-
-| Need | Authoritative guide |
-| --- | --- |
-| Ingest, fetch, inspect, transform or compare an artifact | [Transfer](docs/transfer.md), including a complete local Store roundtrip and exact manifest-ctl options |
-| Implement sparse readers/writers or interpret a reference/carrier | [Artifacts](docs/artifacts.md): sparse model, identity, Chunk/Manifest, encryption, tarstream and Bundle |
-| Deploy or embed authoritative persistence | [Store](docs/store.md): FS/S3, generations, visibility, administration and App lifecycle |
-| Deploy or embed acceleration and diagnose misses/recovery | [Cache](docs/cache.md): tiers, sharding/EC, RocksDB/Redis backends and App lifecycle |
-| Prepare an OCI, archive or directory image through the shared library | [Image preparation](docs/image-preparation.md): lifetime, image payload, layout and publication |
-
-[flatten-ctl operations](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten-cli.md) belong to guest-runtime, which publishes the executable. Each guide has a complete Chinese edition via its language selector.
-
 ## Running independently
 
-The three services can be deployed independently of the full platform:
+The command-line tools and Store/Cache services can be used independently of the full platform:
 
 - use `manifest-ctl` to ingest or fetch sparse artifacts;
 - run `store-ctl` with a filesystem root or an S3-compatible endpoint;
@@ -83,6 +71,26 @@ The three services can be deployed independently of the full platform:
 - link `app/store.Run` or `app/cache.Run` into a custom service binary. The official CLIs are peer callers of these same lifecycle functions; custom binaries do not exec or depend on `store-ctl`/`cache-ctl`.
 
 Configuration examples must use local paths, documentation-reserved endpoints, and placeholder credentials. Production deployments should use protected endpoints, explicit resource budgets, durable authoritative storage, and observability appropriate to the selected cache topology.
+
+## Public Go surface
+
+The downstream import surface is kept small and mostly pure Go, so consumers such as `sandboxer` do not pull storage-server, object-storage SDK, erasure-coding, or database implementations into their binaries.
+
+| Package | Purpose |
+| --- | --- |
+| `pkg/sparse` | Authoritative Hole/Zero/Data representation and sparse random/sequential reads |
+| `pkg/manifest` and subpackages | Content organization, chunking, encryption, ingest, fetch, and prefetch |
+| `pkg/store` and `pkg/store/client` | Content-store protocol and client |
+| `pkg/secret` | Secret reference resolution through a local broker, with native file and literal decoders |
+| `pkg/cache` and `pkg/cache/client` | Cache protocol, local/sharded/tiered composition, and clients |
+| `app/store` and `app/cache` | Complete reusable Store/Cache service lifecycles for official and custom executables |
+| `pkg/tarstream` | Sparse local transport artifact with identity and integrity metadata |
+| `pkg/flatten`, `pkg/image`, `pkg/remote`, `pkg/tar` | OCI/directory retrieval, image configuration, and EROFS flattening primitives |
+
+Heavy server backends remain behind component binaries and server packages.
+The detailed sparse Run/Stream, chunk-window and local tarstream contracts belong
+to [Manifest sparse read path](docs/artifacts.md#read-path-in-detail) and
+[file artifacts](docs/artifacts.md), not a separate README protocol.
 
 ## Build and validate changes
 
@@ -98,7 +106,7 @@ Use [Contributing](CONTRIBUTING.md#build-and-test) for toolchain prerequisites, 
 
 ## Select a released product
 
-This component publishes `vX.Y.Z`; aggregate `release-vX.Y.Z` versions select exact independent component tags. Use the [Stable aggregate channel](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest) for a validated combination. Exact artifact inventories, native material collection and packaging checks are in [component release preparation](CONTRIBUTING.md#build-and-package-a-component-release). Shared Preview retention, cleanup, Latest reconciliation and release-line rules have one authority in the [project release contract](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release.md).
+This component publishes `vX.Y.Z`; aggregate `release-vX.Y.Z` versions select exact independent component tags. Choose the release channel and a matching aggregate through [platform installation](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/installation.md); the [Stable aggregate channel](https://github.com/kuasar-sandbox/kuasar-sandbox/releases/latest) identifies the stable selection. Use that release's inventory and matching guides for deployment. Exact artifact inventories, native material collection and packaging checks are in [component release preparation](CONTRIBUTING.md#build-and-package-a-component-release). Shared Preview retention, cleanup, Latest reconciliation and release-line rules have one authority in the [project release contract](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/release.md).
 
 ## Project boundaries
 

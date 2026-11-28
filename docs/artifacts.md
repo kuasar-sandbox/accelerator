@@ -6,6 +6,12 @@ This is the common data contract for Accelerator readers, writers and consumers.
 
 This specification owns generic immutable-file encryption, tarstream and multi-Manifest Bundle contracts, together with the [logical Manifest/Chunk objects and keys](#manifest-objects-and-sparse-access). [Data transfer](transfer.md) owns commands and workflows; [Store](store.md) owns persistence and admission. Sandbox E/S contents belong to the [sandbox artifact contract](https://github.com/kuasar-sandbox/sandboxer/blob/main/docs/artifacts.md#artifact-model), while OCI/EROFS payload semantics belong to [Image preparation](image-preparation.md#image-payload-and-runtime-configuration).
 
+## What to retain and pass to another node
+
+A usable artifact is more than its visible filename or content digest. Retain the complete canonical reference, the bytes it selects, any parent/dependency references, the content-protection key required by that carrier, and a declared guest Runtime when present. A named file location also needs the destination consumer's location mapping; a Manifest needs access to its Store generations or a complete alternative carrier.
+
+Copy a complete published reference unchanged when moving the same logical artifact. Do not strip `@manifest`, `@location` or `@runtime` qualifiers to shorten it. A customer key protects the Manifest key table or local carrier; the hexadecimal Manifest content key in a reference is a locator, not that secret. For commands that prepare, publish and verify these pieces, start with [Publish and reuse an artifact](transfer.md#publish-and-reuse-an-artifact). The remainder of this page defines their exact representation for integrators.
+
 ## Logical data and responsibilities
 
 The Manifest customer key may be supplied as hex or an `@plugin/key` reference.
@@ -161,7 +167,7 @@ key  = SHA256(salt || plaintext)          # convergent key
 
 AES-CTR uses an all-zero IV. The key is derived from the **original plaintext**, while the fixed canonical encoder selects one RAW or Snappy payload for that plaintext. Thus the supported canonical writer does not encrypt two different encoded payloads with the same derived key/IV pair. Under the hash assumptions, identical plaintext in one salt domain produces the same physical object, the same `ContentKey = SHA256(object)`, and one stored byte sequence.
 
-This requires the Go Snappy version, `snappy.Encode`, benefit threshold and format rules to stay fixed. The current reader rejects the older development layout. Do not mix incompatible writers within a salt/key domain. A future change to encoder output or thresholds requires domain separation and an explicitly reviewed migration; changing the format byte alone is insufficient. Verify the selected release's reader/writer compatibility and preserve existing assets and rollback data rather than treating an old “not yet released” note as permission to delete a live salt domain.
+This requires the Go Snappy version, `snappy.Encode`, benefit threshold and format rules to stay fixed. The reader accepts only the [Chunk encryption format](#chunk-encryption-format) described below. Do not mix incompatible writers within a salt/key domain. A change to encoder output or thresholds requires domain separation and an explicitly reviewed migration; changing the format byte alone is insufficient. Verify reader/writer compatibility before upgrading, and retain existing assets and rollback data throughout the migration.
 
 The canonical encoder is the block API in **`github.com/golang/snappy` v1.0.0**. Golden tests constrain identical encoded bytes across amd64, amd64 `noasm` and arm64. Byte-for-byte consistency takes precedence over a higher compression ratio. The standard and Snappy-compatible `klauspost/compress/s2` encoders can produce different block bytes across architecture implementations, so they are not used for canonical writes.
 

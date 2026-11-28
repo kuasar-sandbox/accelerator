@@ -4,6 +4,12 @@
 
 Accelerator 维护 `pkg/flatten`、`pkg/image`、`pkg/remote` 中共享的 OCI/目录/归档制备库。本篇定义来源生命周期、镜像 payload、转换政策、Plan 和完成契约。[flatten-ctl 用法](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten-cli_zh.md)归发布该 CLI 的 guest-runtime；通用稀疏数据、加密和载体由[数据契约](artifacts_zh.md)定义。
 
+## 选择面向用户的入口
+
+应用模板使用平台 [Build 流程](https://github.com/kuasar-sandbox/orchestrator/blob/main/docs/node-build_zh.md)，由其管理任务执行和发布。独立制备可复用镜像文件时，使用已发布的 [flatten-ctl CLI](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten-cli_zh.md)，明确选择 Guest 架构，验证完整输出后再[上传或分发](transfer_zh.md#发布并复用工件)。`flatten-ctl` 由 guest-runtime 交付，不在 Accelerator 组件归档中。
+
+链接的 Go EROFS 生成器处理 OCI、目录和归档制备；不需要先安装 host mkfs.erofs 或挂载 loop 文件系统。Registry 可达性、所选镜像平台、输入所有权和文件系统容量仍是实际前置条件。下文面向库集成及不完整/不兼容输出的诊断，中间 payload 写入成功不等于发布完成。
+
 ## 库入口与消费者责任
 
 `PrepareImage`、`PrepareArchive`、`PrepareDir` 选择并制备不可变逻辑内容，返回的 `PreparedImage` 持有制备出的私有 rootfs（或借用选定目录）、layout、Plan 和 FD，直到 `Close` 等待活动输出结束并释放自有资源。原始归档和层 body 在制备期间消费并关闭，不会保留到 `PreparedImage.Close`。调用者负责执行资源、输入稳定性、目标 writer 和结果发布。以下章节定义精确边界；只写完 payload 不等于工件发布成功。
@@ -155,7 +161,7 @@ pending 文件路径。读取产生的 atime 和排除区域内部变化不导�
 显式正值保留原有保守计费。兼容字段名 `NativeMemoryBytes` 限制 Go 规划器的受控
 分配，分给库和调用方去重/硬链接表，各占一半；扩容计入新旧存储并存。
 `PlanBytes` 限制计划文件及结构元数据；`IndexMemoryBytes` 保留选集、reader 和
-writer 的份额。原先的一百万来源上限改为可寻址来源切片边界。这些估算不是进程
+writer 的份额。来源数量以可寻址来源切片为边界。这些估算不是进程
 RSS 硬上限；GC、栈及分配器残留还须计量。解码器、归档、路径、摘要和完成条件
 检查仍然生效。
 
@@ -206,30 +212,27 @@ Plan/layout 身份。接收方必须同时要求完整工件身份/尾以及 pro
 | `LayerLimits.MetadataBytes` 及所有 `PlanLimits` 字段 | 不增加准入配额；整数/分配表示范围和格式上限仍然有效。 |
 
 前四项可通过对应公开限额字段调整。镜像输入还固定检查 config JSON 不超过
-16 MiB、层数不超过 65,536。CLI 使用零值选项：取消元数据/Plan 配额不等于取消
+16 MiB、层数不超过 65,536。CLI 使用零值选项：不设置元数据/Plan 配额不等于取消
 解码/归档默认限额或这些固定检查。调用者仍须约束执行环境的内存/存储；增加
 Builder 资源不保证任意输入都能完成。
 
-`LayerLimits.MetadataBytes` 和三个 `PlanLimits` 字段改为显式启用的准入配额。
-零值不再隐式施加原先 128 MiB 层估算或 512/512/128 MiB 规划/计划/索引默认值。
+`LayerLimits.MetadataBytes` 和三个 `PlanLimits` 字段是显式启用的准入配额。
 内部将零值计划配额归一化为受检查的整数/分配表示上限，不会预先分配相应大小。
-原先的一百万来源上限改为可寻址来源切片边界；生产端和读取端继续检查字节数、
-整数溢出和格式。显式正值保留原有保守计费及阶段份额，包括选集累计计费和表扩容
-重叠。不新增 umoci 路径镜像表或选集生命周期计费模型。
+来源数量以可寻址来源切片为边界；生产端和读取端都检查字节数、整数溢出和格式。
+显式正值采用保守计费及阶段份额，包括选集累计计费和表扩容重叠。
 
-回归跨越原先 6 GiB 唯一块及来源索引门槛，验证显式配额拒绝，并覆盖来源计数/
-费用溢出和计划损坏。源变化、路径、摘要、解码器、归档及工件完整性检查保持不变。
-Builder Guest/执行资源仍是外层内存边界；独立调用方必须自行约束执行环境。
-这些估算不是总 RSS 限额，零配额也不保证任意大输入都能完成。
-固定跨架构 golden 包含 tarstream 格式变更引入的 presence 载体。
+源变化、路径、摘要、解码器、归档及工件完整性检查独立于这些配额生效。
+Builder Guest/执行资源提供外层内存边界；独立调用方必须自行约束执行环境。
+配额估算不是总 RSS 限额，零配额也不保证任意大输入都能完成。
+跨架构 golden 测试覆盖完整工件，包括 tarstream presence 载体。
 
 payload 记录按来源首次出现顺序写入既有 KERPLAN v1 文件，不创建完整数据 blob
 或 raw 中间文件。转换 lookup/writeback 使用 `umoci-go-erofs-no-xattr-v1`。层条目按
 umoci `CleanPath` 规范化为根相对路径后再计费，并跳过指向解包根目录的条目，
 根条目处理与 containerd/Moby 一致。原始 `..` 路径段遵循 umoci 的根内规范化，
 不再单独拒绝；链接目标仍由 umoci 处理。镜像层输出根目录固定为 `0755`、UID/GID `0:0`，不受构建进程的 umask、身份或父目录
-setgid 继承影响；目录来源输出保留其源根目录元数据。本次兼容性修复保留 v1，
-既有 v1 转换缓存仍可复用，不会为了规范化根目录元数据而重新生成。缺失或不同的
+setgid 继承影响；目录来源输出保留其源根目录元数据。既有 v1 转换缓存仍可复用，
+不会为了规范化根目录元数据而重新生成。缺失或不同的
 政策值视作 miss；显式指定的旧工件和压缩层缓存仍可使用。Builder 与 Guest 必须
 选择相同的转换政策。
 
@@ -408,8 +411,8 @@ python3 test/scripts/bench_flatten.py \
 
 ### Go 生成器测量与已接受的取舍
 
-链接进 CLI 的 Go 生成器移除了独立的运行时 mkfs 程序，但不承诺所有场景都更快。
-[#178 候选对照](https://github.com/kuasar-sandbox/accelerator/issues/178#issuecomment-6177535650)
+链接进 CLI 的 Go 生成器直接生成 EROFS，无需独立运行时 mkfs 程序。性能取决于
+输入和环境。[历史对照](https://github.com/kuasar-sandbox/accelerator/issues/178#issuecomment-6177535650)
 及[已接受的取舍](https://github.com/kuasar-sandbox/accelerator/issues/178#issuecomment-6177892609)
 同时记录了收益和代价。其余语义、失败、确定性、静态制品及 Guest/Builder 验收要求不变。
 
@@ -444,8 +447,8 @@ rootfs，两版生产端 scratch 均约为 1.016 GiB，Go 约多 1 MiB。宿主�
 受测规划器使用两个哈希工作线程及外部 go-erofs 模块
 `v0.0.0-20261014160540-827da6f90114`。4 GiB 低重复计时使用关闭 VCS 标记的诊断
 构建；正常 Makefile 构建使用相同规划器，独立通过内容及资源检查，制品摘要一致。
-正常 CLI 增加 18,909 字节，同时 runtime 移除独立的约 3.9 MB mkfs 程序。这些候选
-记录不替代以真实合入源码和正式制品摘要标识的最终验收。ARM Guest/Builder 实机
-例外仍明确列为未验证；原生 ARM 测试和静态包属于不同证据。
+在该对照中，正常 CLI 增加 18,909 字节，runtime 不包含独立的约 3.9 MB mkfs
+程序。这些记录只描述受测宿主负载及制品，不覆盖 ARM Guest/Builder 执行。
+原生 ARM 测试和静态包检查与 VM 内执行分别验证不同性质。
 
 源码检查、真实挂载夹具及前置条件见[贡献指南](../CONTRIBUTING_zh.md#镜像制备验证)。[Prepared E2E](../test/e2e/README_zh.md)验证产物；包级测试或历史测量都不能建立普适的 VM/工作负载保证。

@@ -4,6 +4,12 @@
 
 Accelerator owns the shared OCI/directory/archive preparation libraries in `pkg/flatten`, `pkg/image` and `pkg/remote`. This guide defines their source lifetime, image payload, conversion policy, Plan and completion contracts. [flatten-ctl usage](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten-cli.md) belongs to guest-runtime, which publishes that CLI. Generic sparse data, encryption and carriers are defined in [artifacts](artifacts.md).
 
+## Choose the user-facing entry point
+
+For an application template, use the platform [Build workflow](https://github.com/kuasar-sandbox/orchestrator/blob/main/docs/node-build.md#client-workflow), which owns task execution and publication. To prepare a reusable image file independently, use the published [flatten-ctl CLI](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/flatten-cli.md), choose the Guest architecture explicitly, and verify the completed output before [upload or distribution](transfer.md#publish-and-reuse-an-artifact). `flatten-ctl` is delivered by guest-runtime, not the Accelerator component archive.
+
+The linked Go EROFS generator handles OCI, directory and archive preparation. Image generation uses neither a host mkfs.erofs installation nor a loop-mounted filesystem. Registry reachability, selected image platform, input ownership and filesystem capacity remain real prerequisites. The contracts below are for library integrators and for diagnosing incomplete or incompatible output; a successful intermediate payload write is not completed publication.
+
 ## Library entry points and consumer responsibilities
 
 `PrepareImage`, `PrepareArchive` and `PrepareDir` select and prepare immutable logical content. Their `PreparedImage` retains the prepared rootfs (or borrows the selected directory), layout, Plan and descriptors until `Close` joins any active output and releases owned resources. Original archive and layer bodies are consumed and closed during preparation, not retained until `PreparedImage.Close`. Callers own execution-resource limits, stable input, the requested writer and publication of the final result. The sections below define the exact boundaries; successful payload writes alone are not successful artifact publication.
@@ -153,8 +159,8 @@ Explicit positive values keep the existing conservative accounting. The legacy
 name `NativeMemoryBytes` bounds controlled Go planner allocations, split equally
 between the library and caller dedup/hardlink tables; growth accounts for old
 and new storage together. `PlanBytes` bounds Plan files and structural metadata;
-`IndexMemoryBytes` retains selection, reader and writer shares. The former
-one-million-source cap is replaced by an addressable source-slice bound. These
+`IndexMemoryBytes` retains selection, reader and writer shares. Source count is
+bounded by the addressable source slice. These
 estimates are not process RSS limits: GC, stacks and allocator retention still
 need measurement. Decoder, archive, path, digest and completion checks remain
 in force.
@@ -217,29 +223,24 @@ Zero has different meanings across the public limit fields:
 
 The first four rows can be changed through their public limit fields. Image input
 also has fixed checks of at most 16 MiB config JSON and 65,536 layers. The CLI uses
-zero-valued options: removing metadata/Plan quotas does not remove decoded/archive
+zero-valued options: unset metadata/Plan quotas do not remove decoded/archive
 defaults or these fixed checks. Execution memory/storage must still be bounded
 by the caller; increasing Builder resources does not guarantee arbitrary inputs
 will complete.
 
 `LayerLimits.MetadataBytes` and the three `PlanLimits` fields are opt-in
-admission quotas. Zero no longer imposes the former 128 MiB layer estimate or
-512/512/128 MiB planning/plan/index defaults. Internally, zero-valued plan quotas
-normalize to checked integer/allocation ceilings, without allocating those
-amounts. The former one-million-source cap is replaced by the addressable source
-slice bound; both producer and reader still enforce byte, overflow and format
-checks. Explicit positive quotas retain the existing conservative accounting and
-phase shares, including cumulative selection charges and table-growth overlap.
-No duplicate umoci path table or new selection-lifetime model is introduced.
+admission quotas. Internally, zero-valued plan quotas normalize to checked
+integer/allocation ceilings, without allocating those amounts. Source count is
+bounded by the addressable source slice; both producer and reader enforce byte,
+overflow and format checks. Explicit positive quotas use conservative accounting
+and phase shares, including cumulative selection charges and table-growth overlap.
 
-Regressions cross the former 6 GiB unique-block and source-index thresholds,
-check opt-in rejection, and exercise source-count/charge overflow and corrupt
-plans. Source mutation, path, digest, decoder, archive and artifact-integrity
-checks remain unchanged. Builder guest/execution resources remain the outer
-memory boundary; standalone callers must bound their own execution environment.
-These estimates are not total RSS limits, and zero quotas do not guarantee that
-arbitrarily large input will complete. The fixed cross-architecture golden
-includes the presence carrier introduced by the tarstream format change.
+Source mutation, path, digest, decoder, archive and artifact-integrity checks
+apply independently of these quotas. Builder guest/execution resources provide
+the outer memory boundary; standalone callers must bound their own execution
+environment. Quota estimates are not total RSS limits, and zero quotas do not
+guarantee that arbitrarily large input will complete. Cross-architecture golden
+tests cover the complete artifact, including its tarstream presence carrier.
 
 All payload records remain in first-seen source order and are streamed to the
 existing KERPLAN v1 files. No full payload blob or raw intermediate is created.
@@ -250,8 +251,8 @@ handling. Raw `..` components follow umoci normalization within the image root
 instead of a separate rejection rule; link targets remain under umoci handling.
 Image-layer output uses root mode `0755` and UID/GID `0:0`,
 independently of the builder umask, identity or inherited setgid directories.
-Directory-source output retains its source root metadata. The compatibility fix
-retains v1: existing v1 conversion results remain reusable and are not regenerated
+Directory-source output retains its source root metadata. Existing v1 conversion
+results remain reusable and are not regenerated
 to normalize root metadata. Missing or different policy values miss; explicitly
 selected old artifacts and the compressed-layer cache remain usable. Builder and
 Guest must select the same conversion policy.
@@ -435,8 +436,8 @@ the real Guest/Builder path, including the receiver and owned teardown.
 
 ### Go generator measurements and accepted tradeoff
 
-The linked Go generator removes the separate runtime mkfs executable. It does
-not promise a universal speedup. The [#178 candidate comparison](https://github.com/kuasar-sandbox/accelerator/issues/178#issuecomment-6177535650)
+The linked Go generator produces EROFS without a separate runtime mkfs executable.
+Performance depends on the input and environment. The [historical comparison](https://github.com/kuasar-sandbox/accelerator/issues/178#issuecomment-6177535650)
 and [accepted tradeoff](https://github.com/kuasar-sandbox/accelerator/issues/178#issuecomment-6177892609)
 record the measured costs as well as the gains. All other semantic, failure,
 determinism, static-package and Guest/Builder acceptance requirements remain.
@@ -478,10 +479,10 @@ The measured planner uses two hashing workers and external go-erofs module
 `v0.0.0-20261014160540-827da6f90114`. The 4 GiB low-repetition timing series uses
 a diagnostic build with VCS stamping disabled; the normal Makefile build has
 the same planner and independently passes content/resource checks with the same
-artifact digest. The normal CLI grows by 18,909 bytes while the runtime removes
-the separate approximately 3.9 MB mkfs payload. These candidate records do not
-substitute for final acceptance identified by actual merged sources and formal
-artifact hashes. The ARM Guest/Builder hardware exception remains explicitly
-unverified; native ARM tests and static packages are separate evidence.
+artifact digest. In that comparison, the normal CLI grew by 18,909 bytes and the
+runtime omitted the separate approximately 3.9 MB mkfs payload. These records
+describe the measured host workloads and artifacts; they do not cover ARM
+Guest/Builder execution. Native ARM tests and static-package checks establish
+separate properties from execution in a VM.
 
 Source checks, real mount fixtures and their prerequisites are in [Contributing](../CONTRIBUTING.md#image-preparation-validation). [Prepared E2E](../test/e2e/README.md) tests the produced artifacts; neither package-level tests nor historical measurements establish a universal VM or workload guarantee.

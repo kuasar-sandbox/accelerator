@@ -11,6 +11,67 @@ object storage 的读取。embedded 部署可从本地 RocksDB BlockCache 服务
 通过 YAML 配置切换三种运行形态(`local` / `shard` / `tiered`),
 适配不同部署场景。
 
+## 为已验证的 Store 路径增加首个缓存
+
+先通过 [Store](store_zh.md#部署首个持久-store)直接验证工件，此时 Manifest 客户端的 `cache.endpoint` 留空。增加 cache 不需要重新发布工件或改变 Manifest 引用/密钥。
+
+单节点从一个本地后端加 Store origin 的 `tiered` 开始。单独 `local` 是没有 origin fallback 的 KV endpoint，不是任意保留 Manifest 的 read-through 配置。测量到重复源端读取和共享容量需求后，再按需增加 EC 节点。
+
+独立部署的完整示例 `/etc/accelerator/cache.yaml`：
+
+```yaml
+mode: tiered
+listen: 127.0.0.1:7070
+health_listen: 127.0.0.1:7071
+rpc_timeout: 2s
+stats_interval: 30s
+tiers:
+  - type: embedded
+    rocks:
+      path: /var/cache/kuasar-accelerator
+      disk_bytes: 10GiB
+      mem_ratio: 0.01
+origin:
+  type: store
+  store:
+    endpoint: 127.0.0.1:7100
+    pool: 4
+    timeout: 5s
+  max_inflight: 16
+```
+
+让服务账号可写缓存目录，并在启动服务前验证配置：
+
+```bash
+cache-ctl config validate --config /etc/accelerator/cache.yaml
+```
+
+要求输出 `{"valid":true}`，再由服务或独立终端运行 `cache-ctl serve --config /etc/accelerator/cache.yaml`。验证仅检查配置，不打开缓存或测试 Store 连通性；下文的运行服务检查用于完成这条路径的验证。
+
+对 node-infra，由部署方在外部运行 Cache 服务，并将节点 `/etc/node-infra/manifest.yaml` 中的 `cache.endpoint` 指向其可达的数据 listener。Cache 服务所有者管理进程和后端存储；node-infra 不启动此服务。已有服务应直接复用，不对其后端目录或监听地址再启动竞争实例。使用 Unix socket 时，将服务提供方持有的父目录挂载到节点容器，使替换后的 socket 仍然可见。示例 TCP endpoint 使用 loopback，只服务同一 network namespace 内的消费者；服务与消费者位于不同 namespace 时，应选择受保护的可达地址。
+
+`10GiB` 是初始定容输入示例，不是磁盘 quota。`mem_ratio: 0.01` 对应约 102.4 MiB BlockCache，高于 64 MiB 最小值；CMS 各代、写缓冲、原生元数据、在途请求和 OS 内存另计。应测量完整进程和文件系统，[内存预算](#内存预算)及 [RocksDB 调优](#rocksdb-调优)解释其他用量。后文的大容量示例用于说明拓扑，不是通用主机规格。
+
+分别检查控制和数据路径：
+
+```bash
+cache-ctl ping --endpoint 127.0.0.1:7071
+cache-ctl info --endpoint 127.0.0.1:7071 --json
+```
+
+要求打印的健康状态为 `SERVING`；`NOT_SERVING` 时 `ping` 也可能零退出。把既有 Manifest 配置的 `cache.endpoint` 设为 `127.0.0.1:7070`，用相同引用和客户密钥再次执行真实 `manifest-ctl verify`/load；重复代表性读取时观测 hit/miss、origin 和 fill 计数。fill 异步执行，第二次读取不保证完全命中。cache 传输错误不会自动绕过它访问 Store；应诊断当前路径，或明确创建直接访问 Store 的客户端。
+
+### 选择后端，再按需求扩展
+
+| 需求 | 选择 | 运维影响 |
+|---|---|---|
+| 单服务内嵌本地缓存 | RocksDB `embedded` | 管理其目录和磁盘/内存预算，内容可从 origin 重建。 |
+| 缓存后端已作为独立服务运维 | Redis-compatible `redis` | 外部服务负责持久性/容量/淘汰，单独准备 socket/TCP endpoint 和预算；Redis 与 RocksDB 均受支持。 |
+| 跨节点共享缓存容量 | 增加 `ec` tier 和 `shard` 节点 | 保留所选 codec 所需 peer 数；不变的 4+1 至少需要五个 peer。一次滚动一个 peer，并测量修复/回源流量。 |
+| 跨进程重启保留监听 socket | [Socket activation](#命名监听与-socket-activation) | 可选的服务管理器集成，重启后仍验证真实协议和数据恢复。 |
+
+缓存内容不能成为唯一持久副本。用作缓存的 Redis-compatible 服务不能替代 Store；关闭淘汰的 `local` benchmark origin 也不是持久部署建议。客户端直接调用配置的 Store/cache endpoint，不需要 master/worker 或 owner 路由服务。
+
 ## 概述
 
 ### 解决的问题
@@ -51,10 +112,13 @@ YAML 示例见 [配置](#配置)。
 
 ```
 cache-ctl config show     [--config <path>]
+cache-ctl config validate [--config <path>]
 cache-ctl config generate
 ```
 
 `show` 读取 `--config`（或 `CACHE_CONFIG`）并重新序列化解析后的 YAML，不执行 `serve` 的语义 `Validate` 检查。成功输出不证明 daemon 能启动。
+
+`validate` 采用与 `show` 相同的 `--config` / `CACHE_CONFIG` 优先级，再运行 `serve` 使用的静态 `Config.Validate` 检查。成功输出 `{"valid":true}`；加载/校验失败非零退出且不输出成功结果。它检查所选模式、必需的 backend/tier/origin 字段及受支持的组合，不打开目录、不导入 activation FD、不连接 Store/Redis/EC peer，也不绑定 listener。后端初始化、二进制构建选项、资源容量和可达性需要实际启动所选服务并访问验证。共用的 YAML 加载器会忽略未知字段；即使校验成功，也应使用文档规定的字段名。
 
 `generate` 输出带注释模板(默认 tiered:rocksdb L1 + store origin)。
 
@@ -795,7 +859,7 @@ tiered 仅提供 object read chain,拒绝 writes 和 shard operations。协议�
 
 Cache 读取是单次尝试操作。`Get`/`GetShard` 会释放或取消失败的 payload/stream；后续调用在同一已选 endpoint 重新开始完整对象读取，不拼接旧前缀。已确认 miss 与无法联系 peer 保持不同含义，合法服务端取消仍可重试。现有 endpoint、pool 和单次操作 timeout 设置仍然权威；socket/RPC deadline 只约束一次尝试，是否允许下一次尝试由调用者的 operation context 决定。不增加 retry 参数、fallback endpoint、健康屏蔽、服务重启或兼容模式。
 
-连接额度统一计算空闲、借出和拨号中的连接，Acquire/refill 共用预留上限。即使没有配置读取 deadline，pool 拨号仍使用有界连接 timeout。拨号失败释放预留并返回真实错误；坏连接释放容量并唤醒等待者，即使没有健康连接归还。等待者取消或取得连接后，如仍有空余额度，会转交已消费的通知。Close 阻止新发布、唤醒等待者并取消拨号，借出连接仍由调用者持有至 Release；Release 与 Close 对发布互斥，socket 取消必须在连接归还池前结束。同 endpoint 恢复不需要每次读前 Ping 或整池失效。空闲 Acquire 路径继续使用连接 channel 而不取得发布 mutex；失败尝试不创建无界 refill 任务，停机期间健康/refill 仍只由有界维护 worker 执行。
+连接额度统一计算空闲、借出和拨号中的连接，Acquire/refill 共用预留上限。即使没有配置读取 deadline，pool 拨号仍使用有界连接 timeout。拨号失败释放预留并返回真实错误；坏连接释放容量并唤醒等待者，即使没有健康连接归还。等待者取消或取得连接后，如仍有空余额度，会转交已消费的通知。Close 阻止新发布、唤醒等待者并取消拨号，借出连接仍由调用者持有至 Release；Release 与 Close 对发布互斥，socket 取消必须在连接归还池前结束。同 endpoint 恢复不需要每次读前 Ping 或整池失效。Acquire 从有界 deque 取得最近归还的健康空闲连接，维护和空闲回收取得最老连接。空闲 deque、发布与 Close 共用 mutex，网络调用和重试等待不在锁内执行。Acquire 不增加 Ping；失败尝试不创建无界 refill 任务，停机期间健康/refill 仍只由有界维护 worker 执行。
 
 Cache 调用方使用的 `pkg/readerr` 分类在包装链中保持：已确认 miss 不是 transport failure，未知错误不会自动成为永久失败，joined/wrapped error 中的永久语义原因仍可见。业务重试/退避由消费者而非 accelerator 负责。
 

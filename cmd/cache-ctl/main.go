@@ -101,16 +101,16 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  ping        Health probe")
 	fmt.Fprintln(os.Stderr, "  info        Inspect daemon and backend state")
 	fmt.Fprintln(os.Stderr, "  bench       Run performance benchmark")
-	fmt.Fprintln(os.Stderr, "  config      Inspect or generate the cache-ctl config")
+	fmt.Fprintln(os.Stderr, "  config      Inspect, validate or generate the cache-ctl config")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "Environment:")
-	fmt.Fprintln(os.Stderr, "  CACHE_CONFIG    fallback for serve --config")
+	fmt.Fprintln(os.Stderr, "  CACHE_CONFIG    fallback for serve/config --config")
 	fmt.Fprintln(os.Stderr, "  CACHE_ENDPOINT  fallback for object/shard/bench --endpoint")
 }
 
 // ── serve ──
 
-// cacheConfigEnv overrides --config for cache-ctl serve when both are absent.
+// cacheConfigEnv supplies the fallback when serve/config --config is empty.
 const cacheConfigEnv = "CACHE_CONFIG"
 
 // cacheEndpointEnv supplies --endpoint for client commands (data port:

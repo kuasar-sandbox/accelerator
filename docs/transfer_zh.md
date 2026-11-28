@@ -4,6 +4,27 @@
 
 `manifest-ctl` 与共享 transfer API 在 tarstream 文件、Manifest Bundle 和 Store 之间传输选定的逻辑内容。先完成本地完整往返，再查阅命令和配置。[数据契约](artifacts_zh.md) 定义引用、稀疏数据、格式和加密；本篇定义调用方式、变换、输出与调用者责任。
 
+## 发布并复用工件
+
+转换数据前先选择目的地。平台 Build 可能已发布完整可用的模板引用，应直接使用该引用，无需再次上传 payload。`manifest-ctl` 适合导入既有工件、在受支持的载体间搬运及验证存储内容。
+
+| 场景 | 推荐路径 | 后续读取需要保留 |
+|---|---|---|
+| 工件留在一个节点 | 完整本地 tarstream 或 Bundle，加 `file://` 引用 | 文件及身份限定符、保护密钥（如有）以及所有父层/依赖。 |
+| 多节点使用一致挂载的共享文件系统 | 发布完整文件/依赖集合，并使用消费者的命名位置映射 | 共享字节、位置映射和完整引用；路径名本身不构成跨节点可用性。 |
+| 需要通过对象存储读取工件 | `manifest-ctl store` 写入 Store，再消费 `manifest://<返回key>` | Store 对象/generation、完整引用及封装 key table 的客户密钥。 |
+| 导出或导入可离线搬运的包 | Bundle 输出及规定的 Bundle 传输/验证流程 | Bundle 依赖和所选 root 引用；上传成功后才能发布新的 Store 引用。 |
+
+持久 Store 的使用流程：
+
+1. 部署 [Store](store_zh.md#部署首个持久-store)，创建 [Manifest 配置](#manifest-configyaml)，填写 `store.endpoint`，启用校验，初始不配置 cache endpoint。通过 `MANIFEST_KEY` 或受保护的 `manifest.key` 配置，提供既有 32 字节客户密钥的 64 字符十六进制文本，或已配置的 [`@plugin/key` 引用](secret-plugins_zh.md)。只有明确建立新内容保护域时才生成新密钥，并保留它供后续读取。
+2. 如需制备镜像，使用匹配 guest-runtime 发行版的 `flatten-ctl`。当前制备使用链接的 Go EROFS 生成器，无需先在 host 安装 mkfs.erofs 或进行特权 loop mount；保留所有权的导出仍可能需要 CLI 指南规定的权限。
+3. 执行 `manifest-ctl store --manifest-config /etc/accelerator/manifest.yaml --no-progress /path/to/artifact.img`。仅上传时 stdout 为 Manifest key，成功完成后保存 `manifest://` 加完整 key。不要将摘要前缀或临时源路径作为发布引用。
+4. 执行 `manifest-ctl verify --manifest-config /etc/accelerator/manifest.yaml --no-progress manifest://<返回key>`，随后从预期节点 load 或消费。使用相同客户密钥并核验目标 Store/generation 可见性，路径验证成功后再增加 cache。
+5. 通过平台模板/实例流程发布引用，同时保留密钥、Runtime 声明、父层/依赖引用和持久字节。导出单层不保证依赖父层的快照自包含；需要搬运、合并或重打包时按下文精确选项操作，这些动作可能改变身份。
+
+下文一次性往返会创建并删除测试密钥和存储，用于诊断，不是持久密钥交付方案。普通 tar 和原始 payload 文件不具有平台 tarstream envelope 相同的稀疏/身份契约。
+
 ## 独立 Store 往返
 
 在加入 VM 或 cache 前先验证这一流程。前提为 Linux、Bash、Python 3，以及同一
@@ -13,7 +34,7 @@ aggregate 所选的 `store-ctl`、`manifest-ctl` 和 guest-runtime 的 `flatten-
 旧版不适用。使用配套版本，不要分别下载各组件的 latest。
 
 以下临时 FS Store 使用私有 UDS 和临时客户密钥，不需要 L2、MicroVM、registry、
-公共 listener 或外部数据。[Store generation 初始化](store_zh.md) 和下文 [配置](#配置)
+公共 listener 或外部数据。内联 generation 列表无需初始化；[Store generation 管理](store_zh.md#admin-命令)和下文[配置](#配置)
 仍是权威契约。请在新 shell 执行；退出时总会停止本次子进程，仅成功时删除
 临时目录。失败时保留私有目录并打印路径供诊断。
 
@@ -35,6 +56,7 @@ cleanup() {
   exit "$result"
 }
 trap cleanup EXIT
+mkdir "$LAB/objects"
 cat > "$LAB/store.yaml" <<EOF
 listen: unix://$LAB/store.sock
 backend: fs
@@ -42,10 +64,8 @@ fs:
   root: $LAB/objects
   verify_content_key: true
 generations:
-  file:
-    path: $LAB/generations
+  config: [G1]
 EOF
-store-ctl init --config "$LAB/store.yaml" --generation G1
 store-ctl serve --config "$LAB/store.yaml" >"$LAB/store.log" 2>&1 &
 STORE_PID=$!
 for i in $(seq 1 50); do
@@ -54,7 +74,8 @@ for i in $(seq 1 50); do
   sleep 0.1
 done
 test -S "$LAB/store.sock"
-export MANIFEST_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+MANIFEST_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+export MANIFEST_KEY
 cat > "$LAB/manifest.yaml" <<EOF
 store:
   endpoint: unix://$LAB/store.sock
@@ -83,7 +104,7 @@ SUCCESS=1
 预期获得完整 Manifest key、verify 零失败 chunk 和最终 PASS 行。比较解包后的
 逻辑字节，load 后 tar 包装/名称可能不同。普通文件或通用 tar 不能替代平台的
 稀疏/digest envelope。失败后按 stderr 打印路径检查保留目录的 `store.log`、
-generation 初始化、socket 就绪与密钥；不要把结果未知的写操作当作读取失败重试。本流程
+generation 配置、socket 就绪与密钥；不要把结果未知的写操作当作读取失败重试。本流程
 只验证本地字节往返，不验证稀疏 VM 状态、cache 层级、S3 或恢复。诊断结束后，
 显式删除本次打印的私有测试目录。若需长期保留数据，应保留密钥、配置和 ref，
 不使用此处测试清理；生成的密钥仅存在于本 shell 环境。
@@ -376,6 +397,8 @@ crypto:
   local: off                      # off | auto | required;缺省 off
   ref: auto                       # off | auto | required，独立于 local
 ```
+
+`manifest.key` 和 `MANIFEST_KEY` 均接受十六进制密钥文本或 `@plugin/key` 引用。YAML 中的引用需要加引号，解析后的值必须为 32 字节。broker 配置和密钥生命周期见 [Secret plugin](secret-plugins_zh.md)。
 
 字段说明:
 

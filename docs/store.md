@@ -6,6 +6,32 @@ Use this guide to deploy an independent FS or S3-compatible Store, configure and
 
 `store-ctl` provides a unified persistent-storage data plane for `manifest-ctl` and cache origins. Object data may reside on a local/shared filesystem or in S3-compatible object storage. The generation list can independently come from the main configuration, a regular file or a separate S3 object.
 
+## Deploy a first persistent Store
+
+For a [node-infra deployment](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra.md) using Store, provision an external Store service or reuse an existing one, and set `store.endpoint` in the node's `/etc/node-infra/manifest.yaml` to its reachable address. The Store service owner manages its process, backend storage and generation source; node-infra consumes the endpoint and does not start the service. For a Unix socket, mount the provider-owned parent directory into the node container so socket replacement remains visible. The service's backend data directory stays with the provider. Do not start a competing Store against an existing service's data directory or listener.
+
+When provisioning a new Store, begin with one filesystem backend and a direct client path; S3 and cache can be introduced separately.
+
+1. Install `store-ctl` and `manifest-ctl` from the same selected release combination. Create the persistent root directory and make it writable by the service account before starting; the FS backend requires that directory to exist. Choose an endpoint reachable by the intended consumers. A loopback listener serves only the local network namespace; cluster consumers need a protected reachable address or a deliberately shared service.
+2. Save a complete configuration, for example `/etc/accelerator/store.yaml`:
+
+   ```yaml
+   listen: 127.0.0.1:7100
+   backend: fs
+   fs:
+     root: /var/lib/kuasar-accelerator-store
+     verify_content_key: true
+   generations:
+     config: [G1]
+   ```
+
+   This inline generation list is ready to use and needs no `store-ctl init`. To let the administration commands manage the list, instead select one file or S3 generation source and run `init` once before first startup. Do not reinitialize a retained source on each restart. Data backend and generation source are independent choices.
+3. Run `store-ctl serve --config /etc/accelerator/store.yaml` under your service manager, or in a dedicated foreground terminal. The ordinary listener is sufficient for a first service. [Socket activation](#named-listeners-and-socket-activation) is optional when the deployment needs a manager to retain listeners across process restarts.
+4. Point Manifest configuration at this `store.endpoint`, leave `cache.endpoint` empty, supply the retained customer key, and [upload, verify and read an artifact](transfer.md#publish-and-reuse-an-artifact). A bound socket or active process is not a successful data roundtrip. `store-ctl info --config /etc/accelerator/store.yaml` inspects the configured backend/list and reports counts; it does not probe the running RPC listener.
+5. Back up the object directory, generation list, complete artifact references and customer keys according to their owners. When changing the current write generation, retain every older generation still needed by an image, template, snapshot or parent chain. See [Administrative commands](#administrative-commands) before rollout or purge.
+
+For S3, replace the data backend with the [S3 configuration](#s3-data-backend), verify endpoint/credentials/TLS access from the Store host, and keep remote backend credentials with the service. Clients only need the Store endpoint and their content-protection key. A local cache is optional in both deployments.
+
 ## Core model
 
 There is one representation of generations:
@@ -281,7 +307,7 @@ KillSignal=SIGTERM
 
 Direct Go construction of `storeapp.Config` is equally supported. Dynamic generation or credential providers are explicit `Options` bindings documented by the Go API; they are process-local bindings and are not written back into YAML. A custom caller that wants reload must own its reload trigger and provider callback just as `store-ctl` owns SIGHUP adaptation.
 
-`Options` adds zero-value-compatible `Drain <-chan struct{}` and `DrainTimeout time.Duration`. A nil Drain preserves the old SDK cancellation usage shown above; closing Drain starts irreversible soft shutdown. Context cancellation always cancels in-flight work, immediately escalates drain, and takes precedence when simultaneous. Drain during initialization prevents subsequent started publication or serving. A host can pass `Options{Drain: drain, DrainTimeout: 30*time.Second}`, adapt its first exit request to `close(drain)` and later requests to its own cancel function; the SDK does not register signals. See [`cache_listen` and operations](#cache_listen-and-operations) for the budget and resource ordering.
+`Options` exposes `Drain <-chan struct{}` and `DrainTimeout time.Duration`. With a nil Drain, the SDK uses context cancellation as shown above; closing Drain starts irreversible soft shutdown. Context cancellation always cancels in-flight work, immediately escalates drain, and takes precedence when simultaneous. Drain during initialization prevents subsequent started publication or serving. A host can pass `Options{Drain: drain, DrainTimeout: 30*time.Second}`, adapt its first exit request to `close(drain)` and later requests to its own cancel function; the SDK does not register signals. See [`cache_listen` and operations](#cache_listen-and-operations) for the budget and resource ordering.
 
 Validation of the reusable entry point should compile the custom module independently and exercise real Store protocol requests with the official service binary absent from `PATH`.
 
@@ -309,7 +335,7 @@ rpc Get(GetRequest) returns (stream GetResponse);
 rpc Put(stream PutRequest) returns (PutResponse);
 ```
 
-An empty `AdmitWriteRequest.generation` keeps the existing behavior of choosing the newest writable generation. A nonempty invalid name returns `InvalidArgument`; a valid name absent from the current list observed by this request returns `FailedPrecondition`. An empty server generation list returns `Unavailable`. A successful response always returns the canonical `WriteAdmission` for that generation. The official Go client retains `AdmitWrite(ctx)` and additionally provides `AdmitWriteFor(ctx, generation)`. Put wire format and the Backend interface are unchanged.
+An empty `AdmitWriteRequest.generation` selects the newest writable generation. A nonempty invalid name returns `InvalidArgument`; a valid name absent from the current list observed by this request returns `FailedPrecondition`. An empty server generation list returns `Unavailable`. A successful response always returns the canonical `WriteAdmission` for that generation. The official Go client provides `AdmitWrite(ctx)` for automatic selection and `AdmitWriteFor(ctx, generation)` for an explicit generation. Both return the admission used by Put.
 
 `PutHeader` contains the partition, 32-byte key, generation and a presence-aware `optional uint64 size`. Zero means a known empty object; only absence means unknown size. The official Go client receives a complete `[]byte`, so it always sends `uint64(len(data))`. The server checks overflow before converting to `int64`.
 

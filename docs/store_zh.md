@@ -8,6 +8,32 @@
 位于本地/共享文件系统或 S3-compatible object storage；generation 列表则可独立
 来自主配置、普通文件或单独的 S3 object。
 
+## 部署首个持久 Store
+
+[node-infra 部署](https://github.com/kuasar-sandbox/kuasar-sandbox/blob/main/docs/node-infra_zh.md)需要使用 Store 时，准备外部 Store 服务或复用已有服务，并将节点 `/etc/node-infra/manifest.yaml` 中的 `store.endpoint` 指向其可达地址。Store 服务所有者管理进程、后端存储和 generation source；node-infra 消费该 endpoint，不启动此服务。使用 Unix socket 时，将服务提供方持有的父目录挂载到节点容器，使替换后的 socket 仍然可见。后端数据目录由服务提供方保管，不要对已有服务的数据目录或监听地址再启动竞争 Store。
+
+部署新的 Store 时，先使用一个文件系统后端和直接客户端路径，S3 与 cache 可分别引入。
+
+1. 从同一选定发行组合安装 `store-ctl` 和 `manifest-ctl`，启动前创建持久根目录并让服务账号可写；FS 后端要求该目录已存在。选择消费者可达的 endpoint。loopback 监听只服务本地 network namespace；集群消费者需要受保护的可达地址或明确共享的服务。
+2. 保存完整配置，例如 `/etc/accelerator/store.yaml`：
+
+   ```yaml
+   listen: 127.0.0.1:7100
+   backend: fs
+   fs:
+     root: /var/lib/kuasar-accelerator-store
+     verify_content_key: true
+   generations:
+     config: [G1]
+   ```
+
+   内联 generation 列表可直接使用，无需 `store-ctl init`。需要用管理命令维护列表时，改选一个 file 或 S3 generation source，首次启动前执行一次 `init`，不要在每次重启时重新初始化保留的 source。数据后端与 generation source 是独立选择。
+3. 由服务管理器运行 `store-ctl serve --config /etc/accelerator/store.yaml`，或在独立终端以前台方式运行。首次部署用普通 listener 即可；需要由管理器跨进程重启保留监听时，再选用 [socket activation](#命名监听与-socket-activation)。
+4. 将 Manifest 配置的 `store.endpoint` 指向该服务，保持 `cache.endpoint` 为空，提供保留的客户密钥，执行[工件上传、验证和读取](transfer_zh.md#发布并复用工件)。socket 已绑定或进程 active 不构成数据往返成功。`store-ctl info --config /etc/accelerator/store.yaml` 直接检查配置的后端/列表并报告数量，不探测运行中的 RPC listener。
+5. 按各自所有者备份对象目录、generation 列表、完整工件引用及客户密钥。切换当前写入 generation 时，保留镜像、模板、快照或父链仍需要的旧代。执行 rollout/purge 前阅读 [Admin 命令](#admin-命令)。
+
+使用 S3 时，将数据后端替换为 [S3 配置](#s3-数据后端)，从 Store 主机核验 endpoint、凭据和 TLS 访问，远端后端凭据由服务持有。客户端只需要 Store endpoint 与内容保护密钥；两种部署都可按需增加本地 cache。
+
 ## 核心模型
 
 generation 只有一种表示：
@@ -315,7 +341,7 @@ KillSignal=SIGTERM
 
 也可直接用 Go 构造 `storeapp.Config`。动态 generation/credential provider 通过 Go API 的 `Options` 显式绑定，不写回 YAML。需要 reload 的定制调用方自行拥有 reload 触发和 provider callback；官方 `store-ctl` 只是把 SIGHUP 适配为这些输入。
 
-`Options` 新增零值兼容的 `Drain <-chan struct{}` 和 `DrainTimeout time.Duration`。Drain 为 nil 保留上例的旧 SDK 取消用法;关闭 Drain 发起不可逆软停。ctx 取消始终取消在途工作,drain 中取消立即升级,同时发生时取消优先。初始化期间收到 drain 后不再发布 started 或开始 serving。宿主可传 `Options{Drain: drain, DrainTimeout: 30*time.Second}`,将第一次退出请求适配为 `close(drain)`,后续请求调用自己的 cancel;SDK 不注册信号。预算与资源顺序见 [`cache_listen` 与运维](#cache_listen-与运维)。
+`Options` 提供 `Drain <-chan struct{}` 和 `DrainTimeout time.Duration`。Drain 为 nil 时，SDK 使用上例的 context 取消方式；关闭 Drain 发起不可逆软停。ctx 取消始终取消在途工作,drain 中取消立即升级,同时发生时取消优先。初始化期间收到 drain 后不再发布 started 或开始 serving。宿主可传 `Options{Drain: drain, DrainTimeout: 30*time.Second}`,将第一次退出请求适配为 `close(drain)`,后续请求调用自己的 cancel;SDK 不注册信号。预算与资源顺序见 [`cache_listen` 与运维](#cache_listen-与运维)。
 
 可复用入口的验收应独立编译定制 module，并在服务 `PATH` 中没有官方二进制时执行真实 Store 协议请求。
 
@@ -343,11 +369,11 @@ rpc Get(GetRequest) returns (stream GetResponse);
 rpc Put(stream PutRequest) returns (PutResponse);
 ```
 
-`AdmitWriteRequest.generation` 为空时保持选择最新可写 generation 的原语义；非空时
+`AdmitWriteRequest.generation` 为空时选择最新可写 generation；非空时
 名称非法时返回 `InvalidArgument`;名称有效但不在本请求读取的当前列表中时返回
 `FailedPrecondition`。服务端 generation 列表为空时返回 `Unavailable`。成功响应始终返回该 generation 的 canonical
-`WriteAdmission`。官方 Go client 保留 `AdmitWrite(ctx)`，并新增
-`AdmitWriteFor(ctx, generation)`；Put wire 与 Backend 接口不变。
+`WriteAdmission`。官方 Go client 用 `AdmitWrite(ctx)` 自动选择 generation，
+用 `AdmitWriteFor(ctx, generation)` 指定 generation；两者都返回供 Put 使用的 admission。
 
 `PutHeader` 包含 partition、32-byte key、generation 和真正有 presence 的
 `optional uint64 size`。零表示已知的空对象；字段缺席才表示大小未知。官方 Go

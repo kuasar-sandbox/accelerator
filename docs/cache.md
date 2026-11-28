@@ -6,6 +6,67 @@ This guide owns the complete content-cache service: deployment and configuration
 
 `cache-ctl` is the platform's content cache **shared across sandboxes**. It reuses frequently read chunks on one node and across a shard cluster, reducing reads from remote S3-compatible object storage. Embedded deployments can serve hot content from RocksDB BlockCache; a Redis-compatible external backend is also available. One binary supports three YAML-selected modes: `local`, `shard` and `tiered`.
 
+## Add a first cache to a working Store path
+
+First verify an artifact directly through [Store](store.md#deploy-a-first-persistent-store). Leave the Manifest client's `cache.endpoint` empty for that check. A cache can be added without republishing the artifact or changing its Manifest reference/key.
+
+For one node, use `tiered` with one local backend and a Store origin. `local` alone is a standalone KV endpoint with no origin fallback; it is not the read-through configuration for arbitrary retained Manifests. EC peers are an optional next step after measuring repeated origin reads and shared capacity needs.
+
+A complete independent example, `/etc/accelerator/cache.yaml`:
+
+```yaml
+mode: tiered
+listen: 127.0.0.1:7070
+health_listen: 127.0.0.1:7071
+rpc_timeout: 2s
+stats_interval: 30s
+tiers:
+  - type: embedded
+    rocks:
+      path: /var/cache/kuasar-accelerator
+      disk_bytes: 10GiB
+      mem_ratio: 0.01
+origin:
+  type: store
+  store:
+    endpoint: 127.0.0.1:7100
+    pool: 4
+    timeout: 5s
+  max_inflight: 16
+```
+
+Make the cache directory writable by its service account and validate the configuration before starting the service:
+
+```bash
+cache-ctl config validate --config /etc/accelerator/cache.yaml
+```
+
+Require `{"valid":true}`, then run `cache-ctl serve --config /etc/accelerator/cache.yaml` in a service or dedicated terminal. Validation checks the configuration without opening the cache or testing Store connectivity; the running-service checks below complete that path.
+
+For node-infra, the deployment owner runs Cache as an external service and sets `cache.endpoint` in the node's `/etc/node-infra/manifest.yaml` to its reachable data listener. The Cache service owner manages its process and backend storage; node-infra does not start it. Reuse an existing service without starting a competing instance against its backend directory or listener. For a Unix socket, mount the provider-owned parent directory into the node container so socket replacement remains visible. The example TCP endpoint is loopback and serves only consumers in the same network namespace; choose a protected reachable address when the service and consumer use different namespaces.
+
+The `10GiB` value illustrates an initial sizing input, not a disk quota. At `mem_ratio: 0.01`, it selects about 102.4 MiB of BlockCache, above the 64 MiB minimum. CMS generations, write buffers, native metadata, in-flight requests and OS memory are additional. Measure the complete process and filesystem; [memory budgeting](#memory-budgeting) and [RocksDB tuning](#rocksdb-tuning) explain the other allowances. The larger examples later in this guide describe topology, not a universal host size.
+
+Check control and data separately:
+
+```bash
+cache-ctl ping --endpoint 127.0.0.1:7071
+cache-ctl info --endpoint 127.0.0.1:7071 --json
+```
+
+Require the printed health state `SERVING`; `ping` can exit zero for `NOT_SERVING`. Set the existing Manifest config's `cache.endpoint` to `127.0.0.1:7070`, then repeat a real `manifest-ctl verify`/load with the same reference and customer key. Inspect hit/miss, origin and fill counters while repeating representative reads. Filling is asynchronous, so the second read is not guaranteed to be fully warm. A cache transport error does not transparently bypass it to Store; diagnose the configured path or deliberately construct a direct-Store client.
+
+### Choose a backend and expand deliberately
+
+| Need | Choice | Operational consequence |
+|---|---|---|
+| One service with an embedded local cache | RocksDB `embedded` | Own its directory and disk/memory budget; contents are rebuildable from the origin. |
+| A cache backend already operated as a separate service | Redis-compatible `redis` | The external service owns persistence/capacity/eviction; provision its socket/TCP endpoint and budget separately. Both Redis and RocksDB remain supported. |
+| Share cache capacity across nodes | Add an `ec` tier and `shard` peers | Preserve the selected codec's peer count; unchanged 4+1 needs at least five peers. Roll one peer at a time and measure repair/origin traffic. |
+| Retain listening sockets across process restarts | [Socket activation](#named-listeners-and-socket-activation) | Optional service-manager integration; verify real protocol/data recovery after restart. |
+
+Cache contents are never the sole durable copy. A Redis-compatible service used for caching does not replace Store, and a `local` benchmark origin with eviction disabled is not a persistence recommendation. Clients call the configured Store/cache endpoints directly; no master/worker or owner-routing service is required.
+
 ## Overview
 
 ### Problem
@@ -39,10 +100,13 @@ Either `--config` or `CACHE_CONFIG` is required; the flag takes precedence and b
 
 ```text
 cache-ctl config show     [--config <path>]
+cache-ctl config validate [--config <path>]
 cache-ctl config generate
 ```
 
 `show` reads `--config` (or `CACHE_CONFIG`) and re-serializes the parsed YAML; it does not run the semantic `Validate` checks that `serve` runs. Successful output is not proof that the daemon can start.
+
+`validate` uses the same `--config` / `CACHE_CONFIG` precedence as `show`, then runs the static `Config.Validate` checks used by `serve`. Success prints `{"valid":true}`; load/validation failures return a nonzero exit without success output. It checks the selected mode, required backend/tier/origin fields and their supported combinations. It does not open directories, import activation FDs, connect to Store/Redis/EC peers or bind listeners. Backend initialization, executable build options, resource capacity and reachability require starting the selected service and exercising it. The shared YAML loader ignores unknown fields; use the documented field names even when validation succeeds.
 
 `generate` prints a commented template, defaulting to a tiered configuration with embedded RocksDB L1 and a store origin.
 
@@ -704,7 +768,7 @@ Tiered exposes only the object read chain. It rejects writes and shard operation
 
 Cache reads are single-attempt operations. `Get`/`GetShard` release or cancel failed payloads and streams; a later call starts a complete new object read at the same selected endpoint and never splices an old prefix. A confirmed miss remains distinct from inability to contact a peer, and legal server cancellation remains retryable. Existing endpoint, pool and per-operation timeout settings remain authoritative; socket/RPC deadlines bound one attempt, while the caller's operation context decides whether another attempt is allowed. No retry flag, fallback endpoint, health mask, service restart or compatibility mode is added.
 
-Connection capacity counts idle, borrowed and dialing connections under the same reservation limit for Acquire and refill. Pool dialing has a bounded connection timeout even when no read deadline is configured. Failed dials release their reservation and return the actual error. Bad connections release capacity and wake waiters even when no healthy connection is returned; canceling/taking waiters transfer a consumed notification when spare capacity remains. Close prevents new publication, wakes waiters and cancels dials, while borrowed connections remain caller-owned until Release. Release and Close serialize publication, and socket cancellation must finish before connection ownership returns to the pool. Same-endpoint recovery does not require per-read Ping or whole-pool invalidation. The idle Acquire path continues to use the connection channel without the publication mutex; failed attempts create no unbounded refill tasks, and only bounded maintenance workers perform health/refill work across an outage.
+Connection capacity counts idle, borrowed and dialing connections under the same reservation limit for Acquire and refill. Pool dialing has a bounded connection timeout even when no read deadline is configured. Failed dials release their reservation and return the actual error. Bad connections release capacity and wake waiters even when no healthy connection is returned; canceling/taking waiters transfer a consumed notification when spare capacity remains. Close prevents new publication, wakes waiters and cancels dials, while borrowed connections remain caller-owned until Release. Release and Close serialize publication, and socket cancellation must finish before connection ownership returns to the pool. Same-endpoint recovery does not require per-read Ping or whole-pool invalidation. Acquire takes the newest returned healthy idle connection from a bounded deque; maintenance and idle reaping take the oldest. The idle deque, publication and Close share a mutex, with no network calls or retry waits under it. Acquire adds no Ping; failed attempts create no unbounded refill tasks, and only bounded maintenance workers perform health/refill work across an outage.
 
 `pkg/readerr` classification used by cache callers is preserved across wrappers: confirmed miss is not a transport failure, unknown errors are not automatically permanent, and permanent semantic causes remain visible through joined/wrapped errors. Consumers, not accelerator, own business retry/backoff.
 
